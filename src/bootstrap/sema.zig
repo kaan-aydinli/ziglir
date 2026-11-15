@@ -887,6 +887,22 @@ pub const Sema = struct {
         return util.findSimilarName(name, cands[0..cand_count], max_dist);
     }
 
+    fn suggestEnumVariant(self: *const Sema, enum_idx: usize, name: []const u8) ?[]const u8 {
+        if (enum_idx >= self.ast.enum_count) return null;
+        const ed = self.ast.enum_defs[enum_idx];
+        var cands: [64][]const u8 = undefined;
+        var cand_count: usize = 0;
+        const vc = @min(ed.variant_count, @as(u32, @intCast(ed.variants.len)));
+        for (ed.variants[0..vc]) |v| {
+            if (cand_count < cands.len) {
+                cands[cand_count] = self.srcText(v.name_start, v.name_len, ed.source_id);
+                cand_count += 1;
+            }
+        }
+        const max_dist: usize = if (name.len <= 4) 2 else @min(@as(usize, 3), name.len / 2 + 1);
+        return util.findSimilarName(name, cands[0..cand_count], max_dist);
+    }
+
     fn getTupleDesc(self: *const Sema, id: u32) ?parser_mod.TypeDesc {
         if ((id & 0x80000000) != 0) {
             const idx = id & 0x7FFFFFFF;
@@ -2664,7 +2680,7 @@ pub const Sema = struct {
                     self.markExprEscaped(n.child0);
                     if (self.cur_has_explicit_ret) {
                         if (self.cur_ret_type == .void) {
-                            self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, 6, "cannot return a value from void function", .{});
+                            self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, 6, "cannot return a value from void function; specify return type with '-> <type>'", .{});
                         } else if (!self.isExprCompatible(self.cur_ret_type, rty, n.child0)) {
                             self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, 6, "return type mismatches function signature", .{});
                         } else {
@@ -4081,7 +4097,11 @@ pub const Sema = struct {
                                     break :blk .{ .enum_t = ei };
                                 }
                             }
-                            self.failAt(error.UnknownField, n.source_id, n.line, n.col, n.text_len, "enum '{s}' has no variant '{s}'", .{ bname, mname });
+                            if (self.suggestEnumVariant(ei, mname)) |sugg| {
+                                self.failAt(error.UnknownField, n.source_id, n.line, n.col, n.text_len, "enum '{s}' has no variant '{s}'; did you mean '{s}'?", .{ bname, mname, sugg });
+                            } else {
+                                self.failAt(error.UnknownField, n.source_id, n.line, n.col, n.text_len, "enum '{s}' has no variant '{s}'", .{ bname, mname });
+                            }
                             break :blk .unknown;
                         }
                     }
@@ -4105,7 +4125,11 @@ pub const Sema = struct {
                                     break :blk .{ .enum_t = ei };
                                 }
                             }
-                            self.failAt(error.UnknownField, n.source_id, n.line, n.col, n.text_len, "enum '{s}' has no variant '{s}'", .{ bname, mname });
+                            if (self.suggestEnumVariant(ei, mname)) |sugg| {
+                                self.failAt(error.UnknownField, n.source_id, n.line, n.col, n.text_len, "enum '{s}' has no variant '{s}'; did you mean '{s}'?", .{ bname, mname, sugg });
+                            } else {
+                                self.failAt(error.UnknownField, n.source_id, n.line, n.col, n.text_len, "enum '{s}' has no variant '{s}'", .{ bname, mname });
+                            }
                             break :blk .unknown;
                         }
                     }
@@ -4253,7 +4277,11 @@ pub const Sema = struct {
                                 break :blk .{ .enum_t = ei };
                             }
                         }
-                        self.failAt(error.UnknownField, n.source_id, n.line, n.col, n.text_len, "enum '{s}' has no variant '{s}'", .{ ename, fname });
+                        if (self.suggestEnumVariant(ei, fname)) |sugg| {
+                            self.failAt(error.UnknownField, n.source_id, n.line, n.col, n.text_len, "enum '{s}' has no variant '{s}'; did you mean '{s}'?", .{ ename, fname, sugg });
+                        } else {
+                            self.failAt(error.UnknownField, n.source_id, n.line, n.col, n.text_len, "enum '{s}' has no variant '{s}'", .{ ename, fname });
+                        }
                         break :blk .unknown;
                     }
                 }

@@ -852,6 +852,63 @@ pub const str_src =
     \\    return hits
     \\}
     \\
+    \\fn str_replace(s: string, from: string, to: string) -> string {
+    \\    let sn = @string_len(s)
+    \\    let fn_len = @string_len(from)
+    \\    let tn = @string_len(to)
+    \\    if fn_len <= 0 or sn < fn_len { return s }
+    \\    let count = str_count(s, from)
+    \\    if count <= 0 { return s }
+    \\    let diff = tn - fn_len
+    \\    let out_len = sn + count * diff
+    \\    if out_len <= 0 { return "" }
+    \\    let buf = @malloc(out_len + 1)
+    \\    if buf == 0 as *u8 { return s }
+    \\    var si: i64 = 0
+    \\    var bi: i64 = 0
+    \\    let limit = sn - fn_len
+    \\    while si < sn {
+    \\        var match_found = false
+    \\        if si <= limit {
+    \\            var j: i64 = 0
+    \\            while j < fn_len {
+    \\                if @string_char_at(s, si + j) != @string_char_at(from, j) { break }
+    \\                j += 1
+    \\            }
+    \\            if j == fn_len { match_found = true }
+    \\        }
+    \\        if match_found {
+    \\            if tn > 0 {
+    \\                @memcpy(@ptr_add(buf, bi), to, tn)
+    \\                bi += tn
+    \\            }
+    \\            si += fn_len
+    \\        } else {
+    \\            @write_u8(@ptr_add(buf, bi), @string_char_at(s, si))
+    \\            bi += 1
+    \\            si += 1
+    \\        }
+    \\    }
+    \\    let res = @string_new(buf, bi)
+    \\    @free(buf)
+    \\    return res
+    \\}
+    \\
+    \\fn str_reverse(s: string) -> string {
+    \\    let n = @string_len(s)
+    \\    if n <= 1 { return s }
+    \\    let buf = @malloc(n + 1)
+    \\    if buf == 0 as *u8 { return s }
+    \\    var i: i64 = 0
+    \\    while i < n {
+    \\        @write_u8(@ptr_add(buf, i), @string_char_at(s, n - 1 - i))
+    \\        i += 1
+    \\    }
+    \\    let res = @string_new(buf, n)
+    \\    @free(buf)
+    \\    return res
+    \\}
+    \\
     \\fn str_pad_left(s: string, total_len: i64, pad_ch: i64) -> string {
     \\    let slen = @string_len(s)
     \\    if slen >= total_len { return s }

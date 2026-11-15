@@ -75,6 +75,13 @@ class CliTests(unittest.TestCase):
         self.assertEqual((self.cwd / "program").read_bytes(), b"existing artifact")
         self.assertFalse(list(self.cwd.glob("*.lir_tmp_*")))
 
+    def test_repl_evaluation(self):
+        script = "10 + 32\nlet x = 5\nx * 7\n:exit\n"
+        proc = subprocess.run([str(COMPILER), "repl"], input=script, text=True, capture_output=True, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("=> 42", proc.stdout)
+        self.assertIn("=> 35", proc.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

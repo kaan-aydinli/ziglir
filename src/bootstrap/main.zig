@@ -63,6 +63,7 @@ const printUsize = util.printUsize;
 const project = @import("project.zig");
 const manifest = @import("manifest.zig");
 const sysExit = util.sysExit;
+const repl_mod = @import("repl.zig");
 
 // ════════════════════════════════════════════════════════════════════════════
 // CLI
@@ -77,6 +78,10 @@ pub fn main() !void {
     defer std.process.argsFree(alloc, args);
 
     if (args.len < 2) {
+        if (std.io.getStdIn().isTty()) {
+            repl_mod.cmdRepl();
+            return;
+        }
         printUsage();
         return;
     }
@@ -106,11 +111,13 @@ pub fn main() !void {
         if (args.len > 3) unexpectedArgument(args[3]);
         const name = if (args.len >= 3) args[2] else "myproject";
         cmdInit(name);
+    } else if (eql(command, "repl")) {
+        repl_mod.cmdRepl();
     } else if (eql(command, "install")) {
         cmdInstall();
     } else {
         const known_commands = [_][]const u8{
-            "build", "run", "check", "ir", "ast", "explain", "test", "targets", "init", "install", "help", "version",
+            "build", "run", "check", "ir", "ast", "explain", "test", "targets", "init", "repl", "install", "help", "version",
         };
         printErr("Unknown command: '");
         printErr(command);
@@ -145,6 +152,7 @@ fn printUsage() void {
         \\  ast [file|dir]      Pretty-print Abstract Syntax Tree
         \\  explain [topic]     Interactive developer reference & error explanation
         \\  test [file|dir]     Run #[test] suite
+        \\  repl                Start interactive Read-Eval-Print Loop
         \\  targets             List supported cross-compilation targets and host defaults
         \\  init [name]         Create a new project
         \\  install             Install lir binary to system PATH
@@ -467,7 +475,7 @@ fn dumpNode(ast: *const parser_mod.AST, source: []const u8, idx: u32, depth: usi
     }
 }
 
-fn dumpAST(ast: *const parser_mod.AST, source: []const u8) void {
+pub fn dumpAST(ast: *const parser_mod.AST, source: []const u8) void {
     printStr("=== LIR Abstract Syntax Tree ===\n\n");
     if (ast.struct_count > 0) {
         printStr("Structs:\n");
@@ -589,7 +597,7 @@ fn cmdAst(args: []const []const u8) void {
     dumpAST(ast, source_buf);
 }
 
-fn cmdExplain(args: []const []const u8) void {
+pub fn cmdExplain(args: []const []const u8) void {
     if (args.len == 0) {
         printStr(
             \\LIR Architecture & Language Explanations

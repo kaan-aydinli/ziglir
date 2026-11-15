@@ -3842,3 +3842,53 @@ test "smart compiler: algebraic reassociation and identity folding" {
     try std.testing.expectEqual(@as(u8, 0), run_res.exit_code);
     try std.testing.expectEqualStrings("55\n99\n", run_res.stdout);
 }
+
+test "stdlib: str_replace and str_reverse execute correctly" {
+    const src =
+        \\import std::str
+        \\fn main() -> i64 {
+        \\    let r1 = str_replace("banana", "a", "o")
+        \\    let r2 = str_reverse("racecar")
+        \\    let r3 = str_reverse("hello")
+        \\    println(r1)
+        \\    println(r2)
+        \\    println(r3)
+        \\    return 0
+        \\}
+    ;
+    const elf = try compileSourceWithOpt(src, .O2);
+    defer std.testing.allocator.free(elf);
+    const run_res = try runElfCapture(std.testing.allocator, elf, "str_ops");
+    defer std.testing.allocator.free(run_res.stdout);
+    try std.testing.expectEqual(@as(u8, 0), run_res.exit_code);
+    try std.testing.expectEqualStrings("bonono\nracecar\nolleh\n", run_res.stdout);
+}
+
+test "diagnostics: smart suggestions for typos in keywords, enum variants, and conditions" {
+    // 1. Enum variant typo suggestion
+    {
+        var c = main.Compiler.init(
+            \\enum Status { Ready, InProgress, Finished }
+            \\fn main() -> i64 {
+            \\    let s = Status::Read
+            \\    return 0
+            \\}
+        , "<test>");
+        c.quiet = true;
+        try std.testing.expectError(error.UnknownField, c.compile());
+    }
+
+    // 2. Keyword typo suggestion
+    {
+        var c = main.Compiler.init("func compute() -> i64 { return 42 }\nfn main() -> i64 { return 0 }", "<test>");
+        c.quiet = true;
+        try std.testing.expectError(error.InvalidSyntax, c.compile());
+    }
+
+    // 3. Conditional assignment suggestion
+    {
+        var c = main.Compiler.init("fn main() -> i64 { var x = 1; if x = 2 { return 10 } return 0 }", "<test>");
+        c.quiet = true;
+        try std.testing.expectError(error.InvalidSyntax, c.compile());
+    }
+}

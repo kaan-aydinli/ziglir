@@ -818,7 +818,16 @@ pub const Parser = struct {
             } else {
                 self.pending_fn_flags = 0;
                 const t = self.peek();
-                self.reportErr(t, "expected top-level declaration (fn, struct, union, enum, trait, const, type, impl, import), got '{s}'", .{self.lex.text(t)});
+                const txt = self.lex.text(t);
+                if (std.mem.eql(u8, txt, "function") or std.mem.eql(u8, txt, "func") or std.mem.eql(u8, txt, "def") or std.mem.eql(u8, txt, "procedure")) {
+                    self.reportErr(t, "unknown keyword '{s}'; did you mean 'fn'?", .{txt});
+                } else if (std.mem.eql(u8, txt, "class")) {
+                    self.reportErr(t, "unknown keyword 'class'; did you mean 'struct'?", .{});
+                } else if (std.mem.eql(u8, txt, "var") or std.mem.eql(u8, txt, "let")) {
+                    self.reportErr(t, "top-level variable declarations must use 'const'", .{});
+                } else {
+                    self.reportErr(t, "expected top-level declaration (fn, struct, union, enum, trait, const, type, impl, import), got '{s}'", .{txt});
+                }
                 _ = self.advance();
             }
             self.skipNewlines();
@@ -3130,6 +3139,11 @@ pub const Parser = struct {
         const saved = self.in_cond_header;
         self.in_cond_header = true;
         const cond = self.parseExpr();
+        if (self.match(.eq)) {
+            const eq_tok = self.advance();
+            self.reportErr(eq_tok, "assignment '=' used in condition; did you mean '=='?", .{});
+            _ = self.parseExpr();
+        }
         self.in_cond_header = saved;
         self.skipOnlyNewlines();
         const then_b = self.parseBlock();
@@ -3155,6 +3169,11 @@ pub const Parser = struct {
             const saved = self.in_cond_header;
             self.in_cond_header = true;
             const cond = self.parseExpr();
+            if (self.match(.eq)) {
+                const eq_tok = self.advance();
+                self.reportErr(eq_tok, "assignment '=' used in condition; did you mean '=='?", .{});
+                _ = self.parseExpr();
+            }
             self.in_cond_header = saved;
             self.skipOnlyNewlines();
             const body = self.parseBlock();
@@ -3176,6 +3195,11 @@ pub const Parser = struct {
         const saved = self.in_cond_header;
         self.in_cond_header = true;
         const raw_cond = self.parseExpr();
+        if (self.match(.eq)) {
+            const eq_tok = self.advance();
+            self.reportErr(eq_tok, "assignment '=' used in condition; did you mean '=='?", .{});
+            _ = self.parseExpr();
+        }
         self.in_cond_header = saved;
         const cond = self.newNode(.unary_expr, tok.line);
         self.ast.nodes[cond].op = @intFromEnum(TokenKind.bang);
@@ -3201,6 +3225,11 @@ pub const Parser = struct {
         const saved = self.in_cond_header;
         self.in_cond_header = true;
         const raw_cond = self.parseExpr();
+        if (self.match(.eq)) {
+            const eq_tok = self.advance();
+            self.reportErr(eq_tok, "assignment '=' used in condition; did you mean '=='?", .{});
+            _ = self.parseExpr();
+        }
         self.in_cond_header = saved;
         const cond = self.newNode(.unary_expr, tok.line);
         self.ast.nodes[cond].op = @intFromEnum(TokenKind.bang);
@@ -3220,6 +3249,11 @@ pub const Parser = struct {
         const saved = self.in_cond_header;
         self.in_cond_header = true;
         const raw_cond = self.parseExpr();
+        if (self.match(.eq)) {
+            const eq_tok = self.advance();
+            self.reportErr(eq_tok, "assignment '=' used in condition; did you mean '=='?", .{});
+            _ = self.parseExpr();
+        }
         self.in_cond_header = saved;
         self.skipOnlyNewlines();
         _ = self.expect(.kw_else);
@@ -3242,6 +3276,11 @@ pub const Parser = struct {
         const saved = self.in_cond_header;
         self.in_cond_header = true;
         const cond = self.parseExpr();
+        if (self.match(.eq)) {
+            const eq_tok = self.advance();
+            self.reportErr(eq_tok, "assignment '=' used in condition; did you mean '=='?", .{});
+            _ = self.parseExpr();
+        }
         self.in_cond_header = saved;
         self.skipOnlyNewlines();
         const body = self.parseBlock();
