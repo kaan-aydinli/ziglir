@@ -176,6 +176,38 @@ pub fn emitC(alloc: std.mem.Allocator, module: *const IRModule, source: []const 
         \\    if (b == 0ULL) return a;
         \\    return ((int64_t)a < 0) ? ~((~a) >> b) : (a >> b);
         \\}
+        \\static inline uint64_t lir_popcount(uint64_t x) {
+        \\#if defined(__GNUC__) || defined(__clang__)
+        \\    return (uint64_t)__builtin_popcountll((unsigned long long)x);
+        \\#else
+        \\    uint64_t c = 0; while (x) { c += (x & 1ULL); x >>= 1; } return c;
+        \\#endif
+        \\}
+        \\static inline uint64_t lir_clz(uint64_t x) {
+        \\    if (x == 0ULL) return 64ULL;
+        \\#if defined(__GNUC__) || defined(__clang__)
+        \\    return (uint64_t)__builtin_clzll((unsigned long long)x);
+        \\#else
+        \\    uint64_t c = 0; while ((x & (1ULL << 63)) == 0ULL) { c++; x <<= 1; } return c;
+        \\#endif
+        \\}
+        \\static inline uint64_t lir_ctz(uint64_t x) {
+        \\    if (x == 0ULL) return 64ULL;
+        \\#if defined(__GNUC__) || defined(__clang__)
+        \\    return (uint64_t)__builtin_ctzll((unsigned long long)x);
+        \\#else
+        \\    uint64_t c = 0; while ((x & 1ULL) == 0ULL) { c++; x >>= 1; } return c;
+        \\#endif
+        \\}
+        \\static inline uint64_t lir_bswap(uint64_t x) {
+        \\#if defined(__GNUC__) || defined(__clang__)
+        \\    return (uint64_t)__builtin_bswap64((unsigned long long)x);
+        \\#elif defined(_MSC_VER)
+        \\    return (uint64_t)_byteswap_uint64(x);
+        \\#else
+        \\    return ((x>>56)&0xff)|((x>>40)&0xff00)|((x>>24)&0xff0000)|((x>>8)&0xff000000ULL)|((x&0xff000000ULL)<<8)|((x&0xff0000ULL)<<24)|((x&0xff00ULL)<<40)|((x&0xffULL)<<56);
+        \\#endif
+        \\}
         \\static int64_t lir_checked_add(int64_t a, int64_t b) {
         \\    if ((b > 0 && a > INT64_MAX - b) || (b < 0 && a < INT64_MIN - b)) lir_trap();
         \\    return a + b;
@@ -1316,10 +1348,10 @@ pub fn emitC(alloc: std.mem.Allocator, module: *const IRModule, source: []const 
                     .call_round => try w.print("    v{d} = lir_d2u(round(lir_u2d(v{d})));\n", .{ inst.dest, inst.args[0] }),
                     .call_sin => try w.print("    v{d} = lir_d2u(sin(lir_u2d(v{d})));\n", .{ inst.dest, inst.args[0] }),
                     .call_cos => try w.print("    v{d} = lir_d2u(cos(lir_u2d(v{d})));\n", .{ inst.dest, inst.args[0] }),
-                    .call_popcount => try w.print("    do {{ uint64_t _x = v{d}; uint64_t _c = 0; while (_x) {{ _c += (_x & 1ULL); _x >>= 1; }} v{d} = _c; }} while (0);\n", .{ inst.args[0], inst.dest }),
-                    .call_clz => try w.print("    do {{ uint64_t _x = v{d}; uint64_t _c = 0; if (_x == 0ULL) _c = 64; else while ((_x & (1ULL << 63)) == 0ULL) {{ _c++; _x <<= 1; }} v{d} = _c; }} while (0);\n", .{ inst.args[0], inst.dest }),
-                    .call_ctz => try w.print("    do {{ uint64_t _x = v{d}; uint64_t _c = 0; if (_x == 0ULL) _c = 64; else while ((_x & 1ULL) == 0ULL) {{ _c++; _x >>= 1; }} v{d} = _c; }} while (0);\n", .{ inst.args[0], inst.dest }),
-                    .call_bswap => try w.print("    do {{ uint64_t _x = v{d}; v{d} = ((_x>>56)&0xff)|((_x>>40)&0xff00)|((_x>>24)&0xff0000)|((_x>>8)&0xff000000ULL)|((_x&0xff000000ULL)<<8)|((_x&0xff0000ULL)<<24)|((_x&0xff00ULL)<<40)|((_x&0xffULL)<<56); }} while (0);\n", .{ inst.args[0], inst.dest }),
+                    .call_popcount => try w.print("    v{d} = lir_popcount(v{d});\n", .{ inst.dest, inst.args[0] }),
+                    .call_clz => try w.print("    v{d} = lir_clz(v{d});\n", .{ inst.dest, inst.args[0] }),
+                    .call_ctz => try w.print("    v{d} = lir_ctz(v{d});\n", .{ inst.dest, inst.args[0] }),
+                    .call_bswap => try w.print("    v{d} = lir_bswap(v{d});\n", .{ inst.dest, inst.args[0] }),
                     .call_atomic_add => try w.print("    lir_chk_ptr_n(v{d}, 8u); v{d} = __sync_fetch_and_add((int64_t *)(uintptr_t)v{d}, (int64_t)v{d});\n", .{ inst.args[0], inst.dest, inst.args[0], inst.args[1] }),
                     .call_atomic_cas => try w.print("    lir_chk_ptr_n(v{d}, 8u); v{d} = __sync_bool_compare_and_swap((uint64_t *)(uintptr_t)v{d}, v{d}, v{d}) ? 1ULL : 0ULL;\n", .{ inst.args[0], inst.dest, inst.args[0], inst.args[1], inst.args[2] }),
                     .call_malloc => try w.print("    v{d} = lir_malloc((int64_t)v{d});\n", .{ inst.dest, inst.args[0] }),
