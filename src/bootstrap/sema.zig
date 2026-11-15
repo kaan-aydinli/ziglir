@@ -2366,7 +2366,6 @@ pub const Sema = struct {
                     } else if (init_n.kind == .identifier) {
                         self.markExprEscaped(n.child0);
                     }
-                    }
                 }
                 self.info.node_types[stmt_idx] = ty;
             },
