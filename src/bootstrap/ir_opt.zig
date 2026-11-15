@@ -2961,15 +2961,29 @@ fn coalesceCopiesPostSSA(f: *IRFn) bool {
         var i: u16 = 0;
         while (i + 1 < b.inst_count) : (i += 1) {
             const inst0 = b.insts[i];
-            const inst1 = b.insts[i + 1];
             if (inst0.op == .nop or inst0.op == .phi or inst0.op.isTerminator()) continue;
             if (inst0.dest == 0 or inst0.dest >= MAX_TRACKED_VREGS) continue;
             const tmp = inst0.dest;
             if (def_cnt[tmp] != 1 or use_cnt[tmp] != 1) continue;
+
+            const inst1 = b.insts[i + 1];
+            if (inst1.src1 != tmp and inst1.src2 != tmp and i + 2 < b.inst_count) {
+                const mid = inst1;
+                const chk2 = b.insts[i + 2];
+                if ((chk2.src1 == tmp or chk2.src2 == tmp) and isPureHeaderOp(mid.op) and
+                    mid.dest != tmp and mid.dest != 0 and
+                    inst0.src1 != mid.dest and inst0.src2 != mid.dest)
+                {
+                    b.insts[i] = mid;
+                    b.insts[i + 1] = inst0;
+                    changed = true;
+                    continue;
+                }
+            }
             if (inst1.dest == 0 or inst1.dest == tmp) continue;
             const dst = inst1.dest;
             const is_two_addr = switch (inst1.op) {
-                .add, .sub, .mul, .bit_and, .bit_or, .bit_xor, .shl, .shr, .ushr => true,
+                .add, .sub, .mul, .bit_and, .bit_or, .bit_xor, .shl, .shr, .ushr, .@"mod" => true,
                 else => false,
             };
             if (!is_two_addr) continue;
@@ -3070,6 +3084,111 @@ fn coalesceCopiesPostSSA(f: *IRFn) bool {
             b.insts[ci_idx + 1].src1 = dst;
             b.insts[ci_idx + 1].src2 = fresh_v;
             changed = true;
+        }
+
+        // Pass D: XOR-shift reassociation
+        //   [k]   tmp_s = (shr|ushr|shl) x, shift
+        //   [k+1] tmp_x = bit_xor (tmp_s, x)
+        //   ... optional mid_inst defining y
+        //   [m]   dst = bit_xor (tmp_x, y)
+        // -> (y ^ (x ^ (x >> shift))) == ((x >> shift) ^ (y ^ x))
+        var di_idx: u16 = 0;
+        while (di_idx + 2 < b.inst_count) : (di_idx += 1) {
+            const inst_shr = b.insts[di_idx];
+            const is_shift = (inst_shr.op == .shr or inst_shr.op == .ushr or inst_shr.op == .shl);
+            if (!is_shift) continue;
+            if (inst_shr.dest == 0 or inst_shr.dest >= MAX_TRACKED_VREGS) continue;
+            if (inst_shr.src1 == 0 or inst_shr.src1 >= MAX_TRACKED_VREGS) continue;
+            const tmp_s = inst_shr.dest;
+            const x = inst_shr.src1;
+            const shift = inst_shr.src2;
+            if (tmp_s == x) continue;
+
+            const inst_xor1 = b.insts[di_idx + 1];
+            if (inst_xor1.op != .bit_xor) continue;
+            if (inst_xor1.dest == 0 or inst_xor1.dest >= MAX_TRACKED_VREGS) continue;
+            const tmp_x = inst_xor1.dest;
+            if (tmp_x == x) continue;
+            const matches1 = (inst_xor1.src1 == tmp_s and inst_xor1.src2 == x) or
+                (inst_xor1.src2 == tmp_s and inst_xor1.src1 == x);
+            if (!matches1) continue;
+
+            const exp_defs: u16 = if (tmp_x == tmp_s) 2 else 1;
+            const exp_uses: u16 = if (tmp_x == tmp_s) 2 else 1;
+            if (def_cnt[tmp_s] != exp_defs or use_cnt[tmp_s] != exp_uses) continue;
+            if (def_cnt[tmp_x] != exp_defs or use_cnt[tmp_x] != exp_uses) continue;
+
+            // Search for inst_xor2 at m in di_idx + 2 .. min(di_idx + 4, b.inst_count)
+            var m_opt: ?u16 = null;
+            var y_opt: ?u16 = null;
+            var search_m: u16 = di_idx + 2;
+            const search_limit = @min(di_idx + 4, b.inst_count);
+            while (search_m < search_limit) : (search_m += 1) {
+                const im = b.insts[search_m];
+                if (im.op == .bit_xor) {
+                    if (im.src1 == tmp_x and im.src2 != tmp_x and im.src2 != tmp_s) {
+                        m_opt = search_m;
+                        y_opt = im.src2;
+                        break;
+                    } else if (im.src2 == tmp_x and im.src1 != tmp_x and im.src1 != tmp_s) {
+                        m_opt = search_m;
+                        y_opt = im.src1;
+                        break;
+                    }
+                }
+            }
+            const m = m_opt orelse continue;
+            const y = y_opt orelse continue;
+            if (y == 0 or y >= MAX_TRACKED_VREGS or y == x) continue;
+            const dst = b.insts[m].dest;
+            if (dst == 0 or dst >= MAX_TRACKED_VREGS) continue;
+
+            // Verify x is not modified between di_idx and m
+            var x_safe = true;
+            for (di_idx..m + 1) |chk_k| {
+                if (b.insts[chk_k].dest == x) {
+                    x_safe = false;
+                    break;
+                }
+            }
+            if (!x_safe) continue;
+            if (f.vreg_count >= MAX_TRACKED_VREGS - 4) continue;
+
+            if (m == di_idx + 2) {
+                const fresh_s = f.vreg_count;
+                f.vreg_count += 1;
+                b.insts[di_idx] = .{ .op = .bit_xor, .dest = tmp_x, .src1 = y, .src2 = x };
+                b.insts[di_idx + 1] = .{ .op = inst_shr.op, .dest = fresh_s, .src1 = x, .src2 = shift };
+                b.insts[di_idx + 2] = .{ .op = .bit_xor, .dest = dst, .src1 = fresh_s, .src2 = tmp_x };
+                def_cnt[tmp_x] = 1;
+                use_cnt[tmp_x] = 1;
+                if (fresh_s < MAX_TRACKED_VREGS) {
+                    def_cnt[fresh_s] = 1;
+                    use_cnt[fresh_s] = 1;
+                }
+                changed = true;
+            } else if (m == di_idx + 3) {
+                const mid_inst = b.insts[di_idx + 2];
+                if (mid_inst.dest != y) continue;
+                if (!isPureHeaderOp(mid_inst.op)) continue;
+                if (mid_inst.dest == x or mid_inst.dest == shift) continue;
+                if (mid_inst.src1 == tmp_s or mid_inst.src1 == tmp_x or
+                    mid_inst.src2 == tmp_s or mid_inst.src2 == tmp_x) continue;
+
+                const fresh_s = f.vreg_count;
+                f.vreg_count += 1;
+                b.insts[di_idx] = mid_inst;
+                b.insts[di_idx + 1] = .{ .op = .bit_xor, .dest = tmp_x, .src1 = y, .src2 = x };
+                b.insts[di_idx + 2] = .{ .op = inst_shr.op, .dest = fresh_s, .src1 = x, .src2 = shift };
+                b.insts[di_idx + 3] = .{ .op = .bit_xor, .dest = dst, .src1 = fresh_s, .src2 = tmp_x };
+                def_cnt[tmp_x] = 1;
+                use_cnt[tmp_x] = 1;
+                if (fresh_s < MAX_TRACKED_VREGS) {
+                    def_cnt[fresh_s] = 1;
+                    use_cnt[fresh_s] = 1;
+                }
+                changed = true;
+            }
         }
 
         if (changed) {
@@ -3333,11 +3452,14 @@ fn unrollCountedLoops(f: *IRFn) bool {
         // Verify `iv` is incremented by constant +1 and not read inside body after update
         const iv_inst = b.insts[iv_def_idx];
         var step_ok = false;
+        var const_one: u16 = 0;
         if (iv_inst.op == .add) {
             if (iv_inst.src1 == iv and iv_inst.src2 < MAX_TRACKED_VREGS and const_known[iv_inst.src2] and const_val[iv_inst.src2] == 1) {
                 step_ok = true;
+                const_one = iv_inst.src2;
             } else if (iv_inst.src2 == iv and iv_inst.src1 < MAX_TRACKED_VREGS and const_known[iv_inst.src1] and const_val[iv_inst.src1] == 1) {
                 step_ok = true;
+                const_one = iv_inst.src1;
             }
         }
         if (!step_ok) continue;
@@ -3396,7 +3518,7 @@ fn unrollCountedLoops(f: *IRFn) bool {
         const uf_v = f.vreg_count + 7;
         f.vreg_count += 8;
 
-        const unroll_factor: u16 = if (body_len <= 8 and f.vreg_count + body_len * 8 + 32 < MAX_TRACKED_VREGS) 8 else 4;
+        const unroll_factor: u16 = if (body_len <= 6 and f.vreg_count + body_len * 8 + 32 < MAX_TRACKED_VREGS) 8 else 4;
         const unroll_m: i64 = @as(i64, unroll_factor) - 1;
 
         f.blocks[b_chk_min].inst_count = 3;
@@ -3460,6 +3582,66 @@ fn unrollCountedLoops(f: *IRFn) bool {
         var cur_map: [MAX_TRACKED_VREGS]u16 = undefined;
         for (0..MAX_TRACKED_VREGS) |k| cur_map[k] = @intCast(k);
         var iv_mul_dest: [MAX_INSTS_PER_BLOCK]u16 = .{0} ** MAX_INSTS_PER_BLOCK;
+        var iv_mul_const: [MAX_INSTS_PER_BLOCK]u16 = .{0} ** MAX_INSTS_PER_BLOCK;
+        var iv_mul_fed: [MAX_INSTS_PER_BLOCK]bool = .{false} ** MAX_INSTS_PER_BLOCK;
+        var iv_add_for_mul: [MAX_INSTS_PER_BLOCK]u16 = .{0} ** MAX_INSTS_PER_BLOCK;
+        var iv_add_dest: [MAX_INSTS_PER_BLOCK]u16 = .{0} ** MAX_INSTS_PER_BLOCK;
+        var iv_add_inv: [MAX_INSTS_PER_BLOCK]bool = .{false} ** MAX_INSTS_PER_BLOCK;
+        var iv_add_inv_dest: [MAX_INSTS_PER_BLOCK]u16 = .{0} ** MAX_INSTS_PER_BLOCK;
+
+        for (0..body_len) |ii| {
+            const bi_inst = b.insts[ii];
+            if (bi_inst.op == .mul) {
+                var c_side: u16 = 0;
+                if (bi_inst.src1 == iv and bi_inst.src2 > 0 and bi_inst.src2 < MAX_TRACKED_VREGS and const_known[bi_inst.src2]) {
+                    c_side = bi_inst.src2;
+                } else if (bi_inst.src2 == iv and bi_inst.src1 > 0 and bi_inst.src1 < MAX_TRACKED_VREGS and const_known[bi_inst.src1]) {
+                    c_side = bi_inst.src1;
+                }
+                if (c_side != 0) {
+                    iv_mul_const[ii] = c_side;
+                    for (ii + 1..body_len) |chk_add| {
+                        const ai = b.insts[chk_add];
+                        if (ai.op == .add) {
+                            if (ai.src1 == bi_inst.dest) {
+                                if (ai.src2 > 0 and ai.src2 < MAX_TRACKED_VREGS and blk_def_cnt[ai.src2] == 0) {
+                                    iv_mul_fed[ii] = true;
+                                    iv_add_for_mul[chk_add] = @intCast(ii + 1);
+                                    break;
+                                }
+                            } else if (ai.src2 == bi_inst.dest) {
+                                if (ai.src1 > 0 and ai.src1 < MAX_TRACKED_VREGS and blk_def_cnt[ai.src1] == 0) {
+                                    iv_mul_fed[ii] = true;
+                                    iv_add_for_mul[chk_add] = @intCast(ii + 1);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if (bi_inst.op == .add and bi_inst.dest != iv) {
+                if (bi_inst.src1 == iv and bi_inst.src2 > 0 and bi_inst.src2 < MAX_TRACKED_VREGS and blk_def_cnt[bi_inst.src2] == 0) {
+                    iv_add_inv[ii] = true;
+                } else if (bi_inst.src2 == iv and bi_inst.src1 > 0 and bi_inst.src1 < MAX_TRACKED_VREGS and blk_def_cnt[bi_inst.src1] == 0) {
+                    iv_add_inv[ii] = true;
+                }
+            }
+        }
+
+        var all_iv_reads_handled = true;
+        for (0..body_len) |ii| {
+            const bi_inst = b.insts[ii];
+            if (bi_inst.dest == iv and bi_inst.op == .add) continue;
+            if (instReadsVreg(bi_inst, iv)) {
+                if (iv_mul_const[ii] != 0 and iv_mul_fed[ii]) {
+                    // handled by iv_add_for_mul in subsequent reps
+                } else if (iv_add_inv[ii]) {
+                    // handled by iv_add_inv in subsequent reps
+                } else {
+                    all_iv_reads_handled = false;
+                }
+            }
+        }
 
         var w4: u16 = 0;
         var rep: usize = 0;
@@ -3472,7 +3654,11 @@ fn unrollCountedLoops(f: *IRFn) bool {
                     if (ni.args[ai] > 0 and ni.args[ai] < MAX_TRACKED_VREGS) ni.args[ai] = cur_map[ni.args[ai]];
                 }
 
-                if (!iv_read_in_body and ni.dest == iv and ni.op == .add) {
+                if ((!iv_read_in_body or all_iv_reads_handled) and ni.dest == iv and ni.op == .add) {
+                    continue;
+                }
+
+                if (rep > 0 and iv_mul_const[ii] != 0 and iv_mul_fed[ii]) {
                     continue;
                 }
 
@@ -3489,25 +3675,33 @@ fn unrollCountedLoops(f: *IRFn) bool {
                     }
                 }
 
-                if (ni.op == .mul) {
-                    var iv_side: u8 = 0;
-                    var const_side: u16 = 0;
-                    if (ni.src1 == cur_map[iv] and ni.src2 > 0 and ni.src2 < MAX_TRACKED_VREGS and const_known[ni.src2]) {
-                        iv_side = 1;
-                        const_side = ni.src2;
-                    } else if (ni.src2 == cur_map[iv] and ni.src1 > 0 and ni.src1 < MAX_TRACKED_VREGS and const_known[ni.src1]) {
-                        iv_side = 2;
-                        const_side = ni.src1;
+                if (iv_mul_const[ii] != 0) {
+                    if (rep == 0) {
+                        iv_mul_dest[ii] = ni.dest;
+                    } else if (iv_mul_dest[ii] != 0) {
+                        ni.op = .add;
+                        ni.src1 = iv_mul_dest[ii];
+                        ni.src2 = iv_mul_const[ii];
+                        iv_mul_dest[ii] = ni.dest;
                     }
-                    if (iv_side != 0) {
-                        if (rep == 0) {
-                            iv_mul_dest[ii] = ni.dest;
-                        } else if (iv_mul_dest[ii] != 0) {
-                            ni.op = .add;
-                            ni.src1 = iv_mul_dest[ii];
-                            ni.src2 = const_side;
-                            iv_mul_dest[ii] = ni.dest;
-                        }
+                } else if (iv_add_for_mul[ii] != 0) {
+                    const orig_mul: usize = @as(usize, iv_add_for_mul[ii]) - 1;
+                    if (rep == 0) {
+                        iv_add_dest[ii] = ni.dest;
+                    } else if (iv_add_dest[ii] != 0) {
+                        ni.op = .add;
+                        ni.src1 = iv_add_dest[ii];
+                        ni.src2 = iv_mul_const[orig_mul];
+                        iv_add_dest[ii] = ni.dest;
+                    }
+                } else if (iv_add_inv[ii]) {
+                    if (rep == 0) {
+                        iv_add_inv_dest[ii] = ni.dest;
+                    } else if (const_one != 0 and iv_add_inv_dest[ii] != 0) {
+                        ni.op = .add;
+                        ni.src1 = iv_add_inv_dest[ii];
+                        ni.src2 = const_one;
+                        iv_add_inv_dest[ii] = ni.dest;
                     }
                 }
 
@@ -3519,13 +3713,13 @@ fn unrollCountedLoops(f: *IRFn) bool {
         }
 
         // Emit write-backs for loop-carried variables that were updated in the unrolled repetitions
-        if (!iv_read_in_body and w4 < MAX_INSTS_PER_BLOCK - 2) {
+        if ((!iv_read_in_body or all_iv_reads_handled) and w4 < MAX_INSTS_PER_BLOCK - 2) {
             f.blocks[b_4x].insts[w4] = .{ .op = .add, .dest = iv, .src1 = iv, .src2 = uf_v };
             w4 += 1;
         }
 
         for (0..MAX_TRACKED_VREGS) |orig_v| {
-            if (orig_v == iv and !iv_read_in_body) continue;
+            if (orig_v == iv and (!iv_read_in_body or all_iv_reads_handled)) continue;
             if (cur_map[orig_v] != orig_v and blk_def_cnt[orig_v] > 0 and
                 is_loop_carried[orig_v] and
                 w4 < MAX_INSTS_PER_BLOCK - 2)

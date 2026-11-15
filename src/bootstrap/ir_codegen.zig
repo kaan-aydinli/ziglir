@@ -128,6 +128,15 @@ fn signedDivMagic(divisor: i64) SignedDivMagic {
     return .{ .multiplier = multiplier, .shift = @intCast(p - 64) };
 }
 
+const DeferredDiv64 = struct {
+    j_div64: u32,
+    resume_pos: u32,
+    res_reg: u8,
+    dest: u16,
+    known_c: bool,
+    known_imm: i64,
+};
+
 const Reloc = struct {
     kind: RelocKind,
     opcode_pos: u32,
@@ -228,6 +237,9 @@ pub const IRCodegen = struct {
     cur_shrink_ret_imm: i64 = 0,
     cur_shrink_ret_is_imm: bool = false,
     cur_shrink_cont_bi: u16 = 0xFFFF,
+
+    deferred_div64: [256]DeferredDiv64 = undefined,
+    deferred_div64_count: usize = 0,
 
     // Entry register-only parameter tracking for current function
     param_reg_only: [8]bool = .{false} ** 8,
@@ -1114,6 +1126,7 @@ pub const IRCodegen = struct {
                 } else if (inst.dest > 0 and inst.dest < MAX_VREGS) {
                     const two_addr_s1: u16 = switch (inst.op) {
                         .add, .sub, .mul, .bit_and, .bit_or, .bit_xor, .shl, .shr, .ushr => inst.src1,
+                        .@"mod" => if (inst.src2 > 0 and inst.src2 < MAX_VREGS and self.vreg_const_known[inst.src2]) inst.src1 else 0,
                         .call_ptr_add => if (inst.arg_count >= 1) inst.args[0] else 0,
                         else => 0,
                     };
@@ -1319,7 +1332,7 @@ pub const IRCodegen = struct {
             order_count += 1;
         }
 
-        // Record preferred hardware registers for arguments of calls
+        // Record preferred hardware registers for arguments of calls and hardware div/mod
         for (0..ir_fn.block_count) |bi| {
             const blk = &ir_fn.blocks[bi];
             for (0..blk.inst_count) |ii| {
@@ -1334,6 +1347,19 @@ pub const IRCodegen = struct {
                                     self.vreg_pref_hw_reg[av] = hw;
                                 }
                             }
+                        }
+                    }
+                } else if (inst.op == .@"mod" and
+                    !(inst.src2 > 0 and inst.src2 < MAX_VREGS and self.vreg_const_known[inst.src2]))
+                {
+                    if (inst.dest > 0 and inst.dest < MAX_VREGS and !self.vreg_crosses_call[inst.dest]) {
+                        if (self.vreg_pref_hw_reg[inst.dest] == NO_REG) {
+                            self.vreg_pref_hw_reg[inst.dest] = 2; // RDX for remainder
+                        }
+                    }
+                    if (inst.src2 > 0 and inst.src2 < MAX_VREGS and !self.vreg_crosses_call[inst.src2]) {
+                        if (self.vreg_pref_hw_reg[inst.src2] == NO_REG) {
+                            self.vreg_pref_hw_reg[inst.src2] = 1; // RCX for divisor
                         }
                     }
                 }
@@ -1877,6 +1903,7 @@ pub const IRCodegen = struct {
 
         self.cur_fn_idx = fi;
         self.cur_total_locals = ir_fn.total_locals;
+        self.deferred_div64_count = 0;
         self.allocRegsForFn(ir_fn);
         const has_calls = self.detectEntryRegOnlyParams(ir_fn);
         var has_stack_addr_taken = false;
@@ -2782,6 +2809,34 @@ pub const IRCodegen = struct {
             }
         }
 
+        // Emit out-of-line 64-bit division fallbacks so fast 32-bit division has zero taken jumps
+        for (self.deferred_div64[0..self.deferred_div64_count]) |dd| {
+            self.relocs[dd.j_div64].target_id = self.code_len;
+            if (!(dd.known_c and dd.known_imm != -1)) {
+                // Guard hardware #DE on MIN_INT / -1: cmp rcx, -1; jne ok; mov r11, MIN_INT; cmp rax, r11; jne ok; ud2
+                self.emitCmpRegImm32(1, -1);
+                const j_ok1 = self.emitJccReloc(0x5, .code_offset, 0, fi);
+                self.mov64imm(11, @bitCast(@as(i64, std.math.minInt(i64))));
+                self.emit8(0x4C);
+                self.emit8(0x39);
+                self.emit8(0xD8); // cmp rax, r11
+                const j_ok2 = self.emitJccReloc(0x5, .code_offset, 0, fi);
+                self.emit8(0x0F);
+                self.emit8(0x0B); // ud2
+                const ok_pos = self.code_len;
+                self.relocs[j_ok1].target_id = ok_pos;
+                self.relocs[j_ok2].target_id = ok_pos;
+            }
+            self.emit8(0x48);
+            self.emit8(0x99); // cqo
+            self.emit8(0x48);
+            self.emit8(0xF7);
+            self.emit8(0xF9); // idiv rcx
+            self.storeRegToVreg(dd.res_reg, dd.dest);
+            _ = self.emitJmpReloc(.code_offset, dd.resume_pos, fi);
+        }
+        self.deferred_div64_count = 0;
+
         var needs_fallback = true;
         if (ir_fn.block_count > 0) {
             const lb = &ir_fn.blocks[emit_order[ir_fn.block_count - 1]];
@@ -3254,17 +3309,17 @@ pub const IRCodegen = struct {
                         self.emit8(0x01);
                         self.emitModRM(3, save_reg, 2); // add rdx, save_reg
                     }
+                    self.movRegReg(0, 2);
+                    self.emit8(0x48);
+                    self.emit8(0xC1);
+                    self.emit8(0xE8);
+                    self.emit8(63); // shr rax, 63: extract sign bit in parallel with sar
                     if (magic.shift > 0) {
                         self.emit8(0x48);
                         self.emit8(0xC1);
                         self.emit8(0xFA);
                         self.emit8(magic.shift); // sar rdx, shift
                     }
-                    self.movRegReg(0, 2);
-                    self.emit8(0x48);
-                    self.emit8(0xC1);
-                    self.emit8(0xE8);
-                    self.emit8(63); // shr rax, 63: adjust arithmetic shift toward zero
                     self.emit8(0x48);
                     self.emit8(0x01);
                     self.emit8(0xC2); // add rdx, rax
@@ -3300,9 +3355,7 @@ pub const IRCodegen = struct {
                 }
                 self.loadVregToReg(inst.src1, 0);
                 self.loadVregToReg(inst.src2, 1);
-                if (!(known_c and known_imm != 0)) {
-                    self.emitTestRegZeroTrap(1);
-                }
+                self.emitTestRegZeroTrap(1);
                 // Fast 32-bit division/mod when operands fit in non-negative 32-bit range
                 self.movRegReg(2, 0);
                 self.emit8(0x48);
@@ -3317,31 +3370,19 @@ pub const IRCodegen = struct {
                 self.emit8(0xD2); // xor edx, edx
                 self.emit8(0xF7);
                 self.emit8(0xF1); // div ecx (fast 32-bit div: ~10 cycles)
-                const j_done = self.emitJmpReloc(.code_offset, 0, fi); // jmp done
-                self.relocs[j_div64].target_id = self.code_len;
-                if (!(known_c and known_imm != -1)) {
-                    // Guard hardware #DE on MIN_INT / -1: cmp rcx, -1; jne ok; mov r11, MIN_INT; cmp rax, r11; jne ok; ud2
-                    self.emitCmpRegImm32(1, -1);
-                    const j_ok1 = self.emitJccReloc(0x5, .code_offset, 0, fi);
-                    self.mov64imm(11, @bitCast(@as(i64, std.math.minInt(i64))));
-                    self.emit8(0x4C);
-                    self.emit8(0x39);
-                    self.emit8(0xD8); // cmp rax, r11
-                    const j_ok2 = self.emitJccReloc(0x5, .code_offset, 0, fi);
-                    self.emit8(0x0F);
-                    self.emit8(0x0B); // ud2
-                    const ok_pos = self.code_len;
-                    self.relocs[j_ok1].target_id = ok_pos;
-                    self.relocs[j_ok2].target_id = ok_pos;
+                const res_reg: u8 = if (inst.op == .@"mod") 2 else 0;
+                self.storeRegToVreg(res_reg, inst.dest);
+                if (self.deferred_div64_count < self.deferred_div64.len) {
+                    self.deferred_div64[self.deferred_div64_count] = .{
+                        .j_div64 = j_div64,
+                        .resume_pos = self.code_len,
+                        .res_reg = res_reg,
+                        .dest = inst.dest,
+                        .known_c = known_c,
+                        .known_imm = known_imm,
+                    };
+                    self.deferred_div64_count += 1;
                 }
-                self.emit8(0x48);
-                self.emit8(0x99); // cqo
-                self.emit8(0x48);
-                self.emit8(0xF7);
-                self.emit8(0xF9); // idiv rcx
-                self.relocs[j_done].target_id = self.code_len;
-                if (inst.op == .@"mod") self.movRegReg(0, 2);
-                self.storeRegToVreg(0, inst.dest);
             },
             .udiv, .umod => {
                 const known_c = inst.src2 > 0 and inst.src2 < MAX_VREGS and self.vreg_const_known[inst.src2];
