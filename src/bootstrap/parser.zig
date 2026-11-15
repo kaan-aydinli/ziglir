@@ -276,6 +276,16 @@ pub const TypeAliasDef = struct {
     target_tag: TypeTag,
     target_extra: u32 = 0,
     target_elem: TypeTag = .none,
+    has_range: bool = false,
+    min_val: i64 = 0,
+    max_val: i64 = 0,
+};
+
+pub const FnContract = struct {
+    fn_node: u32 = 0,
+    pre_expr: u32 = 0,
+    post_expr: u32 = 0,
+    is_pure: bool = false,
 };
 
 pub const AST = struct {
@@ -289,6 +299,8 @@ pub const AST = struct {
     enum_count: u32,
     alias_defs: [MAX_ALIASES]TypeAliasDef,
     alias_count: u32,
+    contracts: [256]FnContract = undefined,
+    contract_count: u32 = 0,
     type_descs: [MAX_TYPE_DESCS]TypeDesc,
     type_desc_count: u32,
     trait_defs: [MAX_TRAITS]TraitDef,
@@ -309,6 +321,7 @@ pub const AST = struct {
         self.struct_count = 0;
         self.enum_count = 0;
         self.alias_count = 0;
+        self.contract_count = 0;
         self.type_desc_count = 1;
         self.type_descs[0] = .{};
         self.trait_count = 0;
@@ -318,6 +331,14 @@ pub const AST = struct {
         self.source_count = 0;
         self.sources[SYNTH_SOURCE_ID] = self.synth_buf[0..0];
         self.nodes[0] = .{ .kind = .identifier, .line = 0 };
+    }
+
+    pub fn findContract(self: *const AST, fn_node: u32) ?FnContract {
+        const count = @min(@as(usize, self.contract_count), self.contracts.len);
+        for (0..count) |i| {
+            if (self.contracts[i].fn_node == fn_node) return self.contracts[i];
+        }
+        return null;
     }
 
     pub fn init() AST {
@@ -463,6 +484,24 @@ pub const AST = struct {
         return null;
     }
 
+    pub fn findAliasIdxBySlice(self: *const AST, fallback_src: []const u8, sought: []const u8) ?u32 {
+        const count = @min(@as(usize, self.alias_count), self.alias_defs.len);
+        for (0..count) |i| {
+            const def = self.alias_defs[i];
+            const src = if (def.source_id == SYNTH_SOURCE_ID)
+                self.sources[SYNTH_SOURCE_ID]
+            else if (def.source_id < self.source_count)
+                self.sources[def.source_id]
+            else
+                fallback_src;
+            if (!validSourceRange(src, def.name_start, def.name_len)) continue;
+            if (std.mem.eql(u8, src[@as(usize, def.name_start)..][0..@as(usize, def.name_len)], sought)) {
+                return @intCast(i);
+            }
+        }
+        return null;
+    }
+
     pub fn copySubtree(self: *AST, other: *const AST, root: u32, source_id: u32) u32 {
         if (root == 0 or root >= other.count) return 0;
         var remap: [MAX_AST_NODES]u32 = .{@as(u32, 0)} ** MAX_AST_NODES;
@@ -545,6 +584,7 @@ pub const ParsedType = struct {
     tag: TypeTag = .none,
     extra: u32 = 0, // struct_idx+1, enum_idx+1, or fixed_array length
     elem_type: TypeTag = .none,
+    alias_idx: u32 = 0, // alias_idx + 1 if from a type alias
 };
 
 pub const Parser = struct {
@@ -565,8 +605,20 @@ pub const Parser = struct {
     active_gen_params: [4]parser_mod_TextSpan = .{parser_mod_TextSpan{}} ** 4,
     active_gen_count: u8 = 0,
     pending_fn_flags: u8 = 0,
+    pending_pre_expr: u32 = 0,
+    pending_post_expr: u32 = 0,
+    pending_is_pure: bool = false,
+    recursion_depth: u32 = 0,
 
+    const MAX_RECURSION_DEPTH: u32 = 64;
     const parser_mod_TextSpan = TextSpan;
+
+    fn clearPendingAttrs(self: *Parser) void {
+        self.pending_fn_flags = 0;
+        self.pending_pre_expr = 0;
+        self.pending_post_expr = 0;
+        self.pending_is_pure = false;
+    }
 
     fn newNode(self: *Parser, kind: NodeKind, line: u32) u32 {
         const idx = self.ast.addNode(kind, line);
@@ -650,6 +702,21 @@ pub const Parser = struct {
                                 self.pending_fn_flags |= 8;
                             } else if (std.mem.eql(u8, attr, "cold")) {
                                 self.pending_fn_flags |= 16;
+                            } else if (std.mem.eql(u8, attr, "pure")) {
+                                self.pending_is_pure = true;
+                                self.pending_fn_flags |= 128;
+                            } else if (std.mem.eql(u8, attr, "pre")) {
+                                if (self.match(.lparen)) {
+                                    _ = self.advance();
+                                    self.pending_pre_expr = self.parseExpr();
+                                    _ = self.expect(.rparen);
+                                }
+                            } else if (std.mem.eql(u8, attr, "post")) {
+                                if (self.match(.lparen)) {
+                                    _ = self.advance();
+                                    self.pending_post_expr = self.parseExpr();
+                                    _ = self.expect(.rparen);
+                                }
                             }
                         } else {
                             _ = self.advance();
@@ -666,7 +733,7 @@ pub const Parser = struct {
                 if (self.match(.kw_fn)) {
                     self.pending_fn_flags |= 16;
                     _ = self.parseFnDecl(0);
-                    self.pending_fn_flags = 0;
+                    self.clearPendingAttrs();
                 } else {
                     const t = self.peek();
                     self.reportErr(t, "expected fn after top-level comptime", .{});
@@ -674,9 +741,9 @@ pub const Parser = struct {
                 }
             } else if (self.match(.kw_fn)) {
                 _ = self.parseFnDecl(0);
-                self.pending_fn_flags = 0;
+                self.clearPendingAttrs();
             } else if (self.match(.kw_import) or self.match(.kw_use)) {
-                self.pending_fn_flags = 0;
+                self.clearPendingAttrs();
                 _ = self.advance();
                 if (self.match(.string_literal)) {
                     const path_tok = self.advance();
@@ -708,28 +775,28 @@ pub const Parser = struct {
                     self.skipToStmtEnd();
                 }
             } else if (self.match(.kw_struct)) {
-                self.pending_fn_flags = 0;
+                self.clearPendingAttrs();
                 _ = self.parseStructDecl();
             } else if (self.match(.kw_union)) {
-                self.pending_fn_flags = 0;
+                self.clearPendingAttrs();
                 _ = self.parseUnionDecl();
             } else if (self.match(.kw_trait)) {
-                self.pending_fn_flags = 0;
+                self.clearPendingAttrs();
                 _ = self.parseTraitDecl();
             } else if (self.match(.kw_impl)) {
-                self.pending_fn_flags = 0;
+                self.clearPendingAttrs();
                 self.parseImplDecl();
             } else if (self.match(.kw_enum)) {
-                self.pending_fn_flags = 0;
+                self.clearPendingAttrs();
                 _ = self.parseEnumDecl();
             } else if (self.match(.kw_const)) {
-                self.pending_fn_flags = 0;
+                self.clearPendingAttrs();
                 _ = self.parseConstDecl();
             } else if (self.match(.kw_type)) {
-                self.pending_fn_flags = 0;
+                self.clearPendingAttrs();
                 _ = self.parseTypeAliasDecl();
             } else if (self.match(.kw_mod) or self.match(.kw_extern)) {
-                self.pending_fn_flags = 0;
+                self.clearPendingAttrs();
                 const t = self.peek();
                 self.reportErr(t, "unsupported top-level declaration '{s}'", .{@tagName(t.kind)});
                 _ = self.advance();
@@ -751,7 +818,16 @@ pub const Parser = struct {
             } else {
                 self.pending_fn_flags = 0;
                 const t = self.peek();
-                self.reportErr(t, "expected top-level declaration (fn, struct, union, enum, trait, const, type, impl, import), got '{s}'", .{self.lex.text(t)});
+                const txt = self.lex.text(t);
+                if (std.mem.eql(u8, txt, "function") or std.mem.eql(u8, txt, "func") or std.mem.eql(u8, txt, "def") or std.mem.eql(u8, txt, "procedure")) {
+                    self.reportErr(t, "unknown keyword '{s}'; did you mean 'fn'?", .{txt});
+                } else if (std.mem.eql(u8, txt, "class")) {
+                    self.reportErr(t, "unknown keyword 'class'; did you mean 'struct'?", .{});
+                } else if (std.mem.eql(u8, txt, "var") or std.mem.eql(u8, txt, "let")) {
+                    self.reportErr(t, "top-level variable declarations must use 'const'", .{});
+                } else {
+                    self.reportErr(t, "expected top-level declaration (fn, struct, union, enum, trait, const, type, impl, import), got '{s}'", .{txt});
+                }
                 _ = self.advance();
             }
             self.skipNewlines();
@@ -976,6 +1052,10 @@ pub const Parser = struct {
         }
         if (tok.kind == .identifier) {
             const name = self.lex.text(tok);
+            if (std.mem.eql(u8, name, "anyopaque")) {
+                _ = self.advance();
+                return .{ .tag = .void };
+            }
             if (std.mem.eql(u8, name, "Map")) {
                 _ = self.advance();
                 var desc = TypeDesc{ .kind = .map, .param_count = 2 };
@@ -1050,7 +1130,8 @@ pub const Parser = struct {
             }
             if (self.ast.findAliasBySlice(self.src, name)) |al| {
                 _ = self.advance();
-                return .{ .tag = al.target_tag, .extra = al.target_extra, .elem_type = al.target_elem };
+                const ai = self.ast.findAliasIdxBySlice(self.src, name) orelse 0;
+                return .{ .tag = al.target_tag, .extra = al.target_extra, .elem_type = al.target_elem, .alias_idx = ai + 1 };
             }
         }
         self.reportErr(tok, "unsupported or unknown type '{s}'", .{self.lex.text(tok)});
@@ -1087,6 +1168,24 @@ pub const Parser = struct {
         const name_tok = self.expect(.identifier);
         _ = self.expect(.assign);
         const target = self.parseTypeSpec(true);
+        var has_range = false;
+        var min_val: i64 = 0;
+        var max_val: i64 = 0;
+        if (self.match(.identifier) and std.mem.eql(u8, self.lex.text(self.peek()), "range")) {
+            _ = self.advance();
+            const min_neg = self.match(.minus);
+            if (min_neg) _ = self.advance();
+            const min_tok = self.expect(.int_literal);
+            min_val = self.parseIntLiteralToken(min_tok);
+            if (min_neg) min_val = -min_val;
+            _ = if (self.match(.dot_dot_eq)) self.advance() else self.expect(.dot_dot);
+            const max_neg = self.match(.minus);
+            if (max_neg) _ = self.advance();
+            const max_tok = self.expect(.int_literal);
+            max_val = self.parseIntLiteralToken(max_tok);
+            if (max_neg) max_val = -max_val;
+            has_range = true;
+        }
         if (target.tag != .none and @as(usize, self.ast.alias_count) < self.ast.alias_defs.len) {
             self.ast.alias_defs[self.ast.alias_count] = .{
                 .name_start = name_tok.start,
@@ -1095,6 +1194,9 @@ pub const Parser = struct {
                 .target_tag = target.tag,
                 .target_extra = target.extra,
                 .target_elem = target.elem_type,
+                .has_range = has_range,
+                .min_val = min_val,
+                .max_val = max_val,
             };
             self.ast.alias_count += 1;
         }
@@ -1548,6 +1650,7 @@ pub const Parser = struct {
             self.ast.nodes[pnode].elem_type = ptype.elem_type;
             self.ast.nodes[pnode].child0 = ptype.extra;
             self.ast.nodes[pnode].flags = pflags;
+            self.ast.nodes[pnode].int_val = ptype.alias_idx;
             if (self.match(.assign)) {
                 _ = self.advance();
                 self.ast.nodes[pnode].child2 = self.parseExpr();
@@ -1610,10 +1713,29 @@ pub const Parser = struct {
                 self.ast.generic_count += 1;
             }
         }
+        if (self.pending_pre_expr != 0 or self.pending_post_expr != 0 or self.pending_is_pure) {
+            if (self.ast.contract_count < self.ast.contracts.len) {
+                self.ast.contracts[self.ast.contract_count] = .{
+                    .fn_node = node,
+                    .pre_expr = self.pending_pre_expr,
+                    .post_expr = self.pending_post_expr,
+                    .is_pure = self.pending_is_pure,
+                };
+                self.ast.contract_count += 1;
+            }
+            self.clearPendingAttrs();
+        }
         return node;
     }
 
     fn parseSingleStatement(self: *Parser) u32 {
+        if (self.recursion_depth >= MAX_RECURSION_DEPTH) {
+            self.reportErr(self.peek(), "nesting exceeds maximum recursion depth ({d})", .{MAX_RECURSION_DEPTH});
+            return 0;
+        }
+        self.recursion_depth += 1;
+        defer self.recursion_depth -= 1;
+
         var stmt: u32 = 0;
         if (self.match(.kw_unreachable)) {
             const tok = self.advance();
@@ -1703,6 +1825,7 @@ pub const Parser = struct {
             self.ast.nodes[stmt].elem_type = ann_type.elem_type;
             self.ast.nodes[stmt].flags = is_mut;
             self.ast.nodes[stmt].type_tag = ann_type.tag;
+            self.ast.nodes[stmt].int_val = ann_type.alias_idx;
         } else if (self.match(.kw_const)) {
             stmt = self.parseConstDecl();
         } else if (self.match(.kw_defer)) {
@@ -1737,10 +1860,16 @@ pub const Parser = struct {
             self.ast.nodes[stmt].col = t.col;
         } else if (self.match(.kw_if)) {
             stmt = self.parseIf();
+        } else if (self.match(.kw_unless)) {
+            stmt = self.parseUnless();
+        } else if (self.match(.kw_until)) {
+            stmt = self.parseUntil();
+        } else if (self.match(.kw_guard)) {
+            stmt = self.parseGuard();
         } else if (self.match(.lbrace)) {
             stmt = self.parseBlock();
-        } else if (self.match(.kw_unsafe) or self.match(.kw_volatile) or
-            self.match(.kw_asm) or self.match(.kw_try))
+        } else if (self.match(.kw_volatile) or
+            self.match(.kw_asm) or self.match(.kw_try) or self.match(.kw_unsafe))
         {
             const t = self.peek();
             self.reportErr(t, "unsupported statement '{s}'", .{@tagName(t.kind)});
@@ -1781,6 +1910,13 @@ pub const Parser = struct {
     }
 
     fn parseBlock(self: *Parser) u32 {
+        if (self.recursion_depth >= MAX_RECURSION_DEPTH) {
+            self.reportErr(self.peek(), "nesting exceeds maximum recursion depth ({d})", .{MAX_RECURSION_DEPTH});
+            return 0;
+        }
+        self.recursion_depth += 1;
+        defer self.recursion_depth -= 1;
+
         const lb = self.expect(.lbrace);
         self.skipNewlines();
         const block = self.newNode(.block, lb.line);
@@ -1817,6 +1953,13 @@ pub const Parser = struct {
     // ── Expression parsing with proper precedence ──────────────────
 
     fn parseExpr(self: *Parser) u32 {
+        if (self.recursion_depth >= MAX_RECURSION_DEPTH) {
+            self.reportErr(self.peek(), "nesting exceeds maximum recursion depth ({d})", .{MAX_RECURSION_DEPTH});
+            return 0;
+        }
+        self.recursion_depth += 1;
+        defer self.recursion_depth -= 1;
+
         var left = self.parseTernary();
         while (self.match(.pipe_gt)) {
             const ptok = self.advance();
@@ -2003,6 +2146,7 @@ pub const Parser = struct {
             self.ast.nodes[cn].type_tag = target.tag;
             self.ast.nodes[cn].extra = target.extra;
             self.ast.nodes[cn].elem_type = target.elem_type;
+            self.ast.nodes[cn].int_val = target.alias_idx;
             expr = cn;
         }
         return expr;
@@ -2281,6 +2425,7 @@ pub const Parser = struct {
                 self.parseBlock()
             else if (self.match(.kw_return) or self.match(.kw_break) or self.match(.kw_continue) or
                 self.match(.kw_unreachable) or self.match(.kw_defer) or self.match(.kw_if) or
+                self.match(.kw_unless) or self.match(.kw_until) or self.match(.kw_guard) or
                 self.match(.kw_while) or self.match(.kw_loop) or self.match(.kw_for) or self.match(.kw_let) or self.match(.kw_var))
                 self.parseSingleStatement()
             else
@@ -2405,49 +2550,67 @@ pub const Parser = struct {
                     if (raw[j] == '{') bdepth += 1 else if (raw[j] == '}') bdepth -= 1;
                 }
                 if (bdepth == 0) {
-                    if (i > cur_start) {
-                        const lit_sp = self.ast.addSynthText(raw[cur_start..i]);
-                        const sn = self.newNode(.string_literal, tok.line);
-                        self.ast.nodes[sn].col = tok.col;
-                        self.ast.nodes[sn].source_id = lit_sp.source_id;
-                        self.ast.nodes[sn].text_start = lit_sp.start;
-                        self.ast.nodes[sn].text_len = lit_sp.len;
-                        if (seg_head == 0) seg_head = sn else self.ast.stmt_chains[seg_tail] = sn;
-                        seg_tail = sn;
-                    }
                     const expr_raw = std.mem.trim(u8, raw[i + 1 .. j - 1], " \t\r\n");
-                    if (expr_raw.len > 0) {
+                    var is_valid_interp = false;
+                    var en: u32 = 0;
+                    if (expr_raw.len > 0 and expr_raw[0] != '\\' and expr_raw[0] != ':' and expr_raw[0] != '"') {
                         const expr_sp = self.ast.addSynthText(expr_raw);
                         const expr_slice = self.ast.sources[SYNTH_SOURCE_ID][expr_sp.start..][0..expr_sp.len];
                         if (std.heap.page_allocator.create(Lexer)) |sub_lex| {
                             defer std.heap.page_allocator.destroy(sub_lex);
                             sub_lex.* = Lexer.init(expr_slice);
                             sub_lex.tokenize();
-                            var sub_p = Parser{
-                                .lex = sub_lex,
-                                .pos = 0,
-                                .ast = self.ast,
-                                .src = self.ast.sources[SYNTH_SOURCE_ID],
-                                .source_id = SYNTH_SOURCE_ID,
-                                .diag = self.diag,
-                            };
-                            // Adjust sub-lexer token offsets into synth_buf base
-                            for (0..sub_lex.token_count) |ti| {
-                                sub_lex.tokens[ti].start += expr_sp.start;
+                            if (!sub_lex.invalid and sub_lex.token_count > 0) {
+                                var temp_diag = diag_mod.DiagList.init();
+                                var sub_p = Parser{
+                                    .lex = sub_lex,
+                                    .pos = 0,
+                                    .ast = self.ast,
+                                    .src = self.ast.sources[SYNTH_SOURCE_ID],
+                                    .source_id = SYNTH_SOURCE_ID,
+                                    .diag = &temp_diag,
+                                };
+                                for (0..sub_lex.token_count) |ti| {
+                                    sub_lex.tokens[ti].start += expr_sp.start;
+                                }
+                                sub_lex.src = self.ast.sources[SYNTH_SOURCE_ID];
+                                const saved_ast_count = self.ast.count;
+                                en = sub_p.parseExpr();
+                                if (!sub_p.invalid_syntax and temp_diag.error_count == 0 and (sub_p.match(.eof) or sub_p.pos >= sub_lex.token_count - 1)) {
+                                    is_valid_interp = true;
+                                } else {
+                                    self.ast.count = saved_ast_count;
+                                }
                             }
-                            sub_lex.src = self.ast.sources[SYNTH_SOURCE_ID];
-                            const en = sub_p.parseExpr();
-                            if (sub_p.invalid_syntax) self.invalid_syntax = true;
-                            if (seg_head == 0) seg_head = en else self.ast.stmt_chains[seg_tail] = en;
-                            seg_tail = en;
                         } else |_| {}
                     }
-                    i = j;
-                    cur_start = j;
-                    continue;
+                    if (is_valid_interp) {
+                        if (i > cur_start) {
+                            const lit_sp = self.ast.addSynthText(raw[cur_start..i]);
+                            const sn = self.newNode(.string_literal, tok.line);
+                            self.ast.nodes[sn].col = tok.col;
+                            self.ast.nodes[sn].source_id = lit_sp.source_id;
+                            self.ast.nodes[sn].text_start = lit_sp.start;
+                            self.ast.nodes[sn].text_len = lit_sp.len;
+                            if (seg_head == 0) seg_head = sn else self.ast.stmt_chains[seg_tail] = sn;
+                            seg_tail = sn;
+                        }
+                        if (seg_head == 0) seg_head = en else self.ast.stmt_chains[seg_tail] = en;
+                        seg_tail = en;
+                        i = j;
+                        cur_start = j;
+                        continue;
+                    }
                 }
             }
             i += 1;
+        }
+        if (seg_head == 0) {
+            const n = self.newNode(.string_literal, tok.line);
+            self.ast.nodes[n].col = tok.col;
+            self.ast.nodes[n].text_start = inner_start;
+            self.ast.nodes[n].text_len = inner_len;
+            return n;
         }
         if (cur_start < raw.len) {
             const lit_sp = self.ast.addSynthText(raw[cur_start..]);
@@ -2793,6 +2956,7 @@ pub const Parser = struct {
             }
             self.in_cond_header = saved_cond;
             _ = self.expect(.rparen);
+            if (e0 == 0) return 0;
             return self.parsePostfix(e0);
         }
 
@@ -2834,7 +2998,7 @@ pub const Parser = struct {
             return n;
         }
 
-        if (self.match(.identifier) or self.match(.kw_self)) {
+        if (self.match(.identifier) or self.match(.kw_self) or (self.match(.kw_string) and self.lex.get(self.pos + 1).kind == .lbrace)) {
             _ = self.advance();
             var result = self.newNode(.identifier, tok.line);
             self.ast.nodes[result].col = tok.col;
@@ -2929,6 +3093,10 @@ pub const Parser = struct {
             return self.parsePostfix(self.parseIf());
         }
 
+        if (self.match(.kw_unless)) {
+            return self.parsePostfix(self.parseUnless());
+        }
+
         if (self.match(.kw_panic)) {
             const ptok = self.advance();
             const msg_expr = if (self.match(.lparen)) blk: {
@@ -2954,8 +3122,8 @@ pub const Parser = struct {
             return cn;
         }
 
-        if (self.match(.kw_try) or self.match(.kw_unsafe) or
-            self.match(.kw_volatile) or self.match(.kw_asm))
+        if (self.match(.kw_try) or
+            self.match(.kw_volatile) or self.match(.kw_asm) or self.match(.kw_unsafe))
         {
             self.reportErr(tok, "unsupported expression '{s}'", .{@tagName(tok.kind)});
         } else {
@@ -2971,6 +3139,11 @@ pub const Parser = struct {
         const saved = self.in_cond_header;
         self.in_cond_header = true;
         const cond = self.parseExpr();
+        if (self.match(.eq)) {
+            const eq_tok = self.advance();
+            self.reportErr(eq_tok, "assignment '=' used in condition; did you mean '=='?", .{});
+            _ = self.parseExpr();
+        }
         self.in_cond_header = saved;
         self.skipOnlyNewlines();
         const then_b = self.parseBlock();
@@ -2996,6 +3169,11 @@ pub const Parser = struct {
             const saved = self.in_cond_header;
             self.in_cond_header = true;
             const cond = self.parseExpr();
+            if (self.match(.eq)) {
+                const eq_tok = self.advance();
+                self.reportErr(eq_tok, "assignment '=' used in condition; did you mean '=='?", .{});
+                _ = self.parseExpr();
+            }
             self.in_cond_header = saved;
             self.skipOnlyNewlines();
             const body = self.parseBlock();
@@ -3011,12 +3189,98 @@ pub const Parser = struct {
         return self.parseBlock();
     }
 
+    fn parseUnless(self: *Parser) u32 {
+        const tok = self.expect(.kw_unless);
+        self.skipOnlyNewlines();
+        const saved = self.in_cond_header;
+        self.in_cond_header = true;
+        const raw_cond = self.parseExpr();
+        if (self.match(.eq)) {
+            const eq_tok = self.advance();
+            self.reportErr(eq_tok, "assignment '=' used in condition; did you mean '=='?", .{});
+            _ = self.parseExpr();
+        }
+        self.in_cond_header = saved;
+        const cond = self.newNode(.unary_expr, tok.line);
+        self.ast.nodes[cond].op = @intFromEnum(TokenKind.bang);
+        self.ast.nodes[cond].child0 = raw_cond;
+        self.skipOnlyNewlines();
+        const then_b = self.parseBlock();
+        var else_b: u32 = 0;
+        self.skipOnlyNewlines();
+        if (self.match(.kw_else) or self.match(.kw_elif)) {
+            else_b = self.parseElseTail(tok.line);
+        }
+        const n = self.newNode(.if_stmt, tok.line);
+        self.ast.nodes[n].col = tok.col;
+        self.ast.nodes[n].child0 = cond;
+        self.ast.nodes[n].child1 = then_b;
+        self.ast.nodes[n].child2 = else_b;
+        return n;
+    }
+
+    fn parseUntil(self: *Parser) u32 {
+        const tok = self.expect(.kw_until);
+        self.skipOnlyNewlines();
+        const saved = self.in_cond_header;
+        self.in_cond_header = true;
+        const raw_cond = self.parseExpr();
+        if (self.match(.eq)) {
+            const eq_tok = self.advance();
+            self.reportErr(eq_tok, "assignment '=' used in condition; did you mean '=='?", .{});
+            _ = self.parseExpr();
+        }
+        self.in_cond_header = saved;
+        const cond = self.newNode(.unary_expr, tok.line);
+        self.ast.nodes[cond].op = @intFromEnum(TokenKind.bang);
+        self.ast.nodes[cond].child0 = raw_cond;
+        self.skipOnlyNewlines();
+        const body = self.parseBlock();
+        const n = self.newNode(.while_stmt, tok.line);
+        self.ast.nodes[n].col = tok.col;
+        self.ast.nodes[n].child0 = cond;
+        self.ast.nodes[n].child1 = body;
+        return n;
+    }
+
+    fn parseGuard(self: *Parser) u32 {
+        const tok = self.expect(.kw_guard);
+        self.skipOnlyNewlines();
+        const saved = self.in_cond_header;
+        self.in_cond_header = true;
+        const raw_cond = self.parseExpr();
+        if (self.match(.eq)) {
+            const eq_tok = self.advance();
+            self.reportErr(eq_tok, "assignment '=' used in condition; did you mean '=='?", .{});
+            _ = self.parseExpr();
+        }
+        self.in_cond_header = saved;
+        self.skipOnlyNewlines();
+        _ = self.expect(.kw_else);
+        self.skipOnlyNewlines();
+        const else_b = if (self.match(.lbrace)) self.parseBlock() else self.parseSingleStatement();
+        const cond = self.newNode(.unary_expr, tok.line);
+        self.ast.nodes[cond].op = @intFromEnum(TokenKind.bang);
+        self.ast.nodes[cond].child0 = raw_cond;
+        const n = self.newNode(.if_stmt, tok.line);
+        self.ast.nodes[n].col = tok.col;
+        self.ast.nodes[n].child0 = cond;
+        self.ast.nodes[n].child1 = else_b;
+        self.ast.nodes[n].child2 = 0;
+        return n;
+    }
+
     fn parseWhile(self: *Parser) u32 {
         const tok = self.expect(.kw_while);
         self.skipOnlyNewlines();
         const saved = self.in_cond_header;
         self.in_cond_header = true;
         const cond = self.parseExpr();
+        if (self.match(.eq)) {
+            const eq_tok = self.advance();
+            self.reportErr(eq_tok, "assignment '=' used in condition; did you mean '=='?", .{});
+            _ = self.parseExpr();
+        }
         self.in_cond_header = saved;
         self.skipOnlyNewlines();
         const body = self.parseBlock();
@@ -3134,6 +3398,7 @@ pub const Parser = struct {
     }
 
     fn parsePostfix(self: *Parser, base: u32) u32 {
+        if (base == 0) return 0;
         var result = base;
         while (self.match(.dot) or self.match(.lbracket) or self.match(.colon_colon) or
             self.match(.lparen) or (self.match(.question) and !self.isTernaryAtQuestion()))

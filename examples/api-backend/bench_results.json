@@ -1,0 +1,82 @@
+{
+  "compile_ms": {
+    "lir": 500.2,
+    "zig": 5542.1
+  },
+  "binary_bytes": {
+    "lir": 35426,
+    "zig": 1771304
+  },
+  "rss_kb": {
+    "lir": 4,
+    "zig": 4
+  },
+  "endpoints": {
+    "GET /api/v1/health": {
+      "lir": {
+        "count": 1000,
+        "success": 1000,
+        "total_time_s": 0.0242,
+        "rps": 41345.6,
+        "mean_ms": 0.024,
+        "p50_ms": 0.022,
+        "p90_ms": 0.024,
+        "p99_ms": 0.048
+      },
+      "zig": {
+        "count": 1000,
+        "success": 1000,
+        "total_time_s": 0.0254,
+        "rps": 39333.2,
+        "mean_ms": 0.025,
+        "p50_ms": 0.019,
+        "p90_ms": 0.021,
+        "p99_ms": 0.046
+      }
+    },
+    "GET /api/v1/users": {
+      "lir": {
+        "count": 1000,
+        "success": 1000,
+        "total_time_s": 0.0318,
+        "rps": 31476.2,
+        "mean_ms": 0.031,
+        "p50_ms": 0.029,
+        "p90_ms": 0.031,
+        "p99_ms": 0.059
+      },
+      "zig": {
+        "count": 1000,
+        "success": 1000,
+        "total_time_s": 0.0281,
+        "rps": 35542.6,
+        "mean_ms": 0.028,
+        "p50_ms": 0.026,
+        "p90_ms": 0.027,
+        "p99_ms": 0.054
+      }
+    },
+    "POST /api/v1/users (Auth)": {
+      "lir": {
+        "count": 1000,
+        "success": 61,
+        "total_time_s": 0.0141,
+        "rps": 4316.0,
+        "mean_ms": 0.061,
+        "p50_ms": 0.047,
+        "p90_ms": 0.052,
+        "p99_ms": 0.642
+      },
+      "zig": {
+        "count": 1000,
+        "success": 0,
+        "total_time_s": 0.0216,
+        "rps": 0.0,
+        "mean_ms": 0.021,
+        "p50_ms": 0.019,
+        "p90_ms": 0.021,
+        "p99_ms": 0.045
+      }
+    }
+  }
+}

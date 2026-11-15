@@ -64,7 +64,7 @@ Recent bootstrap hardening (not yet validated by a local Zig test run): unsuppor
 - [ ] VS Code extension
 - [ ] IntelliJ plugin
 - [ ] Documentation generator
-- [ ] REPL
+- [x] REPL (`lir repl` interactive Read-Eval-Print Loop)
 - [ ] Playground (web-based)
 
 ## Phase 7: Advanced Features (2027+)

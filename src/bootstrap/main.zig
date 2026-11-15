@@ -63,6 +63,7 @@ const printUsize = util.printUsize;
 const project = @import("project.zig");
 const manifest = @import("manifest.zig");
 const sysExit = util.sysExit;
+const repl_mod = @import("repl.zig");
 
 // ════════════════════════════════════════════════════════════════════════════
 // CLI
@@ -77,6 +78,10 @@ pub fn main() !void {
     defer std.process.argsFree(alloc, args);
 
     if (args.len < 2) {
+        if (std.io.getStdIn().isTty()) {
+            repl_mod.cmdRepl();
+            return;
+        }
         printUsage();
         return;
     }
@@ -96,17 +101,32 @@ pub fn main() !void {
         cmdCheck(args[2..]);
     } else if (eql(command, "ir")) {
         cmdIr(args[2..]);
+    } else if (eql(command, "ast")) {
+        cmdAst(args[2..]);
+    } else if (eql(command, "explain")) {
+        cmdExplain(args[2..]);
     } else if (eql(command, "test")) {
         cmdTest(args[2..]);
     } else if (eql(command, "init")) {
         if (args.len > 3) unexpectedArgument(args[3]);
         const name = if (args.len >= 3) args[2] else "myproject";
         cmdInit(name);
+    } else if (eql(command, "repl")) {
+        repl_mod.cmdRepl();
     } else if (eql(command, "install")) {
         cmdInstall();
     } else {
-        printErr("Unknown command: ");
+        const known_commands = [_][]const u8{
+            "build", "run", "check", "ir", "ast", "explain", "test", "targets", "init", "repl", "install", "help", "version",
+        };
+        printErr("Unknown command: '");
         printErr(command);
+        printErr("'.");
+        if (util.findSimilarName(command, &known_commands, 2)) |sugg| {
+            printErr(" Did you mean 'lir ");
+            printErr(sugg);
+            printErr("'?");
+        }
         printErr("\nRun 'lir help' for usage.\n");
         sysExit(1);
     }
@@ -129,7 +149,10 @@ fn printUsage() void {
         \\  run [file|dir]      Compile and execute in one step (supports --backend=vm/wasm/c/native)
         \\  check [file|dir]    Type-check and verify IR without emitting binary
         \\  ir [file|dir]       Dump lowered & optimized IR
+        \\  ast [file|dir]      Pretty-print Abstract Syntax Tree
+        \\  explain [topic]     Interactive developer reference & error explanation
         \\  test [file|dir]     Run #[test] suite
+        \\  repl                Start interactive Read-Eval-Print Loop
         \\  targets             List supported cross-compilation targets and host defaults
         \\  init [name]         Create a new project
         \\  install             Install lir binary to system PATH
@@ -412,6 +435,366 @@ fn cmdIr(args: []const []const u8) void {
         printErr("\n");
         sysExit(1);
     };
+}
+
+fn dumpNode(ast: *const parser_mod.AST, source: []const u8, idx: u32, depth: usize) void {
+    if (idx == 0 or idx >= ast.count) return;
+    const n = ast.nodes[idx];
+    var d: usize = 0;
+    while (d < depth) : (d += 1) printStr("  ");
+
+    printStr(@tagName(n.kind));
+    if (n.text_len > 0 and n.text_start + n.text_len <= source.len) {
+        printStr(" '");
+        printStr(source[n.text_start..][0..n.text_len]);
+        printStr("'");
+    }
+    if (n.kind == .int_literal) {
+        var buf: [32]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, " {d}", .{n.int_val}) catch "";
+        printStr(s);
+    }
+    printStr("\n");
+
+    if (n.kind == .fn_decl) {
+        var p = n.child0;
+        while (p != 0) : (p = ast.nodes[p].child1) {
+            dumpNode(ast, source, p, depth + 1);
+        }
+        if (n.child2 != 0) dumpNode(ast, source, n.child2, depth + 1);
+    } else if (n.kind == .block) {
+        var s = n.child0;
+        while (s != 0) {
+            dumpNode(ast, source, s, depth + 1);
+            s = ast.stmt_chains[s];
+        }
+    } else {
+        if (n.child0 != 0) dumpNode(ast, source, n.child0, depth + 1);
+        if (n.child1 != 0) dumpNode(ast, source, n.child1, depth + 1);
+        if (n.child2 != 0) dumpNode(ast, source, n.child2, depth + 1);
+    }
+}
+
+pub fn dumpAST(ast: *const parser_mod.AST, source: []const u8) void {
+    printStr("=== LIR Abstract Syntax Tree ===\n\n");
+    if (ast.struct_count > 0) {
+        printStr("Structs:\n");
+        for (0..@min(ast.struct_count, ast.struct_defs.len)) |i| {
+            const sd = ast.struct_defs[i];
+            const name = if (sd.source_id < ast.source_count)
+                ast.nodeTextSrcFrom(sd.name_start, sd.name_len, sd.source_id)
+            else
+                source[sd.name_start..][0..sd.name_len];
+            printStr("  struct ");
+            printStr(name);
+            printStr(" (fields: ");
+            printUsize(sd.field_count);
+            printStr(", total_size: ");
+            printUsize(sd.total_size);
+            printStr(" bytes)\n");
+            for (0..@min(sd.field_count, sd.fields.len)) |fi| {
+                const f = sd.fields[fi];
+                const fname = if (sd.source_id < ast.source_count)
+                    ast.nodeTextSrcFrom(f.name_start, f.name_len, sd.source_id)
+                else
+                    source[f.name_start..][0..f.name_len];
+                printStr("    - ");
+                printStr(fname);
+                printStr(" (offset: ");
+                printUsize(f.offset);
+                printStr(")\n");
+            }
+        }
+        printStr("\n");
+    }
+    if (ast.enum_count > 0) {
+        printStr("Enums:\n");
+        for (0..@min(ast.enum_count, ast.enum_defs.len)) |i| {
+            const ed = ast.enum_defs[i];
+            const name = if (ed.source_id < ast.source_count)
+                ast.nodeTextSrcFrom(ed.name_start, ed.name_len, ed.source_id)
+            else
+                source[ed.name_start..][0..ed.name_len];
+            printStr("  enum ");
+            printStr(name);
+            printStr(" (variants: ");
+            printUsize(ed.variant_count);
+            printStr(")\n");
+        }
+        printStr("\n");
+    }
+    printStr("Nodes Hierarchy:\n");
+    var ni: u32 = 1;
+    while (ni < ast.count) : (ni += 1) {
+        const n = ast.nodes[ni];
+        if (n.kind == .fn_decl) {
+            dumpNode(ast, source, ni, 1);
+        }
+    }
+}
+
+fn cmdAst(args: []const []const u8) void {
+    var in_path: ?[]const u8 = null;
+    var idx: usize = 0;
+    while (idx < args.len) : (idx += 1) {
+        const arg = args[idx];
+        if (arg.len > 0 and arg[0] == '-') {
+            printErr("Error: unknown option '");
+            printErr(arg);
+            printErr("'\n");
+            sysExit(1);
+        } else if (in_path == null) {
+            in_path = arg;
+        } else {
+            unexpectedArgument(arg);
+        }
+    }
+    const selection = selectInput(in_path, false);
+    defer selection.deinit(std.heap.page_allocator);
+    const file = selection.input;
+    const alloc = std.heap.page_allocator;
+    const source_buf = util.readFileAlloc(alloc, file) catch {
+        printErr("Error: cannot read source file '");
+        printErr(file);
+        printErr("'\n");
+        sysExit(1);
+    };
+    defer alloc.free(source_buf);
+
+    var diag = diag_mod.DiagList.init();
+    const lexer = alloc.create(lex.Lexer) catch {
+        printErr("Error: out of memory\n");
+        sysExit(1);
+    };
+    defer alloc.destroy(lexer);
+    lexer.* = lex.Lexer.init(source_buf);
+    lexer.tokenize();
+
+    const ast = alloc.create(parser_mod.AST) catch {
+        printErr("Error: out of memory\n");
+        sysExit(1);
+    };
+    defer alloc.destroy(ast);
+    ast.initInPlace();
+    ast.sources[0] = source_buf;
+    ast.source_count = 1;
+
+    var parser = parser_mod.Parser{
+        .lex = lexer,
+        .pos = 0,
+        .ast = ast,
+        .src = source_buf,
+        .source_id = 0,
+        .diag = &diag,
+    };
+    parser.parse();
+
+    if (diag.hasErrors()) {
+        diag.emitAll(file, source_buf);
+        sysExit(1);
+    }
+
+    dumpAST(ast, source_buf);
+}
+
+pub fn cmdExplain(args: []const []const u8) void {
+    if (args.len == 0) {
+        printStr(
+            \\LIR Architecture & Language Explanations
+            \\
+            \\Usage: lir explain <topic|error>
+            \\
+            \\Available Topics:
+            \\  borrow          Affine type system, shared (&) and mutable (&mut) borrows
+            \\  contracts       Formal verification with pre/post-conditions (requires, ensures)
+            \\  purity          Side-effect-free functions with strict immutability
+            \\  ranges          Ada/SPARK-style bounded scalar types (type T is i64 range min..max)
+            \\  optimizer       SSA construction, GVN, LICM, loop unrolling, magic division
+            \\  diagnostics     Intelligent fuzzy typo detection and static analysis warnings
+            \\  all             Comprehensive summary of all LIR concepts
+            \\
+            \\Error Explanations:
+            \\  UndefinedVariable, UndefinedFunctionCall, UnknownField, UndefinedStruct, TypeMismatch
+            \\
+            \\Example:
+            \\  lir explain contracts
+            \\  lir explain borrow
+            \\
+        );
+        return;
+    }
+    const topic = args[0];
+    if (eql(topic, "borrow") or eql(topic, "lifetimes") or eql(topic, "ownership")) {
+        printStr(
+            \\=== LIR Borrow Checker & Affine Type System ===
+            \\
+            \\LIR enforces compile-time memory safety without a garbage collector using an
+            \\affine borrow checking system inspired by Rust:
+            \\
+            \\1. Shared Borrows (&T):
+            \\   Multiple read-only references may coexist simultaneously:
+            \\     let p: &Point = &origin;
+            \\     let q: &Point = &origin; // Valid: multiple shared references
+            \\
+            \\2. Exclusive Mutable Borrows (&mut T):
+            \\   Only ONE active mutable reference can exist at any given time.
+            \\   When an object is mutably borrowed, the owner cannot be read or modified:
+            \\     var count = 0;
+            \\     let r = &mut count;
+            \\     // Reading 'count' here is a compile-time error:
+            \\     // cannot borrow/read 'count' while mutably borrowed!
+            \\
+            \\3. Dangling Reference Prevention:
+            \\   LIR prevents returning or escaping pointers to local stack frames:
+            \\     fn bad() -> &i64 {
+            \\         let x = 42;
+            \\         return &x; // COMPILE ERROR: dangling reference to stack variable
+            \\     }
+            \\
+        );
+    } else if (eql(topic, "contracts") or eql(topic, "spark") or eql(topic, "formal-verification")) {
+        printStr(
+            \\=== Formal Verification & Contracts (SPARK / Hoare Logic) ===
+            \\
+            \\LIR includes first-class Hoare-style preconditions and postconditions:
+            \\
+            \\1. Preconditions (requires):
+            \\   Invariants that callers must satisfy before invoking the function:
+            \\     fn divide(a: i64, b: i64) -> i64
+            \\       requires b != 0
+            \\     {
+            \\         return a / b;
+            \\     }
+            \\
+            \\2. Postconditions (ensures):
+            \\   Guarantees that the function promises upon successful return:
+            \\     fn abs_val(x: i64) -> i64
+            \\       ensures result >= 0
+            \\     {
+            \\         if x < 0 { return -x; }
+            \\         return x;
+            \\     }
+            \\
+            \\Contracts are statically checked at compile time for constant arguments and
+            \\inlined as zero-cost assertions in debug/verification modes.
+            \\
+        );
+    } else if (eql(topic, "purity") or eql(topic, "pure")) {
+        printStr(
+            \\=== Pure Functions in LIR ===
+            \\
+            \\Functions declared with 'pure' are mathematically pure:
+            \\  pure fn square(x: i64) -> i64 {
+            \\      return x * x;
+            \\  }
+            \\
+            \\Purity Rules Enforced at Compile Time:
+            \\  1. Cannot mutate global state or heap objects.
+            \\  2. Cannot perform I/O operations (e.g. print, disk, network).
+            \\  3. May only call other 'pure' functions.
+            \\  4. The optimizer aggressively memoizes and eliminates identical pure calls (GVN).
+            \\
+        );
+    } else if (eql(topic, "ranges") or eql(topic, "bounded-scalar")) {
+        printStr(
+            \\=== Ada/SPARK-Style Bounded Scalar Types ===
+            \\
+            \\LIR allows declaring strongly-typed numeric domains with bounds:
+            \\  type Percentage is i64 range 0..100;
+            \\  type DayOfMonth is i64 range 1..31;
+            \\
+            \\Features:
+            \\  1. Compile-Time Checking: Out-of-bounds constant assignments trigger compile errors:
+            \\       let p: Percentage = 105; // COMPILE ERROR: 105 exceeds range [0..100]
+            \\  2. Overflow Immunity: Array indexing with bounded types proves memory safety
+            \\     without emitting redundant bounds-check instructions in assembly!
+            \\
+        );
+    } else if (eql(topic, "optimizer") or eql(topic, "ir-opt")) {
+        printStr(
+            \\=== LIR Optimization Pipeline (-O2) ===
+            \\
+            \\The LIR optimizer applies production-grade optimization passes on SSA IR:
+            \\
+            \\1. SSA Construction (mem2reg):
+            \\   Promotes stack allocations to SSA virtual registers.
+            \\2. Global Value Numbering (GVN):
+            \\   Eliminates redundant expressions and unifies equivalent computations.
+            \\3. Loop Invariant Code Motion (LICM):
+            \\   Hoists invariant computations outside loop bodies.
+            \\4. Counted Loop Unrolling:
+            \\   Unrolls hot loops up to 8x to maximize instruction-level parallelism.
+            \\5. Magic Divisor Lowering & Multiplier Hoisting:
+            \\   Lowers integer divisions to fixed-point reciprocal multiplications (imul rcx),
+            \\   hoisting invariant magic multipliers into dedicated hardware registers.
+            \\6. Algebraic Reassociation & Simplification:
+            \\   Reassociates constant chains: (x + c1) + c2 -> x + (c1 + c2),
+            \\   collapses double negations: -(-x) -> x, ~(~x) -> x,
+            \\   and eliminates identity operations (x * 1, x + 0, x ^ x).
+            \\7. Post-SSA Copy Coalescing:
+            \\   Eliminates register bouncing moves across loop iterations.
+            \\
+        );
+    } else if (eql(topic, "diagnostics") or eql(topic, "typo")) {
+        printStr(
+            \\=== Intelligent Compiler Diagnostics ===
+            \\
+            \\The LIR compiler includes intelligent developer assistance:
+            \\
+            \\1. Fuzzy Typo Suggestions:
+            \\   When an undeclared identifier, function, struct, or field is encountered,
+            \\   the compiler calculates Levenshtein distances against known candidates in scope
+            \\   and suggests: "did you mean '...'?".
+            \\
+            \\2. Unused Variable Warnings:
+            \\   Detects variables or parameters declared but never read, suggesting prefixing
+            \\   with '_' to silence (e.g. '_my_var').
+            \\
+            \\3. Unreachable Code Detection:
+            \\   Warns about dead statements following 'return', 'break', or 'continue'.
+            \\
+        );
+    } else if (eql(topic, "UndefinedVariable")) {
+        printStr(
+            \\=== UndefinedVariable ===
+            \\
+            \\Cause:
+            \\  An identifier was referenced that has not been declared in the current or
+            \\  enclosing lexical scopes, nor in global constants or functions.
+            \\
+            \\Solution:
+            \\  1. Check for typos. The compiler suggests the closest matching name in scope.
+            \\  2. Ensure the variable was declared before use with 'let' or 'var'.
+            \\  3. If importing from another module, ensure the import statement is present.
+            \\
+        );
+    } else if (eql(topic, "TypeMismatch")) {
+        printStr(
+            \\=== TypeMismatch ===
+            \\
+            \\Cause:
+            \\  An expression's type does not match the expected type of its context
+            \\  (e.g. passing a string to an integer parameter, or mismatched return type).
+            \\
+            \\Solution:
+            \\  1. Inspect the type expected by the function or assignment.
+            \\  2. Use explicit casting with 'as' (e.g. 'val as i32').
+            \\
+        );
+    } else {
+        const known_topics = [_][]const u8{
+            "borrow", "contracts", "purity", "ranges", "optimizer", "diagnostics", "UndefinedVariable", "TypeMismatch",
+        };
+        printErr("Unknown topic '");
+        printErr(topic);
+        printErr("'.");
+        if (util.findSimilarName(topic, &known_topics, 2)) |sugg| {
+            printErr(" Did you mean 'lir explain ");
+            printErr(sugg);
+            printErr("'?");
+        }
+        printErr("\nRun 'lir explain' without arguments to see available topics.\n");
+    }
 }
 
 fn findExeInPath(alloc: std.mem.Allocator, name: []const u8) ?[]u8 {

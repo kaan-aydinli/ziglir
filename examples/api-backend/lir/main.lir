@@ -1,0 +1,400 @@
+// ════════════════════════════════════════════════════════════════════════════
+// LIR Enterprise API Backend (LirStore REST API)
+//
+// %100 LIR dilinde sıfır harici C/kütüphane bağımlılığı olmaksızın
+// yazılmış RESTful HTTP/JSON mikroservis mimarisi.
+//
+// Desteklenen Uç Noktalar (Endpoints):
+//   - GET    /api/v1/health        (Sistem sağlık durumu ve çalışma süresi)
+//   - GET    /api/v1/stats         (İşlem hacmi, aktif kullanıcı ve bakiye istatistikleri)
+//   - GET    /api/v1/users         (Tüm kullanıcıları listele)
+//   - GET    /api/v1/users/:id     (Tekil kullanıcı detayı sorgula)
+//   - POST   /api/v1/users         (Yeni kullanıcı oluştur - Bearer Token korumalı)
+//   - DELETE /api/v1/users/:id     (Kullanıcı sil - Bearer Token korumalı)
+//   - OPTIONS *                    (CORS preflight desteği)
+//
+// Derleme:   ./bin/lir build examples/api-backend/lir/main.lir -O2 -o bin/api_lir
+// Çalıştırma: ./bin/api_lir
+// ════════════════════════════════════════════════════════════════════════════
+
+proc appendStr(buf: *u8, pos: i64, s: string) -> i64 {
+    var i = 0
+    var p = pos
+    until i >= s.len {
+        @write_u8(@ptr_add(buf, p), s[i] as u8)
+        p += 1
+        i += 1
+    }
+    return p
+}
+
+proc appendDigit(buf: *u8, pos: i64, d: i64) -> i64 {
+    @write_u8(@ptr_add(buf, pos), (48 + d) as u8)
+    return pos + 1
+}
+
+proc appendInt(buf: *u8, pos: i64, n: i64) -> i64 {
+    if n == 0 {
+        return appendDigit(buf, pos, 0)
+    }
+    var num = n
+    if num < 0 {
+        @write_u8(@ptr_add(buf, pos), 45 as u8) // '-'
+        num = -num
+        return appendInt(buf, pos + 1, num)
+    }
+    var digits: [32]i64 = [0; 32]
+    var dc = 0
+    while num > 0 {
+        let p: *i64 = @ptr_add(&digits[0], dc * 8) as *i64
+        *p = num % 10
+        num = num / 10
+        dc += 1
+    }
+    var p = pos
+    var di = dc - 1
+    until di < 0 {
+        let dp: *i64 = @ptr_add(&digits[0], di * 8) as *i64
+        p = appendDigit(buf, p, *dp)
+        di -= 1
+    }
+    return p
+}
+
+proc findSubstr(buf: *u8, buf_len: i64, needle: string) -> i64 {
+    guard buf_len >= needle.len else return -1
+    let limit = buf_len - needle.len
+    var k = 0
+    while k <= limit {
+        var match_cnt = 0
+        var j = 0
+        while j < needle.len {
+            let ch = @read_u8(@ptr_add(buf, k + j)) as i64
+            let nch = needle[j] as i64
+            if ch == nch {
+                match_cnt += 1
+            }
+            j += 1
+        }
+        if match_cnt == needle.len {
+            return k
+        }
+        k += 1
+    }
+    return -1
+}
+
+proc parseUserId(req: *u8, len: i64) -> i64 {
+    let prefix = "/api/v1/users/"
+    let p = findSubstr(req, len, prefix)
+    guard p >= 0 else return -1
+
+    var id = 0
+    var k = p + prefix.len
+    var has_digit = false
+    while k < len {
+        let ch = @read_u8(@ptr_add(req, k)) as i64
+        if ch >= 48 and ch <= 57 {
+            id = id * 10 + (ch - 48)
+            has_digit = true
+        } else {
+            break
+        }
+        k += 1
+    }
+    return has_digit ? id : -1
+}
+
+proc sendHttpResponse(
+    client_fd: i64,
+    status_code: i64,
+    status_text: string,
+    content_type: string,
+    body_ptr: *u8,
+    body_len: i64,
+) {
+    let hdr_buf = @malloc(1024)
+    var p = 0
+
+    p = appendStr(hdr_buf, p, "HTTP/1.1 ")
+    p = appendInt(hdr_buf, p, status_code)
+    p = appendStr(hdr_buf, p, " ")
+    p = appendStr(hdr_buf, p, status_text)
+    p = appendStr(hdr_buf, p, "\r\nContent-Type: ")
+    p = appendStr(hdr_buf, p, content_type)
+    p = appendStr(hdr_buf, p, "\r\nContent-Length: ")
+    p = appendInt(hdr_buf, p, body_len)
+    p = appendStr(hdr_buf, p, "\r\nAccess-Control-Allow-Origin: *")
+    p = appendStr(hdr_buf, p, "\r\nAccess-Control-Allow-Headers: Authorization, Content-Type")
+    p = appendStr(hdr_buf, p, "\r\nAccess-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS")
+    p = appendStr(hdr_buf, p, "\r\nConnection: close\r\n\r\n")
+
+    let _w1 = @syscall(1, client_fd, hdr_buf as i64, p)
+    if body_len > 0 {
+        let _w2 = @syscall(1, client_fd, body_ptr as i64, body_len)
+    }
+    @free(hdr_buf)
+}
+
+proc main() -> i64 {
+    println("================================================================")
+    println("  LIR ENTERPRISE API BACKEND v2.2")
+    println("================================================================")
+
+    // In-memory Veritabanı Tablosu (En fazla 64 kullanıcı)
+    var user_id: [64]i64 = [0; 64]
+    var user_balance: [64]i64 = [0; 64]
+    var user_active: [64]i64 = [0; 64]
+    var user_names: [64]string = [""; 64]
+    var user_emails: [64]string = [""; 64]
+    var user_roles: [64]string = [""; 64]
+
+    // Başlangıç verileri ekle (Seed data)
+    user_id[0] = 1
+    user_names[0] = "Alice Smith"
+    user_emails[0] = "alice@lir.org"
+    user_roles[0] = "admin"
+    user_balance[0] = 5000
+    user_active[0] = 1
+
+    user_id[1] = 2
+    user_names[1] = "Bob Jones"
+    user_emails[1] = "bob@lir.org"
+    user_roles[1] = "engineer"
+    user_balance[1] = 3200
+    user_active[1] = 1
+
+    user_id[2] = 3
+    user_names[2] = "David Miller"
+    user_emails[2] = "david@lir.org"
+    user_roles[2] = "designer"
+    user_balance[2] = 2800
+    user_active[2] = 1
+
+    var user_count: i64 = 3
+    var next_user_id: i64 = 4
+    var req_counter: i64 = 0
+
+    // TCP Soketi Aç: sys_socket(AF_INET=2, SOCK_STREAM=1, 0)
+    let server_fd = @syscall(41, 2, 1, 0)
+    guard server_fd >= 0 else {
+        println("Hata: TCP soket olusturulamadi")
+        return 1
+    }
+
+    // SO_REUSEADDR: setsockopt
+    let opt_buf = @malloc(8)
+    let opt_ptr: *i64 = opt_buf as *i64
+    *opt_ptr = 1
+    let _s = @syscall(54, server_fd, 1, 2, opt_buf as i64, 4)
+    @free(opt_buf)
+
+    // sockaddr_in (16 bayt): Port 8081 = 0x911F (big endian 8081 = 0x1F91 -> LE bytes 91 1F = 37151)
+    let addr = @malloc(32)
+    @memset(addr, 0, 32)
+    let p_fam: *i64 = @ptr_add(addr, 0) as *i64
+    *p_fam = 2 // AF_INET
+    let p_port: *i64 = @ptr_add(addr, 2) as *i64
+    *p_port = 37151 // 8081 portu
+
+    let b_res = @syscall(49, server_fd, addr as i64, 16)
+    @free(addr)
+    guard b_res >= 0 else {
+        println("Hata: 0.0.0.0:8081 portuna baglanilamadi")
+        return 1
+    }
+
+    let l_res = @syscall(50, server_fd, 64, 0)
+    guard l_res >= 0 else {
+        println("Hata: Dinleme baslatilamadi")
+        return 1
+    }
+
+    println("LIR REST API Servisi dinliyor -> http://0.0.0.0:8081")
+    println("Test etmek icin: curl http://localhost:8081/api/v1/health")
+
+    let req_buf = @malloc(4096)
+    let resp_buf = @malloc(16384)
+
+    // Ana HTTP İstek Döngüsü
+    while true {
+        let client_fd = @syscall(43, server_fd, 0, 0)
+        if client_fd >= 0 {
+            let req_len = @syscall(0, client_fd, req_buf as i64, 4096)
+            if req_len > 0 {
+                req_counter += 1
+                var resp_p: i64 = 0
+
+                // 1. CORS Preflight
+                if findSubstr(req_buf, req_len, "OPTIONS ") == 0 {
+                    sendHttpResponse(client_fd, 204, "No Content", "text/plain", resp_buf, 0)
+                }
+                // 2. GET /api/v1/health
+                else if findSubstr(req_buf, req_len, "GET /api/v1/health") >= 0 {
+                    resp_p = appendStr(resp_buf, resp_p, "{\"status\":\"healthy\",\"engine\":\"LIR Systems Language v2.2\",\"total_requests\":")
+                    resp_p = appendInt(resp_buf, resp_p, req_counter)
+                    resp_p = appendStr(resp_buf, resp_p, ",\"uptime_ticks\":")
+                    resp_p = appendInt(resp_buf, resp_p, req_counter * 3)
+                    resp_p = appendStr(resp_buf, resp_p, ",\"memory\":\"zero-gc-native\"}\n")
+                    sendHttpResponse(client_fd, 200, "OK", "application/json", resp_buf, resp_p)
+                }
+                // 3. GET /api/v1/stats
+                else if findSubstr(req_buf, req_len, "GET /api/v1/stats") >= 0 {
+                    var total_bal: i64 = 0
+                    var active_cnt: i64 = 0
+                    var i = 0
+                    until i >= user_count {
+                        if user_active[i] == 1 {
+                            active_cnt += 1
+                            total_bal += user_balance[i]
+                        }
+                        i += 1
+                    }
+
+                    resp_p = appendStr(resp_buf, resp_p, "{\"total_users\":")
+                    resp_p = appendInt(resp_buf, resp_p, user_count)
+                    resp_p = appendStr(resp_buf, resp_p, ",\"active_users\":")
+                    resp_p = appendInt(resp_buf, resp_p, active_cnt)
+                    resp_p = appendStr(resp_buf, resp_p, ",\"total_balance\":")
+                    resp_p = appendInt(resp_buf, resp_p, total_bal)
+                    resp_p = appendStr(resp_buf, resp_p, ",\"requests_processed\":")
+                    resp_p = appendInt(resp_buf, resp_p, req_counter)
+                    resp_p = appendStr(resp_buf, resp_p, "}\n")
+                    sendHttpResponse(client_fd, 200, "OK", "application/json", resp_buf, resp_p)
+                }
+                // 4. GET /api/v1/users/:id (Tekil Kullanıcı)
+                else if findSubstr(req_buf, req_len, "GET /api/v1/users/") >= 0 {
+                    let target_id = parseUserId(req_buf, req_len)
+                    var found_idx = -1
+                    var i = 0
+                    until i >= user_count {
+                        if user_id[i] == target_id and user_active[i] == 1 {
+                            found_idx = i
+                            break
+                        }
+                        i += 1
+                    }
+
+                    if found_idx >= 0 {
+                        resp_p = appendStr(resp_buf, resp_p, "{\"id\":")
+                        resp_p = appendInt(resp_buf, resp_p, user_id[found_idx])
+                        resp_p = appendStr(resp_buf, resp_p, ",\"name\":\"")
+                        resp_p = appendStr(resp_buf, resp_p, user_names[found_idx])
+                        resp_p = appendStr(resp_buf, resp_p, "\",\"email\":\"")
+                        resp_p = appendStr(resp_buf, resp_p, user_emails[found_idx])
+                        resp_p = appendStr(resp_buf, resp_p, "\",\"role\":\"")
+                        resp_p = appendStr(resp_buf, resp_p, user_roles[found_idx])
+                        resp_p = appendStr(resp_buf, resp_p, "\",\"balance\":")
+                        resp_p = appendInt(resp_buf, resp_p, user_balance[found_idx])
+                        resp_p = appendStr(resp_buf, resp_p, ",\"active\":true}\n")
+                        sendHttpResponse(client_fd, 200, "OK", "application/json", resp_buf, resp_p)
+                    } else {
+                        let err = "{\"error\":\"UserNotFound\",\"code\":404,\"message\":\"Kullanici bulunamadi\"}\n"
+                        sendHttpResponse(client_fd, 404, "Not Found", "application/json", err.ptr as *u8, err.len)
+                    }
+                }
+                // 5. GET /api/v1/users (Kullanıcı Listesi)
+                else if findSubstr(req_buf, req_len, "GET /api/v1/users") >= 0 {
+                    resp_p = appendStr(resp_buf, resp_p, "{\"count\":")
+                    resp_p = appendInt(resp_buf, resp_p, user_count)
+                    resp_p = appendStr(resp_buf, resp_p, ",\"users\":[")
+
+                    var first = true
+                    var i = 0
+                    until i >= user_count {
+                        if user_active[i] == 1 {
+                            unless first {
+                                resp_p = appendStr(resp_buf, resp_p, ",")
+                            }
+                            first = false
+                            resp_p = appendStr(resp_buf, resp_p, "{\"id\":")
+                            resp_p = appendInt(resp_buf, resp_p, user_id[i])
+                            resp_p = appendStr(resp_buf, resp_p, ",\"name\":\"")
+                            resp_p = appendStr(resp_buf, resp_p, user_names[i])
+                            resp_p = appendStr(resp_buf, resp_p, "\",\"email\":\"")
+                            resp_p = appendStr(resp_buf, resp_p, user_emails[i])
+                            resp_p = appendStr(resp_buf, resp_p, "\",\"role\":\"")
+                            resp_p = appendStr(resp_buf, resp_p, user_roles[i])
+                            resp_p = appendStr(resp_buf, resp_p, "\",\"balance\":")
+                            resp_p = appendInt(resp_buf, resp_p, user_balance[i])
+                            resp_p = appendStr(resp_buf, resp_p, "}")
+                        }
+                        i += 1
+                    }
+                    resp_p = appendStr(resp_buf, resp_p, "]}\n")
+                    sendHttpResponse(client_fd, 200, "OK", "application/json", resp_buf, resp_p)
+                }
+                // 6. POST /api/v1/users (Yeni Kullanıcı Ekle - Token Korumalı)
+                else if findSubstr(req_buf, req_len, "POST /api/v1/users") >= 0 {
+                    // Bearer Token Yetkilendirme Kontrolü
+                    let has_auth = (findSubstr(req_buf, req_len, "Bearer lir-secret-token-2026") >= 0)
+                    unless has_auth {
+                        let unauth = "{\"error\":\"Unauthorized\",\"code\":401,\"message\":\"Gecersiz veya eksik Bearer token\"}\n"
+                        sendHttpResponse(client_fd, 401, "Unauthorized", "application/json", unauth.ptr as *u8, unauth.len)
+                    } else {
+                        guard user_count < 63 else {
+                            let full_err = "{\"error\":\"CapacityExceeded\",\"code\":507,\"message\":\"Kullanici kapasitesi dolu\"}\n"
+                            sendHttpResponse(client_fd, 507, "Insufficient Storage", "application/json", full_err.ptr as *u8, full_err.len)
+                        }
+
+                        let new_id = next_user_id
+                        next_user_id += 1
+
+                        user_id[user_count] = new_id
+                        user_names[user_count] = "New User"
+                        user_emails[user_count] = "newuser@lir.org"
+                        user_roles[user_count] = "member"
+                        user_balance[user_count] = 1000
+                        user_active[user_count] = 1
+                        user_count += 1
+
+                        resp_p = appendStr(resp_buf, resp_p, "{\"message\":\"UserCreated\",\"id\":")
+                        resp_p = appendInt(resp_buf, resp_p, new_id)
+                        resp_p = appendStr(resp_buf, resp_p, ",\"name\":\"New User\",\"status\":\"created\"}\n")
+                        sendHttpResponse(client_fd, 201, "Created", "application/json", resp_buf, resp_p)
+                    }
+                }
+                // 7. DELETE /api/v1/users/:id (Kullanıcı Sil - Token Korumalı)
+                else if findSubstr(req_buf, req_len, "DELETE /api/v1/users/") >= 0 {
+                    let has_auth = (findSubstr(req_buf, req_len, "Bearer lir-secret-token-2026") >= 0)
+                    unless has_auth {
+                        let unauth = "{\"error\":\"Unauthorized\",\"code\":401,\"message\":\"Gecersiz veya eksik Bearer token\"}\n"
+                        sendHttpResponse(client_fd, 401, "Unauthorized", "application/json", unauth.ptr as *u8, unauth.len)
+                    } else {
+                        let target_id = parseUserId(req_buf, req_len)
+                        var found = false
+                        var i = 0
+                        until i >= user_count {
+                            if user_id[i] == target_id and user_active[i] == 1 {
+                                user_active[i] = 0 // Soft delete
+                                found = true
+                                break
+                            }
+                            i += 1
+                        }
+
+                        if found {
+                            resp_p = appendStr(resp_buf, resp_p, "{\"message\":\"UserDeleted\",\"id\":")
+                            resp_p = appendInt(resp_buf, resp_p, target_id)
+                            resp_p = appendStr(resp_buf, resp_p, ",\"success\":true}\n")
+                            sendHttpResponse(client_fd, 200, "OK", "application/json", resp_buf, resp_p)
+                        } else {
+                            let not_found = "{\"error\":\"UserNotFound\",\"code\":404,\"message\":\"Silinecek kullanici bulunamadi\"}\n"
+                            sendHttpResponse(client_fd, 404, "Not Found", "application/json", not_found.ptr as *u8, not_found.len)
+                        }
+                    }
+                }
+                // 8. Bilinmeyen Uç Nokta
+                else {
+                    let nf = "{\"error\":\"NotFound\",\"code\":404,\"message\":\"Gecersiz API rotasi\"}\n"
+                    sendHttpResponse(client_fd, 404, "Not Found", "application/json", nf.ptr as *u8, nf.len)
+                }
+            }
+            let _c = @syscall(3, client_fd, 0, 0)
+        }
+    }
+
+    @free(req_buf)
+    @free(resp_buf)
+    return 0
+}

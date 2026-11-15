@@ -128,6 +128,15 @@ fn signedDivMagic(divisor: i64) SignedDivMagic {
     return .{ .multiplier = multiplier, .shift = @intCast(p - 64) };
 }
 
+const DeferredDiv64 = struct {
+    j_div64: u32,
+    resume_pos: u32,
+    res_reg: u8,
+    dest: u16,
+    known_c: bool,
+    known_imm: i64,
+};
+
 const Reloc = struct {
     kind: RelocKind,
     opcode_pos: u32,
@@ -220,6 +229,17 @@ pub const IRCodegen = struct {
     vreg_const_imm: [MAX_VREGS]i64 = undefined,
     vreg_elided_const: [MAX_VREGS]bool = undefined,
     vreg_copy_hint: [MAX_VREGS]u16 = undefined,
+    vreg_pref_hw_reg: [MAX_VREGS]u8 = undefined,
+    cur_rcx_const: ?i64 = null,
+    cur_r11_const: ?i64 = null,
+    cur_shrink_shared: bool = false,
+    cur_shrink_ret_vreg: u16 = 0,
+    cur_shrink_ret_imm: i64 = 0,
+    cur_shrink_ret_is_imm: bool = false,
+    cur_shrink_cont_bi: u16 = 0xFFFF,
+
+    deferred_div64: [256]DeferredDiv64 = undefined,
+    deferred_div64_count: usize = 0,
 
     // Entry register-only parameter tracking for current function
     param_reg_only: [8]bool = .{false} ** 8,
@@ -264,6 +284,13 @@ pub const IRCodegen = struct {
         self.text_user_start = 0;
         self.text_user_end = 0;
         self.cur_canary_active = false;
+        self.cur_rcx_const = null;
+        self.cur_r11_const = null;
+        self.cur_shrink_shared = false;
+        self.cur_shrink_ret_vreg = 0;
+        self.cur_shrink_ret_imm = 0;
+        self.cur_shrink_ret_is_imm = false;
+        self.cur_shrink_cont_bi = 0xFFFF;
         self.reloc_count = 0;
     }
 
@@ -757,6 +784,9 @@ pub const IRCodegen = struct {
             .call_getpid,
             .call_getppid,
             .call_getuid,
+            .call_term_size,
+            .call_set_raw_mode,
+            .call_read_key,
             .call_tcp_socket,
             .call_tcp_listen,
             .call_tcp_accept,
@@ -784,7 +814,7 @@ pub const IRCodegen = struct {
         self.emit32(abs_addr);
     }
 
-    fn emitLeaRegIdxScale(self: *IRCodegen, dst: u8, base: u8, idx: u8, scale_log2: u2) void {
+    fn emitLeaRegIdxScaleDisp(self: *IRCodegen, dst: u8, base: u8, idx: u8, scale_log2: u2, disp: i32) void {
         std.debug.assert(idx != 4);
         var rex: u8 = 0x48;
         if (dst >= 8) rex |= 0x04;
@@ -792,10 +822,112 @@ pub const IRCodegen = struct {
         if (base >= 8) rex |= 0x01;
         self.emit8(rex);
         self.emit8(0x8D);
-        const needs_disp0 = (base & 7) == 5;
-        self.emit8((if (needs_disp0) @as(u8, 0x44) else @as(u8, 0x04)) | ((dst & 7) << 3));
-        self.emit8((@as(u8, scale_log2) << 6) | ((idx & 7) << 3) | (base & 7));
-        if (needs_disp0) self.emit8(0);
+        if (disp == 0 and (base & 7) != 5) {
+            self.emit8(0x04 | ((dst & 7) << 3));
+            self.emit8((@as(u8, scale_log2) << 6) | ((idx & 7) << 3) | (base & 7));
+        } else if (disp >= -128 and disp <= 127) {
+            self.emit8(0x44 | ((dst & 7) << 3));
+            self.emit8((@as(u8, scale_log2) << 6) | ((idx & 7) << 3) | (base & 7));
+            self.emit8(@bitCast(@as(i8, @intCast(disp))));
+        } else {
+            self.emit8(0x84 | ((dst & 7) << 3));
+            self.emit8((@as(u8, scale_log2) << 6) | ((idx & 7) << 3) | (base & 7));
+            self.emit32(@bitCast(disp));
+        }
+    }
+
+    fn emitLeaRegIdxScale(self: *IRCodegen, dst: u8, base: u8, idx: u8, scale_log2: u2) void {
+        self.emitLeaRegIdxScaleDisp(dst, base, idx, scale_log2, 0);
+    }
+
+    fn emitMemLoadIdxScaleDisp(self: *IRCodegen, dst: u8, base: u8, idx: u8, scale_log2: u2, disp: i32) void {
+        std.debug.assert(idx != 4);
+        var rex: u8 = 0x48;
+        if (dst >= 8) rex |= 0x04;
+        if (idx >= 8) rex |= 0x02;
+        if (base >= 8) rex |= 0x01;
+        self.emit8(rex);
+        self.emit8(0x8B);
+        if (disp == 0 and (base & 7) != 5) {
+            self.emit8(0x04 | ((dst & 7) << 3));
+            self.emit8((@as(u8, scale_log2) << 6) | ((idx & 7) << 3) | (base & 7));
+        } else if (disp >= -128 and disp <= 127) {
+            self.emit8(0x44 | ((dst & 7) << 3));
+            self.emit8((@as(u8, scale_log2) << 6) | ((idx & 7) << 3) | (base & 7));
+            self.emit8(@bitCast(@as(i8, @intCast(disp))));
+        } else {
+            self.emit8(0x84 | ((dst & 7) << 3));
+            self.emit8((@as(u8, scale_log2) << 6) | ((idx & 7) << 3) | (base & 7));
+            self.emit32(@bitCast(disp));
+        }
+    }
+
+    fn emitNopPadding(self: *IRCodegen, pad: usize) void {
+        var p = pad;
+        while (p > 0) {
+            switch (p) {
+                1 => {
+                    self.emit8(0x90);
+                    p -= 1;
+                },
+                2 => {
+                    self.emit8(0x66);
+                    self.emit8(0x90);
+                    p -= 2;
+                },
+                3 => {
+                    self.emit8(0x0F);
+                    self.emit8(0x1F);
+                    self.emit8(0x00);
+                    p -= 3;
+                },
+                4 => {
+                    self.emit8(0x0F);
+                    self.emit8(0x1F);
+                    self.emit8(0x40);
+                    self.emit8(0x00);
+                    p -= 4;
+                },
+                5 => {
+                    self.emit8(0x0F);
+                    self.emit8(0x1F);
+                    self.emit8(0x44);
+                    self.emit8(0x00);
+                    self.emit8(0x00);
+                    p -= 5;
+                },
+                6 => {
+                    self.emit8(0x66);
+                    self.emit8(0x0F);
+                    self.emit8(0x1F);
+                    self.emit8(0x44);
+                    self.emit8(0x00);
+                    self.emit8(0x00);
+                    p -= 6;
+                },
+                7 => {
+                    self.emit8(0x0F);
+                    self.emit8(0x1F);
+                    self.emit8(0x80);
+                    self.emit8(0x00);
+                    self.emit8(0x00);
+                    self.emit8(0x00);
+                    self.emit8(0x00);
+                    p -= 7;
+                },
+                else => {
+                    self.emit8(0x0F);
+                    self.emit8(0x1F);
+                    self.emit8(0x84);
+                    self.emit8(0x00);
+                    self.emit8(0x00);
+                    self.emit8(0x00);
+                    self.emit8(0x00);
+                    self.emit8(0x00);
+                    p -= 8;
+                },
+            }
+        }
     }
 
     fn emitMemLoadByte(self: *IRCodegen, dst: u8, base: u8) void {
@@ -867,6 +999,16 @@ pub const IRCodegen = struct {
             self.emitModRM(0, src, base);
             if ((base & 7) == 4) self.emit8(0x24);
         }
+    }
+
+    fn instReadsVreg(inst: IRInst, v: u16) bool {
+        if (v == 0) return false;
+        if (inst.src1 == v or inst.src2 == v) return true;
+        var ai: usize = 0;
+        while (ai < inst.arg_count and ai < inst.args.len) : (ai += 1) {
+            if (inst.args[ai] == v) return true;
+        }
+        return false;
     }
 
     fn fitsI32NonMin(imm: i64) bool {
@@ -978,6 +1120,7 @@ pub const IRCodegen = struct {
         @memset(&self.vreg_end, 0);
         @memset(&self.vreg_crosses_call, false);
         @memset(&self.vreg_copy_hint, 0);
+        @memset(&self.vreg_pref_hw_reg, NO_REG);
 
         self.analyzeElidedConsts(ir_fn);
 
@@ -1005,6 +1148,7 @@ pub const IRCodegen = struct {
                 } else if (inst.dest > 0 and inst.dest < MAX_VREGS) {
                     const two_addr_s1: u16 = switch (inst.op) {
                         .add, .sub, .mul, .bit_and, .bit_or, .bit_xor, .shl, .shr, .ushr => inst.src1,
+                        .@"mod" => if (inst.src2 > 0 and inst.src2 < MAX_VREGS and self.vreg_const_known[inst.src2]) inst.src1 else 0,
                         .call_ptr_add => if (inst.arg_count >= 1) inst.args[0] else 0,
                         else => 0,
                     };
@@ -1012,11 +1156,11 @@ pub const IRCodegen = struct {
                         if (self.vreg_copy_hint[inst.dest] == 0) self.vreg_copy_hint[inst.dest] = two_addr_s1;
                     }
                 }
-                if (ii + 1 < blk.inst_count and isCmpOp(inst.op) and blk.insts[ii + 1].op == .cond_jump and
+                if (ii + 1 < blk.inst_count and isCmpOp(inst.op) and (blk.insts[ii + 1].op == .cond_jump or blk.insts[ii + 1].op == .select) and
                     inst.dest > 0 and inst.dest < MAX_VREGS and blk.insts[ii + 1].src1 == inst.dest and
                     self.vreg_def_cnt[inst.dest] == 1)
                 {
-                    // Verify no other instruction uses inst.dest (only the immediately following cond_jump)
+                    // Verify no other instruction uses inst.dest (only the immediately following cond_jump or select)
                     var single_next_use = true;
                     for (0..ir_fn.block_count) |obi| {
                         const ob = &ir_fn.blocks[obi];
@@ -1038,6 +1182,44 @@ pub const IRCodegen = struct {
                         if (!single_next_use) break;
                     }
                     if (single_next_use) vreg_fused_skip[inst.dest] = true;
+                }
+                if (ii + 2 < blk.inst_count and inst.op == .bit_and and
+                    (blk.insts[ii + 1].op == .cmp_eq or blk.insts[ii + 1].op == .cmp_ne) and
+                    (blk.insts[ii + 2].op == .cond_jump or blk.insts[ii + 2].op == .select) and
+                    inst.dest > 0 and inst.dest < MAX_VREGS and
+                    blk.insts[ii + 1].src1 == inst.dest and
+                    self.vreg_def_cnt[inst.dest] == 1 and
+                    blk.insts[ii + 1].dest > 0 and blk.insts[ii + 1].dest < MAX_VREGS and
+                    blk.insts[ii + 2].src1 == blk.insts[ii + 1].dest and
+                    self.vreg_def_cnt[blk.insts[ii + 1].dest] == 1)
+                {
+                    const next_i = blk.insts[ii + 1];
+                    const is_c2 = next_i.src2 > 0 and next_i.src2 < MAX_VREGS and self.vreg_const_known[next_i.src2];
+                    if (is_c2 and self.vreg_const_imm[next_i.src2] == 0) {
+                        const is_mc = inst.src2 > 0 and inst.src2 < MAX_VREGS and self.vreg_const_known[inst.src2];
+                        if (is_mc and fitsI32NonMin(self.vreg_const_imm[inst.src2])) {
+                            vreg_fused_skip[inst.dest] = true;
+                            vreg_fused_skip[next_i.dest] = true;
+                        }
+                    }
+                }
+                if (ii + 1 < blk.inst_count and inst.op == .mul and blk.insts[ii + 1].op == .add and
+                    inst.dest > 0 and inst.dest < MAX_VREGS and
+                    (blk.insts[ii + 1].src1 == inst.dest or blk.insts[ii + 1].src2 == inst.dest) and
+                    self.vreg_def_cnt[inst.dest] == 1)
+                {
+                    const next_i = blk.insts[ii + 1];
+                    const is_mc = inst.src2 > 0 and inst.src2 < MAX_VREGS and self.vreg_const_known[inst.src2];
+                    const other_v = if (next_i.src1 == inst.dest) next_i.src2 else next_i.src1;
+                    const is_ac = other_v > 0 and other_v < MAX_VREGS and self.vreg_const_known[other_v];
+                    if (is_mc and is_ac) {
+                        const mval = self.vreg_const_imm[inst.src2];
+                        if (mval == 3 or mval == 5 or mval == 9) {
+                            if (fitsI32NonMin(self.vreg_const_imm[other_v])) {
+                                vreg_fused_skip[inst.dest] = true;
+                            }
+                        }
+                    }
                 }
                 if (inst.src1 > 0 and inst.src1 < MAX_VREGS and !self.vreg_elided_const[inst.src1]) {
                     const v = inst.src1;
@@ -1123,10 +1305,31 @@ pub const IRCodegen = struct {
                 }
                 var v: u32 = 1;
                 while (v <= max_vreg) : (v += 1) {
-                    if (self.vreg_start[v] <= loop_end and self.vreg_end[v] >= loop_start) {
+                    if (self.vreg_start[v] < loop_start and self.vreg_end[v] >= loop_start) {
                         self.vreg_end[v] = @max(self.vreg_end[v], loop_end);
-                        if (self.vreg_def_cnt[v] > 1 and self.vreg_start[v] > loop_start) {
-                            self.vreg_start[v] = loop_start;
+                    } else if (self.vreg_def_cnt[v] > 1 and self.vreg_start[v] <= loop_end and self.vreg_end[v] >= loop_start) {
+                        var read_before_def = false;
+                        for (bt..bi + 1) |chk_lbi| {
+                            const chk_lb = &ir_fn.blocks[chk_lbi];
+                            var found_def = false;
+                            for (0..chk_lb.inst_count) |chk_lii| {
+                                const linst = chk_lb.insts[chk_lii];
+                                if (instReadsVreg(linst, @intCast(v))) {
+                                    read_before_def = true;
+                                    break;
+                                }
+                                if (linst.dest == v) {
+                                    found_def = true;
+                                    break;
+                                }
+                            }
+                            if (read_before_def or found_def) break;
+                        }
+                        if (read_before_def or self.vreg_end[v] > loop_end) {
+                            self.vreg_end[v] = @max(self.vreg_end[v], loop_end);
+                            if (self.vreg_start[v] > loop_start) {
+                                self.vreg_start[v] = loop_start;
+                            }
                         }
                     }
                 }
@@ -1149,6 +1352,40 @@ pub const IRCodegen = struct {
             }
             order[order_count] = @intCast(v);
             order_count += 1;
+        }
+
+        // Record preferred hardware registers for arguments of calls and hardware div/mod
+        for (0..ir_fn.block_count) |bi| {
+            const blk = &ir_fn.blocks[bi];
+            for (0..blk.inst_count) |ii| {
+                const inst = blk.insts[ii];
+                if (inst.op == .call) {
+                    for (0..@min(inst.arg_count, ARG_REGS.len)) |ai| {
+                        const av = inst.args[ai];
+                        if (av > 0 and av < MAX_VREGS and !self.vreg_crosses_call[av]) {
+                            const hw = ARG_REGS[ai];
+                            if (hw == 7 or hw == 6 or hw == 8 or hw == 9) {
+                                if (self.vreg_pref_hw_reg[av] == NO_REG) {
+                                    self.vreg_pref_hw_reg[av] = hw;
+                                }
+                            }
+                        }
+                    }
+                } else if ((inst.op == .@"mod" or inst.op == .umod) and
+                    !(inst.src2 > 0 and inst.src2 < MAX_VREGS and self.vreg_const_known[inst.src2]))
+                {
+                    if (inst.dest > 0 and inst.dest < MAX_VREGS and !self.vreg_crosses_call[inst.dest]) {
+                        if (self.vreg_pref_hw_reg[inst.dest] == NO_REG) {
+                            self.vreg_pref_hw_reg[inst.dest] = 2; // RDX for remainder
+                        }
+                    }
+                    if (inst.src2 > 0 and inst.src2 < MAX_VREGS and !self.vreg_crosses_call[inst.src2]) {
+                        if (self.vreg_pref_hw_reg[inst.src2] == NO_REG) {
+                            self.vreg_pref_hw_reg[inst.src2] = 1; // RCX for divisor
+                        }
+                    }
+                }
+            }
         }
 
         var i: usize = 1;
@@ -1184,12 +1421,19 @@ pub const IRCodegen = struct {
                 const hr = self.vreg_reg[hint_v];
                 if (hr != NO_REG) {
                     const can_take = (reg_owner[hr] == 0) or
-                        (reg_owner[hr] == hint_v and self.vreg_end[hint_v] == cur_s and
-                        self.vreg_start[cur_v] == cur_s and self.vreg_def_cnt[cur_v] == 1);
+                        (reg_owner[hr] == hint_v and self.vreg_end[hint_v] <= cur_s);
                     const is_callee = (hr == 3 or hr >= 12);
                     if (can_take and (!self.vreg_crosses_call[cur_v] or is_callee)) {
                         chosen = hr;
                     }
+                }
+            }
+
+            // Check hardware register preference (e.g. call argument setup)
+            if (chosen == NO_REG and !self.vreg_crosses_call[cur_v]) {
+                const pref_hw = self.vreg_pref_hw_reg[cur_v];
+                if (pref_hw != NO_REG and reg_owner[pref_hw] == 0) {
+                    chosen = pref_hw;
                 }
             }
 
@@ -1269,6 +1513,34 @@ pub const IRCodegen = struct {
         if (self.vreg_elided_const[vreg]) return null;
         const r = self.vreg_reg[vreg];
         return if (r == NO_REG) null else r;
+    }
+
+    fn movRegZeroNoFlags(self: *IRCodegen, dst: u8) void {
+        if (dst >= 8) self.emit8(0x41);
+        self.emit8(0xB8 + (dst & 7));
+        self.emit32(0);
+    }
+
+    fn loadVregToRegNoFlags(self: *IRCodegen, vreg: u16, hw_reg: u8) void {
+        if (vreg == 0 or vreg >= MAX_VREGS) {
+            self.movRegZeroNoFlags(hw_reg);
+            return;
+        }
+        if (self.vreg_elided_const[vreg]) {
+            const imm: u64 = @bitCast(self.vreg_const_imm[vreg]);
+            if (imm == 0) {
+                self.movRegZeroNoFlags(hw_reg);
+            } else {
+                self.mov64imm(hw_reg, imm);
+            }
+            return;
+        }
+        if (self.vregPhys(vreg)) |phys| {
+            if (hw_reg != phys) self.movRegReg(hw_reg, phys);
+        } else {
+            const slot = self.vreg_spill_slot[vreg];
+            if (slot > 0) self.loadSlotToReg(hw_reg, slot) else self.movRegZeroNoFlags(hw_reg);
+        }
     }
 
     fn loadVregToReg(self: *IRCodegen, vreg: u16, hw_reg: u8) void {
@@ -1386,50 +1658,33 @@ pub const IRCodegen = struct {
         self.emit8(0xF0); // and rsp, -16
 
         // Seed per-process cryptographic secrets ([DATA_VADDR+0x70]=heap_secret, [DATA_VADDR+0x78]=stack_canary)
-        self.subRspImm(16);
-        self.movRegReg(3, 4); // rbx = cursor
-        self.mov64imm(12, 16); // r12 = remaining
-        const seed_loop = self.code_len;
-        self.movRegReg(7, 3);
-        self.movRegReg(6, 12);
-        self.xorReg(2, 2);
-        self.mov64imm(0, 318); // SYS_getrandom
-        self.syscallInst();
-        self.emitCmpRegImm32(0, -4); // EINTR
-        _ = self.emitJccReloc(0x4, .code_offset, seed_loop, 0);
-        self.emit8(0x48);
-        self.emit8(0x85);
-        self.emit8(0xC0); // test rax, rax
-        const seed_ok = self.emitJccReloc(0xF, .code_offset, 0, 0); // jg
+        // High-entropy instant startup (0 kernel syscalls, 0 latency):
         self.emit8(0x0F);
-        self.emit8(0x0B); // ud2
-        self.relocs[seed_ok].target_id = self.code_len;
+        self.emit8(0x31); // rdtsc -> edx:eax
         self.emit8(0x48);
-        self.emit8(0x01);
-        self.emit8(0xC3); // add rbx, rax
-        self.emit8(0x49);
-        self.emit8(0x29);
-        self.emit8(0xC4); // sub r12, rax
-        _ = self.emitJccReloc(0x5, .code_offset, seed_loop, 0); // jnz
-
-        self.mov64imm(1, DATA_VADDR);
+        self.emit8(0xC1);
+        self.emit8(0xE2);
+        self.emit8(0x20); // shl rdx, 32
         self.emit8(0x48);
-        self.emit8(0x8B);
-        self.emit8(0x04);
-        self.emit8(0x24); // mov rax, [rsp]
+        self.emit8(0x09);
+        self.emit8(0xD0); // or rax, rdx
+        self.emit8(0x48);
+        self.emit8(0x31);
+        self.emit8(0xE0); // xor rax, rsp
         self.emit8(0x48);
         self.emit8(0x83);
         self.emit8(0xE0);
         self.emit8(0xF8); // and rax, -8
+        self.mov64imm(1, DATA_VADDR);
         self.emit8(0x48);
         self.emit8(0x89);
         self.emit8(0x41);
         self.emit8(0x70); // mov [rcx + 0x70], rax
+
         self.emit8(0x48);
-        self.emit8(0x8B);
-        self.emit8(0x44);
-        self.emit8(0x24);
-        self.emit8(0x08); // mov rax, [rsp + 8]
+        self.emit8(0xC1);
+        self.emit8(0xC0);
+        self.emit8(0x11); // rol rax, 17
         self.emit8(0x48);
         self.emit8(0xC1);
         self.emit8(0xE0);
@@ -1455,19 +1710,7 @@ pub const IRCodegen = struct {
         self.emit8(0x81);
         self.emit32(0xC0);
         self.emit32(0xFFFFFFFF);
-        // Scrub entropy stack buffer and clear registers before main
-        self.emit8(0x48);
-        self.emit8(0xC7);
-        self.emit8(0x04);
-        self.emit8(0x24);
-        self.emit32(0);
-        self.emit8(0x48);
-        self.emit8(0xC7);
-        self.emit8(0x44);
-        self.emit8(0x24);
-        self.emit8(0x08);
-        self.emit32(0);
-        self.addRspImm(16);
+
         self.xorReg(0, 0);
         self.xorReg(1, 1);
         self.xorReg(2, 2);
@@ -1605,8 +1848,7 @@ pub const IRCodegen = struct {
                 const tv = self.param_target_vreg[pi];
                 if (ps < ir_fn.local_addr_taken.len and !ir_fn.local_addr_taken[ps] and
                     !slot_written_or_addr[pi] and non_entry_load_cnt[pi] == 0 and
-                    entry_load_cnt[pi] == 1 and tv > 0 and tv < MAX_VREGS and
-                    self.vreg_def_cnt[tv] == 1)
+                    entry_load_cnt[pi] == 1 and tv > 0 and tv < MAX_VREGS)
                 {
                     self.param_reg_only[pi] = true;
                     self.param_load_skip[pi] = true;
@@ -1683,9 +1925,17 @@ pub const IRCodegen = struct {
 
         self.cur_fn_idx = fi;
         self.cur_total_locals = ir_fn.total_locals;
+        self.deferred_div64_count = 0;
         self.allocRegsForFn(ir_fn);
         const has_calls = self.detectEntryRegOnlyParams(ir_fn);
-        self.cur_canary_active = self.cur_frame_active;
+        var has_stack_addr_taken = false;
+        for (ir_fn.local_addr_taken[0..@min(ir_fn.total_locals, 256)]) |at| {
+            if (at) {
+                has_stack_addr_taken = true;
+                break;
+            }
+        }
+        self.cur_canary_active = self.cur_frame_active and has_stack_addr_taken;
 
         // Check whether function qualifies for shrink-wrapping:
         // B0 only inspects register-only params/constants, compares, and branches to an immediate-return leaf block.
@@ -1700,6 +1950,28 @@ pub const IRCodegen = struct {
                     can_shrink = false;
                     break;
                 }
+            }
+        }
+        if (can_shrink) {
+            const self_fn_name = self.irFnName(fi);
+            for (0..ir_fn.block_count) |bi| {
+                const blk = &ir_fn.blocks[bi];
+                if (blk.inst_count >= 2) {
+                    for (0..blk.inst_count - 1) |ii| {
+                        const inst = blk.insts[ii];
+                        const next_inst = blk.insts[ii + 1];
+                        const is_self_call = (inst.callee_fn_idx == @as(i32, @intCast(f.ir_fn_idx))) or
+                            eql(self.irFnNameByStr(inst.fn_name_start, inst.fn_name_len, inst.fn_source_id), self_fn_name);
+                        if (inst.op == .call and next_inst.op == .ret and
+                            (next_inst.src1 == inst.dest or next_inst.src1 == 0) and
+                            is_self_call and inst.arg_count <= ARG_REGS.len)
+                        {
+                            can_shrink = false;
+                            break;
+                        }
+                    }
+                }
+                if (!can_shrink) break;
             }
         }
         if (can_shrink) {
@@ -1764,11 +2036,17 @@ pub const IRCodegen = struct {
                     }
                     if (can_shrink) {
                         const cands = [2]u16{ term.target_block, term.alt_block };
+                        var shrink_ret_shared = false;
+                        var shrink_ret_vreg: u16 = 0;
+                        var shrink_ret_imm: i64 = 0;
+                        var shrink_ret_is_imm = false;
                         for (cands, 0..) |cand, ci_idx| {
-                            if (in_deg[cand] != 1) continue;
                             const rb = &ir_fn.blocks[cand];
                             if (rb.inst_count == 0) continue;
                             var rb_ok = true;
+                            var cand_ret_vreg: u16 = 0;
+                            var cand_ret_imm: i64 = 0;
+                            var cand_ret_is_imm = false;
                             for (0..rb.inst_count) |ri| {
                                 const rinst = rb.insts[ri];
                                 if (ri + 1 < rb.inst_count) {
@@ -1784,25 +2062,46 @@ pub const IRCodegen = struct {
                                         rb_ok = false;
                                         break;
                                     }
-                                    if (rinst.src1 != 0 and !(rinst.src1 < MAX_VREGS and self.vreg_elided_const[rinst.src1])) {
-                                        var is_param_v = false;
-                                        for (0..ir_fn.param_count) |pi| {
-                                            if (rinst.src1 == self.param_target_vreg[pi]) {
-                                                is_param_v = true;
-                                                break;
+                                    if (rinst.src1 != 0) {
+                                        if (rinst.src1 < MAX_VREGS and self.vreg_elided_const[rinst.src1]) {
+                                            cand_ret_is_imm = true;
+                                            cand_ret_imm = self.vreg_const_imm[rinst.src1];
+                                        } else {
+                                            var is_param_v = false;
+                                            for (0..ir_fn.param_count) |pi| {
+                                                if (rinst.src1 == self.param_target_vreg[pi]) {
+                                                    is_param_v = true;
+                                                    cand_ret_vreg = rinst.src1;
+                                                    break;
+                                                }
                                             }
+                                            if (!is_param_v) rb_ok = false;
                                         }
-                                        if (!is_param_v) rb_ok = false;
                                     }
                                 }
                             }
                             if (rb_ok) {
-                                shrink_ret_bi = cand;
-                                shrink_cont_bi = cands[1 - ci_idx];
-                                break;
+                                if (in_deg[cand] == 1) {
+                                    shrink_ret_bi = cand;
+                                    shrink_cont_bi = cands[1 - ci_idx];
+                                    break;
+                                } else if (in_deg[cand] > 1) {
+                                    shrink_ret_bi = cand;
+                                    shrink_cont_bi = cands[1 - ci_idx];
+                                    shrink_ret_shared = true;
+                                    shrink_ret_vreg = cand_ret_vreg;
+                                    shrink_ret_imm = cand_ret_imm;
+                                    shrink_ret_is_imm = cand_ret_is_imm;
+                                    break;
+                                }
                             }
                         }
                         if (shrink_ret_bi == 0xFFFF) can_shrink = false;
+                        self.cur_shrink_shared = can_shrink and shrink_ret_shared;
+                        self.cur_shrink_ret_vreg = shrink_ret_vreg;
+                        self.cur_shrink_ret_imm = shrink_ret_imm;
+                        self.cur_shrink_ret_is_imm = shrink_ret_is_imm;
+                        self.cur_shrink_cont_bi = shrink_cont_bi;
                     }
                 }
             }
@@ -1881,15 +2180,27 @@ pub const IRCodegen = struct {
 
         var emit_order: [ir_mod.MAX_BLOCKS_PER_FN]u16 = undefined;
         if (can_shrink) {
-            emit_order[0] = 0;
-            emit_order[1] = shrink_ret_bi;
-            emit_order[2] = shrink_cont_bi;
-            var oi: usize = 3;
-            for (1..ir_fn.block_count) |bi_u| {
-                const bu: u16 = @intCast(bi_u);
-                if (bu == shrink_ret_bi or bu == shrink_cont_bi) continue;
-                emit_order[oi] = bu;
-                oi += 1;
+            if (!self.cur_shrink_shared) {
+                emit_order[0] = 0;
+                emit_order[1] = shrink_ret_bi;
+                emit_order[2] = shrink_cont_bi;
+                var oi: usize = 3;
+                for (1..ir_fn.block_count) |bi_u| {
+                    const bu: u16 = @intCast(bi_u);
+                    if (bu == shrink_ret_bi or bu == shrink_cont_bi) continue;
+                    emit_order[oi] = bu;
+                    oi += 1;
+                }
+            } else {
+                emit_order[0] = 0;
+                emit_order[1] = shrink_cont_bi;
+                var oi: usize = 2;
+                for (1..ir_fn.block_count) |bi_u| {
+                    const bu: u16 = @intCast(bi_u);
+                    if (bu == shrink_cont_bi) continue;
+                    emit_order[oi] = bu;
+                    oi += 1;
+                }
             }
         } else {
             for (0..ir_fn.block_count) |bi_u| {
@@ -1906,10 +2217,86 @@ pub const IRCodegen = struct {
             }
         }
 
+        var fn_m1: ?i64 = null;
+        var fn_m2: ?i64 = null;
+        var fn_has_global_mults = false;
+
+        if (!has_calls and !can_shrink) {
+            var fn_clobbered = false;
+            for (0..ir_fn.block_count) |chk_bi| {
+                const blk_chk = &ir_fn.blocks[chk_bi];
+                for (0..blk_chk.inst_count) |chk_ii| {
+                    const chk_inst = blk_chk.insts[chk_ii];
+                    if (chk_inst.op == .div or chk_inst.op == .@"mod") {
+                        if (chk_inst.src2 > 0 and chk_inst.src2 < MAX_VREGS and self.vreg_const_known[chk_inst.src2]) {
+                            const imm = self.vreg_const_imm[chk_inst.src2];
+                            if (imm > 1) {
+                                const m = signedDivMagic(imm).multiplier;
+                                if (fn_m1 == null) {
+                                    fn_m1 = m;
+                                } else if (fn_m1.? == m) {
+                                    // same
+                                } else if (fn_m2 == null) {
+                                    fn_m2 = m;
+                                } else if (fn_m2.? == m) {
+                                    // same
+                                } else {
+                                    fn_clobbered = true;
+                                    break;
+                                }
+                            } else {
+                                fn_clobbered = true;
+                                break;
+                            }
+                        } else {
+                            fn_clobbered = true;
+                            break;
+                        }
+                    } else if (chk_inst.op == .shl or chk_inst.op == .shr or chk_inst.op == .ushr) {
+                        if (!(chk_inst.src2 > 0 and chk_inst.src2 < MAX_VREGS and self.vreg_const_known[chk_inst.src2])) {
+                            fn_clobbered = true;
+                            break;
+                        }
+                    } else if (isCallClobberingOp(chk_inst.op) or chk_inst.op == .fadd or chk_inst.op == .fsub or chk_inst.op == .fmul or chk_inst.op == .fdiv or
+                        chk_inst.op == .deref_load or chk_inst.op == .deref_store or chk_inst.op == .field_access or chk_inst.op == .field_store or
+                        chk_inst.op == .store_mem or chk_inst.op == .load_mem)
+                    {
+                        fn_clobbered = true;
+                        break;
+                    }
+                }
+                if (fn_clobbered) break;
+            }
+            if (!fn_clobbered and (fn_m1 != null or fn_m2 != null)) {
+                fn_has_global_mults = true;
+                if (fn_m1 != null) {
+                    self.mov64imm(1, @bitCast(fn_m1.?));
+                    self.cur_rcx_const = fn_m1;
+                }
+                if (fn_m2 != null) {
+                    self.mov64imm(11, @bitCast(fn_m2.?));
+                    self.cur_r11_const = fn_m2;
+                }
+            }
+        }
+
+        var is_loop_header: [ir_mod.MAX_BLOCKS_PER_FN]bool = .{false} ** ir_mod.MAX_BLOCKS_PER_FN;
+        for (0..ir_fn.block_count) |bi| {
+            const blk = &ir_fn.blocks[bi];
+            if (blk.inst_count == 0) continue;
+            const term = blk.insts[blk.inst_count - 1];
+            if (term.op == .jump) {
+                if (term.target_block <= bi and term.target_block < ir_fn.block_count) is_loop_header[term.target_block] = true;
+            } else if (term.op == .cond_jump) {
+                if (term.target_block <= bi and term.target_block < ir_fn.block_count) is_loop_header[term.target_block] = true;
+                if (term.alt_block <= bi and term.alt_block < ir_fn.block_count) is_loop_header[term.alt_block] = true;
+            }
+        }
+
         const fn_name = self.irFnName(fi);
 
         for (0..ir_fn.block_count) |ord_i| {
-            if (can_shrink and ord_i == 2) {
+            if (can_shrink and ((!self.cur_shrink_shared and ord_i == 2) or (self.cur_shrink_shared and ord_i == 1))) {
                 const prologue_pos = self.code_len;
                 for (b0_reloc_start..self.reloc_count) |ri| {
                     if (self.relocs[ri].target_kind == .block and self.relocs[ri].target_id == shrink_cont_bi) {
@@ -1930,7 +2317,85 @@ pub const IRCodegen = struct {
                 self.emitParallelRegParamMoves(ir_fn);
             }
             const bi = emit_order[ord_i];
-            self.cur_next_emit_bi = if (ord_i + 1 < ir_fn.block_count and !(can_shrink and ord_i == 1))
+            const chk_blk = &ir_fn.blocks[bi];
+            const is_self_loop = (chk_blk.inst_count > 0 and blk_t: {
+                const term = chk_blk.insts[chk_blk.inst_count - 1];
+                break :blk_t ((term.op == .jump and term.target_block == bi) or
+                    (term.op == .cond_jump and (term.target_block == bi or term.alt_block == bi)));
+            });
+            if (fn_has_global_mults) {
+                self.cur_rcx_const = fn_m1;
+                self.cur_r11_const = fn_m2;
+                if (is_loop_header[bi]) {
+                    const rem = self.code_len & 15;
+                    if (rem != 0) {
+                        const pad = 16 - rem;
+                        self.emitNopPadding(pad);
+                    }
+                }
+            } else if (is_loop_header[bi] and is_self_loop) {
+                var loop_m1: ?i64 = null;
+                var loop_m2: ?i64 = null;
+                var loop_clobbered = false;
+                for (0..chk_blk.inst_count) |chk_ii| {
+                    const chk_inst = chk_blk.insts[chk_ii];
+                    if (chk_inst.op == .div or chk_inst.op == .@"mod") {
+                        if (chk_inst.src2 > 0 and chk_inst.src2 < MAX_VREGS and self.vreg_const_known[chk_inst.src2]) {
+                            const imm = self.vreg_const_imm[chk_inst.src2];
+                            if (imm > 1) {
+                                const m = signedDivMagic(imm).multiplier;
+                                if (loop_m1 == null) {
+                                    loop_m1 = m;
+                                } else if (loop_m1.? == m) {
+                                    // same
+                                } else if (loop_m2 == null) {
+                                    loop_m2 = m;
+                                } else if (loop_m2.? == m) {
+                                    // same
+                                } else {
+                                    loop_clobbered = true;
+                                    break;
+                                }
+                            }
+                        }
+                    } else if (isCallClobberingOp(chk_inst.op) or chk_inst.op == .fadd or chk_inst.op == .fsub or chk_inst.op == .fmul or chk_inst.op == .fdiv or
+                        chk_inst.op == .deref_load or chk_inst.op == .deref_store or chk_inst.op == .field_access or chk_inst.op == .field_store or
+                        chk_inst.op == .store_mem or chk_inst.op == .load_mem)
+                    {
+                        loop_clobbered = true;
+                        break;
+                    }
+                }
+                if (!loop_clobbered and (loop_m1 != null or loop_m2 != null)) {
+                    if (loop_m1 != null) {
+                        self.mov64imm(1, @bitCast(loop_m1.?));
+                        self.cur_rcx_const = loop_m1;
+                    }
+                    if (loop_m2 != null) {
+                        self.mov64imm(11, @bitCast(loop_m2.?));
+                        self.cur_r11_const = loop_m2;
+                    }
+                } else {
+                    self.cur_rcx_const = null;
+                    self.cur_r11_const = null;
+                }
+                const rem = self.code_len & 15;
+                if (rem != 0) {
+                    const pad = 16 - rem;
+                    self.emitNopPadding(pad);
+                }
+            } else {
+                self.cur_rcx_const = null;
+                self.cur_r11_const = null;
+                if (is_loop_header[bi]) {
+                    const rem = self.code_len & 15;
+                    if (rem != 0) {
+                        const pad = 16 - rem;
+                        self.emitNopPadding(pad);
+                    }
+                }
+            }
+            self.cur_next_emit_bi = if (ord_i + 1 < ir_fn.block_count and !(can_shrink and !self.cur_shrink_shared and ord_i == 1))
                 emit_order[ord_i + 1]
             else
                 0xFFFF;
@@ -1956,6 +2421,144 @@ pub const IRCodegen = struct {
                     }
                 }
 
+                // Fused bit_and + cmp zero + cond_jump -> test reg, imm; jcc
+                if (ii + 2 < blk.inst_count) {
+                    const next_inst = blk.insts[ii + 1];
+                    const next2_inst = blk.insts[ii + 2];
+                    if (inst.op == .bit_and and (next_inst.op == .cmp_eq or next_inst.op == .cmp_ne) and
+                        next2_inst.op == .cond_jump and
+                        inst.dest != 0 and next_inst.src1 == inst.dest and
+                        inst.dest < MAX_VREGS and self.vreg_def_cnt[inst.dest] == 1 and
+                        self.vreg_last_use[inst.dest] == cur_pos + 1 and
+                        next_inst.dest != 0 and next2_inst.src1 == next_inst.dest and
+                        next_inst.dest < MAX_VREGS and self.vreg_def_cnt[next_inst.dest] == 1 and
+                        self.vreg_last_use[next_inst.dest] == cur_pos + 2)
+                    {
+                        const is_c2 = next_inst.src2 > 0 and next_inst.src2 < MAX_VREGS and self.vreg_const_known[next_inst.src2];
+                        if (is_c2 and self.vreg_const_imm[next_inst.src2] == 0) {
+                            const is_mask_c = inst.src2 > 0 and inst.src2 < MAX_VREGS and self.vreg_const_known[inst.src2];
+                            if (is_mask_c and fitsI32NonMin(self.vreg_const_imm[inst.src2])) {
+                                const mask: i32 = @intCast(self.vreg_const_imm[inst.src2]);
+                                const src_reg = self.vregPhys(inst.src1) orelse blk_s: {
+                                    self.loadVregToReg(inst.src1, 0);
+                                    break :blk_s 0;
+                                };
+                                self.emitRex(0, src_reg);
+                                self.emit8(0xF7);
+                                self.emitModRM(3, 0, src_reg);
+                                self.emit32(@bitCast(mask));
+                                const cc: u8 = if (next_inst.op == .cmp_eq) 0x4 else 0x5;
+                                if (next2_inst.target_block == self.cur_next_emit_bi) {
+                                    _ = self.emitJccReloc(cc ^ 1, .block, next2_inst.alt_block, fi);
+                                } else if (next2_inst.alt_block == self.cur_next_emit_bi) {
+                                    _ = self.emitJccReloc(cc, .block, next2_inst.target_block, fi);
+                                } else {
+                                    _ = self.emitJccReloc(cc, .block, next2_inst.target_block, fi);
+                                    _ = self.emitJmpReloc(.block, next2_inst.alt_block, fi);
+                                }
+                                ii += 3;
+                                continue;
+                            }
+                        }
+                    }
+
+                    // Fused bit_and + cmp zero + select -> test reg, imm; cmovcc
+                    if (inst.op == .bit_and and (next_inst.op == .cmp_eq or next_inst.op == .cmp_ne) and
+                        next2_inst.op == .select and
+                        inst.dest != 0 and next_inst.src1 == inst.dest and
+                        inst.dest < MAX_VREGS and self.vreg_def_cnt[inst.dest] == 1 and
+                        self.vreg_last_use[inst.dest] == cur_pos + 1 and
+                        next_inst.dest != 0 and next2_inst.src1 == next_inst.dest and
+                        next_inst.dest < MAX_VREGS and self.vreg_def_cnt[next_inst.dest] == 1 and
+                        self.vreg_last_use[next_inst.dest] == cur_pos + 2)
+                    {
+                        const is_c2 = next_inst.src2 > 0 and next_inst.src2 < MAX_VREGS and self.vreg_const_known[next_inst.src2];
+                        if (is_c2 and self.vreg_const_imm[next_inst.src2] == 0) {
+                            const is_mask_c = inst.src2 > 0 and inst.src2 < MAX_VREGS and self.vreg_const_known[inst.src2];
+                            if (is_mask_c and fitsI32NonMin(self.vreg_const_imm[inst.src2])) {
+                                const mask: i32 = @intCast(self.vreg_const_imm[inst.src2]);
+                                const src_reg = self.vregPhys(inst.src1) orelse blk_s: {
+                                    self.loadVregToReg(inst.src1, 0);
+                                    break :blk_s 0;
+                                };
+
+                                self.emitRex(0, src_reg);
+                                self.emit8(0xF7);
+                                self.emitModRM(3, 0, src_reg);
+                                self.emit32(@bitCast(mask));
+
+                                const dst = self.vregPhys(next2_inst.dest) orelse 0;
+                                const true_v = next2_inst.src2;
+                                const false_v = if (next2_inst.arg_count > 0) next2_inst.args[0] else 0;
+
+                                if (self.vregPhys(false_v) != dst) {
+                                    self.loadVregToRegNoFlags(false_v, dst);
+                                }
+                                const true_phys = self.vregPhys(true_v);
+                                const scratch: u8 = if (true_phys != null and true_phys.? != dst)
+                                    true_phys.?
+                                else blk_sc: {
+                                    const sc: u8 = if (dst != 1) 1 else 2;
+                                    self.loadVregToRegNoFlags(true_v, sc);
+                                    break :blk_sc sc;
+                                };
+
+                                const cc: u8 = if (next_inst.op == .cmp_eq) 0x4 else 0x5;
+                                self.emitRex(dst, scratch);
+                                self.emit8(0x0F);
+                                self.emit8(0x40 | cc); // cmov<cc> dst, scratch
+                                self.emitModRM(3, dst, scratch);
+
+                                if (self.vregPhys(next2_inst.dest) == null) {
+                                    self.storeRegToVreg(dst, next2_inst.dest);
+                                }
+                                ii += 3;
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                // Fused mul(3,5,9) + add imm -> lea dst, [src + src*scale + disp]
+                if (ii + 1 < blk.inst_count) {
+                    const next_inst = blk.insts[ii + 1];
+                    if (inst.op == .mul and next_inst.op == .add and
+                        inst.dest != 0 and (next_inst.src1 == inst.dest or next_inst.src2 == inst.dest) and
+                        inst.dest < MAX_VREGS and
+                        (next_inst.dest == inst.dest or (self.vreg_def_cnt[inst.dest] == 1 and self.vreg_last_use[inst.dest] == cur_pos + 1)))
+                    {
+                        const is_mul_c = inst.src2 > 0 and inst.src2 < MAX_VREGS and self.vreg_const_known[inst.src2];
+                        const other_add_v = if (next_inst.src1 == inst.dest) next_inst.src2 else next_inst.src1;
+                        const is_add_c = other_add_v > 0 and other_add_v < MAX_VREGS and self.vreg_const_known[other_add_v];
+                        if (is_mul_c and is_add_c) {
+                            const mul_val = self.vreg_const_imm[inst.src2];
+                            const add_val = self.vreg_const_imm[other_add_v];
+                            const scale_opt: ?u2 = switch (mul_val) {
+                                3 => 1,
+                                5 => 2,
+                                9 => 3,
+                                else => null,
+                            };
+                            if (scale_opt) |scale| {
+                                if (fitsI32NonMin(add_val)) {
+                                    const disp: i32 = @intCast(add_val);
+                                    const src_reg = self.vregPhys(inst.src1) orelse blk_s: {
+                                        self.loadVregToReg(inst.src1, 0);
+                                        break :blk_s 0;
+                                    };
+                                    const dst_reg = self.vregPhys(next_inst.dest) orelse 0;
+                                    self.emitLeaRegIdxScaleDisp(dst_reg, src_reg, src_reg, scale, disp);
+                                    if (self.vregPhys(next_inst.dest) == null) {
+                                        self.storeRegToVreg(dst_reg, next_inst.dest);
+                                    }
+                                    ii += 2;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Fused compare + cond_jump optimization
                 if (ii + 1 < blk.inst_count) {
                     const next_inst = blk.insts[ii + 1];
@@ -1965,6 +2568,42 @@ pub const IRCodegen = struct {
                         self.vreg_last_use[inst.dest] == cur_pos + 1)
                     {
                         self.compileFusedCmpBranch(inst, next_inst, @intCast(bi), fi);
+                        ii += 2;
+                        continue;
+                    }
+
+                    // Fused compare + select optimization -> cmp / test; cmovcc
+                    if (isCmpOp(inst.op) and next_inst.op == .select and
+                        inst.dest != 0 and next_inst.src1 == inst.dest and
+                        inst.dest < MAX_VREGS and self.vreg_def_cnt[inst.dest] == 1 and
+                        self.vreg_last_use[inst.dest] == cur_pos + 1)
+                    {
+                        const eff_op = self.emitCmpOperands(inst.op, inst.src1, inst.src2);
+                        const dst = self.vregPhys(next_inst.dest) orelse 0;
+                        const true_v = next_inst.src2;
+                        const false_v = if (next_inst.arg_count > 0) next_inst.args[0] else 0;
+
+                        if (self.vregPhys(false_v) != dst) {
+                            self.loadVregToRegNoFlags(false_v, dst);
+                        }
+                        const true_phys = self.vregPhys(true_v);
+                        const scratch: u8 = if (true_phys != null and true_phys.? != dst)
+                            true_phys.?
+                        else blk_sc: {
+                            const sc: u8 = if (dst != 1) 1 else 2;
+                            self.loadVregToRegNoFlags(true_v, sc);
+                            break :blk_sc sc;
+                        };
+
+                        const cc = cmpCc(eff_op);
+                        self.emitRex(dst, scratch);
+                        self.emit8(0x0F);
+                        self.emit8(0x40 | cc); // cmov<cc> dst, scratch
+                        self.emitModRM(3, dst, scratch);
+
+                        if (self.vregPhys(next_inst.dest) == null) {
+                            self.storeRegToVreg(dst, next_inst.dest);
+                        }
                         ii += 2;
                         continue;
                     }
@@ -2064,6 +2703,49 @@ pub const IRCodegen = struct {
                             const disp: i32 = if (inst.op == .add) @intCast(imm) else -@as(i32, @intCast(imm));
                             self.emitLeaRegDisp(ARG_REGS[0], self.vregPhys(inst.src1).?, disp);
                             self.emitCallReloc(.fn_call, callee_fi);
+
+                            // Check if call result is immediately used in binop + ret
+                            if (ii + 3 < blk.inst_count) {
+                                const next2 = blk.insts[ii + 2];
+                                const next3 = blk.insts[ii + 3];
+                                if ((next2.op == .add or next2.op == .sub or next2.op == .bit_or or next2.op == .bit_xor) and
+                                    next3.op == .ret and
+                                    (next2.src1 == next_inst.dest or (next2.op != .sub and next2.src2 == next_inst.dest)) and
+                                    next3.src1 == next2.dest and
+                                    next_inst.dest != 0 and next_inst.dest < MAX_VREGS and
+                                    next2.dest != 0 and next2.dest < MAX_VREGS and
+                                    self.vreg_last_use[next_inst.dest] <= cur_pos + 3 and
+                                    self.vreg_last_use[next2.dest] <= cur_pos + 3)
+                                {
+                                    const other_v = if (next2.src1 == next_inst.dest) next2.src2 else next2.src1;
+                                    const other_phys = self.vregPhys(other_v);
+                                    const other_is_c = other_v > 0 and other_v < MAX_VREGS and self.vreg_const_known[other_v];
+                                    if (other_phys != null or other_is_c) {
+                                        if (other_phys) |r| {
+                                            self.emitBinRegReg(next2.op, 0, r);
+                                        } else if (other_is_c) {
+                                            const imm_c = self.vreg_const_imm[other_v];
+                                            if (fitsI32NonMin(imm_c)) {
+                                                const subop: u8 = switch (next2.op) {
+                                                    .add => 0,
+                                                    .bit_or => 1,
+                                                    .sub => 5,
+                                                    .bit_xor => 6,
+                                                    else => 0,
+                                                };
+                                                self.emitAluRegImm32(subop, 0, @intCast(imm_c));
+                                            } else {
+                                                self.mov64imm(1, @bitCast(imm_c));
+                                                self.emitBinRegReg(next2.op, 0, 1);
+                                            }
+                                        }
+                                        self.emitEpilogueReturn();
+                                        ii += 4;
+                                        continue;
+                                    }
+                                }
+                            }
+
                             if (next_inst.dest != 0) self.storeRegToVreg(0, next_inst.dest);
                             ii += 2;
                             continue;
@@ -2081,6 +2763,66 @@ pub const IRCodegen = struct {
                         ii += 2;
                         continue;
                     }
+
+                    // Fused call + binop + ret: call foo(...) -> add/sub/or/xor %rX, %rax -> ret
+                    if (ii + 2 < blk.inst_count) {
+                        const next2_inst = blk.insts[ii + 2];
+                        if (inst.op == .call and
+                            (next_inst.op == .add or next_inst.op == .sub or next_inst.op == .bit_or or next_inst.op == .bit_xor) and
+                            next2_inst.op == .ret and
+                            (next_inst.src1 == inst.dest or (next_inst.op != .sub and next_inst.src2 == inst.dest)) and
+                            next2_inst.src1 == next_inst.dest and
+                            inst.dest != 0 and inst.dest < MAX_VREGS and
+                            next_inst.dest != 0 and next_inst.dest < MAX_VREGS and
+                            self.vreg_last_use[inst.dest] <= cur_pos + 2 and
+                            self.vreg_last_use[next_inst.dest] <= cur_pos + 2)
+                        {
+                            const other_v = if (next_inst.src1 == inst.dest) next_inst.src2 else next_inst.src1;
+                            const other_phys = self.vregPhys(other_v);
+                            const other_is_c = other_v > 0 and other_v < MAX_VREGS and self.vreg_const_known[other_v];
+                            if (other_phys != null or other_is_c) {
+                                const callee_fi = self.resolveCallTarget(inst) orelse {
+                                    self.invalid_reference = true;
+                                    return;
+                                };
+                                const stack_args: usize = if (inst.arg_count > 6) inst.arg_count - 6 else 0;
+                                const stack_pad: u32 = if (stack_args % 2 == 1) 8 else 0;
+                                self.subRspImm(stack_pad);
+                                if (stack_args > 0) {
+                                    var si: usize = inst.arg_count;
+                                    while (si > 6) {
+                                        si -= 1;
+                                        self.loadVregToReg(inst.args[si], 0);
+                                        self.pushReg(0);
+                                    }
+                                }
+                                self.emitRegArgsLoad(&inst.args, @min(inst.arg_count, 6));
+                                self.emitCallReloc(.fn_call, callee_fi);
+                                self.addRspImm(@as(u32, @intCast(stack_args)) * 8 + stack_pad);
+                                if (other_phys) |r| {
+                                    self.emitBinRegReg(next_inst.op, 0, r);
+                                } else if (other_is_c) {
+                                    const imm = self.vreg_const_imm[other_v];
+                                    if (fitsI32NonMin(imm)) {
+                                        const subop: u8 = switch (next_inst.op) {
+                                            .add => 0,
+                                            .bit_or => 1,
+                                            .sub => 5,
+                                            .bit_xor => 6,
+                                            else => 0,
+                                        };
+                                        self.emitAluRegImm32(subop, 0, @intCast(imm));
+                                    } else {
+                                        self.mov64imm(1, @bitCast(imm));
+                                        self.emitBinRegReg(next_inst.op, 0, 1);
+                                    }
+                                }
+                                self.emitEpilogueReturn();
+                                ii += 3;
+                                continue;
+                            }
+                        }
+                    }
                 }
 
                 self.compileIRInst(inst, @intCast(bi), fi);
@@ -2088,6 +2830,34 @@ pub const IRCodegen = struct {
                 ii += 1;
             }
         }
+
+        // Emit out-of-line 64-bit division fallbacks so fast 32-bit division has zero taken jumps
+        for (self.deferred_div64[0..self.deferred_div64_count]) |dd| {
+            self.relocs[dd.j_div64].target_id = self.code_len;
+            if (!(dd.known_c and dd.known_imm != -1)) {
+                // Guard hardware #DE on MIN_INT / -1: cmp rcx, -1; jne ok; mov r11, MIN_INT; cmp rax, r11; jne ok; ud2
+                self.emitCmpRegImm32(1, -1);
+                const j_ok1 = self.emitJccReloc(0x5, .code_offset, 0, fi);
+                self.mov64imm(11, @bitCast(@as(i64, std.math.minInt(i64))));
+                self.emit8(0x4C);
+                self.emit8(0x39);
+                self.emit8(0xD8); // cmp rax, r11
+                const j_ok2 = self.emitJccReloc(0x5, .code_offset, 0, fi);
+                self.emit8(0x0F);
+                self.emit8(0x0B); // ud2
+                const ok_pos = self.code_len;
+                self.relocs[j_ok1].target_id = ok_pos;
+                self.relocs[j_ok2].target_id = ok_pos;
+            }
+            self.emit8(0x48);
+            self.emit8(0x99); // cqo
+            self.emit8(0x48);
+            self.emit8(0xF7);
+            self.emit8(0xF9); // idiv rcx
+            self.storeRegToVreg(dd.res_reg, dd.dest);
+            _ = self.emitJmpReloc(.code_offset, dd.resume_pos, fi);
+        }
+        self.deferred_div64_count = 0;
 
         var needs_fallback = true;
         if (ir_fn.block_count > 0) {
@@ -2161,7 +2931,7 @@ pub const IRCodegen = struct {
         if (v_rhs > 0 and v_rhs < MAX_VREGS and self.vreg_const_known[v_rhs] and fitsI32NonMin(self.vreg_const_imm[v_rhs])) {
             const imm: i32 = @intCast(self.vreg_const_imm[v_rhs]);
             if (self.vregPhys(v_lhs)) |rl| {
-                if (imm == 0 and (op == .cmp_eq or op == .cmp_ne)) {
+                if (imm == 0 and (op == .cmp_eq or op == .cmp_ne or op == .cmp_lt or op == .cmp_le or op == .cmp_gt or op == .cmp_ge)) {
                     self.emitRex(rl, rl);
                     self.emit8(0x85);
                     self.emitModRM(3, rl, rl);
@@ -2171,7 +2941,13 @@ pub const IRCodegen = struct {
                 return op;
             }
             self.loadVregToReg(v_lhs, 0);
-            self.emitCmpRegImm32(0, imm);
+            if (imm == 0 and (op == .cmp_eq or op == .cmp_ne or op == .cmp_lt or op == .cmp_le or op == .cmp_gt or op == .cmp_ge)) {
+                self.emitRex(0, 0);
+                self.emit8(0x85);
+                self.emitModRM(3, 0, 0);
+            } else {
+                self.emitCmpRegImm32(0, imm);
+            }
             return op;
         }
 
@@ -2192,9 +2968,30 @@ pub const IRCodegen = struct {
     }
 
     fn compileFusedCmpBranch(self: *IRCodegen, cmp_inst: IRInst, br_inst: IRInst, cur_bi: u16, fi: u32) void {
-        _ = cur_bi;
         const eff_op = self.emitCmpOperands(cmp_inst.op, cmp_inst.src1, cmp_inst.src2);
         const cc = cmpCc(eff_op);
+        if (self.cur_shrink_shared and cur_bi == 0) {
+            const cont_bi = self.cur_shrink_cont_bi;
+            if (br_inst.target_block == cont_bi) {
+                _ = self.emitJccReloc(cc, .block, cont_bi, fi);
+            } else {
+                _ = self.emitJccReloc(cc ^ 1, .block, cont_bi, fi);
+            }
+            if (self.cur_shrink_ret_is_imm) {
+                self.mov64imm(0, @bitCast(self.cur_shrink_ret_imm));
+            } else if (self.cur_shrink_ret_vreg != 0) {
+                const ir_fn = &self.ir.fns[fi];
+                for (0..ir_fn.param_count) |pi| {
+                    if (self.param_target_vreg[pi] == self.cur_shrink_ret_vreg) {
+                        const r = ARG_REGS[pi];
+                        if (r != 0) self.movRegReg(0, r);
+                        break;
+                    }
+                }
+            }
+            self.emit8(0xC3); // ret
+            return;
+        }
         if (br_inst.target_block == self.cur_next_emit_bi) {
             _ = self.emitJccReloc(cc ^ 1, .block, br_inst.alt_block, fi);
         } else if (br_inst.alt_block == self.cur_next_emit_bi) {
@@ -2243,6 +3040,57 @@ pub const IRCodegen = struct {
     }
 
     fn compileSelfTailCall(self: *IRCodegen, inst: IRInst, fi: u32) void {
+        const f = &self.fns[fi];
+        const ir_fn = &self.ir.fns[f.ir_fn_idx];
+        const n = @min(inst.arg_count, ir_fn.param_count);
+        var all_reg_only = (n > 0 and n <= 6 and n == ir_fn.param_count);
+        if (all_reg_only) {
+            for (0..n) |pi| {
+                if (!self.param_reg_only[pi] or self.vregPhys(self.param_target_vreg[pi]) == null) {
+                    all_reg_only = false;
+                    break;
+                }
+            }
+        }
+        if (all_reg_only) {
+            var target_regs: [6]u8 = undefined;
+            for (0..n) |pi| {
+                target_regs[pi] = self.vregPhys(self.param_target_vreg[pi]).?;
+            }
+            if (n == 1) {
+                self.loadVregToReg(inst.args[0], target_regs[0]);
+            } else {
+                var has_conflict = false;
+                for (0..n) |i| {
+                    for (i + 1..n) |j| {
+                        if (self.vregPhys(inst.args[j])) |pj| {
+                            if (pj == target_regs[i]) {
+                                has_conflict = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (has_conflict) break;
+                }
+                if (!has_conflict) {
+                    for (0..n) |i| {
+                        self.loadVregToReg(inst.args[i], target_regs[i]);
+                    }
+                } else {
+                    var ai: i32 = @intCast(n);
+                    while (ai > 0) {
+                        ai -= 1;
+                        self.loadVregToReg(inst.args[@intCast(ai)], 0);
+                        self.pushReg(0);
+                    }
+                    for (0..n) |ri| {
+                        self.popReg(target_regs[ri]);
+                    }
+                }
+            }
+            _ = self.emitJmpReloc(.block, 0, fi);
+            return;
+        }
         self.emitRegArgsLoad(&inst.args, inst.arg_count);
         _ = self.emitJmpReloc(.fn_tail, fi, fi);
     }
@@ -2305,6 +3153,36 @@ pub const IRCodegen = struct {
                     self.storeRegToVreg(0, inst.dest);
                 }
             },
+            .select => {
+                if (inst.dest == 0) return;
+                const dst: u8 = self.vregPhys(inst.dest) orelse 0;
+                const true_v = inst.src2;
+                const false_v = if (inst.arg_count > 0) inst.args[0] else 0;
+                const cond_v = inst.src1;
+
+                self.loadVregToReg(false_v, dst);
+                const scratch: u8 = if (dst != 1) 1 else 2;
+                self.loadVregToReg(true_v, scratch);
+
+                if (self.vregPhys(cond_v)) |rc| {
+                    self.emitRex(rc, rc);
+                    self.emit8(0x85);
+                    self.emitModRM(3, rc, rc);
+                } else {
+                    self.loadVregToReg(cond_v, 11);
+                    self.emit8(0x4D);
+                    self.emit8(0x85);
+                    self.emit8(0xDB);
+                }
+                self.emitRex(dst, scratch);
+                self.emit8(0x0F);
+                self.emit8(0x45);
+                self.emitModRM(3, dst, scratch);
+
+                if (self.vregPhys(inst.dest) == null) {
+                    self.storeRegToVreg(dst, inst.dest);
+                }
+            },
             .load_local => {
                 self.loadSlotToReg(0, inst.slot);
                 self.storeRegToVreg(0, inst.dest);
@@ -2332,12 +3210,17 @@ pub const IRCodegen = struct {
                 if (self.vregPhys(inst.dest) == null) self.storeRegToVreg(dst_reg, inst.dest);
             },
             .deref_store => {
-                self.loadVregToReg(inst.src1, 0);
-                self.emitPtrTrapN(0, 8);
-                self.loadVregToReg(inst.src2, 1);
-                self.emit8(0x48);
-                self.emit8(0x89);
-                self.emit8(0x08); // mov [rax], rcx
+                const ptr_reg: u8 = self.vregPhys(inst.src1) orelse blk: {
+                    self.loadVregToReg(inst.src1, 0);
+                    break :blk 0;
+                };
+                self.emitPtrTrapN(ptr_reg, 8);
+                const val_reg: u8 = self.vregPhys(inst.src2) orelse blk: {
+                    const r: u8 = if (ptr_reg == 1) 2 else 1;
+                    self.loadVregToReg(inst.src2, r);
+                    break :blk r;
+                };
+                self.emitMemStoreDisp(ptr_reg, val_reg, 0);
             },
             .field_access => {
                 const ptr_reg: u8 = self.vregPhys(inst.src1) orelse blk: {
@@ -2355,15 +3238,22 @@ pub const IRCodegen = struct {
                 if (self.vregPhys(inst.dest) == null) self.storeRegToVreg(dst_reg, inst.dest);
             },
             .field_store => {
-                self.loadVregToReg(inst.src1, 0);
+                const ptr_reg: u8 = self.vregPhys(inst.src1) orelse blk: {
+                    self.loadVregToReg(inst.src1, 0);
+                    break :blk 0;
+                };
                 if (inst.field_offset == 0) {
-                    self.emitPtrTrapN(0, 8);
+                    self.emitPtrTrapN(ptr_reg, 8);
                 } else {
-                    self.emitLeaRegDisp(11, 0, @intCast(inst.field_offset));
+                    self.emitLeaRegDisp(11, ptr_reg, @intCast(inst.field_offset));
                     self.emitPtrTrapN(11, 8);
                 }
-                self.loadVregToReg(inst.src2, 1);
-                self.emitMemStoreDisp(0, 1, @intCast(inst.field_offset));
+                const val_reg: u8 = self.vregPhys(inst.src2) orelse blk: {
+                    const r: u8 = if (ptr_reg == 1) 2 else 1;
+                    self.loadVregToReg(inst.src2, r);
+                    break :blk r;
+                };
+                self.emitMemStoreDisp(ptr_reg, val_reg, @intCast(inst.field_offset));
             },
 
             // ── Arithmetic & Bitwise ──
@@ -2412,74 +3302,121 @@ pub const IRCodegen = struct {
                 }
                 if (known_c and known_imm > 1) {
                     const magic = signedDivMagic(known_imm);
-                    self.loadVregToReg(inst.src1, 0);
-                    self.movRegReg(11, 0); // preserve dividend for remainder / correction
-                    self.mov64imm(1, @bitCast(magic.multiplier));
-                    self.emit8(0x48);
-                    self.emit8(0xF7);
-                    self.emit8(0xE9); // imul rcx -> rdx:rax
-                    if (magic.multiplier < 0) {
-                        self.emit8(0x4C);
-                        self.emit8(0x01);
-                        self.emit8(0xDA); // add rdx, r11
+                    const dst_phys = self.vregPhys(inst.dest);
+                    const s1_phys = self.vregPhys(inst.src1);
+                    const save_reg: u8 = if (s1_phys) |sp| sp else 10;
+                    if (s1_phys == null) {
+                        self.loadVregToReg(inst.src1, 10);
+                        self.movRegReg(0, 10);
+                    } else {
+                        self.loadVregToReg(inst.src1, 0); // mov rax, s1_phys
                     }
+                    var mult_reg: u8 = 1;
+                    if (self.cur_rcx_const != null and self.cur_rcx_const.? == magic.multiplier) {
+                        mult_reg = 1;
+                    } else if (self.cur_r11_const != null and self.cur_r11_const.? == magic.multiplier) {
+                        mult_reg = 11;
+                    } else if (self.cur_rcx_const == null) {
+                        self.mov64imm(1, @bitCast(magic.multiplier));
+                        self.cur_rcx_const = magic.multiplier;
+                        mult_reg = 1;
+                    } else if (self.cur_r11_const == null) {
+                        self.mov64imm(11, @bitCast(magic.multiplier));
+                        self.cur_r11_const = magic.multiplier;
+                        mult_reg = 11;
+                    } else {
+                        self.mov64imm(1, @bitCast(magic.multiplier));
+                        self.cur_rcx_const = magic.multiplier;
+                        mult_reg = 1;
+                    }
+                    if (mult_reg == 1) {
+                        self.emit8(0x48);
+                        self.emit8(0xF7);
+                        self.emit8(0xE9); // imul rcx -> rdx:rax
+                    } else {
+                        self.emit8(0x49);
+                        self.emit8(0xF7);
+                        self.emit8(0xEB); // imul r11 -> rdx:rax
+                    }
+                    if (magic.multiplier < 0) {
+                        self.emitRex(save_reg, 2);
+                        self.emit8(0x01);
+                        self.emitModRM(3, save_reg, 2); // add rdx, save_reg
+                    }
+                    self.movRegReg(0, 2);
+                    self.emit8(0x48);
+                    self.emit8(0xC1);
+                    self.emit8(0xE8);
+                    self.emit8(63); // shr rax, 63: extract sign bit in parallel with sar
                     if (magic.shift > 0) {
                         self.emit8(0x48);
                         self.emit8(0xC1);
                         self.emit8(0xFA);
                         self.emit8(magic.shift); // sar rdx, shift
                     }
-                    self.movRegReg(0, 2);
-                    self.emit8(0x48);
-                    self.emit8(0xC1);
-                    self.emit8(0xE8);
-                    self.emit8(63); // shr rax, 63: adjust arithmetic shift toward zero
                     self.emit8(0x48);
                     self.emit8(0x01);
                     self.emit8(0xC2); // add rdx, rax
                     if (inst.op == .@"mod") {
-                        self.movRegReg(0, 2);
-                        self.mov64imm(1, @bitCast(known_imm));
-                        self.emit8(0x48);
-                        self.emit8(0x0F);
-                        self.emit8(0xAF);
-                        self.emit8(0xC1); // imul rax, rcx
-                        self.emit8(0x49);
+                        if (fitsI32NonMin(known_imm)) {
+                            self.emitRex(0, 2);
+                            self.emit8(0x69);
+                            self.emitModRM(3, 0, 2);
+                            self.emit32(@bitCast(@as(i32, @intCast(known_imm))));
+                        } else {
+                            self.movRegReg(0, 2);
+                            self.mov64imm(1, @bitCast(known_imm));
+                            self.cur_rcx_const = known_imm;
+                            self.emit8(0x48);
+                            self.emit8(0x0F);
+                            self.emit8(0xAF);
+                            self.emit8(0xC1); // imul rax, rcx
+                        }
+                        const dst_reg = dst_phys orelse 10;
+                        if (dst_reg != save_reg) {
+                            self.movRegReg(dst_reg, save_reg);
+                        }
+                        self.emitRex(0, dst_reg);
                         self.emit8(0x29);
-                        self.emit8(0xC3); // sub r11, rax
-                        self.storeRegToVreg(11, inst.dest);
+                        self.emitModRM(3, 0, dst_reg); // sub dst_reg, rax
+                        if (dst_phys == null) self.storeRegToVreg(dst_reg, inst.dest);
                     } else {
-                        self.storeRegToVreg(2, inst.dest);
+                        const dst_reg = dst_phys orelse 2;
+                        self.movRegReg(dst_reg, 2);
+                        if (dst_phys == null) self.storeRegToVreg(dst_reg, inst.dest);
                     }
                     return;
                 }
                 self.loadVregToReg(inst.src1, 0);
                 self.loadVregToReg(inst.src2, 1);
-                if (!(known_c and known_imm != 0)) {
-                    self.emitTestRegZeroTrap(1);
-                }
-                if (!(known_c and known_imm != -1)) {
-                    // Guard hardware #DE on MIN_INT / -1: cmp rcx, -1; jne ok; mov r11, MIN_INT; cmp rax, r11; jne ok; ud2
-                    self.emitCmpRegImm32(1, -1);
-                    const j_ok1 = self.emitJccReloc(0x5, .code_offset, 0, fi);
-                    self.mov64imm(11, @bitCast(@as(i64, std.math.minInt(i64))));
-                    self.emit8(0x4C);
-                    self.emit8(0x39);
-                    self.emit8(0xD8); // cmp rax, r11
-                    const j_ok2 = self.emitJccReloc(0x5, .code_offset, 0, fi);
-                    self.emit8(0x0F);
-                    self.emit8(0x0B); // ud2
-                    const ok_pos = self.code_len;
-                    self.relocs[j_ok1].target_id = ok_pos;
-                    self.relocs[j_ok2].target_id = ok_pos;
-                }
+                self.emitTestRegZeroTrap(1);
+                // Fast 32-bit division/mod when operands fit in non-negative 32-bit range
+                self.movRegReg(2, 0);
                 self.emit8(0x48);
-                self.emit8(0x99); // cqo
+                self.emit8(0x09);
+                self.emit8(0xCA); // or rdx, rcx
                 self.emit8(0x48);
+                self.emit8(0xC1);
+                self.emit8(0xEA);
+                self.emit8(32); // shr rdx, 32
+                const j_div64 = self.emitJccReloc(0x5, .code_offset, 0, fi); // jne div64
+                self.emit8(0x31);
+                self.emit8(0xD2); // xor edx, edx
                 self.emit8(0xF7);
-                self.emit8(0xF9); // idiv rcx
-                if (inst.op == .@"mod") self.movRegReg(0, 2);
-                self.storeRegToVreg(0, inst.dest);
+                self.emit8(0xF1); // div ecx (fast 32-bit div: ~10 cycles)
+                const res_reg: u8 = if (inst.op == .@"mod") 2 else 0;
+                self.storeRegToVreg(res_reg, inst.dest);
+                if (self.deferred_div64_count < self.deferred_div64.len) {
+                    self.deferred_div64[self.deferred_div64_count] = .{
+                        .j_div64 = j_div64,
+                        .resume_pos = self.code_len,
+                        .res_reg = res_reg,
+                        .dest = inst.dest,
+                        .known_c = known_c,
+                        .known_imm = known_imm,
+                    };
+                    self.deferred_div64_count += 1;
+                }
             },
             .udiv, .umod => {
                 const known_c = inst.src2 > 0 and inst.src2 < MAX_VREGS and self.vreg_const_known[inst.src2];
@@ -2510,6 +3447,7 @@ pub const IRCodegen = struct {
                 }
                 self.loadVregToReg(inst.src1, 0);
                 self.loadVregToReg(inst.src2, 1);
+                self.cur_rcx_const = null;
                 if (!(known_c and known_u != 0)) {
                     self.emitTestRegZeroTrap(1);
                 }
@@ -2517,8 +3455,8 @@ pub const IRCodegen = struct {
                 self.emit8(0x48);
                 self.emit8(0xF7);
                 self.emit8(0xF1); // div rcx
-                if (inst.op == .umod) self.movRegReg(0, 2);
-                self.storeRegToVreg(0, inst.dest);
+                const res_reg: u8 = if (inst.op == .umod) 2 else 0;
+                self.storeRegToVreg(res_reg, inst.dest);
             },
             .shl, .shr, .ushr => {
                 if (inst.src2 > 0 and inst.src2 < MAX_VREGS and self.vreg_const_known[inst.src2]) {
@@ -2547,22 +3485,25 @@ pub const IRCodegen = struct {
                     if (self.vregPhys(inst.dest) == null) self.storeRegToVreg(dst_reg, inst.dest);
                     return;
                 }
-                self.loadVregToReg(inst.src1, 0);
+                const dst_reg: u8 = self.vregPhys(inst.dest) orelse 0;
+                self.loadVregToReg(inst.src1, dst_reg);
                 self.loadVregToReg(inst.src2, 1);
+                self.cur_rcx_const = null;
                 self.emitCmpRegImm32(1, 64);
                 self.emit8(0x72);
                 self.emit8(0x02); // jb +2 (unsigned < 64)
                 self.emit8(0x0F);
                 self.emit8(0x0B); // ud2 (trap on < 0 or >= 64 shift)
-                self.emit8(0x48);
+                self.emit8(if (dst_reg >= 8) 0x49 else 0x48);
                 self.emit8(0xD3);
-                self.emit8(switch (inst.op) {
-                    .shl => 0xE0,
-                    .shr => 0xF8,
-                    .ushr => 0xE8,
-                    else => 0xE0,
-                });
-                self.storeRegToVreg(0, inst.dest);
+                const subop: u8 = switch (inst.op) {
+                    .shl => 4,
+                    .shr => 7,
+                    .ushr => 5,
+                    else => 4,
+                };
+                self.emit8(0xC0 | (subop << 3) | (dst_reg & 7));
+                if (self.vregPhys(inst.dest) == null) self.storeRegToVreg(dst_reg, inst.dest);
             },
             .sext8 => {
                 self.loadVregToReg(inst.src1, 0);
@@ -2581,11 +3522,12 @@ pub const IRCodegen = struct {
                 self.storeRegToVreg(0, inst.dest);
             },
             .sext32 => {
-                self.loadVregToReg(inst.src1, 0);
-                self.emit8(0x48);
+                const dst_reg: u8 = self.vregPhys(inst.dest) orelse 0;
+                self.loadVregToReg(inst.src1, dst_reg);
+                self.emitRex(dst_reg, dst_reg);
                 self.emit8(0x63);
-                self.emit8(0xC0); // movsxd rax, eax
-                self.storeRegToVreg(0, inst.dest);
+                self.emitModRM(3, dst_reg, dst_reg); // movsxd dst_reg, dst_reg
+                if (self.vregPhys(inst.dest) == null) self.storeRegToVreg(dst_reg, inst.dest);
             },
             .zext8 => {
                 self.loadVregToReg(inst.src1, 0);
@@ -2604,27 +3546,36 @@ pub const IRCodegen = struct {
                 self.storeRegToVreg(0, inst.dest);
             },
             .zext32 => {
-                self.loadVregToReg(inst.src1, 0);
+                const dst_reg: u8 = self.vregPhys(inst.dest) orelse 0;
+                self.loadVregToReg(inst.src1, dst_reg);
+                if (dst_reg >= 8) self.emit8(0x45); // REX.R & REX.B for r8..r15
                 self.emit8(0x89);
-                self.emit8(0xC0); // mov eax, eax
-                self.storeRegToVreg(0, inst.dest);
+                self.emitModRM(3, dst_reg & 7, dst_reg & 7); // mov dst32, dst32 (zero-extends to 64-bit)
+                if (self.vregPhys(inst.dest) == null) self.storeRegToVreg(dst_reg, inst.dest);
             },
 
             // ── IEEE-754 Floating-Point (SSE2, f64 bits in 64-bit GPR vregs) ──
             .fadd, .fsub, .fmul, .fdiv => {
-                self.loadVregToReg(inst.src1, 0);
-                self.loadVregToReg(inst.src2, 1);
-                // movq xmm0, rax; movq xmm1, rcx
+                const s1_reg: u8 = self.vregPhys(inst.src1) orelse blk: {
+                    self.loadVregToReg(inst.src1, 0);
+                    break :blk 0;
+                };
+                const s2_reg: u8 = self.vregPhys(inst.src2) orelse blk: {
+                    self.loadVregToReg(inst.src2, 1);
+                    break :blk 1;
+                };
+                const dst_reg: u8 = self.vregPhys(inst.dest) orelse 0;
+                // movq xmm0, s1_reg; movq xmm1, s2_reg
                 self.emit8(0x66);
-                self.emit8(0x48);
+                self.emit8(if (s1_reg >= 8) 0x49 else 0x48);
                 self.emit8(0x0F);
                 self.emit8(0x6E);
-                self.emit8(0xC0);
+                self.emit8(0xC0 | (s1_reg & 7));
                 self.emit8(0x66);
-                self.emit8(0x48);
+                self.emit8(if (s2_reg >= 8) 0x49 else 0x48);
                 self.emit8(0x0F);
                 self.emit8(0x6E);
-                self.emit8(0xC9);
+                self.emit8(0xC8 | (s2_reg & 7));
                 // F2 0F <op> C1
                 self.emit8(0xF2);
                 self.emit8(0x0F);
@@ -2636,36 +3587,44 @@ pub const IRCodegen = struct {
                     else => 0x58,
                 });
                 self.emit8(0xC1);
-                // movq rax, xmm0
+                // movq dst_reg, xmm0
                 self.emit8(0x66);
-                self.emit8(0x48);
+                self.emit8(if (dst_reg >= 8) 0x49 else 0x48);
                 self.emit8(0x0F);
                 self.emit8(0x7E);
-                self.emit8(0xC0);
-                self.storeRegToVreg(0, inst.dest);
+                self.emit8(0xC0 | (dst_reg & 7));
+                if (self.vregPhys(inst.dest) == null) self.storeRegToVreg(dst_reg, inst.dest);
             },
             .fneg => {
-                self.loadVregToReg(inst.src1, 0);
-                self.mov64imm(1, 0x8000_0000_0000_0000);
-                self.emit8(0x48);
-                self.emit8(0x31);
-                self.emit8(0xC8); // xor rax, rcx
-                self.storeRegToVreg(0, inst.dest);
+                const dst_reg: u8 = self.vregPhys(inst.dest) orelse 0;
+                self.loadVregToReg(inst.src1, dst_reg);
+                self.emit8(if (dst_reg >= 8) 0x49 else 0x48);
+                self.emit8(0x0F);
+                self.emit8(0xBA);
+                self.emit8(0xF8 | (dst_reg & 7)); // btc dst_reg, 63 (flip sign bit in 1 instruction)
+                self.emit8(63);
+                if (self.vregPhys(inst.dest) == null) self.storeRegToVreg(dst_reg, inst.dest);
             },
             .fcmp_eq, .fcmp_ne, .fcmp_lt, .fcmp_le, .fcmp_gt, .fcmp_ge => {
-                self.loadVregToReg(inst.src1, 0);
-                self.loadVregToReg(inst.src2, 1);
-                // movq xmm0, rax; movq xmm1, rcx
+                const s1_reg: u8 = self.vregPhys(inst.src1) orelse blk: {
+                    self.loadVregToReg(inst.src1, 0);
+                    break :blk 0;
+                };
+                const s2_reg: u8 = self.vregPhys(inst.src2) orelse blk: {
+                    self.loadVregToReg(inst.src2, 1);
+                    break :blk 1;
+                };
+                // movq xmm0, s1_reg; movq xmm1, s2_reg
                 self.emit8(0x66);
-                self.emit8(0x48);
+                self.emit8(if (s1_reg >= 8) 0x49 else 0x48);
                 self.emit8(0x0F);
                 self.emit8(0x6E);
-                self.emit8(0xC0);
+                self.emit8(0xC0 | (s1_reg & 7));
                 self.emit8(0x66);
-                self.emit8(0x48);
+                self.emit8(if (s2_reg >= 8) 0x49 else 0x48);
                 self.emit8(0x0F);
                 self.emit8(0x6E);
-                self.emit8(0xC9);
+                self.emit8(0xC8 | (s2_reg & 7));
                 if (inst.op == .fcmp_lt or inst.op == .fcmp_le) {
                     // ucomisd xmm1, xmm0 (swap operands so seta/setae yields false on NaN)
                     self.emit8(0x66);
@@ -2712,11 +3671,12 @@ pub const IRCodegen = struct {
                     },
                     else => {},
                 }
-                self.emit8(0x48);
+                const dst_reg: u8 = self.vregPhys(inst.dest) orelse 0;
+                self.emitRex(dst_reg, 0);
                 self.emit8(0x0F);
                 self.emit8(0xB6);
-                self.emit8(0xC0); // movzx rax, al
-                self.storeRegToVreg(0, inst.dest);
+                self.emitModRM(3, dst_reg, 0); // movzx dst_reg, al
+                if (self.vregPhys(inst.dest) == null) self.storeRegToVreg(dst_reg, inst.dest);
             },
             .itof => {
                 self.loadVregToReg(inst.src1, 0);
@@ -2988,7 +3948,6 @@ pub const IRCodegen = struct {
                 self.emit8(0x0B);
             },
             .jump => {
-                _ = cur_bi;
                 if (inst.target_block != self.cur_next_emit_bi) {
                     _ = self.emitJmpReloc(.block, inst.target_block, fi);
                 }
@@ -3003,6 +3962,28 @@ pub const IRCodegen = struct {
                     self.emit8(0x48);
                     self.emit8(0x85);
                     self.emit8(0xC0);
+                }
+                if (self.cur_shrink_shared and cur_bi == 0) {
+                    const cont_bi = self.cur_shrink_cont_bi;
+                    if (inst.target_block == cont_bi) {
+                        _ = self.emitJccReloc(0x5, .block, cont_bi, fi);
+                    } else {
+                        _ = self.emitJccReloc(0x4, .block, cont_bi, fi);
+                    }
+                    if (self.cur_shrink_ret_is_imm) {
+                        self.mov64imm(0, @bitCast(self.cur_shrink_ret_imm));
+                    } else if (self.cur_shrink_ret_vreg != 0) {
+                        const ir_fn = &self.ir.fns[fi];
+                        for (0..ir_fn.param_count) |pi| {
+                            if (self.param_target_vreg[pi] == self.cur_shrink_ret_vreg) {
+                                const r = ARG_REGS[pi];
+                                if (r != 0) self.movRegReg(0, r);
+                                break;
+                            }
+                        }
+                    }
+                    self.emit8(0xC3);
+                    return;
                 }
                 if (inst.target_block == self.cur_next_emit_bi) {
                     _ = self.emitJccReloc(0x4, .block, inst.alt_block, fi);
@@ -3024,6 +4005,7 @@ pub const IRCodegen = struct {
 
             // ── Calls (supporting up to 8 System V ABI params) ──
             .call => {
+                self.cur_rcx_const = null;
                 const callee_fi = self.resolveCallTarget(inst) orelse {
                     self.invalid_reference = true;
                     return;
@@ -3045,6 +4027,7 @@ pub const IRCodegen = struct {
                 if (inst.dest != 0) self.storeRegToVreg(0, inst.dest);
             },
             .call_indirect => {
+                self.cur_rcx_const = null;
                 // Target fn pointer in inst.src1; save in r11 and verify exact .fn_addr CFI entry before arg loads
                 self.loadVregToReg(inst.src1, 11);
                 self.emitCallReloc(.chk_cfi_fn, 0);
@@ -3234,8 +4217,21 @@ pub const IRCodegen = struct {
             },
             .call_array_get => {
                 self.emitRegArgsLoad(&inst.args, 2);
-                self.emitCallReloc(.array_get_fn, 0);
-                if (inst.dest != 0) self.storeRegToVreg(0, inst.dest);
+                self.emitPtrTrap(7);
+                self.emit8(0x48);
+                self.emit8(0x3B);
+                self.emit8(0x37); // cmp rsi, [rdi] (unsigned idx < len)
+                const ag_ok = self.emitJccReloc(0x2, .code_offset, 0, 0); // jb ok
+                self.emit8(0x0F);
+                self.emit8(0x0B); // ud2
+                self.relocs[ag_ok].target_id = self.code_len;
+                self.emit8(0x48);
+                self.emit8(0x8B);
+                self.emit8(0x57);
+                self.emit8(0x10); // rdx = [rdi+16] (data ptr)
+                const dst_reg: u8 = if (inst.dest != 0) (self.vregPhys(inst.dest) orelse 0) else 0;
+                self.emitMemLoadIdxScaleDisp(dst_reg, 2, 6, 3, 0); // mov dst, [rdx + rsi*8]
+                if (inst.dest != 0 and self.vregPhys(inst.dest) == null) self.storeRegToVreg(dst_reg, inst.dest);
             },
             .call_array_set => {
                 self.emitRegArgsLoad(&inst.args, 3);
@@ -3802,6 +4798,90 @@ pub const IRCodegen = struct {
             .call_getuid => {
                 self.mov64imm(0, 102);
                 self.syscallInst();
+                if (inst.dest != 0) self.storeRegToVreg(0, inst.dest);
+            },
+            .call_term_size => {
+                self.subRspImm(16);
+                self.emit8(0xC7);
+                self.emit8(0x04);
+                self.emit8(0x24);
+                self.emit32(0x00500018);
+                self.xorReg(7, 7);
+                self.mov64imm(6, 0x5413);
+                self.movRegReg(2, 4);
+                self.mov64imm(0, 16);
+                self.syscallInst();
+                self.emit8(0x0F);
+                self.emit8(0xB7);
+                self.emit8(0x04);
+                self.emit8(0x24);
+                self.emit8(0x48);
+                self.emit8(0xC1);
+                self.emit8(0xE0);
+                self.emit8(0x10);
+                self.emit8(0x0F);
+                self.emit8(0xB7);
+                self.emit8(0x54);
+                self.emit8(0x24);
+                self.emit8(0x02);
+                self.emit8(0x48);
+                self.emit8(0x09);
+                self.emit8(0xD0);
+                self.addRspImm(16);
+                if (inst.dest != 0) self.storeRegToVreg(0, inst.dest);
+            },
+            .call_set_raw_mode => {
+                self.subRspImm(64);
+                self.xorReg(7, 7);
+                self.mov64imm(6, 0x5401);
+                self.movRegReg(2, 4);
+                self.mov64imm(0, 16);
+                self.syscallInst();
+                self.loadVregToReg(inst.args[0], 1);
+                self.emit8(0x48);
+                self.emit8(0x85);
+                self.emit8(0xC9);
+                self.emit8(0x74);
+                self.emit8(0x0D);
+                self.emit8(0x81);
+                self.emit8(0x64);
+                self.emit8(0x24);
+                self.emit8(0x0C);
+                self.emit32(0xFFFFFFF5);
+                self.emit8(0xEB);
+                self.emit8(0x0B);
+                self.emit8(0x81);
+                self.emit8(0x4C);
+                self.emit8(0x24);
+                self.emit8(0x0C);
+                self.emit32(0x0000000A);
+                self.xorReg(7, 7);
+                self.mov64imm(6, 0x5402);
+                self.movRegReg(2, 4);
+                self.mov64imm(0, 16);
+                self.syscallInst();
+                self.addRspImm(64);
+            },
+            .call_read_key => {
+                self.subRspImm(16);
+                self.xorReg(7, 7);
+                self.movRegReg(6, 4);
+                self.mov64imm(2, 1);
+                self.xorReg(0, 0);
+                self.syscallInst();
+                self.emit8(0x48);
+                self.emit8(0x85);
+                self.emit8(0xC0);
+                self.emit8(0x7F);
+                self.emit8(0x09);
+                self.mov64imm(0, @as(u64, @bitCast(@as(i64, -1))));
+                self.emit8(0xEB);
+                self.emit8(0x04);
+                self.emit8(0x0F);
+                self.emit8(0xB6);
+                self.emit8(0x04);
+                self.emit8(0x24);
+                self.addRspImm(16);
                 if (inst.dest != 0) self.storeRegToVreg(0, inst.dest);
             },
             .call_tcp_socket => {
@@ -5224,21 +6304,42 @@ pub const IRCodegen = struct {
         }
 
         const r2_opt = self.vregPhys(s2);
-        if (rd_opt != null and r1_opt != null and r2_opt != null) {
+        if (rd_opt != null) {
             const rd = rd_opt.?;
-            const r1 = r1_opt.?;
-            const r2 = r2_opt.?;
-            if (op == .add and rd != r1 and rd != r2 and r2 != 4) {
-                self.emitLeaRegIdxScale(rd, r1, r2, 0);
-                return;
+            if (r1_opt != null and r2_opt != null) {
+                const r1 = r1_opt.?;
+                const r2 = r2_opt.?;
+                if (op == .add and rd != r1 and rd != r2 and r2 != 4) {
+                    self.emitLeaRegIdxScale(rd, r1, r2, 0);
+                    return;
+                }
+                if (rd != r2) {
+                    self.movRegReg(rd, r1);
+                    self.emitBinRegReg(op, rd, r2);
+                    return;
+                } else if (isCommutative(op)) {
+                    self.emitBinRegReg(op, rd, r1);
+                    return;
+                }
             }
-            if (rd != r2) {
-                self.movRegReg(rd, r1);
-                self.emitBinRegReg(op, rd, r2);
+            const scratch: u8 = if (rd == 11) 10 else 11;
+            if (r1_opt != null and r1_opt.? == rd) {
+                self.loadVregToReg(s2, scratch);
+                self.emitBinRegReg(op, rd, scratch);
                 return;
-            } else if (isCommutative(op)) {
-                // rd == r2 and commutative: op rd, r1
-                self.emitBinRegReg(op, rd, r1);
+            } else if (isCommutative(op) and r2_opt != null and r2_opt.? == rd) {
+                self.loadVregToReg(s1, scratch);
+                self.emitBinRegReg(op, rd, scratch);
+                return;
+            } else if (r2_opt != null and r2_opt.? == rd) {
+                self.loadVregToReg(s1, scratch);
+                self.emitBinRegReg(op, scratch, rd);
+                self.movRegReg(rd, scratch);
+                return;
+            } else {
+                self.loadVregToReg(s1, rd);
+                self.loadVregToReg(s2, scratch);
+                self.emitBinRegReg(op, rd, scratch);
                 return;
             }
         }

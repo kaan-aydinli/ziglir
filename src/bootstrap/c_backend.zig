@@ -106,6 +106,8 @@ pub fn emitC(alloc: std.mem.Allocator, module: *const IRModule, source: []const 
         \\#endif
         \\#ifdef __linux__
         \\#include <sys/random.h>
+        \\#include <sys/ioctl.h>
+        \\#include <termios.h>
         \\#endif
         \\#ifdef __wasi__
         \\#include <wasi/api.h>
@@ -173,6 +175,38 @@ pub fn emitC(alloc: std.mem.Allocator, module: *const IRModule, source: []const 
         \\    if (b >= 64ULL) lir_trap();
         \\    if (b == 0ULL) return a;
         \\    return ((int64_t)a < 0) ? ~((~a) >> b) : (a >> b);
+        \\}
+        \\static inline uint64_t lir_popcount(uint64_t x) {
+        \\#if defined(__GNUC__) || defined(__clang__)
+        \\    return (uint64_t)__builtin_popcountll((unsigned long long)x);
+        \\#else
+        \\    uint64_t c = 0; while (x) { c += (x & 1ULL); x >>= 1; } return c;
+        \\#endif
+        \\}
+        \\static inline uint64_t lir_clz(uint64_t x) {
+        \\    if (x == 0ULL) return 64ULL;
+        \\#if defined(__GNUC__) || defined(__clang__)
+        \\    return (uint64_t)__builtin_clzll((unsigned long long)x);
+        \\#else
+        \\    uint64_t c = 0; while ((x & (1ULL << 63)) == 0ULL) { c++; x <<= 1; } return c;
+        \\#endif
+        \\}
+        \\static inline uint64_t lir_ctz(uint64_t x) {
+        \\    if (x == 0ULL) return 64ULL;
+        \\#if defined(__GNUC__) || defined(__clang__)
+        \\    return (uint64_t)__builtin_ctzll((unsigned long long)x);
+        \\#else
+        \\    uint64_t c = 0; while ((x & 1ULL) == 0ULL) { c++; x >>= 1; } return c;
+        \\#endif
+        \\}
+        \\static inline uint64_t lir_bswap(uint64_t x) {
+        \\#if defined(__GNUC__) || defined(__clang__)
+        \\    return (uint64_t)__builtin_bswap64((unsigned long long)x);
+        \\#elif defined(_MSC_VER)
+        \\    return (uint64_t)_byteswap_uint64(x);
+        \\#else
+        \\    return ((x>>56)&0xff)|((x>>40)&0xff00)|((x>>24)&0xff0000)|((x>>8)&0xff000000ULL)|((x&0xff000000ULL)<<8)|((x&0xff0000ULL)<<24)|((x&0xff00ULL)<<40)|((x&0xffULL)<<56);
+        \\#endif
         \\}
         \\static int64_t lir_checked_add(int64_t a, int64_t b) {
         \\    if ((b > 0 && a > INT64_MAX - b) || (b < 0 && a < INT64_MIN - b)) lir_trap();
@@ -322,8 +356,9 @@ pub fn emitC(alloc: std.mem.Allocator, module: *const IRModule, source: []const 
         \\#ifdef __wasi__
         \\    if (p < 64ULL) lir_trap();
         \\#else
-        \\    if (p < 4096ULL) lir_trap();
+        \\    if (p < 4096ULL || p >= 0x800000000000ULL) lir_trap();
         \\#endif
+        \\    if (p > UINT64_MAX - (uint64_t)acc_sz) lir_trap();
         \\#if !LIR_HAS_THREADS
         \\    if (LIR_LIKELY(lir_last_valid && p >= lir_last_user && p <= lir_last_end && acc_sz <= (size_t)(lir_last_end - p))) return;
         \\    if (LIR_LIKELY(p < lir_heap_min || p >= lir_heap_max)) return;
@@ -376,7 +411,7 @@ pub fn emitC(alloc: std.mem.Allocator, module: *const IRModule, source: []const 
         \\#ifdef __wasi__
         \\    if (ptr < 64ULL) lir_trap();
         \\#else
-        \\    if (ptr < 4096ULL) lir_trap();
+        \\    if (ptr < 4096ULL || ptr >= 0x800000000000ULL) lir_trap();
         \\#endif
         \\    lir_heap_lock();
         \\    size_t idx = lir_recs_lower_bound(ptr);
@@ -738,19 +773,32 @@ pub fn emitC(alloc: std.mem.Allocator, module: *const IRModule, source: []const 
         \\        if (r < 0) { if (errno == EINTR) continue; break; }
         \\        done += (size_t)r;
         \\    }
-        \\    while (done < (size_t)n) p[done++] = (uint8_t)(rand() & 0xFF);
+        \\    if (done < (size_t)n) {
+        \\        int fd = open("/dev/urandom", O_RDONLY);
+        \\        if (fd >= 0) {
+        \\            while (done < (size_t)n) {
+        \\                ssize_t r = read(fd, p + done, (size_t)n - done);
+        \\                if (r < 0 && errno == EINTR) continue;
+        \\                if (r <= 0) break;
+        \\                done += (size_t)r;
+        \\            }
+        \\            close(fd);
+        \\        }
+        \\    }
+        \\    if (done < (size_t)n) lir_trap();
         \\#else
         \\    int fd = open("/dev/urandom", O_RDONLY);
         \\    size_t done = 0;
         \\    if (fd >= 0) {
         \\        while (done < (size_t)n) {
         \\            ssize_t r = read(fd, p + done, (size_t)n - done);
+        \\            if (r < 0 && errno == EINTR) continue;
         \\            if (r <= 0) break;
         \\            done += (size_t)r;
         \\        }
         \\        close(fd);
         \\    }
-        \\    while (done < (size_t)n) p[done++] = (uint8_t)(rand() & 0xFF);
+        \\    if (done < (size_t)n) lir_trap();
         \\#endif
         \\    return n;
         \\}
@@ -774,6 +822,32 @@ pub fn emitC(alloc: std.mem.Allocator, module: *const IRModule, source: []const 
         \\    uint8_t diff = 0;
         \\    for (int64_t i = 0; i < n; i++) diff |= pa[i] ^ pb[i];
         \\    return diff == 0 ? 1ULL : 0ULL;
+        \\}
+        \\static int64_t lir_term_size(void) {
+        \\#if defined(__linux__) && defined(TIOCGWINSZ)
+        \\    struct winsize ws = {24, 80, 0, 0};
+        \\    if (ioctl(0, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0) {
+        \\        return ((int64_t)ws.ws_row << 16) | (int64_t)ws.ws_col;
+        \\    }
+        \\#endif
+        \\    return (24LL << 16) | 80LL;
+        \\}
+        \\static void lir_set_raw_mode(int64_t raw) {
+        \\#if defined(__linux__) && defined(TCGETS) && defined(TCSETS)
+        \\    struct termios t;
+        \\    if (ioctl(0, TCGETS, &t) == 0) {
+        \\        if (raw) { t.c_lflag &= ~(tcflag_t)(ECHO | ICANON); }
+        \\        else { t.c_lflag |= (tcflag_t)(ECHO | ICANON); }
+        \\        ioctl(0, TCSETS, &t);
+        \\    }
+        \\#else
+        \\    (void)raw;
+        \\#endif
+        \\}
+        \\static int64_t lir_read_key(void) {
+        \\    unsigned char ch = 0;
+        \\    ssize_t n = read(0, &ch, 1);
+        \\    return n > 0 ? (int64_t)ch : -1LL;
         \\}
         \\static void lir_sleep_ms(int64_t ms) {
         \\    if (ms <= 0) return;
@@ -1155,6 +1229,7 @@ pub fn emitC(alloc: std.mem.Allocator, module: *const IRModule, source: []const 
                     },
                     .const_str => try w.print("    v{d} = (uint64_t)(uintptr_t)&lir_rostr_{d}.data[0];\n", .{ inst.dest, inst.str_idx }),
                     .copy => try w.print("    v{d} = v{d};\n", .{ inst.dest, inst.src1 }),
+                    .select => try w.print("    v{d} = (v{d} != 0) ? v{d} : v{d};\n", .{ inst.dest, inst.src1, inst.src2, if (inst.arg_count > 0) inst.args[0] else 0 }),
                     .load_local => try w.print("    v{d} = slot_mem[{d}];\n", .{ inst.dest, if (inst.slot > 0) inst.slot - 1 else 0 }),
                     .store_local => try w.print("    slot_mem[{d}] = v{d};\n", .{ if (inst.slot > 0) inst.slot - 1 else 0, inst.src1 }),
                     .addr_of => try w.print("    v{d} = (uint64_t)(uintptr_t)&slot_mem[{d}];\n", .{ inst.dest, if (inst.slot > 0) inst.slot - 1 else 0 }),
@@ -1273,10 +1348,10 @@ pub fn emitC(alloc: std.mem.Allocator, module: *const IRModule, source: []const 
                     .call_round => try w.print("    v{d} = lir_d2u(round(lir_u2d(v{d})));\n", .{ inst.dest, inst.args[0] }),
                     .call_sin => try w.print("    v{d} = lir_d2u(sin(lir_u2d(v{d})));\n", .{ inst.dest, inst.args[0] }),
                     .call_cos => try w.print("    v{d} = lir_d2u(cos(lir_u2d(v{d})));\n", .{ inst.dest, inst.args[0] }),
-                    .call_popcount => try w.print("    do {{ uint64_t _x = v{d}; uint64_t _c = 0; while (_x) {{ _c += (_x & 1ULL); _x >>= 1; }} v{d} = _c; }} while (0);\n", .{ inst.args[0], inst.dest }),
-                    .call_clz => try w.print("    do {{ uint64_t _x = v{d}; uint64_t _c = 0; if (_x == 0ULL) _c = 64; else while ((_x & (1ULL << 63)) == 0ULL) {{ _c++; _x <<= 1; }} v{d} = _c; }} while (0);\n", .{ inst.args[0], inst.dest }),
-                    .call_ctz => try w.print("    do {{ uint64_t _x = v{d}; uint64_t _c = 0; if (_x == 0ULL) _c = 64; else while ((_x & 1ULL) == 0ULL) {{ _c++; _x >>= 1; }} v{d} = _c; }} while (0);\n", .{ inst.args[0], inst.dest }),
-                    .call_bswap => try w.print("    do {{ uint64_t _x = v{d}; v{d} = ((_x>>56)&0xff)|((_x>>40)&0xff00)|((_x>>24)&0xff0000)|((_x>>8)&0xff000000ULL)|((_x&0xff000000ULL)<<8)|((_x&0xff0000ULL)<<24)|((_x&0xff00ULL)<<40)|((_x&0xffULL)<<56); }} while (0);\n", .{ inst.args[0], inst.dest }),
+                    .call_popcount => try w.print("    v{d} = lir_popcount(v{d});\n", .{ inst.dest, inst.args[0] }),
+                    .call_clz => try w.print("    v{d} = lir_clz(v{d});\n", .{ inst.dest, inst.args[0] }),
+                    .call_ctz => try w.print("    v{d} = lir_ctz(v{d});\n", .{ inst.dest, inst.args[0] }),
+                    .call_bswap => try w.print("    v{d} = lir_bswap(v{d});\n", .{ inst.dest, inst.args[0] }),
                     .call_atomic_add => try w.print("    lir_chk_ptr_n(v{d}, 8u); v{d} = __sync_fetch_and_add((int64_t *)(uintptr_t)v{d}, (int64_t)v{d});\n", .{ inst.args[0], inst.dest, inst.args[0], inst.args[1] }),
                     .call_atomic_cas => try w.print("    lir_chk_ptr_n(v{d}, 8u); v{d} = __sync_bool_compare_and_swap((uint64_t *)(uintptr_t)v{d}, v{d}, v{d}) ? 1ULL : 0ULL;\n", .{ inst.args[0], inst.dest, inst.args[0], inst.args[1], inst.args[2] }),
                     .call_malloc => try w.print("    v{d} = lir_malloc((int64_t)v{d});\n", .{ inst.dest, inst.args[0] }),
@@ -1373,6 +1448,9 @@ pub fn emitC(alloc: std.mem.Allocator, module: *const IRModule, source: []const 
                     .call_getpid => try w.print("#if defined(_WIN32)\n    v{d} = (uint64_t)_getpid();\n#elif defined(__wasi__)\n    v{d} = 1ULL;\n#else\n    v{d} = (uint64_t)getpid();\n#endif\n", .{ inst.dest, inst.dest, inst.dest }),
                     .call_getppid => try w.print("#if defined(_WIN32) || defined(__wasi__)\n    v{d} = 1ULL;\n#else\n    v{d} = (uint64_t)getppid();\n#endif\n", .{ inst.dest, inst.dest }),
                     .call_getuid => try w.print("#if defined(_WIN32) || defined(__wasi__)\n    v{d} = 0ULL;\n#else\n    v{d} = (uint64_t)getuid();\n#endif\n", .{ inst.dest, inst.dest }),
+                    .call_term_size => try w.print("    v{d} = (uint64_t)lir_term_size();\n", .{inst.dest}),
+                    .call_set_raw_mode => try w.print("    lir_set_raw_mode((int64_t)v{d});\n", .{inst.args[0]}),
+                    .call_read_key => try w.print("    v{d} = (uint64_t)lir_read_key();\n", .{inst.dest}),
                     .call_tcp_socket => try w.print("    v{d} = (uint64_t)lir_tcp_socket();\n", .{inst.dest}),
                     .call_tcp_listen => try w.print("    v{d} = (uint64_t)lir_tcp_listen((int64_t)v{d}, (int64_t)v{d}, (int64_t)v{d});\n", .{ inst.dest, inst.args[0], inst.args[1], inst.args[2] }),
                     .call_tcp_accept => try w.print("    v{d} = (uint64_t)lir_tcp_accept((int64_t)v{d});\n", .{ inst.dest, inst.args[0] }),
@@ -1500,6 +1578,13 @@ pub fn compileCWithToolchain(
     try argv.append(alloc, "-O2");
     if (target.os != .wasi and target.os != .windows) {
         try argv.append(alloc, "-fstack-protector-strong");
+        try argv.append(alloc, "-D_FORTIFY_SOURCE=2");
+    }
+    if (target.os == .linux) {
+        try argv.append(alloc, "-fPIE");
+        try argv.append(alloc, "-pie");
+        try argv.append(alloc, "-Wl,-z,relro,-z,now");
+        try argv.append(alloc, "-Wl,-z,noexecstack");
     }
     try argv.append(alloc, "-w");
     try argv.append(alloc, c_path);

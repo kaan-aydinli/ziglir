@@ -23,6 +23,8 @@ pub const SemaType = union(enum) {
     string,
     ptr,
     ptr_struct: u32,
+    ptr_float: u8,
+    ptr_byte: bool,
     null_t,
     array: TypeTag,
     fixed_array: struct { elem: TypeTag, len: u32 },
@@ -38,6 +40,8 @@ pub const SemaType = union(enum) {
     unknown,
 
     pub const i64_t: SemaType = .{ .int = .{ .bits = 64, .unsigned = false } };
+    pub const i32_t: SemaType = .{ .int = .{ .bits = 32, .unsigned = false } };
+    pub const u8_t: SemaType = .{ .int = .{ .bits = 8, .unsigned = true } };
     pub const f64_t: SemaType = .{ .float = 64 };
     pub const array_t: SemaType = .{ .array = .none };
 
@@ -57,7 +61,14 @@ pub const SemaType = union(enum) {
             .string => .string,
             .void => .void,
             .never => .never,
-            .ptr => if (elem_type == .struct_type and extra > 0) .{ .ptr_struct = extra - 1 } else .ptr,
+            .ptr => blk: {
+                if (elem_type == .struct_type and extra > 0) break :blk .{ .ptr_struct = extra - 1 };
+                if (elem_type == .f32) break :blk .{ .ptr_float = 32 };
+                if (elem_type == .f64) break :blk .{ .ptr_float = 64 };
+                if (elem_type == .u8) break :blk .{ .ptr_byte = true };
+                if (elem_type == .i8) break :blk .{ .ptr_byte = false };
+                break :blk .ptr;
+            },
             .struct_type => if (extra > 0) .{ .struct_t = extra - 1 } else .ptr,
             .enum_type => if (extra > 0) .{ .enum_t = extra - 1 } else i64_t,
             .fixed_array => .{ .fixed_array = .{ .elem = elem_type, .len = extra & 0x7FFFFFFF } },
@@ -92,7 +103,7 @@ pub const SemaType = union(enum) {
             .float => |fb| if (fb == 32) .f32 else .f64,
             .bool => .bool,
             .string => .string,
-            .ptr, .ptr_struct, .null_t => .ptr,
+            .ptr, .ptr_struct, .ptr_float, .ptr_byte, .null_t => .ptr,
             .struct_t => .struct_type,
             .enum_t => .enum_type,
             .void => .void,
@@ -100,9 +111,16 @@ pub const SemaType = union(enum) {
         };
     }
 
+    pub fn isPointer(self: SemaType) bool {
+        return switch (self) {
+            .ptr, .ptr_struct, .ptr_float, .ptr_byte, .null_t => true,
+            else => false,
+        };
+    }
+
     pub fn isScalar(self: SemaType) bool {
         return switch (self) {
-            .int, .float, .bool, .ptr, .ptr_struct, .array, .fixed_array, .enum_t, .fn_t, .tuple_t, .dyn_trait, .map_t, .chan_t, .unknown => true,
+            .int, .float, .bool, .ptr, .ptr_struct, .ptr_float, .ptr_byte, .array, .fixed_array, .enum_t, .fn_t, .tuple_t, .dyn_trait, .map_t, .chan_t, .unknown => true,
             else => false,
         };
     }
@@ -120,6 +138,16 @@ pub const SemaType = union(enum) {
             .bool => b == .bool,
             .string => b == .string,
             .ptr => b == .ptr,
+            .ptr_byte => |ua| switch (b) {
+                .ptr_byte => |ub| ua == ub,
+                .ptr => true,
+                else => false,
+            },
+            .ptr_float => |fa| switch (b) {
+                .ptr_float => |fb| fa == fb,
+                .ptr => true,
+                else => false,
+            },
             .ptr_struct => |sa| switch (b) {
                 .ptr_struct => |sb| sa == sb,
                 .ptr => true,
@@ -172,18 +200,27 @@ pub const SemaType = union(enum) {
         if (expected == .chan_t) return actual == .chan_t;
         if (expected == .int) return actual == .int;
         if (expected == .enum_t) return actual == .enum_t and expected.enum_t == actual.enum_t;
-        if (expected == .null_t) return actual == .null_t or actual == .ptr or actual == .ptr_struct;
+        if (expected == .null_t) return actual == .null_t or actual == .ptr or actual == .ptr_struct or actual == .ptr_float or actual == .ptr_byte;
         if (expected == .ptr) {
-            return actual == .ptr or actual == .ptr_struct or actual == .null_t or actual == .string or actual == .array;
+            return actual == .ptr or actual == .ptr_struct or actual == .ptr_float or actual == .ptr_byte or actual == .null_t or actual == .string or actual == .array;
         }
         if (expected == .ptr_struct) {
             return (actual == .ptr_struct and expected.ptr_struct == actual.ptr_struct) or actual == .ptr or actual == .null_t;
         }
+        if (expected == .ptr_float) {
+            return (actual == .ptr_float and expected.ptr_float == actual.ptr_float) or actual == .ptr or actual == .null_t;
+        }
+        if (expected == .ptr_byte) {
+            return (actual == .ptr_byte and expected.ptr_byte == actual.ptr_byte) or actual == .ptr or actual == .null_t or actual == .string or actual == .array;
+        }
+        if (expected == .array) return actual == .array or actual == .ptr or actual == .null_t;
         if (expected == .bool) return actual == .bool;
         if (expected == .struct_t) return actual == .struct_t and expected.struct_t == actual.struct_t;
         if (expected == .fixed_array and actual == .fixed_array) {
+            const e_elem = SemaType.fromTypeTag(expected.fixed_array.elem, 0, .none);
+            const a_elem = SemaType.fromTypeTag(actual.fixed_array.elem, 0, .none);
             return expected.fixed_array.len == actual.fixed_array.len and
-                (expected.fixed_array.elem == actual.fixed_array.elem or expected.fixed_array.elem == .none or actual.fixed_array.elem == .none);
+                (expected.fixed_array.elem == actual.fixed_array.elem or expected.fixed_array.elem == .none or actual.fixed_array.elem == .none or (e_elem.isInt() and a_elem.isInt()));
         }
         return false;
     }
@@ -238,6 +275,7 @@ const VarEntry = struct {
     ty: SemaType,
     is_mut: bool,
     is_const: bool = false,
+    has_const_val: bool = false,
     is_float: bool = false,
     is_ref_imm: bool = false,
     const_val: i64 = 0,
@@ -257,6 +295,9 @@ const VarEntry = struct {
     decl_source_id: u32 = 0,
     decl_line: u32 = 0,
     decl_col: u32 = 0,
+    bounded_alias_idx: u32 = 0,
+    read_count: u32 = 0,
+    is_param: bool = false,
 };
 
 const ConstEntry = struct {
@@ -287,6 +328,12 @@ const builtins = [_]BuiltinSpec{
     .{ .name = "print", .min_args = 1, .max_args = 1, .ret = .void },
     .{ .name = "println", .min_args = 1, .max_args = 1, .ret = .void },
     .{ .name = "exit", .min_args = 1, .max_args = 1, .ret = .never },
+    .{ .name = "term_size", .min_args = 0, .max_args = 0, .ret = .{ .int = .{ .bits = 32, .unsigned = false } } },
+    .{ .name = "set_raw_mode", .min_args = 1, .max_args = 1, .ret = .void },
+    .{ .name = "read_key", .min_args = 0, .max_args = 0, .ret = .{ .int = .{ .bits = 32, .unsigned = false } } },
+    .{ .name = "@term_size", .min_args = 0, .max_args = 0, .ret = .{ .int = .{ .bits = 32, .unsigned = false } } },
+    .{ .name = "@set_raw_mode", .min_args = 1, .max_args = 1, .ret = .void },
+    .{ .name = "@read_key", .min_args = 0, .max_args = 0, .ret = .{ .int = .{ .bits = 32, .unsigned = false } } },
     .{ .name = "@syscall", .min_args = 1, .max_args = 7, .ret = SemaType.i64_t },
     .{ .name = "@array_new", .min_args = 1, .max_args = 2, .ret = SemaType.array_t },
     .{ .name = "@array_push", .min_args = 2, .max_args = 2, .ret = .void },
@@ -436,6 +483,7 @@ pub const SemaInfo = struct {
     is_float_op: [MAX_AST_NODES]bool,
     is_tail_expr: [MAX_AST_NODES]bool,
     is_len_prop: [MAX_AST_NODES]bool,
+    is_ptr_prop: [MAX_AST_NODES]bool,
     is_const_val: [MAX_AST_NODES]bool,
     is_pattern_binding: [MAX_AST_NODES]bool,
     const_vals: [MAX_AST_NODES]i64,
@@ -461,6 +509,7 @@ pub const SemaInfo = struct {
         @memset(&self.is_float_op, false);
         @memset(&self.is_tail_expr, false);
         @memset(&self.is_len_prop, false);
+        @memset(&self.is_ptr_prop, false);
         @memset(&self.is_const_val, false);
         @memset(&self.is_pattern_binding, false);
         @memset(&self.const_vals, 0);
@@ -500,10 +549,15 @@ pub const Sema = struct {
     spawn_mutex_depth: u32 = 0,
     cur_fn_stack_bytes: u64 = 0,
     skip_res_check_node: u32 = 0,
+    expr_depth: u32 = 0,
 
     cur_ret_type: SemaType = .unknown,
     cur_has_explicit_ret: bool = false,
     first_error: ?SemaError = null,
+    cur_fn_is_pure: bool = false,
+    cur_fn_node_idx: u32 = 0,
+
+    const MAX_EXPR_DEPTH: u32 = 256;
 
     pub fn init(ast: *const AST, diag: *DiagList, info: *SemaInfo) Sema {
         info.initInPlace();
@@ -587,6 +641,29 @@ pub const Sema = struct {
     fn popScope(self: *Sema) void {
         while (self.var_count > 0 and self.vars[self.var_count - 1].scope_depth == self.scope_depth) {
             const v = self.vars[self.var_count - 1];
+            if (v.read_count == 0 and v.name.len > 0 and v.name[0] != '_' and v.name[0] != '$' and v.decl_line > 0) {
+                if (v.is_param) {
+                    self.diag.addFmtAt(
+                        .warning,
+                        v.decl_source_id,
+                        v.decl_line,
+                        v.decl_col,
+                        @intCast(@max(v.name.len, 1)),
+                        "unused parameter '{s}' (prefix with '_' to silence: '_{s}')",
+                        .{ v.name, v.name },
+                    );
+                } else {
+                    self.diag.addFmtAt(
+                        .warning,
+                        v.decl_source_id,
+                        v.decl_line,
+                        v.decl_col,
+                        @intCast(@max(v.name.len, 1)),
+                        "unused variable '{s}' (prefix with '_' to silence: '_{s}')",
+                        .{ v.name, v.name },
+                    );
+                }
+            }
             if (v.borrow_target >= 0) {
                 const bt: usize = @intCast(v.borrow_target);
                 if (bt < self.var_count - 1) {
@@ -696,6 +773,136 @@ pub const Sema = struct {
         return null;
     }
 
+    fn suggestIdentifier(self: *const Sema, name: []const u8) ?[]const u8 {
+        var cands: [256][]const u8 = undefined;
+        var cand_count: usize = 0;
+
+        // 1. Local variables in scope
+        var i: u32 = self.var_count;
+        while (i > 0) {
+            i -= 1;
+            if (cand_count < cands.len) {
+                cands[cand_count] = self.vars[i].name;
+                cand_count += 1;
+            }
+        }
+        // 2. Global constants
+        for (self.consts[0..self.const_count]) |c| {
+            if (cand_count < cands.len) {
+                cands[cand_count] = c.name;
+                cand_count += 1;
+            }
+        }
+        // 3. Free functions
+        for (self.fns[0..self.fn_count]) |f| {
+            if (f.owner_struct_plus1 == 0 and cand_count < cands.len) {
+                cands[cand_count] = f.name;
+                cand_count += 1;
+            }
+        }
+
+        const max_dist: usize = if (name.len <= 4) 2 else @min(@as(usize, 3), name.len / 2 + 1);
+        return util.findSimilarName(name, cands[0..cand_count], max_dist);
+    }
+
+    fn suggestFunction(self: *const Sema, name: []const u8) ?[]const u8 {
+        var cands: [256][]const u8 = undefined;
+        var cand_count: usize = 0;
+
+        for (self.fns[0..self.fn_count]) |f| {
+            if (f.owner_struct_plus1 == 0 and cand_count < cands.len) {
+                cands[cand_count] = f.name;
+                cand_count += 1;
+            }
+        }
+
+        const common_names = [_][]const u8{
+            "print", "println", "print_int", "assert", "panic", "len",
+            "alloc", "free", "abs", "min", "max",
+        };
+        for (common_names) |b| {
+            if (cand_count < cands.len) {
+                cands[cand_count] = b;
+                cand_count += 1;
+            }
+        }
+        for (builtins) |bs| {
+            if (cand_count < cands.len) {
+                cands[cand_count] = bs.name;
+                cand_count += 1;
+            }
+        }
+
+        const max_dist: usize = if (name.len <= 4) 2 else @min(@as(usize, 3), name.len / 2 + 1);
+        return util.findSimilarName(name, cands[0..cand_count], max_dist);
+    }
+
+    fn suggestFieldOrMethod(self: *const Sema, struct_idx: u32, name: []const u8) ?[]const u8 {
+        if (struct_idx >= self.ast.struct_count) return null;
+        const sd = self.ast.struct_defs[struct_idx];
+        var cands: [64][]const u8 = undefined;
+        var cand_count: usize = 0;
+
+        const fc = @min(sd.field_count, @as(u32, @intCast(sd.fields.len)));
+        for (sd.fields[0..fc]) |f| {
+            if (cand_count < cands.len) {
+                cands[cand_count] = self.srcText(f.name_start, f.name_len, sd.source_id);
+                cand_count += 1;
+            }
+        }
+        for (self.fns[0..self.fn_count]) |f| {
+            if (f.owner_struct_plus1 == struct_idx + 1 and cand_count < cands.len) {
+                cands[cand_count] = f.name;
+                cand_count += 1;
+            }
+        }
+
+        const max_dist: usize = if (name.len <= 4) 2 else @min(@as(usize, 3), name.len / 2 + 1);
+        return util.findSimilarName(name, cands[0..cand_count], max_dist);
+    }
+
+    fn suggestStruct(self: *const Sema, name: []const u8) ?[]const u8 {
+        var cands: [64][]const u8 = undefined;
+        var cand_count: usize = 0;
+
+        const sc = @min(@as(usize, self.ast.struct_count), self.ast.struct_defs.len);
+        for (0..sc) |i| {
+            const sd = self.ast.struct_defs[i];
+            if (cand_count < cands.len) {
+                cands[cand_count] = self.srcText(sd.name_start, sd.name_len, sd.source_id);
+                cand_count += 1;
+            }
+        }
+
+        const ec = @min(@as(usize, self.ast.enum_count), self.ast.enum_defs.len);
+        for (0..ec) |i| {
+            const ed = self.ast.enum_defs[i];
+            if (cand_count < cands.len) {
+                cands[cand_count] = self.srcText(ed.name_start, ed.name_len, ed.source_id);
+                cand_count += 1;
+            }
+        }
+
+        const max_dist: usize = if (name.len <= 4) 2 else @min(@as(usize, 3), name.len / 2 + 1);
+        return util.findSimilarName(name, cands[0..cand_count], max_dist);
+    }
+
+    fn suggestEnumVariant(self: *const Sema, enum_idx: usize, name: []const u8) ?[]const u8 {
+        if (enum_idx >= self.ast.enum_count) return null;
+        const ed = self.ast.enum_defs[enum_idx];
+        var cands: [64][]const u8 = undefined;
+        var cand_count: usize = 0;
+        const vc = @min(ed.variant_count, @as(u32, @intCast(ed.variants.len)));
+        for (ed.variants[0..vc]) |v| {
+            if (cand_count < cands.len) {
+                cands[cand_count] = self.srcText(v.name_start, v.name_len, ed.source_id);
+                cand_count += 1;
+            }
+        }
+        const max_dist: usize = if (name.len <= 4) 2 else @min(@as(usize, 3), name.len / 2 + 1);
+        return util.findSimilarName(name, cands[0..cand_count], max_dist);
+    }
+
     fn getTupleDesc(self: *const Sema, id: u32) ?parser_mod.TypeDesc {
         if ((id & 0x80000000) != 0) {
             const idx = id & 0x7FFFFFFF;
@@ -778,6 +985,8 @@ pub const Sema = struct {
             .never => .{ .tag = .never, .extra = 0, .elem = .none },
             .ptr, .null_t => .{ .tag = .ptr, .extra = 0, .elem = .none },
             .ptr_struct => |si| .{ .tag = .ptr, .extra = si + 1, .elem = .struct_type },
+            .ptr_float => |fb| .{ .tag = .ptr, .extra = 0, .elem = if (fb == 32) .f32 else .f64 },
+            .ptr_byte => |u| .{ .tag = .ptr, .extra = 0, .elem = if (u) .u8 else .i8 },
             .struct_t => |si| .{ .tag = .struct_type, .extra = si + 1, .elem = .none },
             .enum_t => |ei| .{ .tag = .enum_type, .extra = ei + 1, .elem = .none },
             .fn_t => |fi| .{ .tag = .fn_ptr, .extra = fi, .elem = .none },
@@ -885,7 +1094,7 @@ pub const Sema = struct {
         return switch (n.kind) {
             .addr_of => blk: {
                 if (self.extractLValueRootVar(n.child0)) |vi| {
-                    if (self.vars[vi].ty != .ptr and self.vars[vi].ty != .ptr_struct and
+                    if (!self.vars[vi].ty.isPointer() and
                         self.vars[vi].ty != .array and self.vars[vi].ty != .map_t)
                     {
                         break :blk vi + 1;
@@ -995,8 +1204,8 @@ pub const Sema = struct {
                     .star_star => util.powWrapping(lhs, rhs),
                     .slash => if (rhs != 0 and !(lhs == std.math.minInt(i64) and rhs == -1)) @divTrunc(lhs, rhs) else null,
                     .percent => if (rhs != 0 and !(lhs == std.math.minInt(i64) and rhs == -1)) @rem(lhs, rhs) else null,
-                    .lshift => if (rhs >= 0 and rhs < 64) lhs << @intCast(rhs) else null,
-                    .rshift => if (rhs >= 0 and rhs < 64) lhs >> @intCast(rhs) else null,
+                    .lshift => if (rhs >= 0 and rhs < 64) @as(i64, @bitCast(@as(u64, @bitCast(lhs)) << @as(u6, @intCast(rhs)))) else null,
+                    .rshift => if (rhs >= 0 and rhs < 64) lhs >> @as(u6, @intCast(rhs)) else null,
                     .amp => lhs & rhs,
                     .pipe => lhs | rhs,
                     .caret => lhs ^ rhs,
@@ -1044,6 +1253,58 @@ pub const Sema = struct {
                 }
                 break :blk null;
             },
+            else => null,
+        };
+    }
+
+    fn evalContractExpr(self: *const Sema, expr_idx: u32, param_nodes: []const u32, param_count: u32, arg_vals: *const [MAX_PARAMS]?i64) ?i64 {
+        if (expr_idx == 0 or expr_idx >= self.ast.count) return null;
+        const n = self.ast.nodes[expr_idx];
+        return switch (n.kind) {
+            .int_literal => n.int_val,
+            .identifier => blk: {
+                const id_name = self.text(expr_idx);
+                for (0..param_count) |pi| {
+                    if (std.mem.eql(u8, self.text(param_nodes[pi]), id_name)) {
+                        break :blk arg_vals[pi];
+                    }
+                }
+                if (self.lookupGlobalConst(id_name)) |ce| break :blk ce.val;
+                break :blk null;
+            },
+            .unary_expr => blk: {
+                const sub = self.evalContractExpr(n.child0, param_nodes, param_count, arg_vals) orelse return null;
+                const op: TokenKind = @enumFromInt(n.op);
+                break :blk switch (op) {
+                    .plus => sub,
+                    .minus => std.math.negate(sub) catch null,
+                    .bang => if (sub == 0) @as(i64, 1) else 0,
+                    .tilde => ~sub,
+                    else => null,
+                };
+            },
+            .binary_expr => blk: {
+                const lhs = self.evalContractExpr(n.child0, param_nodes, param_count, arg_vals) orelse return null;
+                const rhs = self.evalContractExpr(n.child1, param_nodes, param_count, arg_vals) orelse return null;
+                const op: TokenKind = @enumFromInt(n.op);
+                break :blk switch (op) {
+                    .plus => std.math.add(i64, lhs, rhs) catch null,
+                    .minus => std.math.sub(i64, lhs, rhs) catch null,
+                    .star => std.math.mul(i64, lhs, rhs) catch null,
+                    .slash => if (rhs != 0 and !(lhs == std.math.minInt(i64) and rhs == -1)) @divTrunc(lhs, rhs) else null,
+                    .percent => if (rhs != 0 and !(lhs == std.math.minInt(i64) and rhs == -1)) @rem(lhs, rhs) else null,
+                    .eq => if (lhs == rhs) @as(i64, 1) else 0,
+                    .ne => if (lhs != rhs) @as(i64, 1) else 0,
+                    .lt => if (lhs < rhs) @as(i64, 1) else 0,
+                    .le => if (lhs <= rhs) @as(i64, 1) else 0,
+                    .gt => if (lhs > rhs) @as(i64, 1) else 0,
+                    .ge => if (lhs >= rhs) @as(i64, 1) else 0,
+                    .and_and => if (lhs != 0 and rhs != 0) @as(i64, 1) else 0,
+                    .pipe_pipe => if (lhs != 0 or rhs != 0) @as(i64, 1) else 0,
+                    else => null,
+                };
+            },
+            .cast_expr => self.evalContractExpr(n.child0, param_nodes, param_count, arg_vals),
             else => null,
         };
     }
@@ -1457,7 +1718,7 @@ pub const Sema = struct {
         const val = self.evalConstExpr(arg_idx) orelse return;
         if (allow_null and val == 0) return;
         const uval: u64 = @bitCast(val);
-        if (val < 0 or uval < 4096) {
+        if (val < 0 or uval < 4096 or uval >= 0x8000_0000_0000) {
             const n = self.ast.nodes[arg_idx];
             self.failAt(
                 error.TypeMismatch,
@@ -1748,6 +2009,17 @@ pub const Sema = struct {
     fn analyzeFn(self: *Sema, fn_idx: u32) void {
         const fn_node = self.ast.nodes[fn_idx];
         const sig = self.findFn(self.text(fn_idx), fn_node.extra) orelse return;
+        self.cur_fn_node_idx = fn_idx;
+        const is_pure = blk: {
+            if (self.ast.findContract(fn_idx)) |c| {
+                if (c.is_pure) break :blk true;
+            }
+            break :blk false;
+        };
+        const prev_pure = self.cur_fn_is_pure;
+        self.cur_fn_is_pure = is_pure;
+        defer self.cur_fn_is_pure = prev_pure;
+
         self.cur_ret_type = sig.ret_type;
         self.cur_has_explicit_ret = sig.has_explicit_ret;
         self.var_count = 0;
@@ -1768,8 +2040,17 @@ pub const Sema = struct {
             const pty: SemaType = if (pidx < sig.param_count) sig.param_types[pidx] else SemaType.i64_t;
             const pmut: bool = if (pidx < sig.param_count) sig.param_is_mut[pidx] else false;
             self.addVar(pname, pty, pmut, pn.source_id, pn.line, pn.col);
-            if (self.var_count > 0 and pidx == 0 and sig.self_is_ref) {
-                self.vars[self.var_count - 1].is_ref_imm = true;
+            if (self.var_count > 0) {
+                self.vars[self.var_count - 1].is_param = true;
+                if (std.mem.eql(u8, pname, "self")) {
+                    self.vars[self.var_count - 1].read_count = 1;
+                }
+                if (pidx == 0 and sig.self_is_ref) {
+                    self.vars[self.var_count - 1].is_ref_imm = true;
+                }
+                if (pn.int_val > 0) {
+                    self.vars[self.var_count - 1].bounded_alias_idx = @intCast(pn.int_val);
+                }
             }
             pidx += 1;
         }
@@ -1821,6 +2102,7 @@ pub const Sema = struct {
     fn analyzeBlock(self: *Sema, block_idx: u32, create_scope: bool, is_fn_root: bool) void {
         if (create_scope) self.pushScope();
         var stmt = self.ast.nodes[block_idx].child0;
+        var reported_unreachable = false;
         while (stmt != 0) {
             const next = self.ast.stmt_chains[stmt];
             const is_last = (next == 0);
@@ -1859,6 +2141,27 @@ pub const Sema = struct {
             } else {
                 self.analyzeStmt(stmt);
             }
+
+            if (!reported_unreachable and next != 0) {
+                const is_term = switch (sk) {
+                    .return_stmt, .unreachable_stmt, .break_stmt, .continue_stmt => true,
+                    else => self.stmtDefinitelyReturns(stmt),
+                };
+                if (is_term) {
+                    reported_unreachable = true;
+                    const next_n = self.ast.nodes[next];
+                    self.diag.addFmtAt(
+                        .warning,
+                        next_n.source_id,
+                        next_n.line,
+                        next_n.col,
+                        @max(@as(u32, 1), next_n.text_len),
+                        "unreachable code after control flow transfer",
+                        .{},
+                    );
+                }
+            }
+
             stmt = next;
         }
         if (create_scope) self.popScope();
@@ -1971,8 +2274,33 @@ pub const Sema = struct {
                     }
                 }
                 self.addVar(var_name, ty, (n.flags & 1) != 0, n.source_id, n.line, n.col);
-                if (self.var_count > 0 and n.child0 != 0) {
+                if (self.var_count > 0) {
                     const new_vi = self.var_count - 1;
+                    if (n.int_val > 0) {
+                        self.vars[new_vi].bounded_alias_idx = @intCast(n.int_val);
+                    }
+                    if (self.vars[new_vi].bounded_alias_idx > 0 and n.child0 != 0) {
+                        const ai = self.vars[new_vi].bounded_alias_idx - 1;
+                        if (ai < self.ast.alias_count) {
+                            const ad = self.ast.alias_defs[ai];
+                            if (ad.has_range) {
+                                if (self.evalConstExpr(n.child0)) |cval| {
+                                    if (cval < ad.min_val or cval > ad.max_val) {
+                                        const tname = self.srcText(ad.name_start, ad.name_len, ad.source_id);
+                                        self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, @max(n.text_len, 1), "range constraint error: value {d} is outside bounded range [{d}..{d}] for type '{s}'", .{ cval, ad.min_val, ad.max_val, tname });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (n.child0 != 0) {
+                        if ((n.flags & 1) != 0) {
+                            if (self.evalConstExpr(n.child0)) |cval| {
+                                self.vars[new_vi].const_val = cval;
+                                self.vars[new_vi].has_const_val = true;
+                            }
+                        }
+                    }
                     var init_idx = n.child0;
                     while (init_idx != 0 and self.ast.nodes[init_idx].kind == .cast_expr) {
                         init_idx = self.ast.nodes[init_idx].child0;
@@ -2087,22 +2415,43 @@ pub const Sema = struct {
                 if (n.text_len > 0) {
                     const vname = self.text(stmt_idx);
                     const rhs_ty = self.analyzeExpr(n.child0);
-                    if ((n.op == @intFromEnum(TokenKind.slash_eq) or n.op == @intFromEnum(TokenKind.percent_eq))) {
-                        if (self.evalConstExpr(n.child0)) |rhs_val| {
-                            if (rhs_val == 0) {
-                                self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, n.text_len, "compound division or modulo by constant zero", .{});
-                            }
-                        }
-                    }
-                    if (n.op == @intFromEnum(TokenKind.lshift_eq) or n.op == @intFromEnum(TokenKind.rshift_eq)) {
-                        if (self.evalConstExpr(n.child0)) |sv| {
-                            if (sv < 0 or sv >= 64) {
-                                self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, n.text_len, "compile-time invalid shift amount {d} in compound shift (must be 0..63)", .{sv});
-                            }
-                        }
-                    }
                     if (self.lookupVarIdx(vname)) |vi| {
                         const ve = self.vars[vi];
+                        if (self.cur_fn_is_pure and vi < self.closure_var_base) {
+                            self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, n.text_len, "purity violation: pure function '{s}' cannot mutate non-local variable '{s}'", .{ self.text(self.cur_fn_node_idx), vname });
+                        }
+                        if (ve.bounded_alias_idx > 0) {
+                            const ai = ve.bounded_alias_idx - 1;
+                            if (ai < self.ast.alias_count) {
+                                const ad = self.ast.alias_defs[ai];
+                                if (ad.has_range) {
+                                    if (self.evalConstExpr(n.child0)) |cval| {
+                                        if (cval < ad.min_val or cval > ad.max_val) {
+                                            const tname = self.srcText(ad.name_start, ad.name_len, ad.source_id);
+                                            self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, n.text_len, "range constraint error: value {d} is outside bounded range [{d}..{d}] for type '{s}'", .{ cval, ad.min_val, ad.max_val, tname });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if (n.op == @intFromEnum(TokenKind.slash_eq) or n.op == @intFromEnum(TokenKind.percent_eq)) {
+                            if (self.evalConstExpr(n.child0)) |rhs_val| {
+                                if (rhs_val == 0) {
+                                    self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, n.text_len, "compound division or modulo by constant zero", .{});
+                                } else if (!ve.ty.isUnsigned() and rhs_val == -1) {
+                                    if (ve.has_const_val and ve.const_val == std.math.minInt(i64)) {
+                                        self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, n.text_len, "compile-time signed division overflow (MIN_I64 / -1)", .{});
+                                    }
+                                }
+                            }
+                        }
+                        if (n.op == @intFromEnum(TokenKind.lshift_eq) or n.op == @intFromEnum(TokenKind.rshift_eq)) {
+                            if (self.evalConstExpr(n.child0)) |sv| {
+                                if (sv < 0 or sv >= 64) {
+                                    self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, n.text_len, "compile-time invalid shift amount {d} in compound shift (must be 0..63)", .{sv});
+                                }
+                            }
+                        }
                         if (ve.ty == .float or rhs_ty == .float) self.info.is_float_op[stmt_idx] = true;
                         if (ve.ty.isUnsigned()) self.info.is_unsigned_op[stmt_idx] = true;
                         if (ve.is_const) {
@@ -2156,6 +2505,16 @@ pub const Sema = struct {
                                 self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, n.text_len, "dangling reference: cannot assign pointer/reference to inner local '{s}' into outer variable '{s}'", .{ self.vars[orig - 1].name, vname });
                             }
                             self.vars[vi].local_ref_origin = orig;
+                            if (n.op == @intFromEnum(TokenKind.assign)) {
+                                if (self.evalConstExpr(n.child0)) |cval| {
+                                    self.vars[vi].const_val = cval;
+                                    self.vars[vi].has_const_val = true;
+                                } else {
+                                    self.vars[vi].has_const_val = false;
+                                }
+                            } else {
+                                self.vars[vi].has_const_val = false;
+                            }
                             if (!self.exprUsesVar(n.child0, vname)) {
                                 self.markExprEscaped(n.child0);
                                 self.vars[vi].res_state = .normal;
@@ -2228,7 +2587,11 @@ pub const Sema = struct {
                     } else if (self.lookupGlobalConst(vname) != null) {
                         self.failAt(error.InvalidAssignmentTarget, n.source_id, n.line, n.col, n.text_len, "cannot assign to constant '{s}'", .{vname});
                     } else {
-                        self.failAt(error.UndefinedVariable, n.source_id, n.line, n.col, n.text_len, "assignment to undeclared variable '{s}'", .{vname});
+                        if (self.suggestIdentifier(vname)) |sugg| {
+                            self.failAt(error.UndefinedVariable, n.source_id, n.line, n.col, n.text_len, "assignment to undeclared variable '{s}'; did you mean '{s}'?", .{ vname, sugg });
+                        } else {
+                            self.failAt(error.UndefinedVariable, n.source_id, n.line, n.col, n.text_len, "assignment to undeclared variable '{s}'", .{vname});
+                        }
                     }
                 } else {
                     const target_kind = if (n.child0 != 0) self.ast.nodes[n.child0].kind else NodeKind.identifier;
@@ -2274,6 +2637,12 @@ pub const Sema = struct {
                         if (self.evalConstExpr(n.child1)) |rhs_val| {
                             if (rhs_val == 0) {
                                 self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, 2, "compound division or modulo by constant zero", .{});
+                            } else if (!lhs_ty.isUnsigned() and rhs_val == -1) {
+                                if (self.evalConstExpr(n.child0)) |lhs_val| {
+                                    if (lhs_val == std.math.minInt(i64)) {
+                                        self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, 2, "compile-time signed division overflow (MIN_I64 / -1)", .{});
+                                    }
+                                }
                             }
                         }
                     }
@@ -2311,7 +2680,7 @@ pub const Sema = struct {
                     self.markExprEscaped(n.child0);
                     if (self.cur_has_explicit_ret) {
                         if (self.cur_ret_type == .void) {
-                            self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, 6, "cannot return a value from void function", .{});
+                            self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, 6, "cannot return a value from void function; specify return type with '-> <type>'", .{});
                         } else if (!self.isExprCompatible(self.cur_ret_type, rty, n.child0)) {
                             self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, 6, "return type mismatches function signature", .{});
                         } else {
@@ -2485,7 +2854,12 @@ pub const Sema = struct {
     fn resolveStructMethod(self: *Sema, si: u32, mname: []const u8, call_node_idx: u32, argc: u32, arg_types: []const SemaType, arg_nodes: []const u32, is_instance: bool, recv_is_ptr: bool, recv_is_mut: bool, source_id: u32, line: u32, col: u32, span_len: u32) SemaType {
         const sig = self.findFn(mname, si + 1) orelse {
             const sd = self.ast.struct_defs[si];
-            self.failAt(error.UndefinedFunctionCall, source_id, line, col, span_len, "struct '{s}' has no method '{s}'", .{ self.srcText(sd.name_start, sd.name_len, sd.source_id), mname });
+            const sname = self.srcText(sd.name_start, sd.name_len, sd.source_id);
+            if (self.suggestFieldOrMethod(si, mname)) |sugg| {
+                self.failAt(error.UndefinedFunctionCall, source_id, line, col, span_len, "struct '{s}' has no method '{s}'; did you mean '{s}'?", .{ sname, mname, sugg });
+            } else {
+                self.failAt(error.UndefinedFunctionCall, source_id, line, col, span_len, "struct '{s}' has no method '{s}'", .{ sname, mname });
+            }
             return .unknown;
         };
         if (is_instance and sig.self_is_mut and !recv_is_mut) {
@@ -2736,6 +3110,13 @@ pub const Sema = struct {
     fn analyzeExpr(self: *Sema, idx: u32) SemaType {
         if (idx == 0 or idx >= self.ast.count) return .unknown;
         const n = self.ast.nodes[idx];
+        if (self.expr_depth >= MAX_EXPR_DEPTH) {
+            self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, n.text_len, "expression exceeds maximum recursion depth ({d})", .{MAX_EXPR_DEPTH});
+            return .unknown;
+        }
+        self.expr_depth += 1;
+        defer self.expr_depth -= 1;
+
         if (n.kind == .call_expr or n.kind == .method_call or n.kind == .scoped_access) {
             var arg = n.child2;
             while (arg != 0) : (arg = self.ast.nodes[arg].child1) {
@@ -2756,6 +3137,7 @@ pub const Sema = struct {
             .identifier => blk: {
                 const name = self.text(idx);
                 if (self.lookupVarIdx(name)) |vi| {
+                    self.vars[vi].read_count += 1;
                     const ve = self.vars[vi];
                     if (idx != self.skip_res_check_node) {
                         if (ve.res_state == .freed) {
@@ -2818,7 +3200,11 @@ pub const Sema = struct {
                     }
                     break :blk .{ .fn_t = 0 };
                 }
-                self.failAt(error.UndefinedVariable, n.source_id, n.line, n.col, n.text_len, "use of undeclared identifier '{s}'", .{name});
+                if (self.suggestIdentifier(name)) |sugg| {
+                    self.failAt(error.UndefinedVariable, n.source_id, n.line, n.col, n.text_len, "use of undeclared identifier '{s}'; did you mean '{s}'?", .{ name, sugg });
+                } else {
+                    self.failAt(error.UndefinedVariable, n.source_id, n.line, n.col, n.text_len, "use of undeclared identifier '{s}'", .{name});
+                }
                 break :blk .unknown;
             },
             .unary_expr => blk: {
@@ -2845,6 +3231,20 @@ pub const Sema = struct {
             .cast_expr => blk: {
                 const src_ty = self.analyzeExpr(n.child0);
                 const dst_ty = SemaType.fromTypeTag(n.type_tag, n.extra, n.elem_type);
+                if (n.int_val > 0) {
+                    const ai = @as(u32, @intCast(n.int_val)) - 1;
+                    if (ai < self.ast.alias_count) {
+                        const ad = self.ast.alias_defs[ai];
+                        if (ad.has_range) {
+                            if (self.evalConstExpr(n.child0)) |cval| {
+                                if (cval < ad.min_val or cval > ad.max_val) {
+                                    const tname = self.srcText(ad.name_start, ad.name_len, ad.source_id);
+                                    self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, 2, "range constraint error: value {d} is outside bounded range [{d}..{d}] for type '{s}'", .{ cval, ad.min_val, ad.max_val, tname });
+                                }
+                            }
+                        }
+                    }
+                }
                 if (dst_ty == .fn_t and src_ty != .fn_t and src_ty != .unknown) {
                     self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, 2, "cannot forge function pointer by casting non-function type", .{});
                 } else if (src_ty == .fn_t and dst_ty != .fn_t and dst_ty != .unknown) {
@@ -2854,17 +3254,17 @@ pub const Sema = struct {
                     src_ty == .map_t or dst_ty == .map_t)
                 {
                     self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, 2, "invalid cast involving composite or void type", .{});
-                } else if (src_ty == .null_t and dst_ty != .ptr and dst_ty != .ptr_struct and dst_ty != .unknown) {
+                } else if (src_ty == .null_t and !dst_ty.isPointer() and dst_ty != .unknown) {
                     self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, 2, "cannot cast null to non-pointer type", .{});
-                } else if ((src_ty == .float and (dst_ty == .ptr or dst_ty == .ptr_struct or dst_ty == .string)) or
-                    (dst_ty == .float and (src_ty == .ptr or src_ty == .ptr_struct or src_ty == .string)))
+                } else if ((src_ty == .float and (dst_ty.isPointer() or dst_ty == .string)) or
+                    (dst_ty == .float and (src_ty.isPointer() or src_ty == .string)))
                 {
                     self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, 2, "cannot cast between float and pointer or string", .{});
-                } else if (src_ty == .bool and (dst_ty == .ptr or dst_ty == .ptr_struct or dst_ty == .string or dst_ty == .float)) {
+                } else if (src_ty == .bool and (dst_ty.isPointer() or dst_ty == .string or dst_ty == .float)) {
                     self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, 2, "cannot cast bool to pointer, string, or float", .{});
                 } else if (dst_ty == .bool and src_ty != .bool and src_ty != .unknown) {
                     self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, 2, "cannot cast non-bool to bool; use explicit comparison", .{});
-                } else if (src_ty == .string and dst_ty != .string and dst_ty != .ptr and dst_ty != .ptr_struct and
+                } else if (src_ty == .string and dst_ty != .string and !dst_ty.isPointer() and
                     !(dst_ty == .int and dst_ty.int.bits == 64) and dst_ty != .unknown)
                 {
                     self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, 2, "invalid cast from string", .{});
@@ -2904,8 +3304,8 @@ pub const Sema = struct {
                     break :blk if (op == .plus) SemaType.string else SemaType.bool;
                 }
                 if (op == .eq or op == .ne) {
-                    const ptr_zero_cmp = ((lhs == .ptr or lhs == .ptr_struct) and self.isUntypedIntExpr(n.child1) and (self.evalConstExpr(n.child1) orelse 1) == 0) or
-                        ((rhs == .ptr or rhs == .ptr_struct) and self.isUntypedIntExpr(n.child0) and (self.evalConstExpr(n.child0) orelse 1) == 0);
+                    const ptr_zero_cmp = (lhs.isPointer() and self.isUntypedIntExpr(n.child1) and (self.evalConstExpr(n.child1) orelse 1) == 0) or
+                        (rhs.isPointer() and self.isUntypedIntExpr(n.child0) and (self.evalConstExpr(n.child0) orelse 1) == 0);
                     if (!ptr_zero_cmp and lhs != .unknown and rhs != .unknown and lhs != .never and rhs != .never) {
                         if (lhs == .int and rhs == .int) {
                             if (self.binIntCompat(lhs, rhs, n.child0, n.child1) == null) {
@@ -2945,7 +3345,7 @@ pub const Sema = struct {
                     };
                 }
                 if (op == .lt or op == .gt or op == .le or op == .ge) {
-                    const is_ptr_cmp = (lhs == .ptr or lhs == .ptr_struct) and (rhs == .ptr or rhs == .ptr_struct);
+                    const is_ptr_cmp = lhs.isPointer() and rhs.isPointer();
                     if (!is_ptr_cmp and lhs != .unknown and rhs != .unknown and lhs != .never and rhs != .never) {
                         if (lhs != .int or rhs != .int or self.binIntCompat(lhs, rhs, n.child0, n.child1) == null) {
                             self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, 1, "ordering comparison requires compatible numeric or pointer operands", .{});
@@ -2954,8 +3354,8 @@ pub const Sema = struct {
                     if (lhs.isUnsigned() or rhs.isUnsigned()) self.info.is_unsigned_op[idx] = true;
                     break :blk SemaType.bool;
                 }
-                if (lhs == .void or lhs == .struct_t or lhs == .bool or lhs == .ptr or lhs == .ptr_struct or lhs == .null_t or
-                    rhs == .void or rhs == .struct_t or rhs == .bool or rhs == .ptr or rhs == .ptr_struct or rhs == .null_t or
+                if (lhs == .void or lhs == .struct_t or lhs == .bool or lhs.isPointer() or
+                    rhs == .void or rhs == .struct_t or rhs == .bool or rhs.isPointer() or
                     lhs == .string or rhs == .string or lhs == .enum_t or rhs == .enum_t or lhs == .fn_t or rhs == .fn_t or
                     lhs == .fixed_array or rhs == .fixed_array)
                 {
@@ -3458,6 +3858,7 @@ pub const Sema = struct {
                 if (sub.kind == .identifier) {
                     const tname = self.text(n.child0);
                     if (self.lookupVarIdx(tname)) |tvi| {
+                        self.vars[tvi].read_count += 1;
                         const tv = self.vars[tvi];
                         if (self.in_spawn and tvi < self.closure_var_base) {
                             self.failAt(error.InvalidAddressOf, n.source_id, n.line, n.col, 1, "dangling reference: cannot take address of outer local variable '{s}' inside spawn", .{tname});
@@ -3487,20 +3888,22 @@ pub const Sema = struct {
             },
             .deref => blk: {
                 const pty = self.analyzeExpr(n.child0);
-                if (pty != .ptr and pty != .ptr_struct and pty != .unknown and pty != .never) {
+                if (!pty.isPointer() and pty != .unknown and pty != .never) {
                     self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, 1, "cannot dereference non-pointer value", .{});
                 }
                 self.checkConstPtrValid(n.child0, false, "dereference");
                 self.checkHeapBounds(n.child0, 8, idx);
                 break :blk switch (pty) {
                     .ptr_struct => |si| .{ .struct_t = si },
+                    .ptr_float => SemaType.f64_t,
+                    .ptr_byte => SemaType.u8_t,
                     else => SemaType.i64_t,
                 };
             },
             .index_expr => blk: {
                 const base_ty = self.analyzeExpr(n.child0);
                 const idx_ty = self.analyzeExpr(n.child1);
-                if (base_ty == .ptr or base_ty == .ptr_struct) {
+                if (base_ty.isPointer()) {
                     self.checkConstPtrValid(n.child0, false, "indexed pointer");
                     if (self.evalConstExpr(n.child1)) |k| {
                         if (self.extractAllocVarAndOffset(n.child0)) |ref| {
@@ -3536,7 +3939,7 @@ pub const Sema = struct {
                     }
                     break :blk SemaType.i64_t;
                 }
-                if (base_ty != .ptr and base_ty != .ptr_struct and base_ty != .array and base_ty != .fixed_array and base_ty != .string and base_ty != .map_t and base_ty != .unknown and base_ty != .never) {
+                if (base_ty != .ptr and base_ty != .ptr_struct and base_ty != .ptr_float and base_ty != .ptr_byte and base_ty != .array and base_ty != .fixed_array and base_ty != .string and base_ty != .map_t and base_ty != .unknown and base_ty != .never) {
                     self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, 1, "cannot index non-array/non-pointer value", .{});
                 }
                 if (idx_ty != .int and idx_ty != .unknown and idx_ty != .never) {
@@ -3552,15 +3955,36 @@ pub const Sema = struct {
                 }
                 break :blk switch (base_ty) {
                     .array => |ea| if (ea != .none) SemaType.fromTypeTag(ea, 0, .none) else SemaType.i64_t,
-                    .fixed_array => |fa| SemaType.fromTypeTag(fa.elem, 0, .none),
+                    .fixed_array => |fa| blk2: {
+                        if (fa.elem == .f32 or fa.elem == .f64) self.info.is_float_op[idx] = true;
+                        break :blk2 SemaType.fromTypeTag(fa.elem, 0, .none);
+                    },
+                    .ptr_float => |fb| blk2: {
+                        self.info.is_float_op[idx] = true;
+                        break :blk2 if (fb == 32) .{ .float = 32 } else SemaType.f64_t;
+                    },
+                    .ptr_byte => |u| .{ .int = .{ .bits = 8, .unsigned = u } },
                     .string => .{ .int = .{ .bits = 8, .unsigned = true } },
                     else => SemaType.i64_t,
                 };
             },
             .struct_init => blk: {
                 const sname = self.text(idx);
+                if (std.mem.eql(u8, sname, "string")) {
+                    var fi = n.child2;
+                    while (fi != 0) : (fi = self.ast.nodes[fi].child1) {
+                        const fn_node = self.ast.nodes[fi];
+                        _ = self.analyzeExpr(fn_node.child0);
+                        self.markExprEscaped(fn_node.child0);
+                    }
+                    break :blk .string;
+                }
                 const si = self.ast.findStructBySlice(self.ast.sources[0], sname) orelse {
-                    self.failAt(error.UndefinedStruct, n.source_id, n.line, n.col, n.text_len, "undefined struct '{s}'", .{sname});
+                    if (self.suggestStruct(sname)) |sugg| {
+                        self.failAt(error.UndefinedStruct, n.source_id, n.line, n.col, n.text_len, "undefined struct '{s}'; did you mean '{s}'?", .{ sname, sugg });
+                    } else {
+                        self.failAt(error.UndefinedStruct, n.source_id, n.line, n.col, n.text_len, "undefined struct '{s}'", .{sname});
+                    }
                     var fi = n.child2;
                     while (fi != 0) : (fi = self.ast.nodes[fi].child1) {
                         _ = self.analyzeExpr(self.ast.nodes[fi].child0);
@@ -3603,7 +4027,11 @@ pub const Sema = struct {
                             seen[k] = true;
                         }
                     } else {
-                        self.failAt(error.UnknownField, fn_node.source_id, fn_node.line, fn_node.col, fn_node.text_len, "struct '{s}' has no field '{s}'", .{ sname, fname });
+                        if (self.suggestFieldOrMethod(si, fname)) |sugg| {
+                            self.failAt(error.UnknownField, fn_node.source_id, fn_node.line, fn_node.col, fn_node.text_len, "struct '{s}' has no field '{s}'; did you mean '{s}'?", .{ sname, fname, sugg });
+                        } else {
+                            self.failAt(error.UnknownField, fn_node.source_id, fn_node.line, fn_node.col, fn_node.text_len, "struct '{s}' has no field '{s}'", .{ sname, fname });
+                        }
                     }
                 }
                 if (sd.is_union) {
@@ -3669,7 +4097,11 @@ pub const Sema = struct {
                                     break :blk .{ .enum_t = ei };
                                 }
                             }
-                            self.failAt(error.UnknownField, n.source_id, n.line, n.col, n.text_len, "enum '{s}' has no variant '{s}'", .{ bname, mname });
+                            if (self.suggestEnumVariant(ei, mname)) |sugg| {
+                                self.failAt(error.UnknownField, n.source_id, n.line, n.col, n.text_len, "enum '{s}' has no variant '{s}'; did you mean '{s}'?", .{ bname, mname, sugg });
+                            } else {
+                                self.failAt(error.UnknownField, n.source_id, n.line, n.col, n.text_len, "enum '{s}' has no variant '{s}'", .{ bname, mname });
+                            }
                             break :blk .unknown;
                         }
                     }
@@ -3693,7 +4125,11 @@ pub const Sema = struct {
                                     break :blk .{ .enum_t = ei };
                                 }
                             }
-                            self.failAt(error.UnknownField, n.source_id, n.line, n.col, n.text_len, "enum '{s}' has no variant '{s}'", .{ bname, mname });
+                            if (self.suggestEnumVariant(ei, mname)) |sugg| {
+                                self.failAt(error.UnknownField, n.source_id, n.line, n.col, n.text_len, "enum '{s}' has no variant '{s}'; did you mean '{s}'?", .{ bname, mname, sugg });
+                            } else {
+                                self.failAt(error.UnknownField, n.source_id, n.line, n.col, n.text_len, "enum '{s}' has no variant '{s}'", .{ bname, mname });
+                            }
                             break :blk .unknown;
                         }
                     }
@@ -3841,13 +4277,23 @@ pub const Sema = struct {
                                 break :blk .{ .enum_t = ei };
                             }
                         }
-                        self.failAt(error.UnknownField, n.source_id, n.line, n.col, n.text_len, "enum '{s}' has no variant '{s}'", .{ ename, fname });
+                        if (self.suggestEnumVariant(ei, fname)) |sugg| {
+                            self.failAt(error.UnknownField, n.source_id, n.line, n.col, n.text_len, "enum '{s}' has no variant '{s}'; did you mean '{s}'?", .{ ename, fname, sugg });
+                        } else {
+                            self.failAt(error.UnknownField, n.source_id, n.line, n.col, n.text_len, "enum '{s}' has no variant '{s}'", .{ ename, fname });
+                        }
                         break :blk .unknown;
                     }
                 }
                 const base_ty = self.analyzeExpr(n.child0);
-                if (base_ty == .ptr or base_ty == .ptr_struct) {
+                if (base_ty.isPointer()) {
                     self.checkConstPtrValid(n.child0, false, "struct field pointer");
+                }
+                if (std.mem.eql(u8, fname, "ptr")) {
+                    if (base_ty == .string) {
+                        self.info.is_ptr_prop[idx] = true;
+                        break :blk SemaType{ .ptr_byte = true };
+                    }
                 }
                 if (std.mem.eql(u8, fname, "len")) {
                     if (base_ty == .string or base_ty == .array or base_ty == .map_t) {
@@ -3871,7 +4317,12 @@ pub const Sema = struct {
                                 break :blk SemaType.fromTypeTag(df.type_tag, df.extra, df.elem_type);
                             }
                         }
-                        self.failAt(error.UnknownField, n.source_id, n.line, n.col, n.text_len, "struct '{s}' has no field '{s}'", .{ self.srcText(sd.name_start, sd.name_len, sd.source_id), fname });
+                        const sname = self.srcText(sd.name_start, sd.name_len, sd.source_id);
+                        if (self.suggestFieldOrMethod(si, fname)) |sugg| {
+                            self.failAt(error.UnknownField, n.source_id, n.line, n.col, n.text_len, "struct '{s}' has no field '{s}'; did you mean '{s}'?", .{ sname, fname, sugg });
+                        } else {
+                            self.failAt(error.UnknownField, n.source_id, n.line, n.col, n.text_len, "struct '{s}' has no field '{s}'", .{ sname, fname });
+                        }
                         break :blk .unknown;
                     },
                     .ptr, .unknown => {
@@ -3934,6 +4385,37 @@ pub const Sema = struct {
 
                 if (fn_node.kind == .identifier) {
                     if (lookupBuiltin(cname)) |b| {
+                        if (self.cur_fn_is_pure) {
+                            const is_pure_builtin = std.mem.eql(u8, cname, "@min") or
+                                std.mem.eql(u8, cname, "@max") or
+                                std.mem.eql(u8, cname, "@clamp") or
+                                std.mem.eql(u8, cname, "@clz") or
+                                std.mem.eql(u8, cname, "@ctz") or
+                                std.mem.eql(u8, cname, "@popcount") or
+                                std.mem.eql(u8, cname, "@bswap") or
+                                std.mem.eql(u8, cname, "@bit_reverse") or
+                                std.mem.eql(u8, cname, "@is_power_of_two") or
+                                std.mem.eql(u8, cname, "@signum") or
+                                std.mem.eql(u8, cname, "@wrapping_add") or
+                                std.mem.eql(u8, cname, "@wrapping_sub") or
+                                std.mem.eql(u8, cname, "@wrapping_mul") or
+                                std.mem.eql(u8, cname, "@checked_add") or
+                                std.mem.eql(u8, cname, "@checked_sub") or
+                                std.mem.eql(u8, cname, "@checked_mul") or
+                                std.mem.eql(u8, cname, "@ptr_add") or
+                                std.mem.eql(u8, cname, "@sqrt") or
+                                std.mem.eql(u8, cname, "@fabs") or
+                                std.mem.eql(u8, cname, "@floor") or
+                                std.mem.eql(u8, cname, "@ceil") or
+                                std.mem.eql(u8, cname, "@round") or
+                                std.mem.eql(u8, cname, "@sin") or
+                                std.mem.eql(u8, cname, "@cos") or
+                                std.mem.eql(u8, cname, "@size_of") or
+                                std.mem.eql(u8, cname, "@align_of");
+                            if (!is_pure_builtin) {
+                                self.failAt(error.TypeMismatch, fn_node.source_id, fn_node.line, fn_node.col, fn_node.text_len, "purity violation: pure function '{s}' cannot invoke side-effecting builtin '{s}'", .{ self.text(self.cur_fn_node_idx), cname });
+                            }
+                        }
                         if (argc < b.min_args or argc > b.max_args) {
                             self.failAt(error.InvalidArgumentCount, fn_node.source_id, fn_node.line, fn_node.col, fn_node.text_len, "builtin '{s}' expects {d}..{d} arguments, got {d}", .{ cname, b.min_args, b.max_args, argc });
                         }
@@ -3945,7 +4427,7 @@ pub const Sema = struct {
                             }
                         }
                         if (is_free_fn and argc >= 1) {
-                            if (arg_types[0] != .ptr and arg_types[0] != .ptr_struct and arg_types[0] != .array and arg_types[0] != .map_t and arg_types[0] != .null_t and arg_types[0] != .unknown and arg_types[0] != .never) {
+                            if (!arg_types[0].isPointer() and arg_types[0] != .array and arg_types[0] != .map_t and arg_types[0] != .unknown and arg_types[0] != .never) {
                                 self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, fn_node.text_len, "{s} expects a heap pointer or container", .{cname});
                             }
                             self.checkConstPtrValid(arg_nodes[0], true, cname);
@@ -4151,7 +4633,7 @@ pub const Sema = struct {
                         } else if ((std.mem.eql(u8, cname, "@read_byte") or std.mem.eql(u8, cname, "@read_u8") or
                             std.mem.eql(u8, cname, "@write_byte") or std.mem.eql(u8, cname, "@write_u8")) and argc >= 1)
                         {
-                            if (arg_types[0] != .ptr and arg_types[0] != .ptr_struct and arg_types[0] != .null_t and arg_types[0] != .unknown and arg_types[0] != .never) {
+                            if (!arg_types[0].isPointer() and arg_types[0] != .unknown and arg_types[0] != .never) {
                                 self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, fn_node.text_len, "'{s}' expects a pointer argument", .{cname});
                             }
                             self.checkConstPtrValid(arg_nodes[0], false, cname);
@@ -4164,7 +4646,7 @@ pub const Sema = struct {
                                 }
                             }
                         } else if ((std.mem.eql(u8, cname, "@read_u32") or std.mem.eql(u8, cname, "@write_u32")) and argc >= 1) {
-                            if (arg_types[0] != .ptr and arg_types[0] != .ptr_struct and arg_types[0] != .null_t and arg_types[0] != .unknown and arg_types[0] != .never) {
+                            if (!arg_types[0].isPointer() and arg_types[0] != .unknown and arg_types[0] != .never) {
                                 self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, fn_node.text_len, "'{s}' expects a pointer argument", .{cname});
                             }
                             self.checkConstPtrValid(arg_nodes[0], false, cname);
@@ -4177,7 +4659,7 @@ pub const Sema = struct {
                                 }
                             }
                         } else if ((std.mem.eql(u8, cname, "@read_u64") or std.mem.eql(u8, cname, "@write_u64")) and argc >= 1) {
-                            if (arg_types[0] != .ptr and arg_types[0] != .ptr_struct and arg_types[0] != .null_t and arg_types[0] != .unknown and arg_types[0] != .never) {
+                            if (!arg_types[0].isPointer() and arg_types[0] != .unknown and arg_types[0] != .never) {
                                 self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, fn_node.text_len, "'{s}' expects a pointer argument", .{cname});
                             }
                             self.checkConstPtrValid(arg_nodes[0], false, cname);
@@ -4266,7 +4748,7 @@ pub const Sema = struct {
                                 }
                             }
                         } else if (std.mem.eql(u8, cname, "@ptr_add") and argc >= 2) {
-                            if (arg_types[0] != .ptr and arg_types[0] != .ptr_struct and arg_types[0] != .string and arg_types[0] != .array and arg_types[0] != .unknown and arg_types[0] != .never) {
+                            if (!arg_types[0].isPointer() and arg_types[0] != .string and arg_types[0] != .array and arg_types[0] != .unknown and arg_types[0] != .never) {
                                 self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, fn_node.text_len, "@ptr_add expects a pointer or string base", .{});
                             }
                             if (arg_types[1] != .int and arg_types[1] != .unknown and arg_types[1] != .never) {
@@ -4381,6 +4863,28 @@ pub const Sema = struct {
 
                     if (self.findFn(cname, 0)) |sig| {
                         self.info.direct_call_fns[idx] = sig.node_idx;
+                        if (self.cur_fn_is_pure) {
+                            if (self.ast.findContract(sig.node_idx)) |target_c| {
+                                if (!target_c.is_pure) {
+                                    self.failAt(error.TypeMismatch, fn_node.source_id, fn_node.line, fn_node.col, fn_node.text_len, "purity violation: pure function '{s}' cannot invoke impure function '{s}'", .{ self.text(self.cur_fn_node_idx), cname });
+                                }
+                            } else {
+                                self.failAt(error.TypeMismatch, fn_node.source_id, fn_node.line, fn_node.col, fn_node.text_len, "purity violation: pure function '{s}' cannot invoke impure function '{s}'", .{ self.text(self.cur_fn_node_idx), cname });
+                            }
+                        }
+                        if (self.ast.findContract(sig.node_idx)) |contract| {
+                            if (contract.pre_expr != 0) {
+                                var arg_consts: [MAX_PARAMS]?i64 = .{null} ** MAX_PARAMS;
+                                for (0..@min(sig.param_count, argc)) |pi| {
+                                    arg_consts[pi] = self.evalConstExpr(arg_nodes[pi]);
+                                }
+                                if (self.evalContractExpr(contract.pre_expr, sig.param_nodes[0..sig.param_count], sig.param_count, &arg_consts)) |res| {
+                                    if (res == 0) {
+                                        self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, fn_node.text_len, "precondition violation: call to '{s}' statically violates contract", .{cname});
+                                    }
+                                }
+                            }
+                        }
                         var provided: [MAX_PARAMS]bool = .{false} ** MAX_PARAMS;
                         var named_seen = false;
                         var wrapper = n.child2;
@@ -4421,7 +4925,11 @@ pub const Sema = struct {
                         break :blk if (sig.ret_type == .unknown) SemaType.i64_t else sig.ret_type;
                     }
 
-                    self.failAt(error.UndefinedFunctionCall, fn_node.source_id, fn_node.line, fn_node.col, fn_node.text_len, "call to undefined function '{s}'", .{cname});
+                    if (self.suggestFunction(cname)) |sugg| {
+                        self.failAt(error.UndefinedFunctionCall, fn_node.source_id, fn_node.line, fn_node.col, fn_node.text_len, "call to undefined function '{s}'; did you mean '{s}'?", .{ cname, sugg });
+                    } else {
+                        self.failAt(error.UndefinedFunctionCall, fn_node.source_id, fn_node.line, fn_node.col, fn_node.text_len, "call to undefined function '{s}'", .{cname});
+                    }
                     break :blk .unknown;
                 } else {
                     // Indirect call expression e.g. get_fn()(x) or closure_arr[0](x)

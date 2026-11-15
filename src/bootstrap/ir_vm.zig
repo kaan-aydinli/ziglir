@@ -33,6 +33,7 @@ pub const VMError = error{
     StackOverflow,
     MemoryFault,
     OutOfMemory,
+    Exit,
 };
 
 pub const VMResult = struct {
@@ -127,6 +128,8 @@ pub const VMState = struct {
 
     // Optional stdio capture (for differential tests)
     capture_io: bool = false,
+    has_exited: bool = false,
+    exit_code: i64 = 0,
     io_lock: std.Thread.Mutex = .{},
     out_buf: std.ArrayListUnmanaged(u8) = .{},
     err_buf: std.ArrayListUnmanaged(u8) = .{},
@@ -255,15 +258,22 @@ pub const VMState = struct {
         return null;
     }
 
-    fn allocHeap(self: *VMState, req_size: i64) VMError!u64 {
+    pub const CANARY_COOKIE: u64 = 0xA55A5AA5C33C3CC3;
+
+    pub fn allocHeap(self: *VMState, req_size: i64) VMError!u64 {
         if (req_size <= 0 or req_size > 256 * 1024 * 1024) return error.Trap;
         const sz: usize = @intCast(req_size);
-        const total = std.math.add(usize, sz, 8) catch return error.Trap;
+        const total = std.math.add(usize, sz, 16) catch return error.Trap;
         const buf = self.alloc.alloc(u8, total) catch return error.OutOfMemory;
         @memset(buf, 0);
         std.mem.writeInt(u64, buf[0..8], sz, .little);
+        std.mem.writeInt(u64, buf[8 + sz .. 16 + sz][0..8], CANARY_COOKIE ^ @as(u64, sz), .little);
         self.mem_lock.lock();
         defer self.mem_lock.unlock();
+        if (self.next_heap_addr + @as(u64, total) >= ARRAY_TAG) {
+            self.alloc.free(buf);
+            return error.OutOfMemory;
+        }
         const vaddr = self.next_heap_addr;
         // Align next address generously with unmapped guard gap
         self.next_heap_addr += ((@as(u64, total) + 64 + 15) & ~@as(u64, 15));
@@ -274,14 +284,19 @@ pub const VMState = struct {
         return vaddr + 8;
     }
 
-    fn freeHeap(self: *VMState, ptr: u64) VMError!void {
+    pub fn freeHeap(self: *VMState, ptr: u64) VMError!void {
         if (ptr == 0) return;
-        if (ptr < HEAP_BASE) return error.MemoryFault;
+        if (ptr < HEAP_BASE or ptr >= 0x8000_0000_0000) return error.MemoryFault;
         self.mem_lock.lock();
         defer self.mem_lock.unlock();
         for (self.heap_allocs.items) |*ha| {
             if (ptr == ha.addr + 8) {
                 if (ha.freed) return error.MemoryFault; // double free
+                const sz: usize = @intCast(std.mem.readInt(u64, ha.data[0..8], .little));
+                if (ha.data.len >= 16 + sz) {
+                    const got_canary = std.mem.readInt(u64, ha.data[8 + sz .. 16 + sz][0..8], .little);
+                    if (got_canary != (CANARY_COOKIE ^ @as(u64, sz))) return error.MemoryFault; // heap overflow canary smashed!
+                }
                 @memset(ha.data, 0); // zero-wipe on free
                 ha.freed = true;
                 return;
@@ -290,8 +305,9 @@ pub const VMState = struct {
         return error.MemoryFault;
     }
 
-    fn resolveSlice(self: *VMState, ptr: u64, size: usize, write_access: bool) VMError![]u8 {
-        if (ptr < 4096) return error.MemoryFault;
+    pub fn resolveSlice(self: *VMState, ptr: u64, size: usize, write_access: bool) VMError![]u8 {
+        if (ptr < 4096 or ptr >= 0x8000_0000_0000) return error.MemoryFault;
+        _ = std.math.add(u64, ptr, @as(u64, size)) catch return error.MemoryFault;
         if (ptr >= RODATA_BASE and ptr < STACK_BASE) {
             if (write_access) return error.MemoryFault; // W^X: rodata is read-only
             // Allow reading header at ptr-8 (within rodata)
@@ -308,12 +324,13 @@ pub const VMState = struct {
             self.mem_lock.lock();
             defer self.mem_lock.unlock();
             for (self.heap_allocs.items) |ha| {
-                const start = ha.addr;
-                const end = start + ha.data.len;
-                if (ptr >= start and ptr < end) {
+                const sz: usize = @intCast(std.mem.readInt(u64, ha.data[0..8], .little));
+                const payload_end = ha.addr + 8 + sz;
+                if (ptr >= ha.addr and ptr < payload_end) {
                     if (ha.freed) return error.MemoryFault; // UAF trap
-                    const off: usize = @intCast(ptr - start);
-                    if (size > ha.data.len - off) return error.MemoryFault;
+                    if (write_access and ptr < ha.addr + 8) return error.MemoryFault; // Prevent heap metadata tampering
+                    const off: usize = @intCast(ptr - ha.addr);
+                    if (size > (8 + sz) - off) return error.MemoryFault; // Strictly reject canary / out-of-bounds access
                     return ha.data[off..][0..size];
                 }
             }
@@ -348,7 +365,7 @@ pub const VMState = struct {
 
     fn readLirString(self: *VMState, ptr: u64) VMError![]const u8 {
         if (ptr == 0) return "";
-        if (ptr < 4096) return error.MemoryFault;
+        if (ptr < 4096 or ptr >= 0x8000_0000_0000) return error.MemoryFault;
         const len_u64 = try self.readU64(ptr - 8);
         if (len_u64 > 64 * 1024 * 1024) return error.MemoryFault;
         const len: usize = @intCast(len_u64);
@@ -357,21 +374,27 @@ pub const VMState = struct {
     }
 
     fn readCString(self: *VMState, ptr: u64) VMError![]const u8 {
-        if (ptr < 4096) return error.MemoryFault;
+        if (ptr < 4096 or ptr >= 0x8000_0000_0000) return error.MemoryFault;
         // Fast path if LIR string (rodata or string_new)
         if (ptr >= RODATA_BASE and ptr < STACK_BASE) {
             const off: usize = @intCast(ptr - RODATA_BASE);
             if (off < self.rodata.items.len) {
                 const rest = self.rodata.items[off..];
-                const nul = std.mem.indexOfScalar(u8, rest, 0) orelse rest.len;
-                return rest[0..nul];
+                if (std.mem.indexOfScalar(u8, rest, 0)) |nul| {
+                    return rest[0..nul];
+                }
             }
         }
         var len: usize = 0;
+        var found_nul = false;
         while (len < 65536) : (len += 1) {
             const b = try self.readU8(ptr + len);
-            if (b == 0) break;
+            if (b == 0) {
+                found_nul = true;
+                break;
+            }
         }
+        if (!found_nul) return error.MemoryFault;
         return try self.resolveSlice(ptr, len, false);
     }
 
@@ -395,7 +418,12 @@ pub const VMState = struct {
 
     pub fn run(self: *VMState) VMError!i64 {
         const main_fi = self.findFn("main") orelse return error.MissingMain;
-        return try self.callFn(main_fi, &[_]u64{}, 0);
+        const res = self.callFn(main_fi, &[_]u64{}, 0) catch |err| {
+            if (err == error.Exit) return self.exit_code;
+            return err;
+        };
+        if (self.has_exited) return self.exit_code;
+        return res;
     }
 
     fn execThreadEntry(self: *VMState, fi: u32, arg: u64, th: *VMThread) void {
@@ -486,6 +514,12 @@ pub const VMState = struct {
                     .const_int => vregs[inst.dest] = @bitCast(inst.imm),
                     .const_str => vregs[inst.dest] = self.str_vaddrs[inst.str_idx],
                     .copy => vregs[inst.dest] = vregs[inst.src1],
+                    .select => {
+                        const cond = if (inst.src1 < vregs.len) vregs[inst.src1] else 0;
+                        const false_v = if (inst.arg_count > 0 and inst.args[0] < vregs.len) vregs[inst.args[0]] else 0;
+                        const true_v = if (inst.src2 < vregs.len) vregs[inst.src2] else 0;
+                        if (inst.dest < vregs.len) vregs[inst.dest] = if (cond != 0) true_v else false_v;
+                    },
                     .load_local => {
                         const slot_idx: u64 = if (inst.slot > 0) @as(u64, inst.slot) - 1 else 0;
                         if (inst.slot > 0 and inst.slot < f.local_addr_taken.len and f.local_addr_taken[inst.slot]) {
@@ -662,6 +696,8 @@ pub const VMState = struct {
                         if (target < FN_TAG or target >= FN_TAG + self.module.fn_count) return error.MemoryFault;
                         const target_fi: u32 = @intCast(target - FN_TAG);
                         if (!self.fn_addr_taken[target_fi]) return error.MemoryFault;
+                        const target_fn = &self.module.fns[target_fi];
+                        if (target_fn.param_count != inst.arg_count) return error.MemoryFault;
                         var cargs: [8]u64 = undefined;
                         for (0..inst.arg_count) |ai| cargs[ai] = vregs[inst.args[ai]];
                         const rv = try self.callFn(target_fi, cargs[0..inst.arg_count], depth + 1);
@@ -828,7 +864,11 @@ pub const VMState = struct {
                 self.writeErr("\n");
                 return error.Trap;
             },
-            .call_exit => std.process.exit(@truncate(vregs[inst.args[0]])),
+            .call_exit => {
+                self.has_exited = true;
+                self.exit_code = @truncate(@as(i64, @bitCast(vregs[inst.args[0]])));
+                return error.Exit;
+            },
             .call_string_len => {
                 const s = try self.readLirString(vregs[inst.args[0]]);
                 vregs[inst.dest] = @intCast(s.len);
@@ -872,7 +912,8 @@ pub const VMState = struct {
             .call_string_concat => {
                 const sa = try self.readLirString(vregs[inst.args[0]]);
                 const sb = try self.readLirString(vregs[inst.args[1]]);
-                const combined = self.alloc.alloc(u8, sa.len + sb.len) catch return error.OutOfMemory;
+                const total_len = std.math.add(usize, sa.len, sb.len) catch return error.OutOfMemory;
+                const combined = self.alloc.alloc(u8, total_len) catch return error.OutOfMemory;
                 defer self.alloc.free(combined);
                 @memcpy(combined[0..sa.len], sa);
                 @memcpy(combined[sa.len..], sb);
@@ -1147,14 +1188,18 @@ pub const VMState = struct {
                 const fi = self.findFn(fname) orelse return error.InvalidFunction;
                 const th = try self.alloc.create(VMThread);
                 th.* = .{ .thread = undefined };
-                th.thread = std.Thread.spawn(.{}, VMState.execThreadEntry, .{ self, fi, vregs[inst.args[1]], th }) catch return error.Trap;
                 self.mem_lock.lock();
                 const id = self.threads.items.len;
                 self.threads.append(self.alloc, th) catch {
                     self.mem_lock.unlock();
+                    self.alloc.destroy(th);
                     return error.OutOfMemory;
                 };
                 self.mem_lock.unlock();
+                th.thread = std.Thread.spawn(.{}, VMState.execThreadEntry, .{ self, fi, vregs[inst.args[1]], th }) catch {
+                    th.joined = true;
+                    return error.Trap;
+                };
                 vregs[inst.dest] = @intCast(id + 1);
             },
             .call_thread_join => {
@@ -1201,6 +1246,38 @@ pub const VMState = struct {
                 @intCast(std.c.getuid())
             else
                 1000,
+            .call_term_size => {
+                var row: u16 = 24;
+                var col: u16 = 80;
+                if (comptime builtin.os.tag == .linux) {
+                    var w: std.os.linux.winsize = .{ .ws_row = 24, .ws_col = 80, .ws_xpixel = 0, .ws_ypixel = 0 };
+                    _ = std.os.linux.ioctl(0, 0x5413, @intFromPtr(&w));
+                    row = w.ws_row;
+                    col = w.ws_col;
+                }
+                vregs[inst.dest] = (@as(u64, row) << 16) | @as(u64, col);
+            },
+            .call_set_raw_mode => {
+                const v = vregs[inst.args[0]];
+                if (comptime builtin.os.tag == .linux) {
+                    var termios: std.os.linux.termios = undefined;
+                    if (std.os.linux.ioctl(0, 0x5401, @intFromPtr(&termios)) == 0) {
+                        if (v != 0) {
+                            termios.lflag.ECHO = false;
+                            termios.lflag.ICANON = false;
+                        } else {
+                            termios.lflag.ECHO = true;
+                            termios.lflag.ICANON = true;
+                        }
+                        _ = std.os.linux.ioctl(0, 0x5402, @intFromPtr(&termios));
+                    }
+                }
+            },
+            .call_read_key => {
+                var buf: [1]u8 = undefined;
+                const n = std.posix.read(0, &buf) catch 0;
+                vregs[inst.dest] = @bitCast(if (n > 0) @as(i64, buf[0]) else @as(i64, -1));
+            },
             .call_unlink => {
                 const p = try self.readCString(vregs[inst.args[0]]);
                 std.fs.cwd().deleteFile(p) catch {

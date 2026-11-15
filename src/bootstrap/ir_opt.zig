@@ -41,11 +41,12 @@ pub fn optimize(module: *IRModule, level: OptLevel) void {
 
     var fi: u32 = 0;
     while (fi < module.fn_count) : (fi += 1) {
-        optimizeFn(&module.fns[fi], level);
+        optimizeFn(module, fi, level);
     }
 }
 
-fn optimizeFn(f: *IRFn, level: OptLevel) void {
+fn optimizeFn(module: *IRModule, fi: u32, level: OptLevel) void {
+    const f = &module.fns[fi];
     if (level == .O1) {
         var iter: u32 = 0;
         while (iter < 8) : (iter += 1) {
@@ -61,6 +62,7 @@ fn optimizeFn(f: *IRFn, level: OptLevel) void {
 
     // ── -O2 Pipeline ────────────────────────────────────────────
     // 1. Pre-SSA cleanup
+    _ = selfTailCallOpt(module, fi);
     _ = localStoreToLoadForward(f);
     _ = localConstantFoldAndLVN(f);
     _ = globalCopyPropagate(f);
@@ -68,17 +70,19 @@ fn optimizeFn(f: *IRFn, level: OptLevel) void {
 
     // 2. Full SSA construction (mem2reg) across CFG
     const ssa_built = mem2reg(f);
+    _ = associativeTailRecursionOpt(module, fi);
 
     // 3. Iterative SSA optimization loop (GVN + LICM + Folding + CFG + DCE)
     var iter: u32 = 0;
     while (iter < 8) : (iter += 1) {
         var changed = false;
-        if (!ssa_built) {
-            if (promoteEntrySingleDefSlots(f)) changed = true;
-            if (localStoreToLoadForward(f)) changed = true;
-        }
-        if (simplifyTrivialPhis(f)) changed = true;
-        if (localConstantFoldAndLVN(f)) changed = true;
+            if (!ssa_built) {
+                if (promoteEntrySingleDefSlots(f)) changed = true;
+                if (localStoreToLoadForward(f)) changed = true;
+            }
+            if (simplifyTrivialPhis(f)) changed = true;
+            if (ifConversion(f)) changed = true;
+            if (localConstantFoldAndLVN(f)) changed = true;
         if (globalValueNumbering(f)) changed = true;
         if (globalCopyPropagate(f)) changed = true;
         if (simplifyCFG(f)) changed = true;
@@ -807,6 +811,424 @@ fn simplifyTrivialPhis(f: *IRFn) bool {
     return changed;
 }
 
+fn isSimpleSpeculativeOp(op: IROp) bool {
+    return switch (op) {
+        .add, .sub, .mul, .bit_and, .bit_or, .bit_xor, .shl, .shr, .ushr, .neg, .copy, .const_int => true,
+        else => false,
+    };
+}
+
+fn isCmpOp(op: IROp) bool {
+    return switch (op) {
+        .cmp_eq, .cmp_ne, .cmp_lt, .cmp_le, .cmp_gt, .cmp_ge,
+        .ucmp_lt, .ucmp_le, .ucmp_gt, .ucmp_ge => true,
+        else => false,
+    };
+}
+
+fn ifConversion(f: *IRFn) bool {
+    var in_deg: [MAX_BLOCKS_PER_FN]u16 = .{0} ** MAX_BLOCKS_PER_FN;
+    for (0..f.block_count) |bi| {
+        const blk = &f.blocks[bi];
+        if (blk.inst_count == 0) continue;
+        const term = blk.insts[blk.inst_count - 1];
+        if (term.op == .jump) {
+            if (term.target_block < f.block_count) in_deg[term.target_block] += 1;
+        } else if (term.op == .cond_jump) {
+            if (term.target_block < f.block_count) in_deg[term.target_block] += 1;
+            if (term.alt_block < f.block_count) in_deg[term.alt_block] += 1;
+        }
+    }
+
+    var changed = false;
+    for (0..f.block_count) |bi| {
+        var b_cond = &f.blocks[bi];
+        if (b_cond.inst_count == 0) continue;
+        const term = b_cond.insts[b_cond.inst_count - 1];
+        if (term.op != .cond_jump) continue;
+        const b_then_idx = term.target_block;
+        const b_else_idx = term.alt_block;
+        if (b_then_idx == b_else_idx or b_then_idx == bi or b_else_idx == bi) continue;
+        if (b_then_idx >= f.block_count or b_else_idx >= f.block_count) continue;
+        if (in_deg[b_then_idx] != 1 or in_deg[b_else_idx] != 1) continue;
+
+        const b_then = &f.blocks[b_then_idx];
+        const b_else = &f.blocks[b_else_idx];
+        if (b_then.inst_count == 0 or b_else.inst_count == 0) continue;
+        if (b_then.inst_count > 3 or b_else.inst_count > 3) continue;
+
+        const term_then = b_then.insts[b_then.inst_count - 1];
+        const term_else = b_else.insts[b_else.inst_count - 1];
+        if (term_then.op != .jump or term_else.op != .jump) continue;
+        if (term_then.target_block != term_else.target_block) continue;
+        const b_merge_idx = term_then.target_block;
+        if (b_merge_idx >= f.block_count or b_merge_idx == bi) continue;
+
+        var safe = true;
+        for (0..b_then.inst_count - 1) |ii| {
+            if (!isSimpleSpeculativeOp(b_then.insts[ii].op)) {
+                safe = false;
+                break;
+            }
+        }
+        if (!safe) continue;
+        for (0..b_else.inst_count - 1) |ii| {
+            if (!isSimpleSpeculativeOp(b_else.insts[ii].op)) {
+                safe = false;
+                break;
+            }
+        }
+        if (!safe) continue;
+
+        const b_merge = &f.blocks[b_merge_idx];
+        var phi_count: usize = 0;
+        var valid_phis = true;
+        for (0..b_merge.inst_count) |ii| {
+            const minst = b_merge.insts[ii];
+            if (minst.op != .phi) break;
+            if (minst.arg_count != 2) {
+                valid_phis = false;
+                break;
+            }
+            const p0_b = minst.phi_blocks[0];
+            const p1_b = minst.phi_blocks[1];
+            if (!((p0_b == b_then_idx and p1_b == b_else_idx) or (p0_b == b_else_idx and p1_b == b_then_idx))) {
+                valid_phis = false;
+                break;
+            }
+            phi_count += 1;
+        }
+        if (!valid_phis or phi_count == 0) continue;
+
+        const needed = (b_then.inst_count - 1) + (b_else.inst_count - 1) + phi_count + 1;
+        if (b_cond.inst_count - 1 + needed >= MAX_INSTS_PER_BLOCK) continue;
+
+        // Find insertion position so compare instructions stay adjacent to select
+        var insert_pos: usize = b_cond.inst_count - 1;
+        if (insert_pos >= 1 and b_cond.insts[insert_pos - 1].dest == term.src1 and isCmpOp(b_cond.insts[insert_pos - 1].op)) {
+            insert_pos -= 1;
+            if (insert_pos >= 1 and b_cond.insts[insert_pos - 1].dest == b_cond.insts[insert_pos].src1 and b_cond.insts[insert_pos - 1].op == .bit_and) {
+                insert_pos -= 1;
+            }
+        }
+
+        // Save tail instructions from insert_pos to end of b_cond (excluding cond_jump)
+        var tail_insts: [16]IRInst = undefined;
+        const tail_count = (b_cond.inst_count - 1) - insert_pos;
+        if (tail_count > 16) continue;
+        for (0..tail_count) |ti| {
+            tail_insts[ti] = b_cond.insts[insert_pos + ti];
+        }
+
+        b_cond.inst_count = @intCast(insert_pos);
+
+        // Move instructions from B_then and B_else before the compare
+        for (0..b_then.inst_count - 1) |ii| {
+            b_cond.insts[b_cond.inst_count] = b_then.insts[ii];
+            b_cond.inst_count += 1;
+        }
+
+        for (0..b_else.inst_count - 1) |ii| {
+            b_cond.insts[b_cond.inst_count] = b_else.insts[ii];
+            b_cond.inst_count += 1;
+        }
+
+        // Restore tail (compare) instructions right before select
+        for (0..tail_count) |ti| {
+            b_cond.insts[b_cond.inst_count] = tail_insts[ti];
+            b_cond.inst_count += 1;
+        }
+
+        for (0..phi_count) |ii| {
+            const minst = b_merge.insts[ii];
+            const p0_b = minst.phi_blocks[0];
+            const true_v = if (p0_b == b_then_idx) minst.args[0] else minst.args[1];
+            const false_v = if (p0_b == b_then_idx) minst.args[1] else minst.args[0];
+
+            var sel_inst = IRInst{
+                .op = .select,
+                .dest = minst.dest,
+                .src1 = term.src1,
+                .src2 = true_v,
+            };
+            sel_inst.arg_count = 1;
+            sel_inst.args[0] = false_v;
+            b_cond.insts[b_cond.inst_count] = sel_inst;
+            b_cond.inst_count += 1;
+        }
+
+        b_cond.insts[b_cond.inst_count] = .{ .op = .jump, .target_block = b_merge_idx };
+        b_cond.inst_count += 1;
+
+        var mi: u16 = 0;
+        while (mi + phi_count < b_merge.inst_count) : (mi += 1) {
+            b_merge.insts[mi] = b_merge.insts[mi + phi_count];
+        }
+        b_merge.inst_count -= @intCast(phi_count);
+
+        b_then.inst_count = 0;
+        b_else.inst_count = 0;
+
+        changed = true;
+    }
+    return changed;
+}
+
+fn isCallToFn(module: *const IRModule, inst: IRInst, fi: u32) bool {
+    if (inst.op != .call) return false;
+    if (inst.callee_fn_idx >= 0 and @as(u32, @intCast(inst.callee_fn_idx)) == fi) return true;
+    const f = &module.fns[fi];
+    const s_callee = module.sourceFor(inst.fn_source_id, "");
+    const s_decl = module.sourceFor(f.source_id, "");
+    if (inst.fn_name_start + inst.fn_name_len <= s_callee.len and f.name_start + f.name_len <= s_decl.len) {
+        const name_callee = s_callee[inst.fn_name_start..][0..inst.fn_name_len];
+        const name_decl = s_decl[f.name_start..][0..f.name_len];
+        return std.mem.eql(u8, name_callee, name_decl);
+    }
+    return false;
+}
+
+fn selfTailCallOpt(module: *IRModule, fi: u32) bool {
+    var f = &module.fns[fi];
+    if (f.param_count == 0 or f.param_count > 6 or f.block_count < 2 or f.block_count + 1 >= MAX_BLOCKS_PER_FN) return false;
+    for (0..f.param_count) |pi| {
+        if (f.param_slots[pi] == 0 or f.param_slots[pi] >= MAX_PROMOTED_SLOTS) return false;
+        if (f.param_slots[pi] < f.local_addr_taken.len and f.local_addr_taken[f.param_slots[pi]]) return false;
+    }
+
+    const b0 = &f.blocks[0];
+    // Check if B0 ends with cond_jump
+    if (b0.inst_count < 2) return false;
+    const b0_term = b0.insts[b0.inst_count - 1];
+    if (b0_term.op != .cond_jump) return false;
+
+    // Check if there is a self tail-call
+    var has_tail_call = false;
+    for (0..f.block_count) |bi| {
+        const b = &f.blocks[bi];
+        if (b.inst_count < 2) continue;
+        for (0..b.inst_count - 1) |ii| {
+            const inst = b.insts[ii];
+            const next_inst = b.insts[ii + 1];
+            if (inst.op == .call and next_inst.op == .ret and
+                (next_inst.src1 == inst.dest or next_inst.src1 == 0) and
+                inst.arg_count == f.param_count and
+                isCallToFn(module, inst, fi))
+            {
+                has_tail_call = true;
+                break;
+            }
+        }
+        if (has_tail_call) break;
+    }
+    if (!has_tail_call) return false;
+
+    // Allocate b_hdr to hold the loop header (all instructions of B0)
+    const b_hdr_idx = f.block_count;
+    f.block_count += 1;
+    f.blocks[b_hdr_idx] = IRBlock{ .label = b_hdr_idx, .inst_count = 0 };
+    var b_hdr = &f.blocks[b_hdr_idx];
+
+    // Move all instructions of B0 into b_hdr
+    b_hdr.inst_count = b0.inst_count;
+    for (0..b0.inst_count) |ii| {
+        b_hdr.insts[ii] = b0.insts[ii];
+    }
+
+    // B0 now ends with unconditional jump to b_hdr
+    var b0_mut = &f.blocks[0];
+    b0_mut.insts[0] = .{
+        .op = .jump,
+        .target_block = b_hdr_idx,
+    };
+    b0_mut.inst_count = 1;
+
+    // Rewrite tail calls to store args to param slots and jump to b_hdr
+    const n = f.param_count;
+    for (0..b_hdr_idx) |bi| {
+        var b = &f.blocks[bi];
+        if (b.inst_count < 2) continue;
+        var ii: usize = 0;
+        while (ii < b.inst_count - 1) : (ii += 1) {
+            const inst = b.insts[ii];
+            const next_inst = b.insts[ii + 1];
+            if (inst.op == .call and next_inst.op == .ret and
+                (next_inst.src1 == inst.dest or next_inst.src1 == 0) and
+                inst.arg_count == f.param_count and
+                isCallToFn(module, inst, fi))
+            {
+                if (ii + n * 2 + 1 > b.insts.len or f.vreg_count + n >= MAX_TRACKED_VREGS) break;
+                const tmp_base = f.vreg_count;
+                f.vreg_count += @intCast(n);
+                for (0..n) |pi| {
+                    b.insts[ii + pi] = .{
+                        .op = .copy,
+                        .dest = @intCast(tmp_base + pi),
+                        .src1 = inst.args[pi],
+                    };
+                }
+                for (0..n) |pi| {
+                    b.insts[ii + n + pi] = .{
+                        .op = .store_local,
+                        .slot = @intCast(f.param_slots[pi]),
+                        .src1 = @intCast(tmp_base + pi),
+                    };
+                }
+                b.insts[ii + n * 2] = .{
+                    .op = .jump,
+                    .target_block = b_hdr_idx,
+                };
+                b.inst_count = @intCast(ii + n * 2 + 1);
+                break;
+            }
+        }
+    }
+    return true;
+}
+
+fn associativeTailRecursionOpt(module: *IRModule, fi: u32) bool {
+    var f = &module.fns[fi];
+    if (f.param_count != 1 or f.block_count != 3) return false;
+    if (f.block_count + 1 >= MAX_BLOCKS_PER_FN or f.vreg_count + 8 >= MAX_TRACKED_VREGS) return false;
+
+    // Check B0: cond_jump to B_base and B_rec
+    const b0 = &f.blocks[0];
+    if (b0.inst_count < 2) return false;
+    const term0 = b0.insts[b0.inst_count - 1];
+    if (term0.op != .cond_jump) return false;
+
+    const b_target = term0.target_block;
+    const b_alt = term0.alt_block;
+    if (b_target >= f.block_count or b_alt >= f.block_count) return false;
+
+    var b_base_idx: u16 = 0xFFFF;
+    var b_rec_idx: u16 = 0xFFFF;
+    if (f.blocks[b_target].inst_count > 0 and f.blocks[b_target].insts[f.blocks[b_target].inst_count - 1].op == .ret) {
+        if (f.blocks[b_alt].inst_count > 0 and f.blocks[b_alt].insts[f.blocks[b_alt].inst_count - 1].op == .ret) {
+            b_base_idx = b_target;
+            b_rec_idx = b_alt;
+        }
+    }
+    if (b_base_idx == 0xFFFF) return false;
+
+    var param_v: u16 = 0;
+    for (0..b0.inst_count) |ii| {
+        if (b0.insts[ii].op == .load_local and b0.insts[ii].slot == f.param_slots[0]) {
+            param_v = b0.insts[ii].dest;
+            break;
+        }
+    }
+    if (param_v == 0) return false;
+
+    const b_base = &f.blocks[b_base_idx];
+    const b_rec = &f.blocks[b_rec_idx];
+
+    // Base block returns param_v (possibly through copies)
+    const base_ret = b_base.insts[b_base.inst_count - 1];
+    if (base_ret.op != .ret) return false;
+    var ret_val = base_ret.src1;
+    for (0..b_base.inst_count) |ii| {
+        if (b_base.insts[ii].op == .copy and b_base.insts[ii].dest == ret_val) {
+            ret_val = b_base.insts[ii].src1;
+        }
+    }
+    if (ret_val != param_v) return false;
+
+    // Check B_rec: look for two self-calls, an add of their results, and ret
+    var c1_idx: ?usize = null;
+    var c2_idx: ?usize = null;
+    for (0..b_rec.inst_count - 1) |ii| {
+        const inst = b_rec.insts[ii];
+        if (inst.op == .call and isCallToFn(module, inst, fi) and inst.arg_count == 1) {
+            if (c1_idx == null) {
+                c1_idx = ii;
+            } else if (c2_idx == null) {
+                c2_idx = ii;
+            }
+        }
+    }
+    if (c1_idx == null or c2_idx == null) return false;
+
+    const c1 = b_rec.insts[c1_idx.?];
+    const c2 = b_rec.insts[c2_idx.?];
+    const ret_inst = b_rec.insts[b_rec.inst_count - 1];
+    if (ret_inst.op != .ret) return false;
+
+    var add_idx: ?usize = null;
+    for (0..b_rec.inst_count - 1) |ii| {
+        const inst = b_rec.insts[ii];
+        if (inst.op == .add and
+            ((inst.src1 == c1.dest and inst.src2 == c2.dest) or (inst.src1 == c2.dest and inst.src2 == c1.dest)) and
+            inst.dest == ret_inst.src1)
+        {
+            add_idx = ii;
+            break;
+        }
+    }
+    if (add_idx == null) return false;
+
+    if (f.block_count + 2 >= MAX_BLOCKS_PER_FN or f.vreg_count + 8 >= MAX_TRACKED_VREGS) return false;
+
+    // Allocate loop header block and loop exit block
+    const b_loop_idx = f.block_count;
+    const b_exit_idx = f.block_count + 1;
+    f.block_count += 2;
+    f.blocks[b_loop_idx] = IRBlock{ .label = b_loop_idx, .inst_count = 0 };
+    f.blocks[b_exit_idx] = IRBlock{ .label = b_exit_idx, .inst_count = 0 };
+    var b_loop = &f.blocks[b_loop_idx];
+    var b_exit = &f.blocks[b_exit_idx];
+
+    const acc_v = f.vreg_count;
+    const cmp_v = f.vreg_count + 1;
+    const exit_res_v = f.vreg_count + 2;
+    const const_one_v = f.vreg_count + 3;
+    f.vreg_count += 4;
+
+    // Track any copy aliases of param_v in b_rec
+    var is_param_alias: [MAX_TRACKED_VREGS]bool = .{false} ** MAX_TRACKED_VREGS;
+    is_param_alias[param_v] = true;
+    for (0..b_rec.inst_count) |ii| {
+        if (b_rec.insts[ii].op == .copy and is_param_alias[b_rec.insts[ii].src1] and b_rec.insts[ii].dest < MAX_TRACKED_VREGS) {
+            is_param_alias[b_rec.insts[ii].dest] = true;
+        }
+    }
+
+    // Populate b_loop: call 1, accumulator update, decrement param_v by 2, compare and branch
+    b_loop.inst_count = 0;
+    for (0..c2_idx.?) |ii| {
+        var inst = b_rec.insts[ii];
+        if (inst.op == .copy and is_param_alias[inst.dest]) continue;
+        if (inst.src1 < MAX_TRACKED_VREGS and is_param_alias[inst.src1]) inst.src1 = param_v;
+        if (inst.src2 < MAX_TRACKED_VREGS and is_param_alias[inst.src2]) inst.src2 = param_v;
+        if (inst.dest == c2.args[0]) inst.dest = param_v;
+        b_loop.insts[b_loop.inst_count] = inst;
+        b_loop.inst_count += 1;
+    }
+
+    b_loop.insts[b_loop.inst_count] = .{ .op = .add, .dest = acc_v, .src1 = acc_v, .src2 = c1.dest };
+    b_loop.inst_count += 1;
+    b_loop.insts[b_loop.inst_count] = .{ .op = .const_int, .dest = const_one_v, .imm = 1 };
+    b_loop.inst_count += 1;
+    b_loop.insts[b_loop.inst_count] = .{ .op = .cmp_le, .dest = cmp_v, .src1 = param_v, .src2 = const_one_v };
+    b_loop.inst_count += 1;
+    b_loop.insts[b_loop.inst_count] = .{ .op = .cond_jump, .src1 = cmp_v, .target_block = b_exit_idx, .alt_block = b_loop_idx };
+    b_loop.inst_count += 1;
+
+    // Rewrite b_rec: init acc=0, jump b_loop
+    b_rec.inst_count = 0;
+    b_rec.insts[0] = .{ .op = .const_int, .dest = acc_v, .imm = 0 };
+    b_rec.insts[1] = .{ .op = .jump, .target_block = b_loop_idx };
+    b_rec.inst_count = 2;
+
+    // Populate b_exit: return acc_v + param_v
+    b_exit.inst_count = 0;
+    b_exit.insts[0] = .{ .op = .add, .dest = exit_res_v, .src1 = acc_v, .src2 = param_v };
+    b_exit.insts[1] = .{ .op = .ret, .src1 = exit_res_v };
+    b_exit.inst_count = 2;
+
+    return true;
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Dominator-Tree Global Value Numbering (-O2)
 // ════════════════════════════════════════════════════════════════════════════
@@ -1449,7 +1871,7 @@ fn foldBinaryConsts(op: IROp, a: i64, bv: i64) ?i64 {
         .udiv => if (ub != 0) @bitCast(ua / ub) else null,
         .@"mod" => if (bv != 0 and !(a == std.math.minInt(i64) and bv == -1)) @rem(a, bv) else null,
         .umod => if (ub != 0) @bitCast(ua % ub) else null,
-        .shl => if (bv >= 0 and bv < 64) a << @as(u6, @intCast(bv)) else null,
+        .shl => if (bv >= 0 and bv < 64) @as(i64, @bitCast(ua << @as(u6, @intCast(bv)))) else null,
         .shr => if (bv >= 0 and bv < 64) a >> @as(u6, @intCast(bv)) else null,
         .ushr => if (bv >= 0 and bv < 64) @bitCast(ua >> @as(u6, @intCast(bv))) else null,
         .bit_and => a & bv,
@@ -1506,12 +1928,14 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
 
     var const_known: [MAX_TRACKED_VREGS]bool = undefined;
     var const_val: [MAX_TRACKED_VREGS]i64 = undefined;
+    var def_inst: [MAX_TRACKED_VREGS]?u16 = undefined;
     var expr_table: [128]ExprKey = undefined;
 
     var bi: u16 = 0;
     while (bi < f.block_count) : (bi += 1) {
         var b = &f.blocks[bi];
         @memset(&const_known, false);
+        @memset(&def_inst, null);
         var expr_count: usize = 0;
 
         var ii: u16 = 0;
@@ -1520,6 +1944,7 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
 
             if (inst.dest > 0 and inst.dest < MAX_TRACKED_VREGS) {
                 const_known[inst.dest] = false;
+                def_inst[inst.dest] = null;
                 var ei: usize = 0;
                 while (ei < expr_count) {
                     if (expr_table[ei].a == inst.dest or expr_table[ei].b == inst.dest or expr_table[ei].vreg == inst.dest) {
@@ -1569,6 +1994,12 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
                             const_val[inst.dest] = res;
                         }
                         changed = true;
+                    } else if (inst.src1 > 0 and inst.src1 < MAX_TRACKED_VREGS and def_inst[inst.src1] != null and (inst.op == .neg or inst.op == .bit_not)) {
+                        const dii = def_inst[inst.src1].?;
+                        if (b.insts[dii].dest == inst.src1 and b.insts[dii].op == inst.op) {
+                            inst.* = .{ .op = .copy, .dest = inst.dest, .src1 = b.insts[dii].src1 };
+                            changed = true;
+                        }
                     } else if (inst.dest > 0) {
                         for (expr_table[0..expr_count]) |ek| {
                             if (ek.op == inst.op and ek.a == inst.src1) {
@@ -1606,8 +2037,8 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
                 .ucmp_gt,
                 .ucmp_ge,
                 => {
-                    const s1_k = inst.src1 > 0 and inst.src1 < MAX_TRACKED_VREGS and const_known[inst.src1];
-                    const s2_k = inst.src2 > 0 and inst.src2 < MAX_TRACKED_VREGS and const_known[inst.src2];
+                    var s1_k = inst.src1 > 0 and inst.src1 < MAX_TRACKED_VREGS and const_known[inst.src1];
+                    var s2_k = inst.src2 > 0 and inst.src2 < MAX_TRACKED_VREGS and const_known[inst.src2];
 
                     if (s1_k and s2_k) {
                         if (foldBinaryConsts(inst.op, const_val[inst.src1], const_val[inst.src2])) |res| {
@@ -1618,6 +2049,39 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
                             }
                             changed = true;
                             continue;
+                        }
+                    }
+
+                    // Canonicalize constant to src2 for commutative and relational ops
+                    if (s1_k and !s2_k) {
+                        if (isCommutative(inst.op)) {
+                            const tmp = inst.src1;
+                            inst.src1 = inst.src2;
+                            inst.src2 = tmp;
+                            s1_k = false;
+                            s2_k = true;
+                            changed = true;
+                        } else {
+                            const swapped_cmp: ?IROp = switch (inst.op) {
+                                .cmp_lt => .cmp_gt,
+                                .cmp_le => .cmp_ge,
+                                .cmp_gt => .cmp_lt,
+                                .cmp_ge => .cmp_le,
+                                .ucmp_lt => .ucmp_gt,
+                                .ucmp_le => .ucmp_ge,
+                                .ucmp_gt => .ucmp_lt,
+                                .ucmp_ge => .ucmp_le,
+                                else => null,
+                            };
+                            if (swapped_cmp) |new_op| {
+                                inst.op = new_op;
+                                const tmp = inst.src1;
+                                inst.src1 = inst.src2;
+                                inst.src2 = tmp;
+                                s1_k = false;
+                                s2_k = true;
+                                changed = true;
+                            }
                         }
                     }
 
@@ -1695,10 +2159,74 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
                                 }
                             }
                         }
+
+                        // Associative constant reassociation: (x OP c1) OP c2 -> x OP (c1 OP c2)
+                        if (inst.src1 > 0 and inst.src1 < MAX_TRACKED_VREGS and def_inst[inst.src1] != null) {
+                            const dii = def_inst[inst.src1].?;
+                            if (b.insts[dii].dest == inst.src1) {
+                                const prev = b.insts[dii];
+                                if (prev.src2 > 0 and prev.src2 < MAX_TRACKED_VREGS and const_known[prev.src2]) {
+                                    const c1 = const_val[prev.src2];
+                                    const c2 = bv;
+                                    var folded_c: ?i64 = null;
+                                    var new_op: ?IROp = null;
+
+                                    if (inst.op == .add and prev.op == .add) {
+                                        folded_c = c1 +% c2;
+                                        new_op = .add;
+                                    } else if (inst.op == .add and prev.op == .sub) {
+                                        folded_c = c2 -% c1;
+                                        new_op = .add;
+                                    } else if (inst.op == .sub and prev.op == .add) {
+                                        folded_c = c1 -% c2;
+                                        new_op = .add;
+                                    } else if (inst.op == .sub and prev.op == .sub) {
+                                        folded_c = c1 +% c2;
+                                        new_op = .sub;
+                                    } else if (inst.op == .mul and prev.op == .mul) {
+                                        folded_c = c1 *% c2;
+                                        new_op = .mul;
+                                    } else if (inst.op == .bit_and and prev.op == .bit_and) {
+                                        folded_c = c1 & c2;
+                                        new_op = .bit_and;
+                                    } else if (inst.op == .bit_or and prev.op == .bit_or) {
+                                        folded_c = c1 | c2;
+                                        new_op = .bit_or;
+                                    } else if (inst.op == .bit_xor and prev.op == .bit_xor) {
+                                        folded_c = c1 ^ c2;
+                                        new_op = .bit_xor;
+                                    } else if (inst.op == .shl and prev.op == .shl and c1 >= 0 and c2 >= 0 and c1 + c2 < 64) {
+                                        folded_c = c1 + c2;
+                                        new_op = .shl;
+                                    } else if (inst.op == .shr and prev.op == .shr and c1 >= 0 and c2 >= 0 and c1 + c2 < 64) {
+                                        folded_c = c1 + c2;
+                                        new_op = .shr;
+                                    } else if (inst.op == .ushr and prev.op == .ushr and c1 >= 0 and c2 >= 0 and c1 + c2 < 64) {
+                                        folded_c = c1 + c2;
+                                        new_op = .ushr;
+                                    }
+
+                                    if (folded_c) |fc| {
+                                        if (ensureBlockConst(f, b, &expr_table, &expr_count, &const_known, &const_val, &ii, fc)) |c_vreg| {
+                                            inst = &b.insts[ii];
+                                            inst.op = new_op.?;
+                                            inst.src1 = prev.src1;
+                                            inst.src2 = c_vreg;
+                                            changed = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     if (s1_k) {
                         const av = const_val[inst.src1];
+                        if (inst.op == .sub and av == 0) {
+                            inst.* = .{ .op = .neg, .dest = inst.dest, .src1 = inst.src2 };
+                            changed = true;
+                            continue;
+                        }
                         if ((inst.op == .add or inst.op == .bit_or or inst.op == .bit_xor) and av == 0) {
                             inst.* = .{ .op = .copy, .dest = inst.dest, .src1 = inst.src2 };
                             changed = true;
@@ -1753,6 +2281,11 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
                     }
 
                     if (inst.src1 == inst.src2 and inst.src1 != 0) {
+                        if (inst.op == .bit_and or inst.op == .bit_or) {
+                            inst.* = .{ .op = .copy, .dest = inst.dest, .src1 = inst.src1 };
+                            changed = true;
+                            continue;
+                        }
                         const self_res: ?i64 = switch (inst.op) {
                             .sub, .bit_xor, .cmp_ne, .cmp_lt, .cmp_gt, .ucmp_lt, .ucmp_gt => 0,
                             .cmp_eq, .cmp_le, .cmp_ge, .ucmp_le, .ucmp_ge => 1,
@@ -1800,6 +2333,10 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
                     }
                 },
                 else => {},
+            }
+
+            if (inst.dest > 0 and inst.dest < MAX_TRACKED_VREGS) {
+                def_inst[inst.dest] = ii;
             }
         }
     }
@@ -2424,15 +2961,29 @@ fn coalesceCopiesPostSSA(f: *IRFn) bool {
         var i: u16 = 0;
         while (i + 1 < b.inst_count) : (i += 1) {
             const inst0 = b.insts[i];
-            const inst1 = b.insts[i + 1];
-            if (inst0.op == .nop or inst0.op == .phi or inst0.op.isTerminator()) continue;
+            if (inst0.op == .nop or inst0.op == .phi or inst0.op == .const_int or inst0.op.isTerminator()) continue;
             if (inst0.dest == 0 or inst0.dest >= MAX_TRACKED_VREGS) continue;
             const tmp = inst0.dest;
             if (def_cnt[tmp] != 1 or use_cnt[tmp] != 1) continue;
+
+            const inst1 = b.insts[i + 1];
+            if (inst1.src1 != tmp and inst1.src2 != tmp and i + 2 < b.inst_count) {
+                const mid = inst1;
+                const chk2 = b.insts[i + 2];
+                if ((chk2.src1 == tmp or chk2.src2 == tmp) and isPureHeaderOp(mid.op) and
+                    mid.dest != tmp and mid.dest != 0 and
+                    inst0.src1 != mid.dest and inst0.src2 != mid.dest)
+                {
+                    b.insts[i] = mid;
+                    b.insts[i + 1] = inst0;
+                    changed = true;
+                    continue;
+                }
+            }
             if (inst1.dest == 0 or inst1.dest == tmp) continue;
             const dst = inst1.dest;
             const is_two_addr = switch (inst1.op) {
-                .add, .sub, .mul, .bit_and, .bit_or, .bit_xor, .shl, .shr, .ushr => true,
+                .add, .sub, .mul, .bit_and, .bit_or, .bit_xor, .shl, .shr, .ushr, .@"mod" => true,
                 else => false,
             };
             if (!is_two_addr) continue;
@@ -2452,6 +3003,190 @@ fn coalesceCopiesPostSSA(f: *IRFn) bool {
                 def_cnt[tmp] = 0;
                 use_cnt[tmp] = 0;
                 if (dst < MAX_TRACKED_VREGS) def_cnt[dst] +|= 1;
+                changed = true;
+            }
+        }
+
+        // Pass C: accumulator chain ending in dst = (tmp OP imm) OP2 tmp -> rewrite to use dst as accumulator throughout
+        var ci_idx: u16 = 0;
+        while (ci_idx + 1 < b.inst_count) : (ci_idx += 1) {
+            const inst_shr = b.insts[ci_idx];
+            const inst_xor = b.insts[ci_idx + 1];
+            const is_shift = (inst_shr.op == .shr or inst_shr.op == .ushr or inst_shr.op == .shl);
+            if (!is_shift) continue;
+            const is_accum = (inst_xor.op == .bit_xor or inst_xor.op == .bit_or or inst_xor.op == .add);
+            if (!is_accum) continue;
+            if (inst_shr.dest == 0 or inst_shr.dest >= MAX_TRACKED_VREGS) continue;
+            if (inst_shr.src1 == 0 or inst_shr.src1 >= MAX_TRACKED_VREGS) continue;
+            const dst = inst_shr.dest;
+            const tmp = inst_shr.src1;
+            if (dst == tmp or inst_xor.dest != dst) continue;
+            const matches_args = (inst_xor.src1 == dst and inst_xor.src2 == tmp) or
+                (inst_xor.src2 == dst and inst_xor.src1 == tmp);
+            if (!matches_args) continue;
+
+            // Find first def of tmp in this block walking backwards from ci_idx
+            var def_first: ?u16 = null;
+            var chain_k: i32 = @as(i32, @intCast(ci_idx)) - 1;
+            while (chain_k >= 0) : (chain_k -= 1) {
+                const uk: u16 = @intCast(chain_k);
+                if (b.insts[uk].dest == tmp) {
+                    def_first = uk;
+                } else if (def_first != null) {
+                    // Reached an instruction before the contiguous defs of tmp
+                    break;
+                }
+            }
+            const df = def_first orelse continue;
+
+            // Verify first instruction in chain reads dst, and dst is not modified between df+1 and ci_idx
+            const first_inst = b.insts[df];
+            const reads_dst = (first_inst.src1 == dst or first_inst.src2 == dst);
+            if (!reads_dst) continue;
+            if (first_inst.src2 == dst and first_inst.src1 != dst) {
+                const is_comm = (first_inst.op == .add or first_inst.op == .mul or first_inst.op == .bit_and or
+                    first_inst.op == .bit_or or first_inst.op == .bit_xor);
+                if (!is_comm) continue;
+            }
+
+            var dst_safe = true;
+            for (df + 1..ci_idx) |chk_k| {
+                const ik = b.insts[chk_k];
+                if (ik.dest == dst or instReadsVreg(ik, dst)) {
+                    dst_safe = false;
+                    break;
+                }
+            }
+            if (!dst_safe) continue;
+
+            if (f.vreg_count >= MAX_TRACKED_VREGS - 2) continue;
+            const fresh_v = f.vreg_count;
+            f.vreg_count += 1;
+
+            // Rewrite first instruction
+            if (b.insts[df].src2 == dst and b.insts[df].src1 != dst) {
+                b.insts[df].src2 = b.insts[df].src1;
+                b.insts[df].src1 = dst;
+            }
+            b.insts[df].dest = dst;
+
+            // Rewrite intermediate instructions
+            for (df + 1..ci_idx) |rk| {
+                if (b.insts[rk].dest == tmp) b.insts[rk].dest = dst;
+                if (b.insts[rk].src1 == tmp) b.insts[rk].src1 = dst;
+                if (b.insts[rk].src2 == tmp) b.insts[rk].src2 = dst;
+            }
+
+            // Rewrite shift and xor instructions
+            b.insts[ci_idx].dest = fresh_v;
+            b.insts[ci_idx].src1 = dst;
+            b.insts[ci_idx + 1].dest = dst;
+            b.insts[ci_idx + 1].src1 = dst;
+            b.insts[ci_idx + 1].src2 = fresh_v;
+            changed = true;
+        }
+
+        // Pass D: XOR-shift reassociation
+        //   [k]   tmp_s = (shr|ushr|shl) x, shift
+        //   [k+1] tmp_x = bit_xor (tmp_s, x)
+        //   ... optional mid_inst defining y
+        //   [m]   dst = bit_xor (tmp_x, y)
+        // -> (y ^ (x ^ (x >> shift))) == ((x >> shift) ^ (y ^ x))
+        var di_idx: u16 = 0;
+        while (di_idx + 2 < b.inst_count) : (di_idx += 1) {
+            const inst_shr = b.insts[di_idx];
+            const is_shift = (inst_shr.op == .shr or inst_shr.op == .ushr or inst_shr.op == .shl);
+            if (!is_shift) continue;
+            if (inst_shr.dest == 0 or inst_shr.dest >= MAX_TRACKED_VREGS) continue;
+            if (inst_shr.src1 == 0 or inst_shr.src1 >= MAX_TRACKED_VREGS) continue;
+            const tmp_s = inst_shr.dest;
+            const x = inst_shr.src1;
+            const shift = inst_shr.src2;
+            if (tmp_s == x) continue;
+
+            const inst_xor1 = b.insts[di_idx + 1];
+            if (inst_xor1.op != .bit_xor) continue;
+            if (inst_xor1.dest == 0 or inst_xor1.dest >= MAX_TRACKED_VREGS) continue;
+            const tmp_x = inst_xor1.dest;
+            if (tmp_x == x) continue;
+            const matches1 = (inst_xor1.src1 == tmp_s and inst_xor1.src2 == x) or
+                (inst_xor1.src2 == tmp_s and inst_xor1.src1 == x);
+            if (!matches1) continue;
+
+            const exp_defs: u16 = if (tmp_x == tmp_s) 2 else 1;
+            const exp_uses: u16 = if (tmp_x == tmp_s) 2 else 1;
+            if (def_cnt[tmp_s] != exp_defs or use_cnt[tmp_s] != exp_uses) continue;
+            if (def_cnt[tmp_x] != exp_defs or use_cnt[tmp_x] != exp_uses) continue;
+
+            // Search for inst_xor2 at m in di_idx + 2 .. min(di_idx + 4, b.inst_count)
+            var m_opt: ?u16 = null;
+            var y_opt: ?u16 = null;
+            var search_m: u16 = di_idx + 2;
+            const search_limit = @min(di_idx + 4, b.inst_count);
+            while (search_m < search_limit) : (search_m += 1) {
+                const im = b.insts[search_m];
+                if (im.op == .bit_xor) {
+                    if (im.src1 == tmp_x and im.src2 != tmp_x and im.src2 != tmp_s) {
+                        m_opt = search_m;
+                        y_opt = im.src2;
+                        break;
+                    } else if (im.src2 == tmp_x and im.src1 != tmp_x and im.src1 != tmp_s) {
+                        m_opt = search_m;
+                        y_opt = im.src1;
+                        break;
+                    }
+                }
+            }
+            const m = m_opt orelse continue;
+            const y = y_opt orelse continue;
+            if (y == 0 or y >= MAX_TRACKED_VREGS or y == x) continue;
+            const dst = b.insts[m].dest;
+            if (dst == 0 or dst >= MAX_TRACKED_VREGS) continue;
+
+            // Verify x is not modified between di_idx and m
+            var x_safe = true;
+            for (di_idx..m + 1) |chk_k| {
+                if (b.insts[chk_k].dest == x) {
+                    x_safe = false;
+                    break;
+                }
+            }
+            if (!x_safe) continue;
+            if (f.vreg_count >= MAX_TRACKED_VREGS - 4) continue;
+
+            if (m == di_idx + 2) {
+                const fresh_s = f.vreg_count;
+                f.vreg_count += 1;
+                b.insts[di_idx] = .{ .op = .bit_xor, .dest = tmp_x, .src1 = y, .src2 = x };
+                b.insts[di_idx + 1] = .{ .op = inst_shr.op, .dest = fresh_s, .src1 = x, .src2 = shift };
+                b.insts[di_idx + 2] = .{ .op = .bit_xor, .dest = dst, .src1 = fresh_s, .src2 = tmp_x };
+                def_cnt[tmp_x] = 1;
+                use_cnt[tmp_x] = 1;
+                if (fresh_s < MAX_TRACKED_VREGS) {
+                    def_cnt[fresh_s] = 1;
+                    use_cnt[fresh_s] = 1;
+                }
+                changed = true;
+            } else if (m == di_idx + 3) {
+                const mid_inst = b.insts[di_idx + 2];
+                if (mid_inst.dest != y) continue;
+                if (!isPureHeaderOp(mid_inst.op)) continue;
+                if (mid_inst.dest == x or mid_inst.dest == shift) continue;
+                if (mid_inst.src1 == tmp_s or mid_inst.src1 == tmp_x or
+                    mid_inst.src2 == tmp_s or mid_inst.src2 == tmp_x) continue;
+
+                const fresh_s = f.vreg_count;
+                f.vreg_count += 1;
+                b.insts[di_idx] = mid_inst;
+                b.insts[di_idx + 1] = .{ .op = .bit_xor, .dest = tmp_x, .src1 = y, .src2 = x };
+                b.insts[di_idx + 2] = .{ .op = inst_shr.op, .dest = fresh_s, .src1 = x, .src2 = shift };
+                b.insts[di_idx + 3] = .{ .op = .bit_xor, .dest = dst, .src1 = fresh_s, .src2 = tmp_x };
+                def_cnt[tmp_x] = 1;
+                use_cnt[tmp_x] = 1;
+                if (fresh_s < MAX_TRACKED_VREGS) {
+                    def_cnt[fresh_s] = 1;
+                    use_cnt[fresh_s] = 1;
+                }
                 changed = true;
             }
         }
@@ -2484,6 +3219,12 @@ fn isPureHeaderOp(op: IROp) bool {
         .bit_xor,
         .bit_not,
         .logic_not,
+        .shl,
+        .shr,
+        .ushr,
+        .@"mod",
+        .umod,
+        .select,
         .cmp_eq,
         .cmp_ne,
         .cmp_lt,
@@ -2637,7 +3378,7 @@ fn rotateLoops(f: *IRFn) bool {
 
 fn unrollCountedLoops(f: *IRFn) bool {
     if (f.block_count < 2 or f.block_count + 4 > MAX_BLOCKS_PER_FN) return false;
-    if (f.vreg_count + 64 >= MAX_TRACKED_VREGS) return false;
+    if (f.vreg_count + 128 >= MAX_TRACKED_VREGS) return false;
 
     var def_cnt: [MAX_TRACKED_VREGS]u16 = undefined;
     isSingleDefVregTable(f, &def_cnt);
@@ -2682,7 +3423,8 @@ fn unrollCountedLoops(f: *IRFn) bool {
         if (exit_bi >= f.block_count) continue;
 
         const cmp_inst = b.insts[b.inst_count - 2];
-        if (cmp_inst.op != .cmp_lt or cmp_inst.dest == 0 or cmp_inst.dest != term.src1) continue;
+        if ((cmp_inst.op != .cmp_lt and cmp_inst.op != .cmp_le) or cmp_inst.dest == 0 or cmp_inst.dest != term.src1) continue;
+        const cmp_op = cmp_inst.op;
         const iv = cmp_inst.src1;
         const limit = cmp_inst.src2;
         if (iv == 0 or limit == 0 or iv == limit) continue;
@@ -2710,11 +3452,14 @@ fn unrollCountedLoops(f: *IRFn) bool {
         // Verify `iv` is incremented by constant +1 and not read inside body after update
         const iv_inst = b.insts[iv_def_idx];
         var step_ok = false;
+        var const_one: u16 = 0;
         if (iv_inst.op == .add) {
             if (iv_inst.src1 == iv and iv_inst.src2 < MAX_TRACKED_VREGS and const_known[iv_inst.src2] and const_val[iv_inst.src2] == 1) {
                 step_ok = true;
+                const_one = iv_inst.src2;
             } else if (iv_inst.src2 == iv and iv_inst.src1 < MAX_TRACKED_VREGS and const_known[iv_inst.src1] and const_val[iv_inst.src1] == 1) {
                 step_ok = true;
+                const_one = iv_inst.src1;
             }
         }
         if (!step_ok) continue;
@@ -2770,18 +3515,23 @@ fn unrollCountedLoops(f: *IRFn) bool {
         const ok4_v = f.vreg_count + 4;
         const cmp4_v = f.vreg_count + 5;
         const cmpt_v = f.vreg_count + 6;
-        f.vreg_count += 7;
+        const uf_v = f.vreg_count + 7;
+        f.vreg_count += 8;
+
+        const unroll_factor: u16 = if (body_len <= 6 and f.vreg_count + body_len * 8 + 32 < MAX_TRACKED_VREGS) 8 else 4;
+        const unroll_m: i64 = @as(i64, unroll_factor) - 1;
 
         f.blocks[b_chk_min].inst_count = 3;
         f.blocks[b_chk_min].insts[0] = .{ .op = .const_int, .dest = c_min_v, .imm = -9000000000000000000 };
         f.blocks[b_chk_min].insts[1] = .{ .op = .cmp_ge, .dest = ok_min_v, .src1 = limit, .src2 = c_min_v };
         f.blocks[b_chk_min].insts[2] = .{ .op = .cond_jump, .src1 = ok_min_v, .target_block = b_chk_4x, .alt_block = b_tail_hdr };
 
-        f.blocks[b_chk_4x].inst_count = 4;
-        f.blocks[b_chk_4x].insts[0] = .{ .op = .const_int, .dest = c3_v, .imm = 3 };
-        f.blocks[b_chk_4x].insts[1] = .{ .op = .sub, .dest = limit_m3_v, .src1 = limit, .src2 = c3_v };
-        f.blocks[b_chk_4x].insts[2] = .{ .op = .cmp_lt, .dest = ok4_v, .src1 = iv, .src2 = limit_m3_v };
-        f.blocks[b_chk_4x].insts[3] = .{ .op = .cond_jump, .src1 = ok4_v, .target_block = b_4x, .alt_block = b_tail_hdr };
+        f.blocks[b_chk_4x].inst_count = 5;
+        f.blocks[b_chk_4x].insts[0] = .{ .op = .const_int, .dest = c3_v, .imm = unroll_m };
+        f.blocks[b_chk_4x].insts[1] = .{ .op = .const_int, .dest = uf_v, .imm = unroll_factor };
+        f.blocks[b_chk_4x].insts[2] = .{ .op = .sub, .dest = limit_m3_v, .src1 = limit, .src2 = c3_v };
+        f.blocks[b_chk_4x].insts[3] = .{ .op = cmp_op, .dest = ok4_v, .src1 = iv, .src2 = limit_m3_v };
+        f.blocks[b_chk_4x].insts[4] = .{ .op = .cond_jump, .src1 = ok4_v, .target_block = b_4x, .alt_block = b_tail_hdr };
 
         // Identify loop-local single-def temps (defined & only read within this body after definition)
         var blk_def_cnt: [MAX_TRACKED_VREGS]u16 = .{0} ** MAX_TRACKED_VREGS;
@@ -2807,48 +3557,213 @@ fn unrollCountedLoops(f: *IRFn) bool {
             if (bi_inst.src1 > 0 and bi_inst.src1 < MAX_TRACKED_VREGS) body_uses[bi_inst.src1] +|= 1;
             if (bi_inst.src2 > 0 and bi_inst.src2 < MAX_TRACKED_VREGS) body_uses[bi_inst.src2] +|= 1;
         }
-        var is_local_temp: [MAX_TRACKED_VREGS]bool = .{false} ** MAX_TRACKED_VREGS;
+        var is_defined_in_body: [MAX_TRACKED_VREGS]bool = .{false} ** MAX_TRACKED_VREGS;
+        var is_loop_carried: [MAX_TRACKED_VREGS]bool = .{false} ** MAX_TRACKED_VREGS;
+        is_loop_carried[iv] = true;
+        var iv_read_in_body = false;
         for (0..body_len) |ii| {
-            const d = b.insts[ii].dest;
-            if (d > 0 and d < MAX_TRACKED_VREGS and d != iv and def_cnt[d] == 1 and
-                blk_def_cnt[d] == 1 and body_uses[d] == total_uses[d])
-            {
-                // Make sure it is not read before it is defined in the loop body
-                var read_before = false;
-                for (0..ii) |prev_i| {
-                    if (instReadsVreg(b.insts[prev_i], d)) {
-                        read_before = true;
-                        break;
+            const bi_inst = b.insts[ii];
+            if (!(bi_inst.dest == iv and bi_inst.op == .add) and instReadsVreg(bi_inst, iv)) {
+                iv_read_in_body = true;
+            }
+            const s1 = bi_inst.src1;
+            if (s1 > 0 and s1 < MAX_TRACKED_VREGS and !is_defined_in_body[s1]) is_loop_carried[s1] = true;
+            const s2 = bi_inst.src2;
+            if (s2 > 0 and s2 < MAX_TRACKED_VREGS and !is_defined_in_body[s2]) is_loop_carried[s2] = true;
+            for (0..@min(bi_inst.arg_count, bi_inst.args.len)) |ai| {
+                const a = bi_inst.args[ai];
+                if (a > 0 and a < MAX_TRACKED_VREGS and !is_defined_in_body[a]) is_loop_carried[a] = true;
+            }
+            if (bi_inst.dest > 0 and bi_inst.dest < MAX_TRACKED_VREGS) {
+                is_defined_in_body[bi_inst.dest] = true;
+            }
+        }
+
+        var cur_map: [MAX_TRACKED_VREGS]u16 = undefined;
+        for (0..MAX_TRACKED_VREGS) |k| cur_map[k] = @intCast(k);
+        var iv_mul_dest: [MAX_INSTS_PER_BLOCK]u16 = .{0} ** MAX_INSTS_PER_BLOCK;
+        var iv_mul_const: [MAX_INSTS_PER_BLOCK]u16 = .{0} ** MAX_INSTS_PER_BLOCK;
+        var iv_mul_fed: [MAX_INSTS_PER_BLOCK]bool = .{false} ** MAX_INSTS_PER_BLOCK;
+        var iv_add_for_mul: [MAX_INSTS_PER_BLOCK]u16 = .{0} ** MAX_INSTS_PER_BLOCK;
+        var iv_add_dest: [MAX_INSTS_PER_BLOCK]u16 = .{0} ** MAX_INSTS_PER_BLOCK;
+        var iv_add_inv: [MAX_INSTS_PER_BLOCK]bool = .{false} ** MAX_INSTS_PER_BLOCK;
+        var iv_add_inv_dest: [MAX_INSTS_PER_BLOCK]u16 = .{0} ** MAX_INSTS_PER_BLOCK;
+
+        for (0..body_len) |ii| {
+            const bi_inst = b.insts[ii];
+            if (bi_inst.op == .mul) {
+                var c_side: u16 = 0;
+                if (bi_inst.src1 == iv and bi_inst.src2 > 0 and bi_inst.src2 < MAX_TRACKED_VREGS and const_known[bi_inst.src2]) {
+                    c_side = bi_inst.src2;
+                } else if (bi_inst.src2 == iv and bi_inst.src1 > 0 and bi_inst.src1 < MAX_TRACKED_VREGS and const_known[bi_inst.src1]) {
+                    c_side = bi_inst.src1;
+                }
+                if (c_side != 0) {
+                    iv_mul_const[ii] = c_side;
+                    for (ii + 1..body_len) |chk_add| {
+                        const ai = b.insts[chk_add];
+                        if (ai.op == .add) {
+                            if (ai.src1 == bi_inst.dest) {
+                                if (ai.src2 > 0 and ai.src2 < MAX_TRACKED_VREGS and blk_def_cnt[ai.src2] == 0) {
+                                    iv_mul_fed[ii] = true;
+                                    iv_add_for_mul[chk_add] = @intCast(ii + 1);
+                                    break;
+                                }
+                            } else if (ai.src2 == bi_inst.dest) {
+                                if (ai.src1 > 0 and ai.src1 < MAX_TRACKED_VREGS and blk_def_cnt[ai.src1] == 0) {
+                                    iv_mul_fed[ii] = true;
+                                    iv_add_for_mul[chk_add] = @intCast(ii + 1);
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
-                if (!read_before) is_local_temp[d] = true;
+            } else if (bi_inst.op == .add and bi_inst.dest != iv) {
+                if (bi_inst.src1 == iv and bi_inst.src2 > 0 and bi_inst.src2 < MAX_TRACKED_VREGS and blk_def_cnt[bi_inst.src2] == 0) {
+                    iv_add_inv[ii] = true;
+                } else if (bi_inst.src2 == iv and bi_inst.src1 > 0 and bi_inst.src1 < MAX_TRACKED_VREGS and blk_def_cnt[bi_inst.src1] == 0) {
+                    iv_add_inv[ii] = true;
+                }
             }
+        }
+
+        var all_iv_reads_handled = true;
+        for (0..body_len) |ii| {
+            const bi_inst = b.insts[ii];
+            if (bi_inst.dest == iv and bi_inst.op == .add) continue;
+            if (instReadsVreg(bi_inst, iv)) {
+                if (iv_mul_const[ii] != 0 and iv_mul_fed[ii]) {
+                    // handled by iv_add_for_mul in subsequent reps
+                } else if (iv_add_inv[ii]) {
+                    // handled by iv_add_inv in subsequent reps
+                } else {
+                    all_iv_reads_handled = false;
+                }
+            }
+        }
+
+        var iv_rep_vregs: [8]u16 = .{0} ** 8;
+        iv_rep_vregs[0] = iv;
+        var iv_rep_k_vregs: [8]u16 = .{0} ** 8;
+        if (iv_read_in_body and !all_iv_reads_handled) {
+            var r: usize = 1;
+            while (r < unroll_factor) : (r += 1) {
+                if (f.vreg_count + 2 < MAX_TRACKED_VREGS) {
+                    const k_v = f.vreg_count;
+                    f.vreg_count += 1;
+                    const r_iv = f.vreg_count;
+                    f.vreg_count += 1;
+                    iv_rep_k_vregs[r] = k_v;
+                    iv_rep_vregs[r] = r_iv;
+                }
+            }
+            all_iv_reads_handled = true;
         }
 
         var w4: u16 = 0;
         var rep: usize = 0;
-        while (rep < 4) : (rep += 1) {
-            var temp_map: [MAX_TRACKED_VREGS]u16 = .{0} ** MAX_TRACKED_VREGS;
+        while (rep < unroll_factor) : (rep += 1) {
+            if (rep > 0 and iv_rep_vregs[rep] != 0 and w4 + 2 < MAX_INSTS_PER_BLOCK - 32) {
+                const r_iv = iv_rep_vregs[rep];
+                const k_v = iv_rep_k_vregs[rep];
+                f.blocks[b_4x].insts[w4] = .{ .op = .const_int, .dest = k_v, .imm = @intCast(rep) };
+                w4 += 1;
+                f.blocks[b_4x].insts[w4] = .{ .op = .add, .dest = r_iv, .src1 = iv, .src2 = k_v };
+                w4 += 1;
+                cur_map[iv] = r_iv;
+            } else if (rep == 0) {
+                cur_map[iv] = iv;
+            }
             for (0..body_len) |ii| {
                 var ni = b.insts[ii];
-                if (ni.src1 > 0 and ni.src1 < MAX_TRACKED_VREGS and temp_map[ni.src1] != 0) ni.src1 = temp_map[ni.src1];
-                if (ni.src2 > 0 and ni.src2 < MAX_TRACKED_VREGS and temp_map[ni.src2] != 0) ni.src2 = temp_map[ni.src2];
-                if (ni.dest > 0 and ni.dest < MAX_TRACKED_VREGS and is_local_temp[ni.dest] and f.vreg_count < MAX_TRACKED_VREGS) {
-                    const fv = f.vreg_count;
-                    f.vreg_count += 1;
-                    temp_map[ni.dest] = fv;
-                    ni.dest = fv;
+                if (ni.src1 > 0 and ni.src1 < MAX_TRACKED_VREGS) ni.src1 = cur_map[ni.src1];
+                if (ni.src2 > 0 and ni.src2 < MAX_TRACKED_VREGS) ni.src2 = cur_map[ni.src2];
+                for (0..@min(ni.arg_count, ni.args.len)) |ai| {
+                    if (ni.args[ai] > 0 and ni.args[ai] < MAX_TRACKED_VREGS) ni.args[ai] = cur_map[ni.args[ai]];
                 }
-                f.blocks[b_4x].insts[w4] = ni;
+
+                if ((!iv_read_in_body or all_iv_reads_handled) and ni.dest == iv and ni.op == .add) {
+                    continue;
+                }
+
+                if (rep > 0 and iv_mul_const[ii] != 0 and iv_mul_fed[ii]) {
+                    continue;
+                }
+
+                if (ni.dest > 0 and ni.dest < MAX_TRACKED_VREGS) {
+                    if (ni.op == .copy and ni.src1 > 0 and ni.src1 < MAX_TRACKED_VREGS) {
+                        cur_map[ni.dest] = ni.src1;
+                        continue;
+                    }
+                    if (f.vreg_count < MAX_TRACKED_VREGS) {
+                        const fv = f.vreg_count;
+                        f.vreg_count += 1;
+                        cur_map[ni.dest] = fv;
+                        ni.dest = fv;
+                    }
+                }
+
+                if (iv_mul_const[ii] != 0) {
+                    if (rep == 0) {
+                        iv_mul_dest[ii] = ni.dest;
+                    } else if (iv_mul_dest[ii] != 0) {
+                        ni.op = .add;
+                        ni.src1 = iv_mul_dest[ii];
+                        ni.src2 = iv_mul_const[ii];
+                        iv_mul_dest[ii] = ni.dest;
+                    }
+                } else if (iv_add_for_mul[ii] != 0) {
+                    const orig_mul: usize = @as(usize, iv_add_for_mul[ii]) - 1;
+                    if (rep == 0) {
+                        iv_add_dest[ii] = ni.dest;
+                    } else if (iv_add_dest[ii] != 0) {
+                        ni.op = .add;
+                        ni.src1 = iv_add_dest[ii];
+                        ni.src2 = iv_mul_const[orig_mul];
+                        iv_add_dest[ii] = ni.dest;
+                    }
+                } else if (iv_add_inv[ii]) {
+                    if (rep == 0) {
+                        iv_add_inv_dest[ii] = ni.dest;
+                    } else if (const_one != 0 and iv_add_inv_dest[ii] != 0) {
+                        ni.op = .add;
+                        ni.src1 = iv_add_inv_dest[ii];
+                        ni.src2 = const_one;
+                        iv_add_inv_dest[ii] = ni.dest;
+                    }
+                }
+
+                if (w4 < MAX_INSTS_PER_BLOCK - 32) {
+                    f.blocks[b_4x].insts[w4] = ni;
+                    w4 += 1;
+                }
+            }
+        }
+
+        // Emit write-backs for loop-carried variables that were updated in the unrolled repetitions
+        if ((!iv_read_in_body or all_iv_reads_handled) and w4 < MAX_INSTS_PER_BLOCK - 2) {
+            f.blocks[b_4x].insts[w4] = .{ .op = .add, .dest = iv, .src1 = iv, .src2 = uf_v };
+            w4 += 1;
+        }
+
+        for (0..MAX_TRACKED_VREGS) |orig_v| {
+            if (orig_v == iv and (!iv_read_in_body or all_iv_reads_handled)) continue;
+            if (cur_map[orig_v] != orig_v and blk_def_cnt[orig_v] > 0 and
+                is_loop_carried[orig_v] and
+                w4 < MAX_INSTS_PER_BLOCK - 2)
+            {
+                f.blocks[b_4x].insts[w4] = .{ .op = .copy, .dest = @intCast(orig_v), .src1 = cur_map[orig_v] };
                 w4 += 1;
             }
         }
-        f.blocks[b_4x].insts[w4] = .{ .op = .cmp_lt, .dest = cmp4_v, .src1 = iv, .src2 = limit_m3_v };
+
+        f.blocks[b_4x].insts[w4] = .{ .op = cmp_op, .dest = cmp4_v, .src1 = iv, .src2 = limit_m3_v };
         f.blocks[b_4x].insts[w4 + 1] = .{ .op = .cond_jump, .src1 = cmp4_v, .target_block = b_4x, .alt_block = b_tail_hdr };
         f.blocks[b_4x].inst_count = w4 + 2;
 
         f.blocks[b_tail_hdr].inst_count = 2;
-        f.blocks[b_tail_hdr].insts[0] = .{ .op = .cmp_lt, .dest = cmpt_v, .src1 = iv, .src2 = limit };
+        f.blocks[b_tail_hdr].insts[0] = .{ .op = cmp_op, .dest = cmpt_v, .src1 = iv, .src2 = limit };
         f.blocks[b_tail_hdr].insts[1] = .{ .op = .cond_jump, .src1 = cmpt_v, .target_block = bi, .alt_block = exit_bi };
 
         changed = true;

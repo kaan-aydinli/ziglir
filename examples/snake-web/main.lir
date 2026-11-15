@@ -1,0 +1,144 @@
+// ════════════════════════════════════════════════════════════════════════════
+// LIR Snake Arcade — Pure LIR Web GUI Application Server
+//
+// 100% LIR ile yazılmış HTTP sunucusu.
+// Linux x86-64 sistem çağrıları ile 0.0.0.0:8080 portunu dinler
+// ve modern HTML5 Canvas GUI Yılan Oyunu sunar.
+//
+// Derleme:    ./bin/lir build examples/snake-web/main.lir -O2 -o bin/snake_web
+// Çalıştırma:  ./bin/snake_web
+// ════════════════════════════════════════════════════════════════════════════
+
+proc readHtmlFile(path: string, out_buf: *u8, max_len: i64) -> i64 {
+    // sys_open(path, O_RDONLY=0, 0)
+    let fd = @syscall(2, path.ptr as i64, 0, 0)
+    guard fd >= 0 else return 0
+
+    var total: i64 = 0
+    var reading = true
+    while reading {
+        let chunk_ptr = @ptr_add(out_buf, total)
+        // sys_read(fd, chunk, rem)
+        let n = @syscall(0, fd, chunk_ptr as i64, max_len - total)
+        if n <= 0 {
+            reading = false
+        } else {
+            total += n
+            if total >= max_len {
+                reading = false
+            }
+        }
+    }
+    // sys_close(fd)
+    let _c = @syscall(3, fd, 0, 0)
+    return total
+}
+
+proc main() -> i64 {
+    println("====================================================")
+    println("  LIR SNAKE ARCADE — WEB GUI SUNUCUSU")
+    println("====================================================")
+
+    // HTML GUI dosyasını belleğe yükle
+    let html_buf = @malloc(65536)
+    let html_len = readHtmlFile("examples/snake-web/web/index.html", html_buf, 65536)
+
+    guard html_len > 0 else {
+        println("Hata: index.html dosyasi yuklenemedi!")
+        return 1
+    }
+
+    print("HTML GUI dosyasi yuklendi: ")
+    printInt(html_len)
+    println(" bayt")
+
+    // TCP Soketi oluştur: sys_socket(AF_INET=2, SOCK_STREAM=1, 0)
+    let server_fd = @syscall(41, 2, 1, 0)
+    guard server_fd >= 0 else {
+        println("Hata: TCP soket olusturulamadi")
+        return 1
+    }
+
+    // SO_REUSEADDR: setsockopt(fd, SOL_SOCKET=1, SO_REUSEADDR=2, &1, 4)
+    let opt_buf = @malloc(8)
+    let opt_ptr: *i64 = opt_buf as *i64
+    *opt_ptr = 1
+    let _s = @syscall(54, server_fd, 1, 2, opt_buf as i64, 4)
+    @free(opt_buf)
+
+    // sockaddr_in (16 bayt): AF_INET=2, port 8080 = 0x901F (big endian)
+    let addr = @malloc(32)
+    @memset(addr, 0, 32)
+    let p_fam: *i64 = @ptr_add(addr, 0) as *i64
+    *p_fam = 2
+    let p_port: *i64 = @ptr_add(addr, 2) as *i64
+    *p_port = 36895 // 8080 portu
+
+    // sys_bind(server_fd, addr, 16)
+    let b_res = @syscall(49, server_fd, addr as i64, 16)
+    @free(addr)
+    guard b_res >= 0 else {
+        println("Hata: 0.0.0.0:8080 portuna baglanilamadi (Port mesgul olabilir)")
+        return 1
+    }
+
+    // sys_listen(server_fd, 16)
+    let l_res = @syscall(50, server_fd, 16, 0)
+    guard l_res >= 0 else {
+        println("Hata: Dinleme baslatilamadi")
+        return 1
+    }
+
+    println("LIR Web GUI Sunucusu 0.0.0.0:8080 portunda dinliyor...")
+    println("Tarayicinizdan http://localhost:8080 adresine girerek oyunu oynayabilirsiniz.")
+
+    let req_buf = @malloc(2048)
+
+    // İstemci kabul ve yanıt döngüsü
+    while true {
+        // sys_accept(server_fd, 0, 0)
+        let client_fd = @syscall(43, server_fd, 0, 0)
+        if client_fd >= 0 {
+            // İstemci isteğini oku
+            let req_len = @syscall(0, client_fd, req_buf as i64, 2048)
+            if req_len > 0 {
+                // Basit yol denetimi: /api/status mu yoksa HTML mi?
+                let first_byte: *u8 = req_buf as *u8
+                // İstek içinde 'api' var mı kontrolü
+                var is_api = false
+                var i: i64 = 0
+                until i >= req_len - 10 {
+                    let p: *u8 = @ptr_add(req_buf, i) as *u8
+                    if *p == 97 { // 'a'
+                        let p1: *u8 = @ptr_add(req_buf, i + 1) as *u8
+                        let p2: *u8 = @ptr_add(req_buf, i + 2) as *u8
+                        if *p1 == 112 and *p2 == 105 { // "api"
+                            is_api = true
+                            break
+                        }
+                    }
+                    i += 1
+                }
+
+                if is_api {
+                    let api_hdr = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
+                    let api_body = "{\"engine\":\"LIR Systems Language\",\"version\":\"2.2.0\",\"game\":\"Snake Arcade\",\"status\":\"running\"}\n"
+                    let _w1 = @syscall(1, client_fd, api_hdr.ptr as i64, api_hdr.len)
+                    let _w2 = @syscall(1, client_fd, api_body.ptr as i64, api_body.len)
+                    println("[LIR HTTP] GET /api/status -> 200 OK (JSON)")
+                } else {
+                    let html_hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n"
+                    let _w1 = @syscall(1, client_fd, html_hdr.ptr as i64, html_hdr.len)
+                    let _w2 = @syscall(1, client_fd, html_buf as i64, html_len)
+                    println("[LIR HTTP] GET / -> 200 OK (Snake Web GUI)")
+                }
+            }
+            // sys_close(client_fd)
+            let _cl = @syscall(3, client_fd, 0, 0)
+        }
+    }
+
+    @free(req_buf)
+    @free(html_buf)
+    return 0
+}
