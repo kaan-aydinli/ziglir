@@ -599,6 +599,99 @@ pub const math_src =
     \\    }
     \\    return count
     \\}
+    \\fn factorial_i64(n: i64) -> i64 {
+    \\    if n <= 1 { return 1 }
+    \\    if n > 20 { return 0 }
+    \\    var res: i64 = 1
+    \\    var i: i64 = 2
+    \\    while i <= n {
+    \\        res *= i
+    \\        i += 1
+    \\    }
+    \\    return res
+    \\}
+    \\fn fibonacci_i64(n: i64) -> i64 {
+    \\    if n <= 0 { return 0 }
+    \\    if n == 1 { return 1 }
+    \\    var a: i64 = 0
+    \\    var b: i64 = 1
+    \\    var i: i64 = 2
+    \\    while i <= n {
+    \\        let c = a + b
+    \\        a = b
+    \\        b = c
+    \\        i += 1
+    \\    }
+    \\    return b
+    \\}
+    \\fn pow_f(base: f64, exp: i64) -> f64 {
+    \\    if exp == 0 { return 1.0 }
+    \\    var b = base
+    \\    var e = exp
+    \\    var inv = false
+    \\    if e < 0 {
+    \\        inv = true
+    \\        e = 0 - e
+    \\    }
+    \\    var res: f64 = 1.0
+    \\    while e > 0 {
+    \\        if (e & 1) != 0 { res *= b }
+    \\        e >>= 1
+    \\        if e > 0 { b *= b }
+    \\    }
+    \\    if inv { return 1.0 / res }
+    \\    return res
+    \\}
+    \\fn exp_f(x: f64) -> f64 {
+    \\    if x == 0.0 { return 1.0 }
+    \\    var term: f64 = 1.0
+    \\    var sum: f64 = 1.0
+    \\    var i: i64 = 1
+    \\    while i <= 24 {
+    \\        term = term * x / (i as f64)
+    \\        sum += term
+    \\        i += 1
+    \\    }
+    \\    return sum
+    \\}
+    \\fn ln_f(x: f64) -> f64 {
+    \\    if x <= 0.0 { return 0.0 }
+    \\    var val = x
+    \\    var k: i64 = 0
+    \\    while val > 2.0 {
+    \\        val /= 2.0
+    \\        k += 1
+    \\    }
+    \\    while val < 0.5 {
+    \\        val *= 2.0
+    \\        k -= 1
+    \\    }
+    \\    let y = (val - 1.0) / (val + 1.0)
+    \\    let y2 = y * y
+    \\    var term = y
+    \\    var sum = y
+    \\    var i: i64 = 3
+    \\    while i <= 21 {
+    \\        term *= y2
+    \\        sum += term / (i as f64)
+    \\        i += 2
+    \\    }
+    \\    return 2.0 * sum + (k as f64) * 0.6931471805599453
+    \\}
+    \\fn atan_f(x: f64) -> f64 {
+    \\    if x > 1.0 { return 1.5707963267948966 - atan_f(1.0 / x) }
+    \\    if x < -1.0 { return -1.5707963267948966 - atan_f(1.0 / x) }
+    \\    let x2 = x * x
+    \\    return x / (1.0 + 0.28 * x2)
+    \\}
+    \\fn atan2_f(y: f64, x: f64) -> f64 {
+    \\    if x > 0.0 { return atan_f(y / x) }
+    \\    if x < 0.0 and y >= 0.0 { return atan_f(y / x) + 3.141592653589793 }
+    \\    if x < 0.0 and y < 0.0 { return atan_f(y / x) - 3.141592653589793 }
+    \\    if x == 0.0 and y > 0.0 { return 1.5707963267948966 }
+    \\    if x == 0.0 and y < 0.0 { return -1.5707963267948966 }
+    \\    return 0.0
+    \\}
 ;
 
 pub const testing_src =
@@ -1052,6 +1145,52 @@ pub const str_src =
     \\    }
     \\    return pi == pn
     \\}
+    \\
+    \\fn str_trim_left(s: string) -> string {
+    \\    let n = @string_len(s)
+    \\    var lo: i64 = 0
+    \\    while lo < n {
+    \\        let ch = @string_char_at(s, lo)
+    \\        if ch != 32 and ch != 9 and ch != 10 and ch != 13 { break }
+    \\        lo += 1
+    \\    }
+    \\    return @string_sub(s, lo, n - lo)
+    \\}
+    \\
+    \\fn str_trim_right(s: string) -> string {
+    \\    let n = @string_len(s)
+    \\    var hi: i64 = n
+    \\    while hi > 0 {
+    \\        let ch = @string_char_at(s, hi - 1)
+    \\        if ch != 32 and ch != 9 and ch != 10 and ch != 13 { break }
+    \\        hi -= 1
+    \\    }
+    \\    return @string_sub(s, 0, hi)
+    \\}
+    \\
+    \\fn str_capitalize(s: string) -> string {
+    \\    let n = @string_len(s)
+    \\    if n <= 0 { return "" }
+    \\    let buf = @malloc(n + 1)
+    \\    if buf == 0 as *u8 { return s }
+    \\    var first = @string_char_at(s, 0)
+    \\    if first >= 97 and first <= 122 { first -= 32 }
+    \\    @write_u8(buf, first)
+    \\    var i: i64 = 1
+    \\    while i < n {
+    \\        var ch = @string_char_at(s, i)
+    \\        if ch >= 65 and ch <= 90 { ch += 32 }
+    \\        @write_u8(@ptr_add(buf, i), ch)
+    \\        i += 1
+    \\    }
+    \\    let res = @string_new(buf, n)
+    \\    @free(buf)
+    \\    return res
+    \\}
+    \\
+    \\fn str_join(a: string, sep: string, b: string) -> string {
+    \\    return a + sep + b
+    \\}
 ;
 
 pub const algo_src =
@@ -1269,6 +1408,47 @@ pub const algo_src =
     \\        i += 1
     \\    }
     \\    return out
+    \\}
+    \\
+    \\fn is_sorted_i64(arr: *u8) -> bool {
+    \\    let n = @array_len(arr)
+    \\    if n <= 1 { return true }
+    \\    var i: i64 = 1
+    \\    while i < n {
+    \\        if @array_get(arr, i) < @array_get(arr, i - 1) { return false }
+    \\        i += 1
+    \\    }
+    \\    return true
+    \\}
+    \\
+    \\fn count_occurrences_i64(arr: *u8, val: i64) -> i64 {
+    \\    let n = @array_len(arr)
+    \\    var count: i64 = 0
+    \\    var i: i64 = 0
+    \\    while i < n {
+    \\        if @array_get(arr, i) == val { count += 1 }
+    \\        i += 1
+    \\    }
+    \\    return count
+    \\}
+    \\
+    \\fn find_index_i64(arr: *u8, val: i64) -> i64 {
+    \\    let n = @array_len(arr)
+    \\    var i: i64 = 0
+    \\    while i < n {
+    \\        if @array_get(arr, i) == val { return i }
+    \\        i += 1
+    \\    }
+    \\    return -1
+    \\}
+    \\
+    \\fn fill_array_i64(arr: *u8, val: i64) {
+    \\    let n = @array_len(arr)
+    \\    var i: i64 = 0
+    \\    while i < n {
+    \\        @array_set(arr, i, val)
+    \\        i += 1
+    \\    }
     \\}
 ;
 
@@ -1621,8 +1801,16 @@ pub const collections_src =
     \\    if st == 0 as *u8 { return 0 }
     \\    return @read_u64(@ptr_add(st, 8))
     \\}
+    \\fn stack_cap(st: *u8) -> i64 {
+    \\    if st == 0 as *u8 { return 0 }
+    \\    return @read_u64(st)
+    \\}
     \\fn stack_is_empty(st: *u8) -> bool {
     \\    return stack_len(st) == 0
+    \\}
+    \\fn stack_is_full(st: *u8) -> bool {
+    \\    if st == 0 as *u8 { return true }
+    \\    return stack_len(st) >= stack_cap(st)
     \\}
     \\fn stack_push(st: *u8, val: i64) -> bool {
     \\    if st == 0 as *u8 { return false }
@@ -1650,6 +1838,17 @@ pub const collections_src =
     \\fn stack_free(st: *u8) {
     \\    if st != 0 as *u8 { @free(st) }
     \\}
+    \\
+    \\// Queue (FIFO)
+    \\fn queue_new(cap: i64) -> *u8 { return rb_new(cap) }
+    \\fn queue_cap(q: *u8) -> i64 { return rb_cap(q) }
+    \\fn queue_len(q: *u8) -> i64 { return rb_len(q) }
+    \\fn queue_is_empty(q: *u8) -> bool { return rb_is_empty(q) }
+    \\fn queue_is_full(q: *u8) -> bool { return rb_is_full(q) }
+    \\fn queue_push(q: *u8, val: i64) -> bool { return rb_push(q, val) }
+    \\fn queue_pop(q: *u8) -> i64 { return rb_pop(q) }
+    \\fn queue_peek(q: *u8) -> i64 { return rb_peek(q) }
+    \\fn queue_free(q: *u8) { rb_free(q) }
 ;
 
 pub const hash_src =

@@ -2961,7 +2961,7 @@ fn coalesceCopiesPostSSA(f: *IRFn) bool {
         var i: u16 = 0;
         while (i + 1 < b.inst_count) : (i += 1) {
             const inst0 = b.insts[i];
-            if (inst0.op == .nop or inst0.op == .phi or inst0.op.isTerminator()) continue;
+            if (inst0.op == .nop or inst0.op == .phi or inst0.op == .const_int or inst0.op.isTerminator()) continue;
             if (inst0.dest == 0 or inst0.dest >= MAX_TRACKED_VREGS) continue;
             const tmp = inst0.dest;
             if (def_cnt[tmp] != 1 or use_cnt[tmp] != 1) continue;
@@ -3643,9 +3643,38 @@ fn unrollCountedLoops(f: *IRFn) bool {
             }
         }
 
+        var iv_rep_vregs: [8]u16 = .{0} ** 8;
+        iv_rep_vregs[0] = iv;
+        var iv_rep_k_vregs: [8]u16 = .{0} ** 8;
+        if (iv_read_in_body and !all_iv_reads_handled) {
+            var r: usize = 1;
+            while (r < unroll_factor) : (r += 1) {
+                if (f.vreg_count + 2 < MAX_TRACKED_VREGS) {
+                    const k_v = f.vreg_count;
+                    f.vreg_count += 1;
+                    const r_iv = f.vreg_count;
+                    f.vreg_count += 1;
+                    iv_rep_k_vregs[r] = k_v;
+                    iv_rep_vregs[r] = r_iv;
+                }
+            }
+            all_iv_reads_handled = true;
+        }
+
         var w4: u16 = 0;
         var rep: usize = 0;
         while (rep < unroll_factor) : (rep += 1) {
+            if (rep > 0 and iv_rep_vregs[rep] != 0 and w4 + 2 < MAX_INSTS_PER_BLOCK - 32) {
+                const r_iv = iv_rep_vregs[rep];
+                const k_v = iv_rep_k_vregs[rep];
+                f.blocks[b_4x].insts[w4] = .{ .op = .const_int, .dest = k_v, .imm = @intCast(rep) };
+                w4 += 1;
+                f.blocks[b_4x].insts[w4] = .{ .op = .add, .dest = r_iv, .src1 = iv, .src2 = k_v };
+                w4 += 1;
+                cur_map[iv] = r_iv;
+            } else if (rep == 0) {
+                cur_map[iv] = iv;
+            }
             for (0..body_len) |ii| {
                 var ni = b.insts[ii];
                 if (ni.src1 > 0 and ni.src1 < MAX_TRACKED_VREGS) ni.src1 = cur_map[ni.src1];

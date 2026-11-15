@@ -3892,3 +3892,87 @@ test "diagnostics: smart suggestions for typos in keywords, enum variants, and c
         try std.testing.expectError(error.InvalidSyntax, c.compile());
     }
 }
+
+test "stdlib: expanded math functions (factorial, fibonacci, pow_f, exp_f, ln_f)" {
+    const src =
+        \\import std::math
+        \\fn main() -> i64 {
+        \\    let f5 = factorial_i64(5)
+        \\    let fib7 = fibonacci_i64(7)
+        \\    let p = pow_f(2.0, 10)
+        \\    let e = exp_f(1.0)
+        \\    let lne = ln_f(e)
+        \\    printInt(f5)
+        \\    printInt(fib7)
+        \\    printInt(p as i64)
+        \\    printInt((e * 1000.0) as i64)
+        \\    printInt((lne * 1000.0) as i64)
+        \\    return 0
+        \\}
+    ;
+    const elf = try compileSourceWithOpt(src, .O2);
+    defer std.testing.allocator.free(elf);
+    const run_res = try runElfCapture(std.testing.allocator, elf, "math_exp");
+    defer std.testing.allocator.free(run_res.stdout);
+    try std.testing.expectEqual(@as(u8, 0), run_res.exit_code);
+    try std.testing.expectEqualStrings("120\n13\n1024\n2718\n1000\n", run_res.stdout);
+}
+
+test "stdlib: expanded algo functions (is_sorted_i64, count_occurrences_i64, find_index_i64, fill_array_i64)" {
+    const src =
+        \\import std::algo
+        \\fn main() -> i64 {
+        \\    let arr = @array_new(4)
+        \\    @array_push(arr, 10)
+        \\    @array_push(arr, 20)
+        \\    @array_push(arr, 20)
+        \\    @array_push(arr, 30)
+        \\    if is_sorted_i64(arr) { println("sorted") }
+        \\    printInt(count_occurrences_i64(arr, 20))
+        \\    printInt(find_index_i64(arr, 30))
+        \\    printInt(find_index_i64(arr, 99))
+        \\    return 0
+        \\}
+    ;
+    const elf = try compileSourceWithOpt(src, .O2);
+    defer std.testing.allocator.free(elf);
+    const run_res = try runElfCapture(std.testing.allocator, elf, "algo_exp");
+    defer std.testing.allocator.free(run_res.stdout);
+    try std.testing.expectEqual(@as(u8, 0), run_res.exit_code);
+    try std.testing.expectEqualStrings("sorted\n2\n3\n-1\n", run_res.stdout);
+}
+
+test "stdlib: expanded str and collections (trim, capitalize, join, queue, stack)" {
+    const src =
+        \\import std::str
+        \\import std::collections
+        \\fn main() -> i64 {
+        \\    let s1 = str_trim_left("  hi")
+        \\    let s2 = str_trim_right("hi  ")
+        \\    let s3 = str_capitalize("hello world")
+        \\    let s4 = str_join("a", "-", "b")
+        \\    println(s1)
+        \\    println(s2)
+        \\    println(s3)
+        \\    println(s4)
+        \\    let q = queue_new(2)
+        \\    let _ok1 = queue_push(q, 42)
+        \\    let _ok2 = queue_push(q, 99)
+        \\    if queue_is_full(q) { println("q_full") }
+        \\    printInt(queue_pop(q))
+        \\    printInt(queue_pop(q))
+        \\    if queue_is_empty(q) { println("q_empty") }
+        \\    queue_free(q)
+        \\    let st = stack_new(3)
+        \\    printInt(stack_cap(st))
+        \\    stack_free(st)
+        \\    return 0
+        \\}
+    ;
+    const elf = try compileSourceWithOpt(src, .O2);
+    defer std.testing.allocator.free(elf);
+    const run_res = try runElfCapture(std.testing.allocator, elf, "str_coll_exp");
+    defer std.testing.allocator.free(run_res.stdout);
+    try std.testing.expectEqual(@as(u8, 0), run_res.exit_code);
+    try std.testing.expectEqualStrings("hi\nhi\nHello world\na-b\nq_full\n42\n99\nq_empty\n3\n", run_res.stdout);
+}

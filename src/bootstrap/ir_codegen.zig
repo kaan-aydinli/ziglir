@@ -1349,7 +1349,7 @@ pub const IRCodegen = struct {
                             }
                         }
                     }
-                } else if (inst.op == .@"mod" and
+                } else if ((inst.op == .@"mod" or inst.op == .umod) and
                     !(inst.src2 > 0 and inst.src2 < MAX_VREGS and self.vreg_const_known[inst.src2]))
                 {
                     if (inst.dest > 0 and inst.dest < MAX_VREGS and !self.vreg_crosses_call[inst.dest]) {
@@ -3421,8 +3421,8 @@ pub const IRCodegen = struct {
                 self.emit8(0x48);
                 self.emit8(0xF7);
                 self.emit8(0xF1); // div rcx
-                if (inst.op == .umod) self.movRegReg(0, 2);
-                self.storeRegToVreg(0, inst.dest);
+                const res_reg: u8 = if (inst.op == .umod) 2 else 0;
+                self.storeRegToVreg(res_reg, inst.dest);
             },
             .shl, .shr, .ushr => {
                 if (inst.src2 > 0 and inst.src2 < MAX_VREGS and self.vreg_const_known[inst.src2]) {
@@ -3451,7 +3451,8 @@ pub const IRCodegen = struct {
                     if (self.vregPhys(inst.dest) == null) self.storeRegToVreg(dst_reg, inst.dest);
                     return;
                 }
-                self.loadVregToReg(inst.src1, 0);
+                const dst_reg: u8 = self.vregPhys(inst.dest) orelse 0;
+                self.loadVregToReg(inst.src1, dst_reg);
                 self.loadVregToReg(inst.src2, 1);
                 self.cur_rcx_const = null;
                 self.emitCmpRegImm32(1, 64);
@@ -3459,15 +3460,16 @@ pub const IRCodegen = struct {
                 self.emit8(0x02); // jb +2 (unsigned < 64)
                 self.emit8(0x0F);
                 self.emit8(0x0B); // ud2 (trap on < 0 or >= 64 shift)
-                self.emit8(0x48);
+                self.emit8(if (dst_reg >= 8) 0x49 else 0x48);
                 self.emit8(0xD3);
-                self.emit8(switch (inst.op) {
-                    .shl => 0xE0,
-                    .shr => 0xF8,
-                    .ushr => 0xE8,
-                    else => 0xE0,
-                });
-                self.storeRegToVreg(0, inst.dest);
+                const subop: u8 = switch (inst.op) {
+                    .shl => 4,
+                    .shr => 7,
+                    .ushr => 5,
+                    else => 4,
+                };
+                self.emit8(0xC0 | (subop << 3) | (dst_reg & 7));
+                if (self.vregPhys(inst.dest) == null) self.storeRegToVreg(dst_reg, inst.dest);
             },
             .sext8 => {
                 self.loadVregToReg(inst.src1, 0);
@@ -3486,11 +3488,12 @@ pub const IRCodegen = struct {
                 self.storeRegToVreg(0, inst.dest);
             },
             .sext32 => {
-                self.loadVregToReg(inst.src1, 0);
-                self.emit8(0x48);
+                const dst_reg: u8 = self.vregPhys(inst.dest) orelse 0;
+                self.loadVregToReg(inst.src1, dst_reg);
+                self.emitRex(dst_reg, dst_reg);
                 self.emit8(0x63);
-                self.emit8(0xC0); // movsxd rax, eax
-                self.storeRegToVreg(0, inst.dest);
+                self.emitModRM(3, dst_reg, dst_reg); // movsxd dst_reg, dst_reg
+                if (self.vregPhys(inst.dest) == null) self.storeRegToVreg(dst_reg, inst.dest);
             },
             .zext8 => {
                 self.loadVregToReg(inst.src1, 0);
@@ -3509,10 +3512,12 @@ pub const IRCodegen = struct {
                 self.storeRegToVreg(0, inst.dest);
             },
             .zext32 => {
-                self.loadVregToReg(inst.src1, 0);
+                const dst_reg: u8 = self.vregPhys(inst.dest) orelse 0;
+                self.loadVregToReg(inst.src1, dst_reg);
+                if (dst_reg >= 8) self.emit8(0x45); // REX.R & REX.B for r8..r15
                 self.emit8(0x89);
-                self.emit8(0xC0); // mov eax, eax
-                self.storeRegToVreg(0, inst.dest);
+                self.emitModRM(3, dst_reg & 7, dst_reg & 7); // mov dst32, dst32 (zero-extends to 64-bit)
+                if (self.vregPhys(inst.dest) == null) self.storeRegToVreg(dst_reg, inst.dest);
             },
 
             // ── IEEE-754 Floating-Point (SSE2, f64 bits in 64-bit GPR vregs) ──
@@ -6236,21 +6241,42 @@ pub const IRCodegen = struct {
         }
 
         const r2_opt = self.vregPhys(s2);
-        if (rd_opt != null and r1_opt != null and r2_opt != null) {
+        if (rd_opt != null) {
             const rd = rd_opt.?;
-            const r1 = r1_opt.?;
-            const r2 = r2_opt.?;
-            if (op == .add and rd != r1 and rd != r2 and r2 != 4) {
-                self.emitLeaRegIdxScale(rd, r1, r2, 0);
-                return;
+            if (r1_opt != null and r2_opt != null) {
+                const r1 = r1_opt.?;
+                const r2 = r2_opt.?;
+                if (op == .add and rd != r1 and rd != r2 and r2 != 4) {
+                    self.emitLeaRegIdxScale(rd, r1, r2, 0);
+                    return;
+                }
+                if (rd != r2) {
+                    self.movRegReg(rd, r1);
+                    self.emitBinRegReg(op, rd, r2);
+                    return;
+                } else if (isCommutative(op)) {
+                    self.emitBinRegReg(op, rd, r1);
+                    return;
+                }
             }
-            if (rd != r2) {
-                self.movRegReg(rd, r1);
-                self.emitBinRegReg(op, rd, r2);
+            const scratch: u8 = if (rd == 11) 10 else 11;
+            if (r1_opt != null and r1_opt.? == rd) {
+                self.loadVregToReg(s2, scratch);
+                self.emitBinRegReg(op, rd, scratch);
                 return;
-            } else if (isCommutative(op)) {
-                // rd == r2 and commutative: op rd, r1
-                self.emitBinRegReg(op, rd, r1);
+            } else if (isCommutative(op) and r2_opt != null and r2_opt.? == rd) {
+                self.loadVregToReg(s1, scratch);
+                self.emitBinRegReg(op, rd, scratch);
+                return;
+            } else if (r2_opt != null and r2_opt.? == rd) {
+                self.loadVregToReg(s1, scratch);
+                self.emitBinRegReg(op, scratch, rd);
+                self.movRegReg(rd, scratch);
+                return;
+            } else {
+                self.loadVregToReg(s1, rd);
+                self.loadVregToReg(s2, scratch);
+                self.emitBinRegReg(op, rd, scratch);
                 return;
             }
         }
