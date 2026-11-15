@@ -1,0 +1,400 @@
+// ════════════════════════════════════════════════════════════════════════════
+// LIR Snake Arcade — Pure LIR Terminal GUI Game
+//
+// %100 LIR dilinde yazılmıştır.
+// Harici kütüphane veya C bağımlılığı yoktur.
+// ANSI renkleri ve imleç konumlandırma ile terminalde akıcı GUI sunar.
+//
+// Derleme:    ./bin/lir build examples/snake-tui/main.lir -O2 -o bin/snake_tui
+// Çalıştırma:  ./bin/snake_tui
+// ════════════════════════════════════════════════════════════════════════════
+
+proc getVal(buf: *i64, idx: i64) -> i64 {
+    let p: *i64 = @ptr_add(buf, idx * 8) as *i64
+    return *p
+}
+
+proc setVal(buf: *i64, idx: i64, val: i64) {
+    let p: *i64 = @ptr_add(buf, idx * 8) as *i64
+    *p = val
+}
+
+proc printSpaces(n: i64) {
+    var i = 0
+    until i >= n {
+        print(" ")
+        i += 1
+    }
+}
+
+proc printHLine(n: i64) {
+    var i = 0
+    until i >= n {
+        print("─")
+        i += 1
+    }
+}
+
+// Satır sonu eklemeden tekil basamak yazdırma
+proc printDigit(d: i64) {
+    match d {
+        0 => print("0")
+        1 => print("1")
+        2 => print("2")
+        3 => print("3")
+        4 => print("4")
+        5 => print("5")
+        6 => print("6")
+        7 => print("7")
+        8 => print("8")
+        else => print("9")
+    }
+}
+
+// Satır sonu eklemeden tam sayı yazdırma (GUI hizalaması için)
+proc printNum(n: i64) {
+    if n < 0 {
+        print("-")
+        printNum(-n)
+        return
+    }
+    if n >= 10 {
+        printNum(n / 10)
+    }
+    printDigit(n % 10)
+}
+
+proc randInt(st: *i64, max_val: i64) -> i64 {
+    guard max_val > 0 else return 0
+    let cur = getVal(st, 14)
+    let next = (cur * 6364136223846793005 + 1442695040888963407) & 9223372036854775807
+    setVal(st, 14, next)
+    let v = next % max_val
+    return v >= 0 ? v : -v
+}
+
+proc isSnakeAt(sx: *i64, sy: *i64, len: i64, x: i64, y: i64) -> bool {
+    var i = 0
+    until i >= len {
+        if getVal(sx, i) == x and getVal(sy, i) == y {
+            return true
+        }
+        i += 1
+    }
+    return false
+}
+
+proc spawnFood(st: *i64, sx: *i64, sy: *i64) {
+    let w = getVal(st, 0)
+    let h = getVal(st, 1)
+    let len = getVal(st, 4)
+
+    var tries = 0
+    until tries >= 100 {
+        let fx = randInt(st, w - 2) + 1
+        let fy = randInt(st, h - 2) + 1
+        unless isSnakeAt(sx, sy, len, fx, fy) {
+            setVal(st, 9, fx)
+            setVal(st, 10, fy)
+            return
+        }
+        tries += 1
+    }
+    setVal(st, 9, 2)
+    setVal(st, 10, 2)
+}
+
+proc resetGame(st: *i64, sx: *i64, sy: *i64) {
+    let w = getVal(st, 0)
+    let h = getVal(st, 1)
+
+    setVal(st, 2, 0)   // score = 0
+    setVal(st, 4, 4)   // len = 4
+    setVal(st, 5, 1)   // dir_x = 1
+    setVal(st, 6, 0)   // dir_y = 0
+    setVal(st, 7, 1)   // next_dir_x = 1
+    setVal(st, 8, 0)   // next_dir_y = 0
+    setVal(st, 11, 0)  // game_over = 0
+    setVal(st, 12, 0)  // paused = 0
+    setVal(st, 13, 90) // speed_ms = 90
+
+    let start_x = w / 2
+    let start_y = h / 2
+
+    var i = 0
+    until i >= 4 {
+        setVal(sx, i, start_x - i)
+        setVal(sy, i, start_y)
+        i += 1
+    }
+
+    spawnFood(st, sx, sy)
+}
+
+proc updateGame(st: *i64, sx: *i64, sy: *i64) {
+    guard getVal(st, 11) == 0 and getVal(st, 12) == 0 else return
+
+    let w = getVal(st, 0)
+    let h = getVal(st, 1)
+    let dir_x = getVal(st, 7)
+    let dir_y = getVal(st, 8)
+    setVal(st, 5, dir_x)
+    setVal(st, 6, dir_y)
+
+    let nhx = getVal(sx, 0) + dir_x
+    let nhy = getVal(sy, 0) + dir_y
+    let len = getVal(st, 4)
+
+    // Duvara çarpışma kontrolü
+    guard nhx >= 0 and nhx < w and nhy >= 0 and nhy < h else {
+        setVal(st, 11, 1) // game_over = 1
+        let sc = getVal(st, 2)
+        if sc > getVal(st, 3) { setVal(st, 3, sc) }
+        return
+    }
+
+    // Kendine çarpışma kontrolü
+    var i = 0
+    until i >= len - 1 {
+        if getVal(sx, i) == nhx and getVal(sy, i) == nhy {
+            setVal(st, 11, 1) // game_over = 1
+            let sc = getVal(st, 2)
+            if sc > getVal(st, 3) { setVal(st, 3, sc) }
+            return
+        }
+        i += 1
+    }
+
+    // Yem yeme kontrolü
+    let food_x = getVal(st, 9)
+    let food_y = getVal(st, 10)
+    let ate = (nhx == food_x and nhy == food_y)
+
+    if ate {
+        let new_score = getVal(st, 2) + 10
+        setVal(st, 2, new_score)
+        if new_score > getVal(st, 3) { setVal(st, 3, new_score) }
+
+        if len < 580 {
+            setVal(st, 4, len + 1)
+        }
+
+        let cur_spd = getVal(st, 13)
+        if cur_spd > 45 and (new_score % 30 == 0) {
+            setVal(st, 13, cur_spd - 5)
+        }
+
+        spawnFood(st, sx, sy)
+    }
+
+    // Gövde kaydırma
+    let cur_len = getVal(st, 4)
+    var seg = cur_len - 1
+    until seg <= 0 {
+        setVal(sx, seg, getVal(sx, seg - 1))
+        setVal(sy, seg, getVal(sy, seg - 1))
+        seg -= 1
+    }
+
+    setVal(sx, 0, nhx)
+    setVal(sy, 0, nhy)
+}
+
+proc handleInput(st: *i64, sx: *i64, sy: *i64) -> bool {
+    let key = @read_key()
+    guard key > 0 else return true
+
+    let dir_x = getVal(st, 5)
+    let dir_y = getVal(st, 6)
+
+    // ESC dizisi (Ok tuşları)
+    if key == 27 {
+        let k2 = @read_key()
+        if k2 == 91 {
+            let k3 = @read_key()
+            if k3 == 65 and dir_y != 1 { setVal(st, 7, 0); setVal(st, 8, -1) } // Yukarı
+            if k3 == 66 and dir_y != -1 { setVal(st, 7, 0); setVal(st, 8, 1) } // Aşağı
+            if k3 == 67 and dir_x != -1 { setVal(st, 7, 1); setVal(st, 8, 0) } // Sağ
+            if k3 == 68 and dir_x != 1 { setVal(st, 7, -1); setVal(st, 8, 0) } // Sol
+        }
+        return true
+    }
+
+    // W / w (Yukarı)
+    if (key == 119 or key == 87) and dir_y != 1 {
+        setVal(st, 7, 0)
+        setVal(st, 8, -1)
+        return true
+    }
+    // S / s (Aşağı)
+    if (key == 115 or key == 83) and dir_y != -1 {
+        setVal(st, 7, 0)
+        setVal(st, 8, 1)
+        return true
+    }
+    // D / d (Sağ)
+    if (key == 100 or key == 68) and dir_x != -1 {
+        setVal(st, 7, 1)
+        setVal(st, 8, 0)
+        return true
+    }
+    // A / a (Sol)
+    if (key == 97 or key == 65) and dir_x != 1 {
+        setVal(st, 7, -1)
+        setVal(st, 8, 0)
+        return true
+    }
+    // P / p (Duraklat)
+    if key == 112 or key == 80 {
+        let pz = getVal(st, 12)
+        setVal(st, 12, pz == 0 ? 1 : 0)
+        return true
+    }
+    // R / r (Yeniden Başlat)
+    if key == 114 or key == 82 {
+        resetGame(st, sx, sy)
+        return true
+    }
+    // Q / q (Çıkış)
+    if key == 113 or key == 81 {
+        return false
+    }
+
+    return true
+}
+
+proc render(st: *i64, sx: *i64, sy: *i64) {
+    let w = getVal(st, 0)
+    let h = getVal(st, 1)
+    let score = getVal(st, 2)
+    let high = getVal(st, 3)
+    let len = getVal(st, 4)
+    let dir_x = getVal(st, 5)
+    let dir_y = getVal(st, 6)
+    let food_x = getVal(st, 9)
+    let food_y = getVal(st, 10)
+    let game_over = getVal(st, 11)
+    let paused = getVal(st, 12)
+
+    // İmleci sol üste taşı (titremesiz tam sayfa güncelleme)
+    print("\x1b[H")
+
+    // Üst Çerçeve
+    print("\x1b[38;5;61m╭")
+    printHLine(w * 2 + 2)
+    print("╮\x1b[0m\n")
+
+    // Başlık ve Skor Paneli
+    print("\x1b[38;5;61m│\x1b[0m ")
+    print("\x1b[38;5;196m●\x1b[38;5;220m●\x1b[38;5;46m●\x1b[0m ")
+    print("\x1b[1m\x1b[38;5;51mLIR SNAKE\x1b[0m")
+    print(" │ \x1b[38;5;250mSkor: \x1b[1m\x1b[38;5;226m")
+    printNum(score)
+    print("\x1b[0m │ \x1b[38;5;250mEn İyi: \x1b[1m\x1b[38;5;214m")
+    printNum(high)
+    print("\x1b[0m │ \x1b[38;5;250mBoy: \x1b[38;5;46m")
+    printNum(len)
+    print("\x1b[0m")
+    printSpaces(8)
+    print("\x1b[38;5;61m│\x1b[0m\n")
+
+    // Ayırıcı
+    print("\x1b[38;5;61m├")
+    printHLine(w * 2 + 2)
+    print("┤\x1b[0m\n")
+
+    // Oyun Alanı Grid Çizimi
+    let hx = getVal(sx, 0)
+    let hy = getVal(sy, 0)
+
+    var y = 0
+    until y >= h {
+        print("\x1b[38;5;61m│\x1b[0m ")
+        var x = 0
+        until x >= w {
+            if x == hx and y == hy {
+                // Yılan Başı
+                if game_over != 0 {
+                    print("\x1b[38;5;196m☠ \x1b[0m")
+                } else if dir_x == 1 {
+                    print("\x1b[1m\x1b[38;5;46m► \x1b[0m")
+                } else if dir_x == -1 {
+                    print("\x1b[1m\x1b[38;5;46m◄ \x1b[0m")
+                } else if dir_y == -1 {
+                    print("\x1b[1m\x1b[38;5;46m▲ \x1b[0m")
+                } else {
+                    print("\x1b[1m\x1b[38;5;46m▼ \x1b[0m")
+                }
+            } else if x == food_x and y == food_y {
+                // Yem (Kırmızı elma)
+                print("\x1b[1m\x1b[38;5;196m🍎\x1b[0m")
+            } else if isSnakeAt(sx, sy, len, x, y) {
+                // Yılan Gövdesi
+                print("\x1b[38;5;34m🟩\x1b[0m")
+            } else {
+                // Boş Hücre
+                print("\x1b[38;5;236m ·\x1b[0m")
+            }
+            x += 1
+        }
+        print(" \x1b[38;5;61m│\x1b[0m\n")
+        y += 1
+    }
+
+    // Alt Ayırıcı
+    print("\x1b[38;5;61m├")
+    printHLine(w * 2 + 2)
+    print("┤\x1b[0m\n")
+
+    // Durum Çubuğu
+    print("\x1b[38;5;61m│\x1b[0m ")
+    if game_over != 0 {
+        print("\x1b[48;5;196m\x1b[1m\x1b[38;5;255m OYUN BİTTİ! \x1b[0m  \x1b[38;5;226m[R] Yeniden\x1b[0m  \x1b[38;5;245m[Q] Çıkış\x1b[0m        ")
+    } else if paused != 0 {
+        print("\x1b[48;5;208m\x1b[1m\x1b[38;5;0m DURAKLATILDI \x1b[0m  \x1b[38;5;250m[P] Devam\x1b[0m   \x1b[38;5;245m[Q] Çıkış\x1b[0m        ")
+    } else {
+        print("\x1b[38;5;51m[W/A/S/D / Oklar]\x1b[0m Yön  \x1b[38;5;220m[P]\x1b[0m Duraklat  \x1b[38;5;196m[Q]\x1b[0m Çıkış ")
+    }
+    print(" \x1b[38;5;61m│\x1b[0m\n")
+
+    print("\x1b[38;5;61m╰")
+    printHLine(w * 2 + 2)
+    print("╯\x1b[0m\n")
+}
+
+proc main() -> i64 {
+    // Terminali ayarla: Alternatif ekrana geç, imleci gizle, ekranı temizle
+    print("\x1b[?1049h\x1b[?25l\x1b[2J")
+
+    // Non-blocking stdin modunu etkinleştir: fcntl(0, F_SETFL=4, O_NONBLOCK=2048)
+    let _nb = @syscall(72, 0, 4, 2048)
+
+    // State dizisi:
+    // 0: w, 1: h, 2: score, 3: high, 4: len, 5: dir_x, 6: dir_y,
+    // 7: next_dir_x, 8: next_dir_y, 9: food_x, 10: food_y,
+    // 11: game_over, 12: paused, 13: speed_ms, 14: rng
+    var st: [16]i64 = [0; 16]
+    var sx: [600]i64 = [0; 600]
+    var sy: [600]i64 = [0; 600]
+
+    setVal(&st[0], 0, 24)         // w = 24
+    setVal(&st[0], 1, 15)         // h = 15
+    setVal(&st[0], 14, 987654321) // rng seed
+
+    resetGame(&st[0], &sx[0], &sy[0])
+
+    var running = true
+    while running {
+        running = handleInput(&st[0], &sx[0], &sy[0])
+        unless getVal(&st[0], 11) != 0 or getVal(&st[0], 12) != 0 {
+            updateGame(&st[0], &sx[0], &sy[0])
+        }
+        render(&st[0], &sx[0], &sy[0])
+        @sleep_ms(getVal(&st[0], 13))
+    }
+
+    // Terminali geri yükle: İmleci göster, alternatif ekrandan çık
+    print("\x1b[?25h\x1b[?1049l\x1b[0m\n")
+    println("LIR Snake Arcade oyununu oynadığınız için teşekkürler!")
+    return 0
+}

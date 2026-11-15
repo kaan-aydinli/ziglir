@@ -363,6 +363,9 @@ pub const Compiler = struct {
             self.emitDiag(&diag, &loaded);
             return err;
         };
+        if (diag.count > 0) {
+            self.emitDiag(&diag, &loaded);
+        }
         if (self.emit_ir) {
             ir_module.dumpModule(self.source);
         }
@@ -383,6 +386,10 @@ pub const Compiler = struct {
             self.emitDiag(&diag, &loaded);
             return err;
         };
+
+        if (diag.count > 0) {
+            self.emitDiag(&diag, &loaded);
+        }
 
         if (self.emit_ir) {
             ir_module.dumpModule(self.source);
@@ -406,6 +413,10 @@ pub const Compiler = struct {
             return err;
         };
 
+        if (diag.count > 0) {
+            self.emitDiag(&diag, &loaded);
+        }
+
         if (self.emit_ir) {
             ir_module.dumpModule(self.source);
         }
@@ -427,6 +438,10 @@ pub const Compiler = struct {
             self.emitDiag(&diag, &loaded);
             return err;
         };
+
+        if (diag.count > 0) {
+            self.emitDiag(&diag, &loaded);
+        }
 
         if (self.emit_ir) {
             ir_module.dumpModule(self.source);

@@ -198,3 +198,48 @@ pub fn powWrapping(base: i64, exponent: i64) ?i64 {
     }
     return result;
 }
+
+/// Computes the Levenshtein edit distance between two strings with case-insensitive comparison.
+pub fn levenshteinDistance(a: []const u8, b: []const u8) usize {
+    if (a.len == 0) return b.len;
+    if (b.len == 0) return a.len;
+    if (a.len > 64 or b.len > 64) {
+        if (std.mem.startsWith(u8, a, b) or std.mem.startsWith(u8, b, a)) {
+            return @max(a.len, b.len) - @min(a.len, b.len);
+        }
+        return 100;
+    }
+    var row: [65]usize = undefined;
+    for (0..b.len + 1) |j| row[j] = j;
+
+    for (0..a.len) |i| {
+        var prev = row[0];
+        row[0] = i + 1;
+        for (0..b.len) |j| {
+            const old_row_j = row[j + 1];
+            const cost: usize = if (std.ascii.toLower(a[i]) == std.ascii.toLower(b[j])) 0 else 1;
+            const ins = row[j] + 1;
+            const del = row[j + 1] + 1;
+            const sub = prev + cost;
+            row[j + 1] = @min(ins, @min(del, sub));
+            prev = old_row_j;
+        }
+    }
+    return row[b.len];
+}
+
+/// Finds the closest matching identifier in a candidate list, if within max_dist.
+pub fn findSimilarName(name: []const u8, candidates: []const []const u8, max_dist: usize) ?[]const u8 {
+    var best_name: ?[]const u8 = null;
+    var best_dist: usize = max_dist + 1;
+    for (candidates) |cand| {
+        if (cand.len == 0 or std.mem.eql(u8, name, cand)) continue;
+        const dist = levenshteinDistance(name, cand);
+        if (dist <= max_dist and dist < best_dist) {
+            best_dist = dist;
+            best_name = cand;
+        }
+    }
+    return best_name;
+}
+

@@ -549,6 +549,17 @@ pub const IRGen = struct {
         self.curFn().param_count = pi;
 
         self.cur_block_idx = self.newBlock();
+        if (self.ast.findContract(ast_idx)) |contract| {
+            if (contract.pre_expr != 0) {
+                const cond_v = self.genExpr(contract.pre_expr);
+                const b_ok = self.newBlock();
+                const b_trap = self.newBlock();
+                self.emit(.{ .op = .cond_jump, .src1 = cond_v, .target_block = b_ok, .alt_block = b_trap });
+                self.cur_block_idx = b_trap;
+                self.emit(.{ .op = .unreachable_trap });
+                self.cur_block_idx = b_ok;
+            }
+        }
         if (fn_node.child2 != 0) {
             self.genBlockRoot(fn_node.child2, false, true);
         }

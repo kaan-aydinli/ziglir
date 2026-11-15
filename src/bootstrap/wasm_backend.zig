@@ -826,6 +826,14 @@ fn emitUserFn(sec: *Buf, alloc: std.mem.Allocator, module: *const IRModule, sour
                     try b.lget(vreg_base + inst.src1);
                     try b.lset(vreg_base + inst.dest);
                 },
+                .select => {
+                    try b.lget(vreg_base + inst.src2);
+                    try b.lget(vreg_base + (if (inst.arg_count > 0) inst.args[0] else 0));
+                    try b.lget(vreg_base + inst.src1);
+                    try b.b(OP_I32_WRAP_I64);
+                    try b.b(OP_SELECT);
+                    try b.lset(vreg_base + inst.dest);
+                },
                 .load_local => {
                     const slot_idx: u32 = if (inst.slot > 0) inst.slot - 1 else 0;
                     if (inst.slot > 0 and inst.slot < f.local_addr_taken.len and f.local_addr_taken[inst.slot]) {

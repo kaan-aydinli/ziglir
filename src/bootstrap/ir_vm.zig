@@ -514,6 +514,12 @@ pub const VMState = struct {
                     .const_int => vregs[inst.dest] = @bitCast(inst.imm),
                     .const_str => vregs[inst.dest] = self.str_vaddrs[inst.str_idx],
                     .copy => vregs[inst.dest] = vregs[inst.src1],
+                    .select => {
+                        const cond = if (inst.src1 < vregs.len) vregs[inst.src1] else 0;
+                        const false_v = if (inst.arg_count > 0 and inst.args[0] < vregs.len) vregs[inst.args[0]] else 0;
+                        const true_v = if (inst.src2 < vregs.len) vregs[inst.src2] else 0;
+                        if (inst.dest < vregs.len) vregs[inst.dest] = if (cond != 0) true_v else false_v;
+                    },
                     .load_local => {
                         const slot_idx: u64 = if (inst.slot > 0) @as(u64, inst.slot) - 1 else 0;
                         if (inst.slot > 0 and inst.slot < f.local_addr_taken.len and f.local_addr_taken[inst.slot]) {

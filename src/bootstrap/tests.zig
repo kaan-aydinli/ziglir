@@ -876,6 +876,22 @@ test "lexer recognizes low-level systems keywords without splitting identifiers"
     }
 }
 
+test "lexer recognizes distinctive keywords: guard, unless, until, proc" {
+    const source = "guard unless until proc guard_mode";
+    const lexer = try std.testing.allocator.create(lexer_mod.Lexer);
+    defer std.testing.allocator.destroy(lexer);
+    lexer.* = lexer_mod.Lexer.init(source);
+    lexer.tokenize();
+
+    const expected = [_]lexer_mod.TokenKind{
+        .kw_guard, .kw_unless, .kw_until, .kw_fn, .identifier, .eof,
+    };
+    try std.testing.expectEqual(expected.len, lexer.token_count);
+    for (expected, 0..) |kind, i| {
+        try std.testing.expectEqual(kind, lexer.get(@intCast(i)).kind);
+    }
+}
+
 test "lexer supports radix literals, char literals, and nested block comments" {
     const source =
         \\/* outer /* inner */ still comment */ let a = 0xFF
@@ -3463,4 +3479,366 @@ test "starter project regression tests" {
 
 test "manifest regression tests" {
     _ = @import("manifest.zig");
+}
+
+test "comprehensive stdlib modules: collections, hash, fmt, time, http, math, and string extensions" {
+    const src =
+        \\import std::collections
+        \\import std::hash
+        \\import std::fmt
+        \\import std::time
+        \\import std::http
+        \\import std::str
+        \\import std::algo
+        \\import std::math
+        \\
+        \\fn main() -> i64 {
+        \\    let rb = rb_new(4)
+        \\    rb_push(rb, 100)
+        \\    rb_push(rb, 200)
+        \\    printInt(rb_len(rb))
+        \\    printInt(rb_pop(rb))
+        \\    printInt(rb_pop(rb))
+        \\    rb_free(rb)
+        \\
+        \\    let bs = bitset_new(64)
+        \\    bitset_set(bs, 42)
+        \\    printInt(bitset_test(bs, 42) ? 1 : 0)
+        \\    printInt(bitset_test(bs, 43) ? 1 : 0)
+        \\    printInt(bitset_count(bs))
+        \\    bitset_free(bs)
+        \\
+        \\    let hp = heap_new(8)
+        \\    heap_push(hp, 30)
+        \\    heap_push(hp, 10)
+        \\    heap_push(hp, 20)
+        \\    printInt(heap_pop(hp))
+        \\    printInt(heap_pop(hp))
+        \\    printInt(heap_pop(hp))
+        \\    heap_free(hp)
+        \\
+        \\    printInt(crc32("123456789"))
+        \\    printInt(adler32("Wikipedia"))
+        \\
+        \\    println(base64_encode("Hello LIR!"))
+        \\    println(base64_decode(base64_encode("Hello LIR!")))
+        \\    println(hex_encode("LIR"))
+        \\    println(hex_decode(hex_encode("LIR")))
+        \\    println(format_bytes(1048576))
+        \\
+        \\    printInt(is_leap_year(2024) ? 1 : 0)
+        \\    printInt(is_leap_year(2023) ? 1 : 0)
+        \\    printInt(days_in_month(2024, 2))
+        \\
+        \\    println(http_status_text(200))
+        \\    println(http_parse_method("GET /index.html HTTP/1.1"))
+        \\    println(http_parse_path("GET /api/users?id=1 HTTP/1.1"))
+        \\
+        \\    printInt(str_glob_match("*.lir", "test.lir") ? 1 : 0)
+        \\    printInt(str_levenshtein("kitten", "sitting"))
+        \\    println(str_pad_left("7", 3, 48))
+        \\
+        \\    let arr = @array_new(8)
+        \\    @array_push(arr, 50)
+        \\    @array_push(arr, 20)
+        \\    @array_push(arr, 40)
+        \\    @array_push(arr, 10)
+        \\    @array_push(arr, 30)
+        \\    quick_sort_i64(arr)
+        \\    printInt(@array_get(arr, 0))
+        \\    printInt(@array_get(arr, 4))
+        \\    printInt(lower_bound_i64(arr, 30))
+        \\    @array_free(arr)
+        \\
+        \\    printInt(is_prime_i64(17) ? 1 : 0)
+        \\    printInt(is_prime_i64(18) ? 1 : 0)
+        \\    printInt(next_prime_i64(18))
+        \\    printInt(log2_i64(1024))
+        \\    printInt(log10_i64(10000))
+        \\    return 0
+        \\}
+    ;
+    const elf = try compileSource(src);
+    defer std.testing.allocator.free(elf);
+    const res = try runElfCapture(std.testing.allocator, elf, "stdlib_comprehensive");
+    defer std.testing.allocator.free(res.stdout);
+    try std.testing.expectEqual(@as(u8, 0), res.exit_code);
+    try std.testing.expectEqualStrings(
+        "2\n100\n200\n1\n0\n1\n10\n20\n30\n3421780262\n300286872\nSGVsbG8gTElSIQ==\nHello LIR!\n4c4952\nLIR\n1 MB\n1\n0\n29\nOK\nGET\n/api/users\n1\n3\n007\n10\n50\n2\n1\n0\n19\n10\n4\n",
+        res.stdout,
+    );
+}
+
+test "distinct syntax: guard, unless, until, proc compile and execute" {
+    const src =
+        \\proc check_guard(x: i64) -> i64 {
+        \\    guard x > 10 else {
+        \\        return -1
+        \\    }
+        \\    return x * 2
+        \\}
+        \\
+        \\proc check_unless(x: i64) -> i64 {
+        \\    unless x == 0 {
+        \\        return 100 / x
+        \\    } else {
+        \\        return 0
+        \\    }
+        \\}
+        \\
+        \\proc check_until(n: i64) -> i64 {
+        \\    var sum = 0
+        \\    var i = 0
+        \\    until i >= n {
+        \\        sum = sum + i
+        \\        i = i + 1
+        \\    }
+        \\    return sum
+        \\}
+        \\
+        \\proc main() -> i64 {
+        \\    printInt(check_guard(5))
+        \\    printInt(check_guard(20))
+        \\    printInt(check_unless(0))
+        \\    printInt(check_unless(4))
+        \\    printInt(check_until(10))
+        \\    let v = unless 1 == 2 { 42 } else { 99 }
+        \\    printInt(v)
+        \\    return 0
+        \\}
+    ;
+    const elf = try compileSource(src);
+    defer std.testing.allocator.free(elf);
+    const res = try runElfCapture(std.testing.allocator, elf, "distinct_syntax");
+    defer std.testing.allocator.free(res.stdout);
+    try std.testing.expectEqual(@as(u8, 0), res.exit_code);
+    try std.testing.expectEqualStrings("-1\n40\n0\n25\n45\n42\n", res.stdout);
+}
+
+test "formal verification: SPARK bounded scalar ranges compile and check statically" {
+    // 1. Valid range initialization and assignment compiles and executes correctly
+    const valid_src =
+        \\type Port = i64 range 1..65535
+        \\fn main() -> i64 {
+        \\    let p: Port = 8080
+        \\    let mut q: Port = 443
+        \\    q = 8443
+        \\    printInt(p)
+        \\    printInt(q)
+        \\    return 0
+        \\}
+    ;
+    const elf = try compileSource(valid_src);
+    defer std.testing.allocator.free(elf);
+    const res = try runElfCapture(std.testing.allocator, elf, "spark_range_valid");
+    defer std.testing.allocator.free(res.stdout);
+    try std.testing.expectEqual(@as(u8, 0), res.exit_code);
+    try std.testing.expectEqualStrings("8080\n8443\n", res.stdout);
+
+    // 2. Out-of-bounds initialization is rejected at compile time
+    try std.testing.expectError(error.TypeMismatch, compileSource(
+        \\type Port = i64 range 1..65535
+        \\fn main() -> i64 {
+        \\    let p: Port = 70000
+        \\    return p
+        \\}
+    ));
+
+    // 3. Out-of-bounds assignment is rejected at compile time
+    try std.testing.expectError(error.TypeMismatch, compileSource(
+        \\type Port = i64 range 1..65535
+        \\fn main() -> i64 {
+        \\    let mut p: Port = 80
+        \\    p = 0
+        \\    return p
+        \\}
+    ));
+
+    // 4. Out-of-bounds cast is rejected at compile time
+    try std.testing.expectError(error.TypeMismatch, compileSource(
+        \\type Port = i64 range 1..65535
+        \\fn main() -> i64 {
+        \\    let p = 70000 as Port
+        \\    return p
+        \\}
+    ));
+}
+
+test "formal verification: Ada SPARK function contracts pre and pure statically verified and runtime trapped" {
+    // 1. Valid precondition contract compiles and executes
+    const valid_pre =
+        \\#[pre(b != 0)]
+        \\fn safe_div(a: i64, b: i64) -> i64 {
+        \\    return a / b
+        \\}
+        \\fn main() -> i64 {
+        \\    printInt(safe_div(100, 5))
+        \\    return 0
+        \\}
+    ;
+    const elf = try compileSource(valid_pre);
+    defer std.testing.allocator.free(elf);
+    const res = try runElfCapture(std.testing.allocator, elf, "spark_pre_valid");
+    defer std.testing.allocator.free(res.stdout);
+    try std.testing.expectEqual(@as(u8, 0), res.exit_code);
+    try std.testing.expectEqualStrings("20\n", res.stdout);
+
+    // 2. Static precondition violation is rejected at compile time
+    try std.testing.expectError(error.TypeMismatch, compileSource(
+        \\#[pre(b != 0)]
+        \\fn safe_div(a: i64, b: i64) -> i64 {
+        \\    return a / b
+        \\}
+        \\fn main() -> i64 {
+        \\    return safe_div(100, 0)
+        \\}
+    ));
+
+    // 3. Dynamic runtime precondition violation causes deterministic hardware trap (exit 132 SIGILL)
+    const trap_pre =
+        \\#[pre(b != 0)]
+        \\fn safe_div(a: i64, b: i64) -> i64 {
+        \\    return a / b
+        \\}
+        \\fn compute_zero() -> i64 {
+        \\    var x = 10
+        \\    x = x - 10
+        \\    return x
+        \\}
+        \\fn main() -> i64 {
+        \\    let z = compute_zero()
+        \\    return safe_div(100, z)
+        \\}
+    ;
+    const trap_elf = try compileSource(trap_pre);
+    defer std.testing.allocator.free(trap_elf);
+    try runElfExpectSigIll(std.testing.allocator, trap_elf, "spark_pre_trap");
+
+    // 4. Pure function calling pure builtins and pure functions compiles and runs
+    const valid_pure =
+        \\#[pure]
+        \\fn pure_add(a: i64, b: i64) -> i64 {
+        \\    return a + b
+        \\}
+        \\#[pure]
+        \\fn pure_min_val(x: i64, y: i64) -> i64 {
+        \\    return pure_add(@min(x, y), 2)
+        \\}
+        \\fn main() -> i64 {
+        \\    printInt(pure_min_val(40, 55))
+        \\    return 0
+        \\}
+    ;
+    const pure_elf = try compileSource(valid_pure);
+    defer std.testing.allocator.free(pure_elf);
+    const pure_res = try runElfCapture(std.testing.allocator, pure_elf, "spark_pure_valid");
+    defer std.testing.allocator.free(pure_res.stdout);
+    try std.testing.expectEqual(@as(u8, 0), pure_res.exit_code);
+    try std.testing.expectEqualStrings("42\n", pure_res.stdout);
+
+    // 5. Pure function calling side-effecting builtin rejected at compile time
+    try std.testing.expectError(error.TypeMismatch, compileSource(
+        \\#[pure]
+        \\fn bad_pure(x: i64) -> i64 {
+        \\    @println("side effect")
+        \\    return x
+        \\}
+        \\fn main() -> i64 {
+        \\    return bad_pure(1)
+        \\}
+    ));
+
+    // 6. Pure function calling impure user function rejected at compile time
+    try std.testing.expectError(error.TypeMismatch, compileSource(
+        \\fn impure_helper() -> i64 {
+        \\    return 42
+        \\}
+        \\#[pure]
+        \\fn bad_caller() -> i64 {
+        \\    return impure_helper()
+        \\}
+        \\fn main() -> i64 {
+        \\    return bad_caller()
+        \\}
+    ));
+}
+
+test "smart compiler: fuzzy matching algorithms" {
+    try std.testing.expectEqual(@as(usize, 0), util.levenshteinDistance("hello", "hello"));
+    try std.testing.expectEqual(@as(usize, 0), util.levenshteinDistance("Hello", "hello"));
+    try std.testing.expectEqual(@as(usize, 1), util.levenshteinDistance("counter", "countr"));
+    try std.testing.expectEqual(@as(usize, 1), util.levenshteinDistance("my_variable", "my_variabl"));
+    try std.testing.expectEqual(@as(usize, 2), util.levenshteinDistance("my_variable", "my_varial"));
+
+    const candidates = [_][]const u8{ "counter", "count_total", "calc_sum", "print_value" };
+    const match1 = util.findSimilarName("countr", &candidates, 2);
+    try std.testing.expect(match1 != null);
+    try std.testing.expectEqualStrings("counter", match1.?);
+
+    const match2 = util.findSimilarName("calc_sun", &candidates, 2);
+    try std.testing.expect(match2 != null);
+    try std.testing.expectEqualStrings("calc_sum", match2.?);
+}
+
+test "smart compiler: did-you-mean diagnostics and unused variable warnings" {
+    // 1. Undeclared variable typo triggers UndefinedVariable
+    try std.testing.expectError(error.UndefinedVariable, compileSource(
+        \\fn main() -> i64 {
+        \\    let my_counter = 42
+        \\    return my_countr
+        \\}
+    ));
+
+    // 2. Undefined function call typo triggers UndefinedFunctionCall
+    try std.testing.expectError(error.UndefinedFunctionCall, compileSource(
+        \\fn calculate_total() -> i64 { return 100 }
+        \\fn main() -> i64 {
+        \\    return calculat_total()
+        \\}
+    ));
+
+    // 3. Unknown struct field typo triggers UnknownField
+    try std.testing.expectError(error.UnknownField, compileSource(
+        \\struct Point { x_coord: i64, y_coord: i64 }
+        \\fn main() -> i64 {
+        \\    let p = Point { x_cord: 1, y_coord: 2 }
+        \\    return p.y_coord
+        \\}
+    ));
+
+    // 4. Undefined struct name typo triggers UndefinedStruct
+    try std.testing.expectError(error.UndefinedStruct, compileSource(
+        \\struct SuperUser { id: i64 }
+        \\fn main() -> i64 {
+        \\    let u = SuperUsr { id: 1 }
+        \\    return u.id
+        \\}
+    ));
+}
+
+test "smart compiler: algebraic reassociation and identity folding" {
+    const src =
+        \\fn math_chain(x: i64) -> i64 {
+        \\    let a = x + 10
+        \\    let b = a + 20
+        \\    let c = b - 30
+        \\    return c
+        \\}
+        \\fn neg_chain(x: i64) -> i64 {
+        \\    let a = -x
+        \\    let b = -a
+        \\    return b
+        \\}
+        \\fn main() -> i64 {
+        \\    printInt(math_chain(55))
+        \\    printInt(neg_chain(99))
+        \\    return 0
+        \\}
+    ;
+    const elf = try compileSourceWithOpt(src, .O2);
+    defer std.testing.allocator.free(elf);
+    const run_res = try runElfCapture(std.testing.allocator, elf, "smart_alg");
+    defer std.testing.allocator.free(run_res.stdout);
+    try std.testing.expectEqual(@as(u8, 0), run_res.exit_code);
+    try std.testing.expectEqualStrings("55\n99\n", run_res.stdout);
 }

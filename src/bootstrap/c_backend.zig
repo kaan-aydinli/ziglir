@@ -1197,6 +1197,7 @@ pub fn emitC(alloc: std.mem.Allocator, module: *const IRModule, source: []const 
                     },
                     .const_str => try w.print("    v{d} = (uint64_t)(uintptr_t)&lir_rostr_{d}.data[0];\n", .{ inst.dest, inst.str_idx }),
                     .copy => try w.print("    v{d} = v{d};\n", .{ inst.dest, inst.src1 }),
+                    .select => try w.print("    v{d} = (v{d} != 0) ? v{d} : v{d};\n", .{ inst.dest, inst.src1, inst.src2, if (inst.arg_count > 0) inst.args[0] else 0 }),
                     .load_local => try w.print("    v{d} = slot_mem[{d}];\n", .{ inst.dest, if (inst.slot > 0) inst.slot - 1 else 0 }),
                     .store_local => try w.print("    slot_mem[{d}] = v{d};\n", .{ if (inst.slot > 0) inst.slot - 1 else 0, inst.src1 }),
                     .addr_of => try w.print("    v{d} = (uint64_t)(uintptr_t)&slot_mem[{d}];\n", .{ inst.dest, if (inst.slot > 0) inst.slot - 1 else 0 }),
