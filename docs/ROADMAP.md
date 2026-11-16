@@ -39,7 +39,41 @@ Validated status (2026-11): `zig build test` passes 115/115 unit + catalogue-con
 - [ ] Vectorization (SIMD)
 - [ ] Profile-guided optimization
 
-### Phase 3 notes: measured gaps (2026-11)
+#### Phase 3 notes: compile-time work (2026-11)
+
+Compilation is the axis where the gains in this branch are unambiguous and
+reproducible, because they are pure work-removal (no code generation change:
+-O0 and -O2 output is byte-identical to the previous compiler on the test
+corpus). Measured with `tools/compile_bench.py`, which subtracts process
+startup and alternates the two binaries sample by sample, on a 255-function
+module (the compiler's per-unit function cap) of four-statement helpers:
+
+| level | before | after | net speedup |
+|---|---|---|---|
+| `-O0` | 15.14 ms | 12.26 ms | 1.24x |
+| `-O1` | 15.92 ms | 12.00 ms | 1.33x |
+| `-O2` | 27.80 ms | 15.21 ms | 1.83x |
+
+In-process phase timers on the same input: IR optimization 2067 -> ~1200 us
+and machine-code + ELF emission 2672 -> ~620 us. The remaining per-unit cost
+is front-end dominated (lexing/parsing ~470 us, sema ~300 us, IR lowering
+~1000 us, codegen ~600 us), i.e. ordinary single-pass work rather than
+redundant table traffic.
+
+The changes are all of one kind: several passes are written against
+fixed-capacity tables (4096 vregs, 192x384 instruction slots) and cleared
+them in full on every invocation, many times per function. See
+`src/bootstrap/ir_opt.zig` (`deadCodeElimination` generation stamp,
+`localConstantFoldAndLVN` dirty list + block-generation stamp,
+`globalCopyPropagateSmall`) and `src/bootstrap/ir_codegen.zig`
+(`allocRegsForFn`/`analyzeElidedConsts` bounded by `IRFn.vreg_count`).
+
+Runtime quality is unchanged by this work. Wall-clock ratios on this shared
+VM move by more than the effects being measured (absolute throughput drifted
+~1.8x between two runs of identical binaries), so the runtime table in the
+README is left as measured earlier rather than restated from a noisy sample.
+
+## Phase 3 notes: measured gaps (2026-11)
 
 Recorded so optimizer work is tracked against evidence rather than assumed.
 Numbers come from `bench/speed_compare` measured with `tools/ab_bench.py`
