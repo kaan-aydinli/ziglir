@@ -241,5 +241,95 @@ class MutableReassignmentTests(unittest.TestCase):
                 self.assertEqual(result.stdout.strip(), "10")
 
 
+
+class OptimizationEquivalenceTests(unittest.TestCase):
+    """-O0, -O1 and -O2 must agree, and must agree with a differential oracle.
+
+    The optimizer is written against fixed-capacity tables and repeatedly runs
+    stateful passes over them; a pass that keeps stale per-function or
+    per-block state produces a plausible-looking but wrong answer instead of a
+    crash. These two gates target that failure mode directly.
+    """
+
+    def run_lir(self, source, *args):
+        with tempfile.TemporaryDirectory(prefix="lir-oeq-") as temp:
+            path = pathlib.Path(temp) / "m.lir"
+            path.write_text(textwrap.dedent(source).lstrip())
+            return subprocess.run([str(COMPILER), *args, str(path)],
+                                  capture_output=True, text=True, timeout=60)
+
+    def test_levels_agree_on_generated_functions(self):
+        """A module of many small functions exercises the per-function state
+        resets; every level must print the same values."""
+        parts = []
+        for index in range(40):
+            parts.append(
+                f"fn fn{index}(a: i64, b: i64) -> i64 {{\n"
+                f"    var x: i64 = a + b * {index % 7 + 1}\n"
+                f"    x = x * x + a\n"
+                f"    return x\n"
+                f"}}"
+            )
+        prints = "\n".join(f"    printInt(fn{i}({i + 1}, {i % 5}))" for i in range(40))
+        source = "\n".join(parts) + f"\nfn main() -> i64 {{\n{prints}\n    return 0\n}}\n"
+
+        outputs = {}
+        for level in LEVELS:
+            result = self.run_lir(source, "run", level)
+            self.assertEqual(result.returncode, 0, f"{level}: {result.stderr}")
+            outputs[level] = result.stdout
+        for level in LEVELS:
+            self.assertEqual(outputs[level], outputs["-O0"],
+                             f"{level} disagrees with -O0")
+
+    def test_random_programs_match_python_oracle(self):
+        """Random straight-line and branching programs, checked against an
+        independent Python evaluation of the same semantics."""
+        import random
+
+        rng = random.Random(20261116)
+        for case in range(25):
+            lines = ["fn work(a: i64, b: i64) -> i64 {", "    var acc: i64 = a"]
+            expected = None
+            # Emit a program whose value Python can recompute exactly.
+            acc = "a"
+            b_val = rng.randrange(1, 9)
+            a_val = rng.randrange(1, 9)
+            py = {"a": a_val, "b": b_val}
+            for _ in range(rng.randrange(3, 7)):
+                choice = rng.randrange(4)
+                const = rng.randrange(1, 6)
+                if choice == 0:
+                    lines.append(f"    acc = acc + b * {const}")
+                    acc = f"({acc}) + b*{const}"
+                elif choice == 1:
+                    lines.append(f"    if acc % {2 * const + 1} == 0 {{ acc = acc + {const} }}")
+                    acc = f"(({acc}) + {const} if ({acc}) % {2 * const + 1} == 0 else ({acc}))"
+                elif choice == 2:
+                    lines.append(f"    acc = acc - {const}")
+                    acc = f"({acc}) - {const}"
+                else:
+                    lines.append(f"    acc = acc * 2 + {const}")
+                    acc = f"({acc})*2 + {const}"
+            lines.append("    return acc")
+            lines.append("}")
+            lines.append("fn main() -> i64 {")
+            lines.append(f"    printInt(work({a_val}, {b_val}))")
+            lines.append("    return 0")
+            lines.append("}")
+            source = "\n".join(lines) + "\n"
+            expected = eval(acc, {}, py)  # noqa: S307 - fixed, generated arithmetic
+
+            with self.subTest(case=case):
+                outputs = {}
+                for level in LEVELS:
+                    result = self.run_lir(source, "run", level)
+                    self.assertEqual(result.returncode, 0, f"{level}: {result.stderr}\n{source}")
+                    outputs[level] = result.stdout.strip()
+                for level in LEVELS:
+                    self.assertEqual(outputs[level], str(expected),
+                                     f"{level} computed {outputs[level]}, expected {expected}\n{source}")
+
+
 if __name__ == "__main__":
     unittest.main()
