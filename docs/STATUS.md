@@ -64,7 +64,7 @@ see the known gaps below.
 | Gate | What it proves |
 |---|---|
 | `zig build test` | lexer/parser/sema/IR/optimizer/backends unit tests + catalogue conformance (every `supported` example compiles; `unsupported` probes are rejected; every documented builtin exists) |
-| `tests/core_test.py` | language semantics end-to-end |
+| `tests/core_test.py` | language semantics end-to-end, including that a `var`/`let mut` binding is never constant-folded across an assignment (checked at `-O0`/`-O1`/`-O2` on the native, VM, and C backends) |
 | `tests/backend_test.py` | native/wasm/C parity, traps, cross-targets |
 | `tests/cli_test.py` | CLI surface, JSON envelopes, exit codes |
 | `tests/ai_test.py` | machine contracts: schemas, catalogue consistency, stdlib imports, tour parity, repair metadata |

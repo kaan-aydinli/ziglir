@@ -156,5 +156,90 @@ class CoreTests(unittest.TestCase):
                     self.assertIn(diagnostic, result.stderr)
 
 
+
+class MutableReassignmentTests(unittest.TestCase):
+    """A `let mut`/`var` binding must never be treated as a compile-time
+    constant. The AST optimizer's constant tracker is keyed by name, so
+    tracking a mutable binding makes a later assignment look like a redundant
+    store and lets a folding pass drop it -- the variable then keeps reading
+    its initial value. These cases pin the behaviour at every optimization
+    level, which is where the bug appeared."""
+
+    def run_lir(self, source, *args):
+        with tempfile.TemporaryDirectory(prefix="lir-mut-") as temp:
+            path = pathlib.Path(temp) / "m.lir"
+            path.write_text(textwrap.dedent(source).lstrip())
+            return subprocess.run([str(COMPILER), *args, str(path)],
+                                  capture_output=True, text=True, timeout=60)
+
+    def test_assignment_inside_folded_then_branch(self):
+        # The condition folds to true, so the assignment is the only statement
+        # that reaches the print. Losing it prints 0 instead of 7.
+        source = """
+            fn main() -> i64 {
+                var a: i64 = 0
+                if 0 == 0 { a = 7 }
+                printInt(a)
+                return 0
+            }
+        """
+        for level in LEVELS:
+            for backend in ("native", "vm", "c"):
+                with self.subTest(level=level, backend=backend):
+                    result = self.run_lir(source, "run", f"--backend={backend}", level)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.strip(), "7")
+
+    def test_var_reassigned_after_constant_initializer(self):
+        source = """
+            fn main() -> i64 {
+                var a: i64 = 1
+                a = 2
+                printInt(a)
+                return 0
+            }
+        """
+        for level in LEVELS:
+            with self.subTest(level=level):
+                result = self.run_lir(source, "run", level)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), "2")
+
+    def test_immutable_let_still_folds(self):
+        # The whole point of the tracker: an immutable scalar `let` must still
+        # propagate, otherwise the fix would have traded a bug for a pessimisation.
+        source = """
+            fn main() -> i64 {
+                let c: i64 = 21
+                printInt(c * 2)
+                return 0
+            }
+        """
+        for level in LEVELS:
+            with self.subTest(level=level):
+                result = self.run_lir(source, "run", level)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), "42")
+
+    def test_mutable_reassigned_in_folded_loop(self):
+        source = """
+            fn main() -> i64 {
+                var sum: i64 = 0
+                var i: i64 = 0
+                while i < 5 {
+                    sum = sum + i
+                    i = i + 1
+                }
+                printInt(sum)
+                return 0
+            }
+        """
+        for level in LEVELS:
+            with self.subTest(level=level):
+                result = self.run_lir(source, "run", level)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), "10")
+
+
 if __name__ == "__main__":
     unittest.main()

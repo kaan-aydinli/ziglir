@@ -314,12 +314,9 @@ pub const IRCodegen = struct {
             self.overflowed = true;
             return;
         }
-        self.code[self.code_len..][0..4].* = .{
-            @truncate(v),
-            @truncate(v >> 8),
-            @truncate(v >> 16),
-            @truncate(v >> 24),
-        };
+        // One unaligned store instead of four byte stores — byte-identical
+        // output, fewer instructions on the compile path.
+        std.mem.writeInt(u32, self.code[self.code_len..][0..4], v, .little);
         self.code_len += 4;
     }
 
@@ -329,16 +326,7 @@ pub const IRCodegen = struct {
             self.overflowed = true;
             return;
         }
-        self.code[self.code_len..][0..8].* = .{
-            @truncate(v),
-            @truncate(v >> 8),
-            @truncate(v >> 16),
-            @truncate(v >> 24),
-            @truncate(v >> 32),
-            @truncate(v >> 40),
-            @truncate(v >> 48),
-            @truncate(v >> 56),
-        };
+        std.mem.writeInt(u64, self.code[self.code_len..][0..8], v, .little);
         self.code_len += 8;
     }
 
