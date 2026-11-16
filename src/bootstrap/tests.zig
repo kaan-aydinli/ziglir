@@ -4071,6 +4071,60 @@ test "cmf: nested blocks and one-line bodies are extracted verbatim" {
     }
 }
 
+test "cmf: HYPERION surface declares offload machines without claiming them" {
+    const cmf = @import("cmf.zig");
+    const source =
+        \\morph Cell =<< u8 u16 >>=
+        \\field ledger: u64[104] ?exclusive ?contiguous
+        \\lens back: reverse(ledger) as backwards
+        \\lens pivot: transpose(ledger*104) as pivot
+        \\machine local: local implemented
+        \\machine pim: pim planned
+        \\telemetry cache: every 100tick
+        \\tune narrow: morph Cell under compressible
+        \\claim writer over ledger check uniqueness
+        \\claim use over ledger for 4tick runtime local
+        \\bloom narrow: morph Cell {
+        \\fn main() -> i64 {
+        \\    let cell: @witness = 7
+        \\    return cell as i64
+        \\}
+        \\}
+    ;
+    const ir = cmf.parseField(source);
+    try std.testing.expectEqual(@as(usize, 0), ir.violation_count);
+    try std.testing.expectEqual(@as(usize, 1), ir.morph_count);
+    try std.testing.expectEqual(@as(usize, 1), ir.field_count);
+    try std.testing.expectEqual(@as(usize, 2), ir.lens_count);
+    // A planned machine never becomes an implemented one.
+    const pim = ir.machineNamed("pim") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!pim.implemented);
+    // Element cost is reported, not assumed: the transpose view is strided.
+    const pivot = ir.lensNamed("pivot") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(cmf.LensCost.strided, pivot.cost);
+    const back = ir.lensNamed("backwards") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(cmf.LensCost.sequential, back.cost);
+    // Variants are measured, so the count of executed instances is exact.
+    try std.testing.expectEqual(@as(usize, 2), ir.variant_count);
+    for (ir.variants[0..ir.variant_count]) |v| {
+        try std.testing.expect(v.verified);
+        try std.testing.expect(v.ran);
+        try std.testing.expect(v.instructions > 0);
+    }
+}
+
+test "cmf: a claim on a planned machine is refused, not downgraded" {
+    const cmf = @import("cmf.zig");
+    const source =
+        \\machine oram: oram planned
+        \\field ledger: u64[8]
+        \\claim secret over ledger for 4tick runtime oram
+    ;
+    const ir = cmf.parseField(source);
+    try std.testing.expect(ir.violation_count > 0);
+    try std.testing.expect(std.mem.indexOf(u8, ir.violations[0].text(), "not implemented") != null);
+}
+
 test "langref: unsupported entries are rejected with a diagnostic" {
     // Non-compiling spellings that a code generator might otherwise try.
     const probes = [_]struct { src: []const u8, why: []const u8 }{

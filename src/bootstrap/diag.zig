@@ -113,6 +113,10 @@ pub const Code = enum(u16) {
     cmf_claim_conflict = 8006,
     cmf_bloom_unsupported = 8007,
     cmf_variant_invalid = 8008,
+    cmf_lens_unsupported = 8009,
+    cmf_machine_unsupported = 8010,
+    cmf_telemetry_unsupported = 8011,
+    cmf_tuning_unsupported = 8012,
     // ── Internal (9000-9099) ───────────────────────────────────────────────
     internal = 9000,
 

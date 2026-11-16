@@ -710,6 +710,30 @@ const code_help = [_]CodeHelp{
         .fix = "Fix the body or narrow the morph. A refused variant is never emitted, so it can never be selected at runtime.",
     },
     .{
+        .code = "LIR-E8009",
+        .title = "Lens would break a field's promise",
+        .cause = "A lens permutes a field declared ?ordered (permutation destroys the ordering the field promises), or transposes a field already declared ?transpose, or views an undeclared field.",
+        .fix = "Filter instead of permuting an ?ordered field, declare the base layout once, and declare the field before the lens that views it.",
+    },
+    .{
+        .code = "LIR-E8010",
+        .title = "Claim depends on an unavailable machine",
+        .cause = "A machine class other than local was marked 'implemented', or a claim names an adjudicator that is neither a declared machine nor adjudicate/verify/check, or depends on a machine declared 'planned'.",
+        .fix = "Mark offload classes 'planned' and adjudicate on 'local' today. A planned machine is analysable in the field and can never discharge a claim.",
+    },
+    .{
+        .code = "LIR-E8011",
+        .title = "Telemetry that measures nothing",
+        .cause = "A telemetry period is not a positive '<n>tick', or a source is sampled but no 'tune' rule consumes it.",
+        .fix = "Use 'telemetry cache: every 100tick' and add a 'tune <bloom>: morph <M> under <condition>' rule that uses it.",
+    },
+    .{
+        .code = "LIR-E8012",
+        .title = "Tuning rule without a real target",
+        .cause = "A tune rule names a bloom that does not exist, disagrees with the bloom's morph, or selects on a measured condition while no telemetry source is declared.",
+        .fix = "Point the rule at a declared bloom whose morph matches, and declare the telemetry source that feeds the condition. Tuning only ever picks an already verified variant.",
+    },
+    .{
         .code = "LIR-E7002",
         .title = "Missing entry point",
         .cause = "The program has no 'fn main' (required unless compiling tests with --test/lir test).",

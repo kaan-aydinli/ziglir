@@ -12,7 +12,8 @@ ve `src/bootstrap/tests.zig` tarafından sabitlenmiştir.
 
 ```
 lir cmf examples/cmf/widening.cmf          # insan biçimi
-lir cmf examples/cmf/widening.cmf --json   # lir.cmf.v1
+lir cmf examples/cmf/hyperion.cmf          # HYPERION yüzeyi, alan olarak
+lir cmf examples/cmf/hyperion.cmf --json   # lir.cmf.v1
 ```
 
 ---
@@ -146,6 +147,94 @@ iddia şişirmesidir.)
 
 ---
 
+## 1.6 HYPERION alanları → CMF direktifleri
+
+HYPERION belgesindeki her katman, burada **denetlenebilir bir direktife** bağlanır.
+Kural: bir alan ya *uygulanmış* olur (denetlenir/ölçülür), ya *planlı* olarak
+ilan edilir (analiz edilir, **hiçbir iddiayı** karşılayamaz). Üçüncü yol yok.
+
+| HYPERION katmanı | CMF'de karşılığı | Durum |
+|---|---|---|
+| §1 HQTT / tip başına pJ | — (pJ bir *tipin* değil, komut dizisinin fonksiyonudur) | ❌ reddedildi, `HYPERION_ASSESSMENT.md` §1.3 |
+| §1 niyet→algoritma sentezi | `morph` + `bloom` (witness başına **gerçek** derleme) | ✅ uygulandı (`LIR-E8008`) |
+| §1.4 nedensellik konileri / bariyersizlik | `claim`, `tune`, ve dilin mevcut `spawn`/`@chan_*` grafiği | ✅ kısmen (alan tarafı denetlenir) |
+| §2 gölge zaman çizgileri | yalnızca `#[pure]` gövdeler speküle edilebilir (dilin kuralı) | 🟡 sınırlı |
+| §3.1 cebirsel lens | **`lens`** — O(1) görünüm + *ölçülen* eleman maliyeti | ✅ uygulandı (`LIR-E8009`) |
+| §3.2 Shannon sınırı sıkıştırma | — | ❌ 12× iddiası reddedildi |
+| §3.3 PIM / aktif kapsül | **`machine pim: pim planned`** | 🟡 ilan edilir, iddia edilemez (`LIR-E8010`) |
+| §4 öz-evrimleşen ikili kod | **`telemetry` + `tune`** (yalnızca *var olan* varyantı seçer) | ✅ uygulandı (`LIR-E8011/8012`) |
+| §5 kuantum-dirençli ORAM | **`machine oram: oram planned`** | ❌ Ω(log n) teoremi; ilan edilir, iddia edilemez |
+| §5 homomorfik veri düzlemi | **`machine fhe: fhe planned`** | ❌ 10³–10⁶× yavaş |
+| §6 fotonik kumaş / küresel adres uzayı | — | ❌ ışık hızı |
+| §8 2.5 ns yaşam döngüsü | — | ❌ tek DRAM erişimi 60–100 ns |
+
+### `lens` — "sıfır kopya"nın dürüst hâli
+
+```
+field ledger: u64[104] ?exclusive ?contiguous
+lens back:   reverse(ledger)            as backwards
+lens hot:    filter(ledger where > 9)   as hot
+lens pivot:  transpose(ledger*104)      as pivot
+```
+
+`lir cmf` her lens için **eleman maliyetini yazar**, çünkü görünümü kurmak O(1)
+ama üzerinde yürümek bedava değildir:
+
+| Lens | Eleman maliyeti | Neden |
+|---|---|---|
+| `reverse` | `sequential` | ters yönde de bitişik |
+| `filter` | `predicated` | ziyaret edilen her eleman için bir yüklem testi |
+| `transpose` | `strided` | stride bir cache satırını aşınca eleman başına bir satır |
+
+Ayrıca **anlam denetimi**: `?ordered` bir alanı permüte eden lens reddedilir —
+permütasyon, alanın verdiği sıralılık sözünü bozar (`LIR-E8009`).
+
+### `machine` — "donanıma gönder" iddiasının dürüst hâli
+
+```
+machine local: local implemented
+machine pim:   pim   planned
+machine fhe:   fhe   planned
+machine oram:  oram  planned
+```
+
+- `local` (bu repodaki IR VM) **tek** `implemented` sınıftır; başka bir sınıfı
+  `implemented` yazmak derleme hatasıdır (`LIR-E8010`).
+- `planned` bir makine **analiz için** ilan edilebilir, ama ona dayanan bir iddia
+  **reddedilir**. Yani HYPERION'un PIM/FHE/ORAM katmanları alanda *görünür*,
+  ama hiçbir taahhüdü sessizce üstlenemez.
+
+### `telemetry` + `tune` — öz-evrimleşmenin dürüst hâli
+
+```
+telemetry cache: every 100tick
+tune narrow: morph Cell under compressible
+```
+
+- `telemetry` bir **periyot** ilan eder (100 µs değil, 100 *tick*); gecikme iddiası
+  değildir.
+- `tune` yalnızca **zaten inşa edilmiş ve doğrulanmış** bir varyantı seçer; yeni
+  kod üretmez, JIT yapmaz, "3 çevrimde mikrokod mutasyonu" iddia etmez.
+- Tüketilmeyen bir telemetri kaynağı reddedilir (`LIR-E8011`); var olmayan bloom'a
+  ya da uyuşmayan morph'a bağlı bir kural reddedilir; ölçüme dayanan bir kural
+  telemetri kaynağı yoksa reddedilir (`LIR-E8012`).
+
+### Ölçüm — tahmin değil
+
+Doğrulanan her varyant IR VM'de **çalıştırılır** ve gerçekten yürütülen komut
+sayısı raporlanır:
+
+```
+narrow/u8   verified: type-checks + passes IR verification, then measured:
+            2 IR instructions, exit 200
+```
+
+Bu repoda "kaç çevrim/pJ sürer" sorusunun tek dürüst cevabı budur: ölçülen.
+(`HYPERION_ASSESSMENT.md` §1.3'teki tablo, gerçek donanım gecikmeleriyle
+karşılaştırmayı zaten yapıyor.)
+
+---
+
 ## 2. Ne yapar, ne yapmaz
 
 | Yapar | Yapmaz |
@@ -193,10 +282,11 @@ testlerdir; ikisi de bu repoda var.
 
 | Dosya | İçerik |
 |---|---|
-| `src/bootstrap/cmf.zig` | alan okuyucu, denetleyici, inşa edici, JSON/insan çıktısı, 7 birim testi |
-| `src/bootstrap/diag.zig` | `LIR-E8001..8008` kodları |
+| `src/bootstrap/cmf.zig` | alan okuyucu, denetleyici, inşa edici, JSON/insan çıktısı, 9 birim testi |
+| `src/bootstrap/diag.zig` | `LIR-E8001..8012` kodları |
 | `src/bootstrap/explain.zig` | `lir explain LIR-E8008` vb. |
 | `src/bootstrap/main.zig` | `lir cmf <file>` komutu |
-| `tests/ai_test.py` | `CmfTests` — 7 uçtan uca test (kabul, ret, vacuous, JSON, örnek dosya) |
-| `src/bootstrap/tests.zig` | 3 birim testi (örnek alan, reddedilen witness, iç içe bloklar) |
-| `examples/cmf/widening.cmf` | çalışan örnek |
+| `tests/ai_test.py` | `CmfTests` — 15 uçtan uca test (kabul, ret, vacuous, JSON, lens maliyeti, planlı makine, telemetri, örnek dosyalar) |
+| `src/bootstrap/tests.zig` | 5 birim testi (örnek alan, reddedilen witness, iç içe bloklar, HYPERION yüzeyi, planlı makine) |
+| `examples/cmf/widening.cmf` | minimal çalışan örnek |
+| `examples/cmf/hyperion.cmf` | HYPERION'un tüm katmanları, alan olarak |

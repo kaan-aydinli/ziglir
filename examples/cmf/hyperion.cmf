@@ -1,0 +1,57 @@
+# ════════════════════════════════════════════════════════════════════════════
+# The HYPERION architecture, expressed as a CMF field instead of prose.
+#
+# Every claim below is either discharged by a check this compiler implements or
+# bound to a machine that is *declared* implemented. Anything this repo cannot
+# do is written with `planned`, and a claim that depends on it is REFUSED -
+# so a claim can never be quietly stronger than the code behind it.
+#
+#   lir cmf examples/cmf/hyperion.cmf
+# ════════════════════════════════════════════════════════════════════════════
+
+# ── 1. Shapes: the instance set is the witness list, not a class hierarchy ──
+morph Cell   =<< u8 u16 u32 u64 >>=
+morph Layout =<< row_major column_major >>=
+
+# ── 4. Substrate: where the data lives, and what is promised about it ──
+#     ?contiguous  - stored in the order it is read (the only shape a
+#                    sequential lens walk is actually free on)
+#     ?ordered     - stored sorted; reads may binary-search instead of sorting
+field ledger: u64[104] ?exclusive ?contiguous
+field sorted: u64[104] ?shared    ?ordered
+
+# ── 4. Lenses: a permutation, not a copy. Creation is O(1); the walk is not,
+#     and the element cost is printed rather than assumed. ──
+lens backwards: reverse(ledger)          as reversed
+lens hot:       filter(ledger where > 9) as hot
+lens pivoted:   transpose(ledger*104)    as pivot_without_copy
+lens kept:      filter(sorted where > 9) as kept
+
+# ── 5. Machines: the only implemented adjudicator is this repo's own VM.
+#     PIM / FHE / ORAM are declarable for analysis, never claimable. ──
+machine local: local implemented
+machine pim:   pim   planned
+machine fhe:   fhe   planned
+machine oram:  oram  planned
+
+# ── 5. Telemetry: a declared sampling period. It is a period, not a latency.
+telemetry cache:     every 100tick
+telemetry bandwidth: every 100tick
+
+# ── 5. Tuning: hardware-adaptive selection, but selection may only pick a
+#     variant that was already constructed and verified. It never invents one.
+tune narrow: morph Cell under compressible
+
+# ── 3. Commitments: each says exactly how it is judged. ──
+claim exclusive_writer over ledger check uniqueness
+claim no_partial_reads over ledger check absence
+claim linear_use       over ledger for 4tick runtime local
+claim order_preserved  over sorted check totality
+
+# ── 2. Expression: one body, constructed once per witness. @witness is real. ──
+bloom narrow: morph Cell {
+fn main() -> i64 {
+    let cell: @witness = 200
+    return cell as i64
+}
+}

@@ -589,18 +589,102 @@ class CmfTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("vacuous", result.stdout)
 
+    HYPERION_FIELD = """
+        morph Cell =<< u8 u16 u32 u64 >>=
+        field ledger: u64[104] ?exclusive ?contiguous
+        field sorted: u64[104] ?shared ?ordered
+        lens back: reverse(ledger) as backwards
+        lens hot: filter(ledger where > 9) as hot
+        lens pivot: transpose(ledger*104) as pivot
+        machine local: local implemented
+        machine pim: pim planned
+        telemetry cache: every 100tick
+        tune narrow: morph Cell under compressible
+        claim exclusive_writer over ledger check uniqueness
+        claim linear_use over ledger for 4tick runtime local
+        bloom narrow: morph Cell {
+        fn main() -> i64 {
+            let cell: @witness = 200
+            return cell as i64
+        }
+        }
+    """
+
+    def test_lenses_report_element_cost_instead_of_zero_cost(self):
+        path = self.write_cmf(self.HYPERION_FIELD)
+        out = run("cmf", str(path)).stdout
+        self.assertIn("O(1) to create, not free to walk", out)
+        self.assertIn("pivot = transpose(ledger)  element cost: strided", out)
+        self.assertIn("backwards = reverse(ledger)  element cost: sequential", out)
+
+    def test_variants_are_measured_not_predicted(self):
+        path = self.write_cmf(self.HYPERION_FIELD)
+        doc = json.loads(run("cmf", str(path), "--json").stdout)
+        verified = [v for v in doc["variants"] if v["status"] == "verified"]
+        self.assertEqual(len(verified), 4)
+        for v in verified:
+            self.assertTrue(v["ran"])
+            self.assertGreater(v["instructions_measured"], 0)
+            self.assertEqual(v["exit_code"], 200)
+
+    def test_planned_machine_cannot_discharge_a_claim(self):
+        path = self.write_cmf("""
+            machine pim: pim planned
+            field ledger: u64[104]
+            claim offloaded over ledger for 4tick runtime pim
+        """)
+        result = run("cmf", str(path), ok=None)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("not implemented in this compiler", result.stderr)
+
+    def test_a_machine_class_cannot_lie_about_being_implemented(self):
+        path = self.write_cmf("machine fhe: fhe implemented\n")
+        result = run("cmf", str(path), ok=None)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("LIR-E8010", result.stderr)
+
+    def test_applied_fields_surface_is_smaller_than_advertised(self):
+        """Unimplemented lenses/machines stay declarable but never silently count."""
+        path = self.write_cmf("""
+            morph Only =<< u8 >>=
+            morph Unused =<< u8 u16 u32 >>=
+            bloom one: morph Only {
+            fn main() -> i64 { return 1 }
+            }
+        """)
+        doc = json.loads(run("cmf", str(path), "--json").stdout)
+        self.assertEqual(doc["variant_surface"], 1)
+
+    def test_lens_that_breaks_an_ordered_field_is_refused(self):
+        path = self.write_cmf("""
+            field sorted: u64[104] ?ordered
+            lens bad: transpose(sorted*104) as broken
+        """)
+        result = run("cmf", str(path), ok=None)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("permutation would break the ordering", result.stderr)
+
+    def test_telemetry_without_a_consumer_is_refused(self):
+        path = self.write_cmf("telemetry cache: every 100tick\n")
+        result = run("cmf", str(path), ok=None)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("no 'tune' rule consumes it", result.stderr)
+
     def test_help_and_explain_cover_the_new_codes(self):
         self.assertIn("cmf <file.cmf>", run("--help").stdout)
         self.assertIn("morph", run("cmf", "--help").stdout)
-        for code in ("LIR-E8001", "LIR-E8005", "LIR-E8008"):
+        for code in ("LIR-E8001", "LIR-E8005", "LIR-E8008", "LIR-E8009", "LIR-E8010", "LIR-E8011", "LIR-E8012"):
             out = run("explain", code).stdout
             self.assertIn("CMF" if code == "LIR-E8001" else "===", out)
 
-    def test_example_file_is_accepted(self):
+    def test_every_example_field_is_accepted(self):
         repo = COMPILER.parent.parent.parent
-        example = repo / "examples" / "cmf" / "widening.cmf"
-        result = run("cmf", str(example), ok=None)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        examples = sorted((repo / "examples" / "cmf").glob("*.cmf"))
+        self.assertTrue(examples, "no example fields found")
+        for example in examples:
+            with self.subTest(example=example.name):
+                result = run("cmf", str(example), ok=None)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 class ScaffoldTests(unittest.TestCase):

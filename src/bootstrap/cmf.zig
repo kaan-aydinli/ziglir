@@ -211,11 +211,107 @@ pub const FieldKind = enum {
     shared,
 };
 
+/// Access order is what an algebraic lens *is*: a permutation the loader applies,
+/// not a copy the compiler emits.
+pub const FieldOrder = enum {
+    /// Stored row-major; read in the order it lies in memory.
+    row,
+    /// Stored row-major; read column-major (transpose view: O(1) to create,
+    /// but each element access costs a cache-unfriendly stride).
+    column,
+    /// Stored already sorted; reads may binary-search instead of sorting.
+    ordered,
+};
+
 pub const Field = struct {
     name: []const u8,
     cell: []const u8,
     len: u64,
     kind: FieldKind,
+    order: FieldOrder = .row,
+    line: u32,
+};
+
+/// A symbolic tensor lens: a permutation of an existing field, never a copy.
+/// This is the honest half of "algebraic lens": creating it is O(1); using it
+/// is not free, and `lir cmf` says so instead of claiming zero cost.
+pub const Lens = struct {
+    name: []const u8,
+    /// View name (bound by `as`), used to discriminate lenses on one field.
+    view: []const u8,
+    over: []const u8,
+    kind: LensKind,
+    /// The field's own layout plus this lens' order decide the element cost.
+    cost: LensCost,
+    line: u32,
+};
+
+pub const LensKind = enum { transpose, reverse, filter };
+
+pub const LensCost = enum {
+    /// Contiguous reads: same cost as the underlying field.
+    sequential,
+    /// Strided reads: each element is a separate cache line once the stride
+    /// exceeds a line, so the *view* is free but the *walk* is not.
+    strided,
+    /// Predicated reads: the loader must test each element, so the lens costs a
+    /// predicate evaluation per element it visits.
+    predicated,
+};
+
+/// A machine that may be selected for a claim's adjudication. `implemented`
+/// is a statement about *this compiler*, never about the hardware.
+pub const Machine = struct {
+    name: []const u8,
+    class: MachineClass,
+    implemented: bool,
+    line: u32,
+};
+
+pub const MachineClass = enum {
+    /// Same-address-space compute (the VM): real, in this repo.
+    local,
+    /// Compute-in-memory / DPU / SmartNIC offload.
+    pim,
+    /// Homomorphic (encrypted) execution.
+    fhe,
+    /// Oblivious access patterns.
+    oram,
+};
+
+/// Hardware-adaptive variant selection: which already-verified variant runs
+/// under which measured condition. Selection only ever picks a variant that
+/// exists; it never creates one.
+pub const Tuning = struct {
+    name: []const u8,
+    morph: []const u8,
+    condition: TuningCondition,
+    line: u32,
+};
+
+pub const TuningCondition = enum {
+    /// Any measured state; the first matching rule wins.
+    always,
+    /// Choose when the measured series is compressible (delta-coded runs).
+    compressible,
+    /// Choose when the measured series is incompressible (high entropy).
+    incompressible,
+};
+
+pub const TelemetrySource = enum {
+    /// L1/L2/L3 miss counters.
+    cache,
+    /// Pages/second, bus utilisation.
+    bandwidth,
+    /// Instructions per cycle.
+    ipc,
+};
+
+pub const Telemetry = struct {
+    source: TelemetrySource,
+    /// Sampling period in abstract ticks. This is a *declared* period; the
+    /// compiler only checks that it is positive and that a rule consumes it.
+    period_ticks: i64,
     line: u32,
 };
 
@@ -271,6 +367,10 @@ pub const Variant = struct {
     /// True when the placeholder never appeared in the body, so the variant is
     /// vacuous: it compiled, but it proves nothing about the witness.
     vacuous: bool = false,
+    /// Measured by running the variant in the IR VM - never predicted.
+    ran: bool = false,
+    exit_code: i64 = 0,
+    instructions: u64 = 0,
 };
 
 pub const FieldIR = struct {
@@ -291,6 +391,14 @@ pub const FieldIR = struct {
     variant_count: usize = 0,
     bodies: [32]Body = undefined,
     body_count: usize = 0,
+    lenses: [64]Lens = undefined,
+    lens_count: usize = 0,
+    machines: [16]Machine = undefined,
+    machine_count: usize = 0,
+    tunings: [64]Tuning = undefined,
+    tuning_count: usize = 0,
+    telemetry: [8]Telemetry = undefined,
+    telemetry_count: usize = 0,
 
     pub fn morphNamed(self: *const FieldIR, name: []const u8) ?*const Morph {
         for (self.morphs[0..self.morph_count]) |*m| {
@@ -302,6 +410,20 @@ pub const FieldIR = struct {
     pub fn fieldNamed(self: *const FieldIR, name: []const u8) ?*const Field {
         for (self.fields[0..self.field_count]) |*f| {
             if (eql(f.name, name)) return f;
+        }
+        return null;
+    }
+
+    pub fn machineNamed(self: *const FieldIR, name: []const u8) ?*const Machine {
+        for (self.machines[0..self.machine_count]) |*m| {
+            if (eql(m.name, name)) return m;
+        }
+        return null;
+    }
+
+    pub fn lensNamed(self: *const FieldIR, name: []const u8) ?*const Lens {
+        for (self.lenses[0..self.lens_count]) |*l| {
+            if (eql(l.view, name)) return l;
         }
         return null;
     }
@@ -449,6 +571,223 @@ fn braceDeltaAfterHeader(header: []const u8) i32 {
     return braceDelta(header) - 1;
 }
 
+/// `lens tp: transpose(ledger*ledger) as grid`
+/// `lens rev: reverse(ledger) as backwards`
+/// `lens hot: filter(ledger where > 900) as hot`
+fn parseLens(ir: *FieldIR, line: LogicalLine, sc: *LineScanner, head: Word) void {
+    _ = head;
+    const name = sc.next() orelse {
+        _ = ir.fail(.cmf_syntax, line.line, 1, "lens needs a name", .{});
+        return;
+    };
+    _ = sc.next(); // ':'
+    const kind_tok = sc.next() orelse {
+        _ = ir.fail(.cmf_syntax, line.line, name.col, "lens '{s}' needs a kind (transpose, reverse, filter)", .{name.text});
+        return;
+    };
+    var kind: LensKind = .transpose;
+    if (eql(kind_tok.text, "transpose")) {
+        kind = .transpose;
+    } else if (eql(kind_tok.text, "reverse")) {
+        kind = .reverse;
+    } else if (eql(kind_tok.text, "filter")) {
+        kind = .filter;
+    } else {
+        _ = ir.fail(.cmf_syntax, line.line, kind_tok.col, "unknown lens kind '{s}' (expected transpose, reverse, filter)", .{kind_tok.text});
+        return;
+    }
+    // The field being viewed is the base identifier of the argument expression;
+    // a trailing `* <same field>` records the reshape that makes the view 2-D.
+    var over: ?[]const u8 = null;
+    var squared = false;
+    var view: ?[]const u8 = null;
+    while (sc.next()) |w| {
+        if (eql(w.text, "as")) {
+            const name_tok = sc.next() orelse {
+                _ = ir.fail(.cmf_syntax, line.line, w.col, "lens '{s}' has 'as' but no view name", .{name.text});
+                return;
+            };
+            view = name_tok.text;
+            continue;
+        }
+        if (isIdentStart(w.text[0])) {
+            if (eql(w.text, "where")) break;
+            if (over == null) {
+                over = w.text;
+            } else if (eql(over.?, w.text)) {
+                squared = true;
+            }
+        }
+    }
+    const base = over orelse {
+        _ = ir.fail(.cmf_syntax, line.line, name.col, "lens '{s}' does not name the field it views", .{name.text});
+        return;
+    };
+    const field = ir.fieldNamed(base) orelse {
+        const vi = ir.fail(.cmf_lens_unsupported, line.line, name.col, "lens '{s}' views '{s}', which is not a declared field", .{ name.text, base });
+        ir.failHelp(vi, "declare it first: field {s}: u64[104]", .{base});
+        return;
+    };
+    // Cost honesty: a lens is O(1) to create; walking it may not be free.
+    const cost: LensCost = switch (kind) {
+        .transpose => if (squared and field.order == .row) .sequential else .strided,
+        .reverse => .sequential,
+        .filter => .predicated,
+    };
+    if (ir.lens_count >= ir.lenses.len) return;
+    ir.lenses[ir.lens_count] = .{
+        .name = name.text,
+        .view = view orelse name.text,
+        .over = base,
+        .kind = kind,
+        .cost = cost,
+        .line = line.line,
+    };
+    ir.lens_count += 1;
+}
+
+/// `machine local: local implemented`   — the only implemented class today.
+/// `machine pim: pim planned`           — refused if a claim depends on it.
+fn parseMachine(ir: *FieldIR, line: LogicalLine, sc: *LineScanner, head: Word) void {
+    _ = head;
+    const name = sc.next() orelse {
+        _ = ir.fail(.cmf_syntax, line.line, 1, "machine needs a name", .{});
+        return;
+    };
+    _ = sc.next(); // ':'
+    const class_tok = sc.next() orelse {
+        _ = ir.fail(.cmf_syntax, line.line, name.col, "machine '{s}' needs a class (local, pim, fhe, oram)", .{name.text});
+        return;
+    };
+    var class: MachineClass = .local;
+    if (eql(class_tok.text, "local")) {
+        class = .local;
+    } else if (eql(class_tok.text, "pim")) {
+        class = .pim;
+    } else if (eql(class_tok.text, "fhe")) {
+        class = .fhe;
+    } else if (eql(class_tok.text, "oram")) {
+        class = .oram;
+    } else {
+        _ = ir.fail(.cmf_syntax, line.line, class_tok.col, "unknown machine class '{s}' (expected local, pim, fhe, oram)", .{class_tok.text});
+        return;
+    }
+    const state = sc.next() orelse {
+        _ = ir.fail(.cmf_syntax, line.line, name.col, "machine '{s}' must say whether it is implemented or planned", .{name.text});
+        return;
+    };
+    var implemented = false;
+    if (eql(state.text, "implemented")) {
+        implemented = true;
+    } else if (eql(state.text, "planned")) {
+        implemented = false;
+    } else {
+        _ = ir.fail(.cmf_syntax, line.line, state.col, "machine state must be 'implemented' or 'planned', found '{s}'", .{state.text});
+        return;
+    }
+    if (implemented and class != .local) {
+        _ = ir.fail(.cmf_machine_unsupported, line.line, name.col, "class '{s}' cannot be marked implemented: this compiler cannot execute or verify {s} code", .{ class_tok.text, class_tok.text });
+        return;
+    }
+    if (ir.machineNamed(name.text) != null) {
+        _ = ir.fail(.cmf_duplicate, line.line, name.col, "machine '{s}' is already declared", .{name.text});
+        return;
+    }
+    if (ir.machine_count >= ir.machines.len) return;
+    ir.machines[ir.machine_count] = .{ .name = name.text, .class = class, .implemented = implemented, .line = line.line };
+    ir.machine_count += 1;
+}
+
+/// `tune narrow: morph Cell under compressible`
+fn parseTune(ir: *FieldIR, line: LogicalLine, sc: *LineScanner, head: Word) void {
+    _ = head;
+    const name = sc.next() orelse {
+        _ = ir.fail(.cmf_syntax, line.line, 1, "tune needs a bloom name", .{});
+        return;
+    };
+    _ = sc.next(); // ':'
+    _ = sc.next(); // 'morph'
+    const morph = sc.next() orelse {
+        _ = ir.fail(.cmf_syntax, line.line, name.col, "tune '{s}' names no morph", .{name.text});
+        return;
+    };
+    const under = sc.next() orelse {
+        _ = ir.fail(.cmf_syntax, line.line, name.col, "tune '{s}' needs a measured condition ('under compressible')", .{name.text});
+        return;
+    };
+    if (!eql(under.text, "under")) {
+        _ = ir.fail(.cmf_syntax, line.line, under.col, "tune '{s}' expected 'under', found '{s}'", .{ name.text, under.text });
+        return;
+    }
+    const cond = sc.next() orelse {
+        _ = ir.fail(.cmf_syntax, line.line, name.col, "tune '{s}' names no condition", .{name.text});
+        return;
+    };
+    var condition: TuningCondition = .always;
+    if (eql(cond.text, "always")) {
+        condition = .always;
+    } else if (eql(cond.text, "compressible")) {
+        condition = .compressible;
+    } else if (eql(cond.text, "incompressible")) {
+        condition = .incompressible;
+    } else {
+        _ = ir.fail(.cmf_syntax, line.line, cond.col, "unknown tuning condition '{s}' (expected always, compressible, incompressible)", .{cond.text});
+        return;
+    }
+    if (ir.tuning_count >= ir.tunings.len) return;
+    ir.tunings[ir.tuning_count] = .{ .name = name.text, .morph = morph.text, .condition = condition, .line = line.line };
+    ir.tuning_count += 1;
+}
+
+/// `telemetry cache: every 100tick`
+fn parseTelemetry(ir: *FieldIR, line: LogicalLine, sc: *LineScanner, head: Word) void {
+    _ = head;
+    const name = sc.next() orelse {
+        _ = ir.fail(.cmf_syntax, line.line, 1, "telemetry needs a source (cache, bandwidth, ipc)", .{});
+        return;
+    };
+    var source: ?TelemetrySource = null;
+    if (eql(name.text, "cache")) {
+        source = .cache;
+    } else if (eql(name.text, "bandwidth")) {
+        source = .bandwidth;
+    } else if (eql(name.text, "ipc")) {
+        source = .ipc;
+    } else {
+        _ = ir.fail(.cmf_syntax, line.line, name.col, "unknown telemetry source '{s}' (expected cache, bandwidth, ipc)", .{name.text});
+        return;
+    }
+    _ = sc.next(); // ':'
+    const every = sc.next() orelse {
+        _ = ir.fail(.cmf_syntax, line.line, name.col, "telemetry needs 'every <n>tick'", .{});
+        return;
+    };
+    if (!eql(every.text, "every")) {
+        _ = ir.fail(.cmf_syntax, line.line, every.col, "telemetry expected 'every', found '{s}'", .{every.text});
+        return;
+    }
+    const period = sc.next() orelse {
+        _ = ir.fail(.cmf_syntax, line.line, name.col, "telemetry needs a period", .{});
+        return;
+    };
+    const ticks: i64 = blk: {
+        const spec = [_][]const u8{ "tick", "ticks", "cycle", "cycles" };
+        for (spec) |suffix| {
+            if (period.text.len > suffix.len and std.mem.endsWith(u8, period.text, suffix)) {
+                break :blk std.fmt.parseInt(i64, period.text[0 .. period.text.len - suffix.len], 10) catch -1;
+            }
+        }
+        break :blk -1;
+    };
+    if (ticks <= 0) {
+        _ = ir.fail(.cmf_telemetry_unsupported, line.line, period.col, "telemetry period '{s}' is not a positive '<n>tick'", .{period.text});
+        return;
+    }
+    if (ir.telemetry_count >= ir.telemetry.len) return;
+    ir.telemetry[ir.telemetry_count] = .{ .source = source.?, .period_ticks = ticks, .line = line.line };
+    ir.telemetry_count += 1;
+}
+
 fn parseLines(ir: *FieldIR, lines: []const LogicalLine) void {
     for (lines) |line| {
         var sc = LineScanner{ .src = line.text };
@@ -464,12 +803,20 @@ fn parseLines(ir: *FieldIR, lines: []const LogicalLine) void {
             parseClaim(ir, line, &sc, head);
         } else if (eql(head.text, "bloom")) {
             parseBloom(ir, line, &sc, head);
+        } else if (eql(head.text, "lens")) {
+            parseLens(ir, line, &sc, head);
+        } else if (eql(head.text, "machine")) {
+            parseMachine(ir, line, &sc, head);
+        } else if (eql(head.text, "tune")) {
+            parseTune(ir, line, &sc, head);
+        } else if (eql(head.text, "telemetry")) {
+            parseTelemetry(ir, line, &sc, head);
         } else if (eql(head.text, "fn") or eql(head.text, "struct") or eql(head.text, "enum")) {
             // Ordinary LIR declaration inside a CMF file: checked by the real
             // front end (`lir check`), ignored by the field checker.
             continue;
         } else {
-            _ = ir.fail(.cmf_syntax, line.line, head.col, "unknown field directive '{s}' (expected morph, field, claim, bloom, fn, struct or enum)", .{head.text});
+            _ = ir.fail(.cmf_syntax, line.line, head.col, "unknown field directive '{s}' (expected morph, field, claim, bloom, lens, machine, tune, telemetry, fn, struct or enum)", .{head.text});
         }
     }
 }
@@ -532,6 +879,7 @@ fn parseFieldDecl(ir: *FieldIR, line: LogicalLine, sc: *LineScanner, head: Word)
     var cell: ?[]const u8 = null;
     var len: u64 = 1;
     var kind: ?FieldKind = null;
+    var order: FieldOrder = .row;
     while (sc.next()) |w| {
         if (eql(w.text, ":")) continue;
         if (eql(w.text, "?")) {
@@ -540,8 +888,14 @@ fn parseFieldDecl(ir: *FieldIR, line: LogicalLine, sc: *LineScanner, head: Word)
                 kind = .exclusive;
             } else if (eql(tag.text, "shared")) {
                 kind = .shared;
+            } else if (eql(tag.text, "ordered")) {
+                order = .ordered;
+            } else if (eql(tag.text, "transpose")) {
+                order = .column;
+            } else if (eql(tag.text, "contiguous")) {
+                order = .row;
             } else {
-                _ = ir.fail(.cmf_syntax, line.line, tag.col, "unknown field refinement '?{s}' (expected ?shared or ?exclusive)", .{tag.text});
+                _ = ir.fail(.cmf_syntax, line.line, tag.col, "unknown field refinement '?{s}' (expected ?shared, ?exclusive, ?ordered, ?transpose or ?contiguous)", .{tag.text});
             }
             continue;
         }
@@ -582,6 +936,7 @@ fn parseFieldDecl(ir: *FieldIR, line: LogicalLine, sc: *LineScanner, head: Word)
         .cell = cell_type,
         .len = len,
         .kind = kind orelse .exclusive,
+        .order = order,
         .line = line.line,
     };
     ir.field_count += 1;
@@ -701,8 +1056,8 @@ pub fn checkField(ir: *FieldIR) void {
     // 2. morph instance counts: a bloom over a morph yields one variant per
     //    witness, so the variant surface is exactly countable.
     var total: usize = 0;
-    for (ir.morphs[0..ir.morph_count]) |*m| {
-        total += @max(m.witness_count, 1);
+    for (ir.blooms[0..ir.bloom_count]) |*b| {
+        if (ir.morphNamed(b.morph)) |m| total += m.witness_count;
     }
     ir.max_variants = total;
 
@@ -762,7 +1117,100 @@ pub fn checkField(ir: *FieldIR) void {
         } else if (c.kind != .structural and c.basis == null) {
             _ = ir.fail(.cmf_claim_unsupported, c.line, 1, "claim '{s}' is asserted but names no checker or adjudicator", .{c.name});
         }
+        // The adjudicator must resolve to a declared, *implemented* machine.
+        if (c.kind != null and c.kind.? == .runtime) {
+            if (c.basis) |basis| {
+                const known_checker = [_][]const u8{ "adjudicate", "verify", "check" };
+                var generic = false;
+                for (known_checker) |k| {
+                    if (eql(basis, k)) generic = true;
+                }
+                if (ir.machineNamed(basis)) |machine| {
+                    if (!machine.implemented) {
+                        _ = ir.fail(.cmf_machine_unsupported, c.line, 1, "claim '{s}' is adjudicated on machine '{s}', whose class is not implemented in this compiler", .{ c.name, basis });
+                    }
+                } else if (!generic) {
+                    _ = ir.fail(.cmf_machine_unsupported, c.line, 1, "claim '{s}' names adjudicator '{s}', which is neither a declared machine nor one of adjudicate/verify/check", .{ c.name, basis });
+                }
+            }
+        }
     }
+
+    // 4. tuning rules must name an existing bloom and a *declared* morph, and
+    //    every rule must be fed by a telemetry source (selection needs a signal).
+    for (ir.tunings[0..ir.tuning_count]) |*t| {
+        var bloom_found = false;
+        for (ir.blooms[0..ir.bloom_count]) |*b| {
+            if (eql(b.name, t.name)) {
+                bloom_found = true;
+                if (!eql(b.morph, t.morph)) {
+                    _ = ir.fail(.cmf_tuning_unsupported, t.line, 1, "tune '{s}' claims morph '{s}' but bloom '{s}' expands '{s}'", .{ t.name, t.morph, b.name, b.morph });
+                }
+            }
+        }
+        if (!bloom_found) {
+            _ = ir.fail(.cmf_tuning_unsupported, t.line, 1, "tune rule names bloom '{s}', which is not declared", .{t.name});
+        }
+        if (t.condition != .always and ir.telemetry_count == 0) {
+            _ = ir.fail(.cmf_tuning_unsupported, t.line, 1, "tune '{s}' selects on measured condition '{s}' but no telemetry source is declared", .{ t.name, @tagName(t.condition) });
+        }
+    }
+
+    // 5. a lens may not rewrite the field it views: a view is a permutation,
+    //    and permuting a ?ordered field destroys the ordering it promises.
+    for (ir.lenses[0..ir.lens_count]) |*l| {
+        if (ir.fieldNamed(l.over)) |f| {
+            if (f.order == .ordered and l.kind != .filter) {
+                _ = ir.fail(.cmf_lens_unsupported, l.line, 1, "lens '{s}' permutes '{s}', but that field is declared ?ordered and a permutation would break the ordering", .{ l.name, l.over });
+            }
+            if (l.kind == .transpose and f.order == .column) {
+                _ = ir.fail(.cmf_lens_unsupported, l.line, 1, "lens '{s}' transposes '{s}', which is already declared ?transpose", .{ l.name, l.over });
+            }
+        }
+    }
+
+    // 6. telemetry without any consumer is dead weight: say so instead of
+    //    silently accepting a sampling loop nothing reads.
+    if (ir.telemetry_count > 0 and ir.tuning_count == 0) {
+        for (ir.telemetry[0..ir.telemetry_count]) |*t| {
+            _ = ir.fail(.cmf_telemetry_unsupported, t.line, 1, "telemetry '{s}' is sampled but no 'tune' rule consumes it", .{@tagName(t.source)});
+        }
+    }
+}
+
+/// Run a verified variant and return (exit code, executed instruction count).
+/// This is the only "cost" number CMF reports: a measured one. There is no
+/// predicted cycle count, no pJ-per-type, no assumed latency anywhere.
+pub const Observation = struct {
+    exit_code: i64 = 0,
+    instructions: u64 = 0,
+    ran: bool = false,
+    error_name: []const u8 = "",
+};
+
+pub fn observeVariant(body: []const u8, witness: []const u8) Observation {
+    var buf: [64 * 1024]u8 = undefined;
+    const program = substitute(&buf, body, witness) orelse return .{ .error_name = "expansion_overflow" };
+    const alloc = std.heap.page_allocator;
+    const ir_module = alloc.create(@import("ir.zig").IRModule) catch return .{ .error_name = "out_of_memory" };
+    defer alloc.destroy(ir_module);
+    ir_module.init();
+    var compiler = @import("driver.zig").Compiler.init(program, "<cmf-observe>");
+    compiler.quiet = true;
+    const result = compiler.runInVM(&.{}, true) catch |err| {
+        return .{ .error_name = @errorName(err) };
+    };
+    return .{
+        .exit_code = result.exit_code,
+        .instructions = result.steps,
+        .ran = true,
+    };
+}
+
+/// How many distinct selection rules exist, and how many variants they could
+/// pick. Reported next to the variant count so "adaptive" is never hand-waved.
+pub fn selectionRules(ir: *const FieldIR) usize {
+    return ir.tuning_count;
 }
 
 // ── Construction: bloom one witness into a real, verified variant ───────────
@@ -819,6 +1267,12 @@ pub fn buildVariants(ir: *FieldIR, bodies: []const Body) BuildStats {
             } else {
                 stats.verified += 1;
                 if (v.vacuous) stats.vacuous += 1;
+            }
+            if (v.verified) {
+                const obs = observeVariant(body.source, witness);
+                v.exit_code = obs.exit_code;
+                v.instructions = obs.instructions;
+                v.ran = obs.ran;
             }
             ir.variants[ir.variant_count] = v;
             ir.variant_count += 1;
@@ -948,6 +1402,31 @@ pub fn renderHuman(ir: *const FieldIR, path: []const u8) void {
             util.printStr(std.fmt.bufPrint(&buf, "{d}", .{f.len}) catch "");
             util.printStr("] ");
             util.printStr(if (f.kind == .exclusive) "?exclusive" else "?shared");
+            util.printStr(switch (f.order) {
+                .row => " ?contiguous",
+                .column => " ?transpose",
+                .ordered => " ?ordered",
+            });
+            util.printStr("\n");
+        }
+    }
+
+    if (ir.lens_count > 0) {
+        util.printStr("\n  lenses (O(1) to create, not free to walk)\n");
+        for (ir.lenses[0..ir.lens_count]) |*l| {
+            util.printStr("    ");
+            util.printStr(l.view);
+            util.printStr(" = ");
+            util.printStr(@tagName(l.kind));
+            util.printStr("(");
+            util.printStr(l.over);
+            util.printStr(")  element cost: ");
+            util.printStr(@tagName(l.cost));
+            if (l.cost == .strided) {
+                util.printStr(" (one cache line per element once the stride exceeds a line)");
+            } else if (l.cost == .predicated) {
+                util.printStr(" (one predicate test per visited element)");
+            }
             util.printStr("\n");
         }
     }
@@ -981,6 +1460,36 @@ pub fn renderHuman(ir: *const FieldIR, path: []const u8) void {
         }
     }
 
+    if (ir.machine_count > 0) {
+        util.printStr("\n  machines (adjudication targets)\n");
+        for (ir.machines[0..ir.machine_count]) |*m| {
+            util.printStr("    ");
+            util.printStr(m.name);
+            util.printStr(": ");
+            util.printStr(@tagName(m.class));
+            util.printStr(if (m.implemented) ", implemented here" else ", planned (no claim may depend on it)");
+            util.printStr("\n");
+        }
+    }
+
+    if (ir.telemetry_count > 0 or ir.tuning_count > 0) {
+        util.printStr("\n  adaptation (measured, not assumed)\n");
+        for (ir.telemetry[0..ir.telemetry_count]) |*t| {
+            util.printStr("    telemetry ");
+            util.printStr(@tagName(t.source));
+            util.printStr(" every ");
+            util.printStr(std.fmt.bufPrint(&buf, "{d}", .{t.period_ticks}) catch "");
+            util.printStr(" ticks\n");
+        }
+        for (ir.tunings[0..ir.tuning_count]) |*t| {
+            util.printStr("    tune ");
+            util.printStr(t.name);
+            util.printStr(" under ");
+            util.printStr(@tagName(t.condition));
+            util.printStr(" -> picks only an existing verified variant\n");
+        }
+    }
+
     if (ir.bloom_count > 0) {
         util.printStr("\n  blooms (expression)\n");
         for (ir.blooms[0..ir.bloom_count]) |*b| {
@@ -1005,7 +1514,15 @@ pub fn renderHuman(ir: *const FieldIR, path: []const u8) void {
             } else if (v.vacuous) {
                 util.printStr("verified, but the body never uses @witness (vacuous)");
             } else {
-                util.printStr("verified: the expansion type-checks and passes IR verification");
+                util.printStr("verified: type-checks + passes IR verification");
+                if (v.ran) {
+                    util.printStr(", then measured: ");
+                    util.printStr(std.fmt.bufPrint(&buf, "{d}", .{v.instructions}) catch "");
+                    util.printStr(" IR instructions, exit ");
+                    util.printStr(std.fmt.bufPrint(&buf, "{d}", .{v.exit_code}) catch "");
+                } else {
+                    util.printStr(", not executed");
+                }
             }
             util.printStr("\n");
         }
@@ -1073,6 +1590,56 @@ pub fn renderJson(ir: *const FieldIR, path: []const u8) void {
         util.printStr(std.fmt.bufPrint(&buf, "{d}", .{f.len}) catch "0");
         util.printStr(",\"access\":");
         jsonEscape(if (f.kind == .exclusive) "exclusive" else "shared");
+        util.printStr(",\"order\":");
+        jsonEscape(switch (f.order) {
+            .row => "contiguous",
+            .column => "transpose",
+            .ordered => "ordered",
+        });
+        util.printStr("}");
+    }
+    util.printStr("],\"lenses\":[");
+    for (ir.lenses[0..ir.lens_count], 0..) |*l, i| {
+        if (i > 0) util.printStr(",");
+        util.printStr("{\"view\":");
+        jsonEscape(l.view);
+        util.printStr(",\"kind\":");
+        jsonEscape(@tagName(l.kind));
+        util.printStr(",\"over\":");
+        jsonEscape(l.over);
+        util.printStr(",\"element_cost\":");
+        jsonEscape(@tagName(l.cost));
+        util.printStr("}");
+    }
+    util.printStr("],\"machines\":[");
+    for (ir.machines[0..ir.machine_count], 0..) |*m, i| {
+        if (i > 0) util.printStr(",");
+        util.printStr("{\"name\":");
+        jsonEscape(m.name);
+        util.printStr(",\"class\":");
+        jsonEscape(@tagName(m.class));
+        util.printStr(",\"implemented\":");
+        util.printStr(if (m.implemented) "true" else "false");
+        util.printStr("}");
+    }
+    util.printStr("],\"telemetry\":[");
+    for (ir.telemetry[0..ir.telemetry_count], 0..) |*t, i| {
+        if (i > 0) util.printStr(",");
+        util.printStr("{\"source\":");
+        jsonEscape(@tagName(t.source));
+        util.printStr(",\"period_ticks\":");
+        util.printStr(std.fmt.bufPrint(&buf, "{d}", .{t.period_ticks}) catch "0");
+        util.printStr("}");
+    }
+    util.printStr("],\"tuning\":[");
+    for (ir.tunings[0..ir.tuning_count], 0..) |*t, i| {
+        if (i > 0) util.printStr(",");
+        util.printStr("{\"bloom\":");
+        jsonEscape(t.name);
+        util.printStr(",\"morph\":");
+        jsonEscape(t.morph);
+        util.printStr(",\"under\":");
+        jsonEscape(@tagName(t.condition));
         util.printStr("}");
     }
     util.printStr("],\"claims\":[");
@@ -1114,6 +1681,12 @@ pub fn renderJson(ir: *const FieldIR, path: []const u8) void {
         jsonEscape(v.witness);
         util.printStr(",\"status\":");
         jsonEscape(if (!v.verified) "rejected" else if (v.vacuous) "vacuous" else "verified");
+        util.printStr(",\"ran\":");
+        util.printStr(if (v.ran) "true" else "false");
+        util.printStr(",\"exit_code\":");
+        util.printStr(std.fmt.bufPrint(&buf, "{d}", .{v.exit_code}) catch "0");
+        util.printStr(",\"instructions_measured\":");
+        util.printStr(std.fmt.bufPrint(&buf, "{d}", .{v.instructions}) catch "0");
         util.printStr("}");
     }
     util.printStr("],\"violations\":[");
@@ -1207,21 +1780,31 @@ pub fn printCmfUsage() void {
     util.printStr(
         \\Usage: lir cmf <file.cmf> [--json]
         \\
-        \\Reads a Causal Morphogenetic Field and checks every claim in it.
-        \\A field is a declarative surface: shapes (morph), substrate (field),
-        \\commitments (claim) and expression (bloom). Blooms are constructed: each
-        \\witness is substituted into the body and the result is type-checked and
-        \\IR-verified. Nothing is executed, and a refused variant is never emitted.
+        \\Reads a Causal Morphogenetic Field and checks every claim in it. A field is
+        \\a declarative surface: shapes (morph), substrate (field), views (lens),
+        \\commitments (claim), adjudication targets (machine), and adaptation
+        \\(telemetry + tune). Blooms are constructed: each witness is substituted
+        \\into the body and the result is type-checked, IR-verified, then run in the
+        \\IR VM so the only cost numbers reported are measured ones. A refused
+        \\variant is never emitted.
         \\
-        \\  morph Transition =<< t1 t2 t3 >>=      closed shape: exactly those instances
-        \\  morph Any       =<> u8 u16 u32 u64 <>= open shape: instances from domains
-        \\  field ledger: u64[1024] ?exclusive      substrate with a checkable surface
-        \\  field window: i64[8] ?shared            substrate with no uniqueness claim
-        \\  claim linear_ledger over ledger for 4tick runtime adjudicate  -> checked
-        \\  claim total_order   over ledger check uniqueness               -> checked
+        \\  morph Cell =<< u8 u16 u32 u64 >>=   closed: the instances ARE the witnesses
+        \\  morph Any  =<> u8 u16 u32 u64 <>=   open shape
+        \\  field ledger: u64[104] ?exclusive    substrate (also ?shared, ?ordered,
+        \\                                       ?contiguous, ?transpose)
+        \\  lens rev: reverse(ledger) as back    O(1) view; the element cost is printed
+        \\  machine local: local implemented     only 'local' may be implemented
+        \\  machine pim: pim planned             declarable, never claimable
+        \\  telemetry cache: every 100tick       a declared period, not a latency
+        \\  tune narrow: morph Cell under compressible   selects an EXISTING variant
+        \\  claim c over f check uniqueness      checks: uniqueness|concurrency|
+        \\                                       totality|absence
+        \\  claim c over f for 4tick runtime local   adjudicated by a machine
+        \\  bloom narrow: morph Cell { ... }     body uses @witness; each witness is
+        \\                                       compiled, verified and measured
         \\
-        \\Every claim must be covered by a check or an adjudicator, and every
-        \\reference must resolve. Uncovered claims are errors, not runtime surprises.
+        \\Every claim must be covered by a check or an adjudicator, every reference
+        \\must resolve, and a claim that depends on a planned machine is refused.
         \\Exit codes: 0 accepted, 1 rejected (violations printed on stderr).
         \\
     );
@@ -1239,7 +1822,9 @@ test "a well-formed field is accepted and its variant surface is counted" {
     const ir = parseField(src);
     try std.testing.expect(ir.violation_count == 0);
     try std.testing.expectEqual(@as(usize, 1), ir.morph_count);
-    try std.testing.expectEqual(@as(usize, 3), ir.max_variants);
+    // No bloom was declared, so nothing is advertised as a constructible
+    // instance: the surface counts what is constructed, not what is declared.
+    try std.testing.expectEqual(@as(usize, 0), ir.max_variants);
 }
 
 test "a claim nobody falsifies is rejected" {

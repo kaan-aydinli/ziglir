@@ -288,3 +288,27 @@ tam olarak bunu söylüyor: *önce ölç, sonra iddia et.*
   (coded computing)
 * NIST FIPS 203/204/205 (ML-KEM, ML-DSA, SLH-DSA), 2024
 * CXL 3.0/3.1 spec (bellek havuzlama ve paylaşım)
+
+---
+
+## 7. Bu değerlendirme artık yürütülebilir
+
+Bu belgedeki ayrımlar (`✅ üründe` / `🟡 kısmen` / `🔶 prototip` / `❌ çelişiyor`)
+`lir cmf` tarafından **denetlenen** alan yüzeyine dönüştürüldü:
+
+```
+lir cmf examples/cmf/hyperion.cmf
+```
+
+| Değerlendirme | CMF'de karşılığı |
+|---|---|
+| ✅ gerçek olan (lens, çok-varyant, seçim) | `lens`, `bloom` (her witness gerçekten derlenir), `telemetry` + `tune` |
+| 🟡 sınırlı (PIM/DPU, kodlanmış hesaplama) | `machine pim: pim planned` — ilan edilir, iddia edilemez |
+| 🔶 prototip (FHE veri düzlemi, HQTT maliyeti) | `machine fhe: fhe planned`; pJ iddiası yok, **ölçülen** komut sayısı var |
+| ❌ çelişen (ORAM, fotonik küresel adres uzayı, 2.5 ns) | temsil edilmez; bir iddia bunlara dayanırsa derleme **reddedilir** (`LIR-E8010`) |
+
+Ölçüm kuralı: her doğrulanmış varyant IR VM'de çalıştırılır ve raporlanan tek
+maliyet **gerçekten yürütülen komut sayısıdır**. "3 çevrim", "2.5 ns",
+"pJ/tip" gibi hiçbir sayı bu repoda üretilmez — çünkü ölçülmemiştir.
+
+Ayrıntı: `docs/CMF_PARADIGM.md` §1.6.
