@@ -376,19 +376,32 @@ The intended standard library includes the following areas; implementation compl
 
 ## Performance Benchmarks: LIR vs Zig 0.13.0
 
-LIR's SSA optimizer and direct machine code backend deliver competitive performance against Zig 0.13.0 (`-O ReleaseFast`), while compiling **~9.5x–11.3x faster** with binaries **~100x–135x smaller**:
+Measured on `Intel(R) Xeon(R) Processor @ 2.60GHz`, 2 logical CPUs, Linux
+x86-64, Zig 0.13.0, both sides at their top optimization level (LIR `-O2`,
+Zig `-O ReleaseFast`). Every row's output was verified identical between the
+two binaries before timing. Runtime includes process startup. Numbers are
+workload- and machine-specific, not a language ranking.
 
-| Workload | LIR -O2 Runtime | Zig ReleaseFast | Speedup / Winner | LIR Compile Time | Zig Compile Time | Binary Size (LIR vs Zig) |
+| Workload | LIR / Zig runtime | Verdict | LIR compile | Zig compile | Compile ratio | Binary size (LIR vs Zig) |
 |---|---|---|---|---|---|---|
-| `tak_recursive_27` | **12.29 ms** | 15.10 ms | **LIR 1.23x faster** | **470 ms** | 4,996 ms (10.6x) | **12 KB** vs 1.66 MB (135x) |
-| `branch_mix_30m` | **39.71 ms** | 47.28 ms | **LIR 1.19x faster** | **464 ms** | 4,648 ms (10.0x) | **12 KB** vs 1.66 MB (135x) |
-| `fib_recursive_38` | **78.34 ms** | 79.62 ms | **LIR 1.02x faster** | **484 ms** | 4,773 ms (9.9x) | **12 KB** vs 1.66 MB (135x) |
-| `mandelbrot_fixed_2d` | **26.06 ms** | 26.94 ms | **LIR 1.03x faster** | **460 ms** | 4,748 ms (10.3x) | **12 KB** vs 1.66 MB (135x) |
-| `collatz_sequence_1m` | **135.38 ms** | 138.60 ms | **LIR 1.02x faster** | **458 ms** | 4,857 ms (10.6x) | **12 KB** vs 1.66 MB (135x) |
-| `prime_count_500k` | **40.02 ms** | 40.11 ms | **LIR 1.00x faster** | **453 ms** | 4,639 ms (10.2x) | **12 KB** vs 1.66 MB (135x) |
-| `nested_matrix_loop_4m` | 30.91 ms | **29.44 ms** | Zig 1.05x | **448 ms** | 4,714 ms (10.5x) | **16 KB** vs 1.66 MB (101x) |
-| `fib_mod_30m` | 100.77 ms | **98.84 ms** | Zig 1.02x | **453 ms** | 4,756 ms (10.5x) | **12 KB** vs 1.66 MB (135x) |
-| `bitwise_hash_20m` | 31.88 ms | **28.75 ms** | Zig 1.11x | **446 ms** | 4,885 ms (10.9x) | **12 KB** vs 1.66 MB (135x) |
+| `tak_recursive_27` | **0.71x** | **LIR 1.40x faster** | 2.2 ms | 4.9 s | 2190x | **12 KB** vs 1.6 MB (135x) |
+| `collatz_sequence_1m` | 1.00x | equivalent | 2.5 ms | 4.9 s | 2000x | **12 KB** vs 1.6 MB (135x) |
+| `fib_mod_30m` | 1.01x | equivalent | 2.3 ms | 4.9 s | 2139x | **12 KB** vs 1.6 MB (135x) |
+| `prime_count_500k` | 1.03x | Zig 1.03x | 2.3 ms | 4.7 s | 2018x | **12 KB** vs 1.6 MB (136x) |
+| `nested_matrix_loop_4m` | 1.03x | Zig 1.03x | 2.5 ms | 4.7 s | 1874x | **12 KB** vs 1.6 MB (135x) |
+| `mandelbrot_fixed_2d` | 1.11x | Zig 1.11x | 2.4 ms | 4.7 s | 1942x | **12 KB** vs 1.6 MB (136x) |
+| `fib_recursive_38` | 1.14x | Zig 1.14x | 2.0 ms | 4.9 s | 2467x | **12 KB** vs 1.6 MB (135x) |
+| `bitwise_hash_20m` | 1.14x | Zig 1.14x | 2.4 ms | 4.8 s | 2002x | **12 KB** vs 1.6 MB (135x) |
+| `branch_mix_30m` | 1.16x | Zig 1.16x | 2.3 ms | 4.8 s | 2087x | **12 KB** vs 1.6 MB (135x) |
+
+LIR wins the deep-recursion workload, is within 1% on two, and trails by
+3-16% on the rest. The gap is instruction selection, not throughput: the
+emitter has no three-operand or load-op selection, so each multiply in an
+inner loop costs an extra `mov` (`imul` forces its destination onto the left
+operand), and counted loops whose body spans more than one basic block are
+not unrolled. Both items are tracked with evidence in
+[ROADMAP Phase 3](docs/ROADMAP.md). Compilation is ~2000x faster and binaries
+are ~135x smaller because there is no LLVM, no DWARF, and no runtime library.
 
 Reproduce with:
 ```bash

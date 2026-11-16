@@ -39,6 +39,31 @@ Validated status (2026-11): `zig build test` passes 115/115 unit + catalogue-con
 - [ ] Vectorization (SIMD)
 - [ ] Profile-guided optimization
 
+### Phase 3 notes: measured gaps (2026-11)
+
+Recorded so optimizer work is tracked against evidence rather than assumed.
+Numbers come from `bench/speed_compare` measured with `tools/ab_bench.py`
+(interleaved paired sampling, median of 13, 3 warmups, ratio = LIR/Zig, 95%
+bootstrap CI); every program is also checked to print byte-identical output
+to its Zig reference.
+
+- Two-address instruction selection: the code generator computes `a * b` as
+  `mov` + `imul` because `imul` forces its destination onto the left
+  operand. Inner loops that multiply therefore carry one extra `mov` per
+  multiply, and the multiply-heavy kernels land around 1.10-1.15x Zig
+  (mandelbrot 1.116, bitwise_hash 1.138, branch_mix 1.135). Three-operand
+  selection and load-op fusion are the next step here.
+- Multi-block loops are not unrolled. `unrollCountedLoops` only matches a
+  single-block self-loop of at most 14 instructions, so a counted loop whose
+  body spans two blocks (variable initialisation plus an `if`/`break`) is
+  left alone. Zig unrolls exactly those loops twice; the extra loop-control
+  overhead is the dominant remaining difference on mandelbrot, whose
+  per-iteration arithmetic is otherwise equivalent.
+- Compiler throughput is not the bottleneck: compile time is 1400-2100x
+  faster than `zig build-exe -OReleaseFast` on the same programs (median of
+  15, warm cache for Zig), so the runtime gap above is a code-quality
+  question.
+
 ## Phase 4: Concurrency
 - [x] Native OS threads (`spawn`, `@thread_create`, `@thread_join`)
 - [x] Bounded MPMC channels (`@chan_new`, `@chan_send`, `@chan_recv`, `@chan_close`)
