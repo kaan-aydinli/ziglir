@@ -47,18 +47,24 @@ Numbers come from `bench/speed_compare` measured with `tools/ab_bench.py`
 bootstrap CI); every program is also checked to print byte-identical output
 to its Zig reference.
 
-- Two-address instruction selection: the code generator computes `a * b` as
-  `mov` + `imul` because `imul` forces its destination onto the left
-  operand. Inner loops that multiply therefore carry one extra `mov` per
-  multiply, and the multiply-heavy kernels land around 1.10-1.15x Zig
-  (mandelbrot 1.116, bitwise_hash 1.138, branch_mix 1.135). Three-operand
-  selection and load-op fusion are the next step here.
+- Inner-loop multiplies move the accumulator first (`mov %A,%B` then
+  `imul`, plus `mov %B,%C` / `sar` to keep the product) where a
+  memory-form `imul mem,reg` or commuting `imul rax,%A` would avoid a copy.
+  This is the visible difference on the multiply-heavy kernels
+  (mandelbrot 1.11x, bitwise_hash 1.14x, branch_mix 1.16x). Note that a
+  naive "extra mov" count is misleading: `1 + 2*1` folds to `3` at -O2 and
+  Zig independently emits the same `mov`-pair shape for `h = h ^ (h >> 32)`,
+  so the gap is in operand selection, not in the optimizer.
 - Multi-block loops are not unrolled. `unrollCountedLoops` only matches a
   single-block self-loop of at most 14 instructions, so a counted loop whose
   body spans two blocks (variable initialisation plus an `if`/`break`) is
-  left alone. Zig unrolls exactly those loops twice; the extra loop-control
-  overhead is the dominant remaining difference on mandelbrot, whose
-  per-iteration arithmetic is otherwise equivalent.
+  left alone. Zig unrolls exactly those loops twice (mandelbrot's inner loop
+  appears as two 26-instruction versions against one 38-instruction version),
+  so the unroll is the measurable structural difference on that kernel.
+- `bitwise_hash_20m` keeps its loop bound in a register because the
+  bound is a function parameter, where Zig receives the same value as an
+  immediate through inlining; that is an inlining-context difference rather
+  than a compare-selection defect.
 - Compiler throughput is not the bottleneck: compile time is 1400-2100x
   faster than `zig build-exe -OReleaseFast` on the same programs (median of
   15, warm cache for Zig), so the runtime gap above is a code-quality

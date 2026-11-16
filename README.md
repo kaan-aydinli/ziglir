@@ -395,11 +395,10 @@ workload- and machine-specific, not a language ranking.
 | `branch_mix_30m` | 1.16x | Zig 1.16x | 2.3 ms | 4.8 s | 2087x | **12 KB** vs 1.6 MB (135x) |
 
 LIR wins the deep-recursion workload, is within 1% on two, and trails by
-3-16% on the rest. The gap is instruction selection, not throughput: the
-emitter has no three-operand or load-op selection, so each multiply in an
-inner loop costs an extra `mov` (`imul` forces its destination onto the left
-operand), and counted loops whose body spans more than one basic block are
-not unrolled. Both items are tracked with evidence in
+3-16% on the rest. The gap is code quality, not compiler throughput: inner
+loop multiplies shuffle their accumulator between registers, and counted
+loops whose body spans more than one basic block are not unrolled (Zig
+unrolls exactly those). Both items are tracked with evidence in
 [ROADMAP Phase 3](docs/ROADMAP.md). Compilation is ~2000x faster and binaries
 are ~135x smaller because there is no LLVM, no DWARF, and no runtime library.
 
