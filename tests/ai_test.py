@@ -339,6 +339,84 @@ deferred-last
         self.assertEqual(run("run", str(tour), "--backend=vm").returncode, 0)
 
 
+class DocsClaimTests(unittest.TestCase):
+    """Documentation must not drift: every LIR snippet in the hand-written docs
+    is compiled (and, when it has no side effects on ordering, executed)."""
+
+    DOCS = ("docs/ODIN_VS_LIR.md", "docs/AI.md", "docs/SPEC.md",
+            "docs/CONTRIBUTING.md", "docs/STDLIB.md")
+
+    def test_lir_snippets_in_docs_compile(self):
+        import re
+        repo = COMPILER.parent.parent.parent
+        checked = 0
+        with tempfile.TemporaryDirectory(prefix="lir-docs-") as temp:
+            for doc in self.DOCS:
+                path = repo / doc
+                if not path.exists():
+                    continue
+                text = path.read_text()
+                for index, block in enumerate(re.findall(r"```lir\n(.*?)```", text, re.S)):
+                    # Only complete programs are compiled; syntax sketches
+                    # (`fn name(p: T) -> T { ... }`) are fragments by design.
+                    if "fn main" not in block:
+                        continue
+                    with self.subTest(doc=doc, block=index):
+                        src = pathlib.Path(temp) / "doc.lir"
+                        src.write_text(block)
+                        result = run("check", str(src), ok=None)
+                        self.assertEqual(result.returncode, 0,
+                                         f"{doc} block {index} does not compile:\n{result.stderr}")
+                        checked += 1
+        self.assertGreaterEqual(checked, 8, "no LIR snippets were checked")
+
+    def test_odin_comparison_matches_reality(self):
+        """The comparison table makes specific LIR claims; keep them true."""
+        import re
+        repo = COMPILER.parent.parent.parent
+        doc = (repo / "docs" / "ODIN_VS_LIR.md").read_text()
+        with tempfile.TemporaryDirectory(prefix="lir-odin-") as temp:
+            def attempt(source):
+                path = pathlib.Path(temp) / "claim.lir"
+                path.write_text(source + "\n")
+                return run("check", str(path), ok=None).returncode == 0
+
+            # Claims of the form "LIR rejects X".
+            rejected = {
+                "range slicing": "fn main() -> i64 { let a = [1,2,3,4] let s = a[1..3] return 0 }",
+                "distinct types": "type C = distinct i64\nfn main() -> i64 { return 0 }",
+                "zero-init struct": "struct P { x: i64, y: i64 }\nfn main() -> i64 { let p: P = P { } return p.x }",
+                "for &x in xs": "fn main() -> i64 { let mut a = [1,2] for &x in a { } return 0 }",
+                "vector/matrix types": "fn main() -> i64 { let m: matrix[2,2]f32 = 0 return 0 }",
+                "extern FFI": 'extern fn puts(s: string) -> i64\nfn main() -> i64 { return 0 }',
+                "method on alias": "type Meters = i64\nimpl Meters { fn d(self) -> i64 { return 1 } }\nfn main() -> i64 { return 0 }",
+                "println with a number": "fn main() -> i64 { println(42) return 0 }",
+            }
+            for claim, source in rejected.items():
+                with self.subTest(claim=claim):
+                    self.assertFalse(attempt(source), f"doc claims LIR rejects {claim}")
+
+            # Claims of the form "LIR supports X".
+            supported = {
+                "closures": "fn main() -> i64 { let k = 3 let f = |x: i64| x + k return f(4) }",
+                "multiple returns": "fn d(a: i64, b: i64) -> (i64, i64) { return (a / b, a % b) }\nfn main() -> i64 { let (q, r) = d(7, 2) return q + r }",
+                "traits and dyn dispatch": "trait T { fn m(self) -> i64 }\nstruct S { v: i64 }\nimpl T for S { fn m(self) -> i64 { return self.v } }\nfn f(x: dyn T) -> i64 { return x.m() }\nfn main() -> i64 { let s = S { v: 4 } return f(s) }",
+                "Result and ?": "fn g() -> Result<i64, i64> { return Ok(1) }\nfn h() -> Result<i64, i64> { let v = g()? return Ok(v) }\nfn main() -> i64 { return 0 }",
+                "bounded ranges": "type P = i64 range 0..100\nfn main() -> i64 { let p: P = 55 return p as i64 }",
+                "atomics": "fn main() -> i64 { let s = @malloc(8) @atomic_add(s, 1) @free(s) return 0 }",
+                "slices as a type": "fn sum(xs: []i64) -> i64 { return 0 }\nfn main() -> i64 { let a = [1,2,3] let s: []i64 = a let n = sum(s) return n }",
+            }
+            for claim, source in supported.items():
+                with self.subTest(claim=claim):
+                    self.assertTrue(attempt(source), f"doc claims LIR supports {claim}")
+
+            # And the "method on a struct" claim used in the comparison snippet.
+            self.assertTrue(attempt(
+                "struct C { v: i64 }\nimpl C {\n    fn bump(self: *mut C) -> i64 {\n"
+                "        self.v = self.v + 1\n        return self.v\n    }\n}\n"
+                "fn main() -> i64 { var c = C { v: 0 } return c.bump() }"))
+
+
 class ScaffoldTests(unittest.TestCase):
     def test_init_ai_writes_agent_files(self):
         with tempfile.TemporaryDirectory(prefix="lir-ai-init-") as temp:

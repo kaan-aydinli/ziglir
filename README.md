@@ -402,6 +402,7 @@ python3 bench/compare_zig.py
 - **Static Warning Analysis:** unused variables/parameters (`_` prefix hint) and unreachable statements after control transfers.
 - **Language catalogue:** `lir lang` (human), `--json` (machines), `--markdown` (regenerates `docs/LANGUAGE_REFERENCE.md`). Every `supported` example is compiled by `zig build test`.
 - **Builtin catalogue:** `lir builtins` lists every intrinsic with its signature and traps.
+- **Comparison against a peer language:** [LIR vs Odin](docs/ODIN_VS_LIR.md) states where LIR is behind (slices, `distinct`, allocator context, C FFI, ecosystem) as plainly as where it is ahead.
 - **Reserved-word list:** `lir lang --keywords` (or `--json` → `lir.keywords.v1`) is generated from the lexer, so generators never collide with a keyword.
 - **Interactive Knowledge Base:** `lir explain <topic>` covers syntax, types, borrow, safety, contracts, purity, ranges, optimizer, concurrency, strings, collections, errors, diagnostics, `ai` and `limitations`.
 - **AST Inspector:** `lir ast <file>` prints the structured syntax tree hierarchy.
@@ -447,6 +448,7 @@ LIR is licensed under the MIT License. See [LICENSE](LICENSE) for details.
 - [AI integration contract](docs/AI.md) — machine-readable schemas and repair loop
 - [Generated language reference](docs/LANGUAGE_REFERENCE.md) — canonical syntax
 - [Generated cheatsheet](docs/CHEATSHEET.md) — one page, for constrained context windows
+- [LIR vs Odin](docs/ODIN_VS_LIR.md) — honest feature-by-feature comparison
 - [Language Specification](docs/SPEC.md)
 - [Standard Library](docs/STDLIB.md)
 - [Canonical tour](examples/canonical-tour.lir) — every supported feature in one file
