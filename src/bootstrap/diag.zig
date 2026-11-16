@@ -104,6 +104,15 @@ pub const Code = enum(u16) {
     driver_missing_main = 7002,
     driver_missing_input = 7003,
     target_missing_builtin = 7004,
+    // ── Causal Morphogenetic Field (8000-8099) ─────────────────────────────
+    cmf_syntax = 8001,
+    cmf_duplicate = 8002,
+    cmf_morph_empty = 8003,
+    cmf_field_empty = 8004,
+    cmf_claim_unsupported = 8005,
+    cmf_claim_conflict = 8006,
+    cmf_bloom_unsupported = 8007,
+    cmf_variant_invalid = 8008,
     // ── Internal (9000-9099) ───────────────────────────────────────────────
     internal = 9000,
 

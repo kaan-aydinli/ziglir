@@ -112,6 +112,7 @@ lir check main.lir --json        # {"schema":"lir.check.v1","status":"ok",...}
 lir run main.lir --backend=vm    # execute anywhere, no toolchain needed
 lir explain ai                   # the agent workflow, in the terminal
 lir init demo --ai               # scaffold + AGENTS.md + lir.agent.json
+lir cmf field.cmf --json         # {"schema":"lir.cmf.v1",...} claims + verified variants
 ```
 
 Three properties make this trustworthy rather than aspirational:
@@ -450,6 +451,7 @@ LIR is licensed under the MIT License. See [LICENSE](LICENSE) for details.
 - [Generated cheatsheet](docs/CHEATSHEET.md) — one page, for constrained context windows
 - [LIR vs Odin](docs/ODIN_VS_LIR.md) — honest feature-by-feature comparison
 - [HYPERION / CMF assessment](docs/HYPERION_ASSESSMENT.md) — which claims are real, which are prototypes, which contradict known theorems
+- [CMF paradigm](docs/CMF_PARADIGM.md) — the second paradigm: programs as falsifiable fields (`lir cmf`)
 - [Language Specification](docs/SPEC.md)
 - [Standard Library](docs/STDLIB.md)
 - [Canonical tour](examples/canonical-tour.lir) — every supported feature in one file

@@ -692,6 +692,24 @@ const code_help = [_]CodeHelp{
         .fix = "Build for a host thread target (default x86_64-linux or the C11 backend), or run the program with --backend=vm during development.",
     },
     .{
+        .code = "LIR-E8001",
+        .title = "CMF field syntax",
+        .cause = "A line in a .cmf file is not one of the field directives (morph, field, claim, bloom), or a directive is incomplete.",
+        .fix = "Headers are one directive per line: 'morph Name =<< w1 w2 >>=', 'field f: u64[64] ?exclusive', 'claim c over f check uniqueness', 'bloom b: morph Name { ... }'. Run 'lir cmf --help'.",
+    },
+    .{
+        .code = "LIR-E8005",
+        .title = "Claim nothing can falsify",
+        .cause = "A claim names a check LIR does not implement, names no field, or carries a duration without an adjudicator.",
+        .fix = "Use check uniqueness|concurrency|totality|absence, or runtime <adjudicator> plus 'for <n>tick', or drop the claim.",
+    },
+    .{
+        .code = "LIR-E8008",
+        .title = "Bloom variant does not verify",
+        .cause = "One witness instance of a morph was substituted into the bloom body and the result failed lexing, parsing, type checking, or IR verification. The variant is refused.",
+        .fix = "Fix the body or narrow the morph. A refused variant is never emitted, so it can never be selected at runtime.",
+    },
+    .{
         .code = "LIR-E7002",
         .title = "Missing entry point",
         .cause = "The program has no 'fn main' (required unless compiling tests with --test/lir test).",

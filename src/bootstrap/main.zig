@@ -55,6 +55,8 @@ pub const Compiler = driver_mod.Compiler;
 pub const CBackend = c_backend_mod;
 pub const WasmBackend = wasm_backend_mod;
 pub const IRVM = ir_vm_mod;
+/// The second paradigm: programs as falsifiable fields rather than objects.
+pub const CMF = cmf_mod;
 
 /// Exposed for the language-catalogue conformance test: the builtin table is
 /// the authority for which call names may resolve.
@@ -73,6 +75,7 @@ const repl_mod = @import("repl.zig");
 const langcmd_mod = @import("langcmd.zig");
 const explain_mod = @import("explain.zig");
 const langref_mod = @import("langref.zig");
+const cmf_mod = @import("cmf.zig");
 
 // ════════════════════════════════════════════════════════════════════════════
 // CLI
@@ -108,6 +111,8 @@ pub fn main() !void {
         printTargets();
     } else if (eql(command, "lang")) {
         langcmd_mod.cmdLang(args[2..]);
+    } else if (eql(command, "cmf")) {
+        cmf_mod.cmdCmf(args[2..]);
     } else if (eql(command, "builtins") or eql(command, "builtin")) {
         langcmd_mod.cmdBuiltins(args[2..]);
     } else if (eql(command, "build")) {
@@ -236,6 +241,7 @@ fn printUsage() void {
         \\  test [file|dir]     Run the #[test] suite
         \\  lang [feature]      Language catalogue: what LIR accepts (--json/--markdown)
         \\  builtins [name]     Builtin catalogue with signatures (--json)
+        \\  cmf <file.cmf>      Check a Causal Morphogenetic Field header (claims, not classes)
         \\  explain [topic]     Knowledge base; also accepts diagnostics codes (LIR-E3004)
         \\  targets             List supported cross-compilation targets and host defaults
         \\  init [name]         Create a new project (--ai adds AGENTS.md + agent manifest)

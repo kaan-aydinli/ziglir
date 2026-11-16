@@ -4004,6 +4004,73 @@ test "langref: documented examples of every supported feature compile" {
     try std.testing.expect(total >= 50);
 }
 
+test "cmf: the example field is accepted and every bloom variant verifies" {
+    const cmf = @import("cmf.zig");
+    const source =
+        \\morph Cell =<< u8 u16 u32 u64 i64 >>=
+        \\field ledger: u64[1024] ?exclusive
+        \\claim exclusive_writer over ledger check uniqueness
+        \\
+        \\bloom narrow: morph Cell {
+        \\fn main() -> i64 {
+        \\    let cell: @witness = 200
+        \\    return cell as i64
+        \\}
+        \\}
+    ;
+    const ir = cmf.parseField(source);
+    try std.testing.expectEqual(@as(usize, 0), ir.violation_count);
+    try std.testing.expectEqual(@as(usize, 5), ir.variant_count);
+    for (ir.variants[0..ir.variant_count]) |v| {
+        try std.testing.expect(v.verified);
+        try std.testing.expect(!v.vacuous);
+    }
+}
+
+test "cmf: an unverifiable witness is refused and never becomes a variant" {
+    const cmf = @import("cmf.zig");
+    const source =
+        \\morph Cell =<< u8 bool >>=
+        \\bloom narrow: morph Cell {
+        \\fn main() -> i64 {
+        \\    let cell: @witness = 200
+        \\    return 7
+        \\}
+        \\}
+    ;
+    const ir = cmf.parseField(source);
+    try std.testing.expect(ir.violation_count > 0);
+    try std.testing.expectEqual(@as(usize, 2), ir.variant_count);
+    var verified: usize = 0;
+    for (ir.variants[0..ir.variant_count]) |v| {
+        if (v.verified) verified += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), verified);
+}
+
+test "cmf: nested blocks and one-line bodies are extracted verbatim" {
+    const cmf = @import("cmf.zig");
+    const source =
+        \\morph Cell =<< u8 u16 >>=
+        \\bloom nested: morph Cell {
+        \\fn main() -> i64 {
+        \\    var total: i64 = 0
+        \\    if true {
+        \\        let cell: @witness = 1
+        \\        total = cell as i64
+        \\    }
+        \\    return total
+        \\}
+        \\}
+    ;
+    const ir = cmf.parseField(source);
+    try std.testing.expectEqual(@as(usize, 1), ir.body_count);
+    for (ir.variants[0..ir.variant_count]) |v| {
+        try std.testing.expect(v.verified);
+        try std.testing.expect(!v.vacuous);
+    }
+}
+
 test "langref: unsupported entries are rejected with a diagnostic" {
     // Non-compiling spellings that a code generator might otherwise try.
     const probes = [_]struct { src: []const u8, why: []const u8 }{

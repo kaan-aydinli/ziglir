@@ -496,6 +496,113 @@ fn main() -> i64 {
             self.assertEqual(result.returncode, expected, result.stderr)
 
 
+CMF_EXAMPLE = """
+# Shapes, substrate, commitments, expression. No classes anywhere.
+morph Cell =<< u8 u16 u32 u64 i64 >>=
+field ledger: u64[1024] ?exclusive
+claim exclusive_writer over ledger check uniqueness
+
+bloom narrow: morph Cell {
+fn main() -> i64 {
+    let cell: @witness = 200
+    return cell as i64
+}
+}
+"""
+
+
+class CmfTests(unittest.TestCase):
+    """`lir cmf` is the second paradigm: a program is a field of claims, and a
+    bloom is constructed (one real compilation per witness), not declared. These
+    tests pin both directions: what is accepted, and what is refused."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="lir-cmf-")
+        self.addCleanup(self.temp.cleanup)
+        self.dir = pathlib.Path(self.temp.name)
+
+    def write_cmf(self, text, name="field.cmf"):
+        path = self.dir / name
+        path.write_text(textwrap.dedent(text).lstrip())
+        return path
+
+    def test_field_with_verified_variants_is_accepted(self):
+        path = self.write_cmf(CMF_EXAMPLE)
+        result = run("cmf", str(path), ok=None)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for witness in ("u8", "u16", "u32", "u64", "i64"):
+            self.assertIn(f"narrow/{witness}  verified", result.stdout)
+        self.assertIn("5 witness instances advertised, 5 constructed and verified", result.stdout)
+
+    def test_json_envelope_is_machine_readable(self):
+        path = self.write_cmf(CMF_EXAMPLE)
+        doc = json.loads(run("cmf", str(path), "--json").stdout)
+        self.assertEqual(doc["schema"], "lir.cmf.v1")
+        self.assertEqual(doc["status"], "ok")
+        self.assertEqual(len(doc["variants"]), 5)
+        self.assertTrue(all(v["status"] == "verified" for v in doc["variants"]))
+        self.assertEqual(doc["fields"][0]["access"], "exclusive")
+        self.assertEqual(doc["claims"][0]["judgment"], "checked")
+
+    def test_a_witness_that_does_not_verify_is_refused(self):
+        """'bool' cannot hold 200, so that instance is refused and never emitted."""
+        path = self.write_cmf("""
+            morph Cell =<< u8 bool >>=
+            bloom narrow: morph Cell {
+            fn main() -> i64 {
+                let cell: @witness = 200
+                return 7
+            }
+            }
+        """)
+        result = run("cmf", str(path), ok=None)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("narrow/bool  rejected (never emitted)", result.stdout)
+        self.assertIn("narrow/u8  verified", result.stdout)
+        self.assertIn("LIR-E8008", result.stderr)
+
+    def test_unfalsifiable_claims_are_errors(self):
+        path = self.write_cmf("""
+            field ledger: u64[64]
+            claim vibes over ledger check charisma
+            claim telepathy over ghost for 9tick
+        """)
+        result = run("cmf", str(path), ok=None)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("no checker implements", result.stderr)
+        self.assertIn("names no adjudicator", result.stderr)
+
+    def test_bloom_over_undeclared_morph_fails_closed(self):
+        path = self.write_cmf("bloom nowhere: morph Ghost\n")
+        result = run("cmf", str(path), ok=None)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("LIR-E8007", result.stderr)
+
+    def test_vacuous_variant_is_reported_not_hidden(self):
+        path = self.write_cmf("""
+            morph Cell =<< u8 u16 >>=
+            bloom narrow: morph Cell {
+            fn main() -> i64 { return 1 }
+            }
+        """)
+        result = run("cmf", str(path), ok=None)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("vacuous", result.stdout)
+
+    def test_help_and_explain_cover_the_new_codes(self):
+        self.assertIn("cmf <file.cmf>", run("--help").stdout)
+        self.assertIn("morph", run("cmf", "--help").stdout)
+        for code in ("LIR-E8001", "LIR-E8005", "LIR-E8008"):
+            out = run("explain", code).stdout
+            self.assertIn("CMF" if code == "LIR-E8001" else "===", out)
+
+    def test_example_file_is_accepted(self):
+        repo = COMPILER.parent.parent.parent
+        example = repo / "examples" / "cmf" / "widening.cmf"
+        result = run("cmf", str(example), ok=None)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
 class ScaffoldTests(unittest.TestCase):
     def test_init_ai_writes_agent_files(self):
         with tempfile.TemporaryDirectory(prefix="lir-ai-init-") as temp:
