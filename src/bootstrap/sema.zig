@@ -1701,12 +1701,40 @@ pub const Sema = struct {
                 if (sig.param_count == 0 and owner > 0 and std.mem.eql(u8, self.text(p), "self")) {
                     if ((pn.flags & 1) != 0) sig.self_is_mut = true;
                     if ((pn.flags & 2) != 0) sig.self_is_ref = true;
+
                 }
                 sig.param_count += 1;
             }
             self.fns[self.fn_count] = sig;
             self.fn_count += 1;
         }
+    }
+
+    /// Trait parameters must line up exactly; `self` keeps its declared
+    /// mutability so `self` vs `self: *mut Self` is a mismatch.
+    /// The receiver must use exactly the convention the trait declares; other
+    /// parameters must line up in both directions.
+    /// Checks only the receiver convention; the concrete struct identity is
+    /// already fixed by `impl Trait for S`.
+    fn traitReceiverMatches(impl_fn: FnSig, want_self: parser_mod.SelfConvention) bool {
+        const have = impl_fn.param_types[0];
+        switch (want_self) {
+            // `self` / `self: S`: value receiver, or a read-only pointer copy.
+            .by_value => return have == .struct_t or (have == .ptr_struct and !impl_fn.self_is_mut),
+            .ptr_mut => return have == .ptr_struct and impl_fn.self_is_mut,
+            .ptr_ref => return have == .ptr_struct and !impl_fn.self_is_mut,
+            .none => return true,
+        }
+    }
+
+    fn traitTypeMatches(self: *const Sema, want: SemaType, impl_fn: FnSig, param_index: usize, want_self: parser_mod.SelfConvention) bool {
+        _ = self;
+        const have = impl_fn.param_types[param_index];
+        if (param_index == 0 and want_self != .none) return traitReceiverMatches(impl_fn, want_self);
+        if (have == .ptr_struct or want == .ptr_struct) {
+            return have == .ptr_struct and want == .ptr_struct and have.ptr_struct == want.ptr_struct;
+        }
+        return have.compatibleWith(want) and want.compatibleWith(have);
     }
 
     fn checkTraits(self: *Sema) void {
@@ -1721,8 +1749,36 @@ pub const Sema = struct {
             for (0..td.method_count) |mi| {
                 const tm = td.methods[mi];
                 const mname = self.srcText(tm.name.start, tm.name.len, tm.name.source_id);
-                if (self.findFn(mname, imp.struct_idx + 1) == null) {
+                const impl_fn = self.findFn(mname, imp.struct_idx + 1) orelse {
                     self.failAt(error.UndefinedFunctionCall, sd.source_id, sd.line, 1, @intCast(@max(mname.len, 1)), "impl '{s}' for '{s}' is missing required method '{s}'", .{ tname, sname, mname });
+                    continue;
+                };
+                // The implementation must match the trait's declaration, in both
+                // directions: a differing signature would dispatch through the
+                // trait but be called with the wrong ABI/count.
+                if (impl_fn.param_count != tm.param_count) {
+                    self.failAt(error.InvalidArgumentCount, sd.source_id, impl_fn.line, 1, @intCast(@max(mname.len, 1)), "method '{s}' in impl '{s}' for '{s}' takes {d} parameter(s) but the trait declares {d}", .{ mname, tname, sname, impl_fn.param_count, tm.param_count });
+                    self.diag.helpAt(self.diag.count - 1, "match the trait's parameter list exactly ('self' counts as the first parameter)");
+                    continue;
+                }
+                var mismatch: ?u8 = null;
+                for (0..tm.param_count) |pi| {
+                    const want = SemaType.fromTypeTag(tm.param_tags[pi], tm.param_extras[pi], tm.param_elems[pi]);
+                    if (!self.traitTypeMatches(want, impl_fn, pi, tm.self_tag)) {
+                        mismatch = @intCast(pi);
+                        break;
+                    }
+                }
+                if (mismatch == null) {
+                    const want_ret = SemaType.fromTypeTag(tm.ret_tag, tm.ret_extra, tm.ret_elem);
+                    if (!(impl_fn.ret_type.compatibleWith(want_ret) or want_ret.compatibleWith(impl_fn.ret_type)) or impl_fn.ret_type == .unknown or want_ret == .unknown) {
+                        self.failAt(error.TypeMismatch, sd.source_id, impl_fn.line, 1, @intCast(@max(mname.len, 1)), "method '{s}' in impl '{s}' for '{s}' returns a type the trait does not declare", .{ mname, tname, sname });
+                        self.diag.helpAt(self.diag.count - 1, "the return type must be identical to the one in the trait declaration");
+                    }
+                } else {
+                    const pi: usize = mismatch.?;
+                    self.failAt(error.TypeMismatch, sd.source_id, impl_fn.line, 1, @intCast(@max(mname.len, 1)), "parameter {d} of method '{s}' in impl '{s}' for '{s}' does not match the trait declaration", .{ pi + 1, mname, tname, sname });
+                    self.diag.helpAt(self.diag.count - 1, "trait methods are called through dynamic dispatch, so parameter types must match exactly");
                 }
             }
         }

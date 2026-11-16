@@ -48,8 +48,9 @@ try.**
 | Zero-init | no (struct literal must name every field) | **yes** — "zero is initialization" |
 | Generics | `fn id<T>(x: T) -> T`, `Box<T>` | parametric polymorphism with `$T: typeid` |
 | Closures | **yes** — `\|x: i64\| x + 1`, captures | **no** — no closures or function literals |
-| Methods | `impl` blocks, `self` / `self: *mut Self` | free procedures; no type-bound methods |
-| Traits / interfaces | `trait` + `dyn Trait` dispatch | no interfaces; tagged unions + `switch` |
+| Methods | `impl` blocks, `self` / `self: *mut Self` / `&mut self` | free procedures; no type-bound methods |
+| Traits / interfaces | `trait` + `dyn Trait` dispatch (signature-checked) | no interfaces; tagged unions + `switch` |
+| OOP as such | no inheritance/embedding/operator overloading; struct+impl+trait only | deliberately none (no methods at all) |
 | Error handling | `Result<T,E>`, `?`, `??`, `Option<T>` | multiple returns + `or_return` / `or_else` |
 | Sum types | `enum` with payloads, exhaustive `match` | tagged `union` + exhaustive `switch` |
 | Distinct/new types | no (`type X = i64` is a plain alias) | **yes** — `distinct` with explicit casts |
@@ -302,6 +303,68 @@ iteration.
    the catalogue marks it `unsupported` with an `avoid` note — no silent
    miscompilation, and no documentation that drifts (CI diffs the generated
    reference and cheatsheet against the compiler).
+
+## 5b. "OOP" in either language
+
+Neither language is object-oriented, but they are non-OOP in *different* ways,
+which is the more interesting question than a yes/no.
+
+**LIR has the OOP-shaped pieces, without inheritance:**
+
+```lir
+struct Counter { value: i64 }
+
+impl Counter {
+    fn get(self) -> i64 { return self.value }              // method
+    fn bump(self: *mut Counter) -> i64 {                    // mutating method
+        self.value = self.value + 1
+        return self.value
+    }
+}
+
+trait Area { fn area(self) -> i64 }                         // interface
+struct Tile { side: i64 }
+impl Area for Tile {                                        // implementation
+    fn area(self) -> i64 { return self.side * self.side }
+}
+fn measure(s: dyn Area) -> i64 { return s.area() }          // dynamic dispatch
+
+fn main() -> i64 {
+    var c = Counter { value: 0 }
+    c.bump()                                               // 1
+    let tile = Tile { side: 3 }
+    return c.get() + measure(tile)                         // 1 + 9 = 10
+}
+```
+
+| OOP concept | LIR | Odin |
+|---|---|---|
+| Data + methods | **yes** — `impl` blocks, `self` / `self: *mut Self` / `&mut self` | no — free procedures taking the struct (`p->x` auto-derefs) |
+| Interfaces / dynamic dispatch | **yes** — `trait` + `dyn Trait`, vtable at the call site | no — tagged unions + exhaustive `switch` |
+| Interface conformance checking | **yes** — an impl with the wrong arity/type/return is rejected (`LIR-E3005`/`LIR-E3004`) | n/a |
+| Inheritance / base classes | no — `struct B : A` is a syntax error | no |
+| Embedding / composition sugar | no (`using` is rejected) | **yes** — `using` embedding for field promotion |
+| Operator overloading | no (`a + b` on structs is a type error) | no |
+| Methods on non-struct types | no — `impl` works on declared structs only (not enums or aliases) | no methods at all |
+| Trait as a first-class value | no — `let t: T` is rejected; only `dyn T` parameters/returns | n/a |
+| Default trait method bodies | no — every trait method must be implemented in each impl | n/a |
+| Constructors | no special syntax; associated functions like `P::new(...)` work | no constructors; compound literals `T{…}` |
+
+So: **Odin rejects OOP entirely and gives you composition (`using`) instead;
+LIR accepts the method/interface half of OOP and rejects the inheritance half.**
+Practically, Odin code is procedural by construction, while LIR code can look
+familiar to someone coming from C#/Java — with the important difference that
+`dyn Trait` dispatch is a parameter type, not a heap-allocated object: `measure(s)`
+passes the struct by value and the vtable is chosen at the call site.
+
+Two practical notes verified on this build: a `&mut self` method requires the
+binding to be mutable (`var c = ...`; calling it on an immutable `let` is
+`LIR-E3009`), and `Counter { value: 0 }` must name every field.
+
+For AI generation this matters: an LIR model can use familiar shapes
+(`struct` + `impl` + `trait`), but must never emit `extends`, `: Base`,
+`using`, default trait bodies, `let x: Trait`, or operators on structs — all of
+which are compile errors with stable codes rather than silent misbehaviour.
 
 ## 6. Philosophy in one line each
 

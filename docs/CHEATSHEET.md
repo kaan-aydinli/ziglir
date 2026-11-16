@@ -22,8 +22,8 @@ Exactly one `fn main() -> i64`; its return value is the exit code. Newline-separ
 | `struct` | `struct Name { field: T }` | Fields are newline separated, not comma separated. Field declarations may not name another struct type (use a … |
 | `enum` | `enum Name { A, B(i64), C(i64, bool) }` | Variants are comma separated. A variant may carry up to 8 payload fields. Construct with Name::Variant(...), … |
 | `union` | `union Name { i: i64 f: f64 }` | Untagged C-style union of 8-byte slots. Reading a field other than the one written is not type-checked. |
-| `impl_methods` | `impl Name { fn m(self) -> T { ... } }` | Methods receive 'self' (read-only) or 'self: *mut Self' (mutable). Call with value syntax p.m(); the receiver … |
-| `trait_dyn` | `trait T { fn m(self) -> T } struct S { .. } impl T for S { fn m(self) -> T { ... } } fn f(x: dyn T) -> T` | Dynamic dispatch through a 'dyn Trait' parameter. Every declared method must be implemented; missing methods … |
+| `impl_methods` | `impl Name { fn m(self) -> T { ... } }` | Structs + impl blocks: the closest thing LIR has to methods, but there is no inheritance, no embedding and no … |
+| `trait_dyn` | `trait T { fn m(self) -> T } struct S { .. } impl T for S { fn m(self) -> T { ... } } fn f(x: dyn T) -> T` | Dynamic dispatch through a 'dyn Trait' parameter. Every declared method must be implemented, and the … |
 | `type_alias` | `type Alias = i64` | Plain alias; the alias name is interchangeable with the aliased type. |
 | `bounded_range_type` | `type Percent = i64 range 0..100` | Bounded integer type. Constant assignments outside the range are compile errors (LIR-E3004); dynamic values … |
 | `generics` | `fn id<T>(x: T) -> T struct Box<T> { v: T } id<i64>(3) Box<i64> { v: 3 }` | Monomorphized generics: instantiate explicitly with <T> at call/construction sites. Nested generic arguments … |

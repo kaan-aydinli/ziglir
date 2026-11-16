@@ -166,8 +166,21 @@ pub const TypeDesc = struct {
     const_expr_node: u32 = 0, // for [CONST_EXPR]T or Option/Result inner
 };
 
+/// How a trait declares its receiver, so implementations can be compared.
+pub const SelfConvention = enum(u8) {
+    /// No receiver (associated function).
+    none,
+    /// `self` or `self: S` — the value is passed by value/inline.
+    by_value,
+    /// `self: *S` — read-only pointer receiver.
+    ptr_ref,
+    /// `self: *mut S` or `&mut self` — mutable pointer receiver.
+    ptr_mut,
+};
+
 pub const TraitMethod = struct {
     name: TextSpan = .{},
+    self_tag: SelfConvention = .none,
     param_count: u8 = 0,
     param_tags: [8]TypeTag = .{.none} ** 8,
     param_extras: [8]u32 = .{0} ** 8,
@@ -585,6 +598,8 @@ pub const ParsedType = struct {
     extra: u32 = 0, // struct_idx+1, enum_idx+1, or fixed_array length
     elem_type: TypeTag = .none,
     alias_idx: u32 = 0, // alias_idx + 1 if from a type alias
+    /// `*mut T` (as opposed to `*T` / `*const T`).
+    is_mut: bool = false,
 };
 
 pub const Parser = struct {
@@ -893,9 +908,14 @@ pub const Parser = struct {
         const tok = self.peek();
         if (tok.kind == .star) {
             _ = self.advance();
-            if (self.match(.kw_const) or self.match(.kw_mut)) _ = self.advance();
+            var is_mut = false;
+            if (self.match(.kw_const) or self.match(.kw_mut)) {
+                is_mut = self.match(.kw_mut);
+                _ = self.advance();
+            }
             const inner = self.parseTypeSpec(true);
             if (inner.tag == .none) return .{};
+            const is_mut_flag = is_mut;
             if (inner.tag == .ptr or inner.tag == .fixed_array or inner.tag == .tuple or
                 inner.tag == .fn_ptr or inner.tag == .generic_inst)
             {
@@ -905,9 +925,9 @@ pub const Parser = struct {
                     .ret_extra = inner.extra,
                     .ret_elem = inner.elem_type,
                 });
-                return .{ .tag = .ptr, .extra = td | 0x80000000, .elem_type = inner.tag };
+                return .{ .tag = .ptr, .extra = td | 0x80000000, .elem_type = inner.tag, .is_mut = is_mut_flag };
             }
-            return .{ .tag = .ptr, .extra = inner.extra, .elem_type = inner.tag };
+            return .{ .tag = .ptr, .extra = inner.extra, .elem_type = inner.tag, .is_mut = is_mut_flag };
         }
         if (tok.kind == .question) {
             _ = self.advance();
@@ -1443,15 +1463,48 @@ pub const Parser = struct {
                         _ = self.expect(.comma);
                         if (self.match(.rparen)) break;
                     }
+                    var self_mut = false;
                     if (idx == 0 and self.match(.amp)) {
                         _ = self.advance();
-                        if (self.match(.kw_mut)) _ = self.advance();
+                        if (self.match(.kw_mut)) {
+                            _ = self.advance();
+                            self_mut = true;
+                        }
                     }
                     const ptok = if (self.match(.kw_self)) self.advance() else self.expect(.identifier);
                     var ptype: ParsedType = if (ptok.kind == .kw_self) .{ .tag = .ptr } else .{ .tag = .i64 };
+                    if (ptok.kind == .kw_self and idx == 0) {
+                        // Record how 'self' was declared so impls are compared
+                        // against the real receiver convention: 'self',
+                        // 'self: *mut S', '&self', '&mut self'.
+                        if (self_mut) {
+                            m.self_tag = .ptr_mut;
+                        } else if (!self.match(.colon)) {
+                            m.self_tag = .by_value;
+                        }
+                    }
                     if (self.match(.colon)) {
                         _ = self.advance();
                         ptype = self.parseTypeSpec(false);
+                        if (ptok.kind == .kw_self and idx == 0) {
+                            if (self_mut) {
+                                m.self_tag = .ptr_mut;
+                            } else if (ptype.tag == .ptr) {
+                                m.self_tag = .ptr_ref;
+                            } else if (ptype.tag == .struct_type) {
+                                m.self_tag = .by_value;
+                            }
+                        }
+                    }
+                    if (ptok.kind == .kw_self and idx == 0 and m.self_tag == .none) {
+                        // Bare `self` with no annotation is the by-value receiver.
+                        if (self_mut) {
+                            m.self_tag = .ptr_mut;
+                        } else if (ptype.tag == .ptr and ptype.extra == 0) {
+                            m.self_tag = .by_value;
+                        } else if (ptype.tag == .ptr) {
+                            m.self_tag = .ptr_ref;
+                        }
                     }
                     if (m.param_count < 8) {
                         const pi = m.param_count;
@@ -1664,6 +1717,9 @@ pub const Parser = struct {
             self.ast.nodes[pnode].type_tag = ptype.tag;
             self.ast.nodes[pnode].elem_type = ptype.elem_type;
             self.ast.nodes[pnode].child0 = ptype.extra;
+            // `*mut T` carries its mutability in the type; fold it into the
+            // parameter flags so `self: *mut S` marks a mutable receiver.
+            if (ptype.is_mut) pflags |= 1;
             self.ast.nodes[pnode].flags = pflags;
             self.ast.nodes[pnode].int_val = ptype.alias_idx;
             if (self.match(.assign)) {

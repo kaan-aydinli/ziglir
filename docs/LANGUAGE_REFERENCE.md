@@ -148,7 +148,7 @@ fn main() -> i64 {
 impl Name { fn m(self) -> T { ... } }
 ```
 
-Methods receive 'self' (read-only) or 'self: *mut Self' (mutable). Call with value syntax p.m(); the receiver is auto-referenced. There is no 'impl Trait for Type' free-standing method block other than trait impls.
+Structs + impl blocks: the closest thing LIR has to methods, but there is no inheritance, no embedding and no operator overloading. Methods receive 'self' (read-only) or 'self: *mut Self' (mutable). Call with value syntax p.m(); the receiver is auto-referenced. There is no 'impl Trait for Type' free-standing method block other than trait impls.
 
 ```lir
 struct Counter {
@@ -181,7 +181,7 @@ impl T for S { fn m(self) -> T { ... } }
 fn f(x: dyn T) -> T
 ```
 
-Dynamic dispatch through a 'dyn Trait' parameter. Every declared method must be implemented; missing methods are a compile error. Values are passed by value and the vtable is selected at the call site.
+Dynamic dispatch through a 'dyn Trait' parameter. Every declared method must be implemented, and the implementation must match the trait exactly: same parameter count/types and same return type, so a mismatched impl fails with LIR-E3005/LIR-E3004. Receiver forms are 'self', 'self: *T', 'self: *mut T', '&self', '&mut self'; a trait may declare a mutable receiver only as '&mut self' or 'self: *mut T'. Trait methods cannot have default bodies. Values are passed by value and the vtable is selected at the call site. Traits cannot be used as standalone values ('let t: T'), only as 'dyn T' parameters/returns.
 
 ```lir
 trait Area {

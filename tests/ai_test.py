@@ -391,6 +391,12 @@ class DocsClaimTests(unittest.TestCase):
                 "extern FFI": 'extern fn puts(s: string) -> i64\nfn main() -> i64 { return 0 }',
                 "method on alias": "type Meters = i64\nimpl Meters { fn d(self) -> i64 { return 1 } }\nfn main() -> i64 { return 0 }",
                 "println with a number": "fn main() -> i64 { println(42) return 0 }",
+                "inheritance": "struct A { x: i64 }\nstruct B : A { y: i64 }\nfn main() -> i64 { return 0 }",
+                "embedding with using": "struct A { x: i64 }\nstruct B { using a: A }\nfn main() -> i64 { return 0 }",
+                "operator overloading": "struct V { x: i64 }\nimpl V { fn add(self, o: V) -> V { return V { x: 1 } } }\nfn main() -> i64 { let a = V { x: 1 } let b = V { x: 2 } return (a + b).x }",
+                "trait as a value": "trait T { fn m(self) -> i64 }\nstruct S { v: i64 }\nimpl T for S { fn m(self) -> i64 { return 1 } }\nfn main() -> i64 { let t: T = S { v: 0 } return 0 }",
+                "default trait body": "trait T { fn m(self) -> i64 { return 7 } }\nstruct S { v: i64 }\nimpl T for S { }\nfn main() -> i64 { return 0 }",
+                "impl on an enum": "enum E { A, B }\nimpl E { fn m(self) -> i64 { return 1 } }\nfn main() -> i64 { return 0 }",
             }
             for claim, source in rejected.items():
                 with self.subTest(claim=claim):
@@ -404,6 +410,8 @@ class DocsClaimTests(unittest.TestCase):
                 "Result and ?": "fn g() -> Result<i64, i64> { return Ok(1) }\nfn h() -> Result<i64, i64> { let v = g()? return Ok(v) }\nfn main() -> i64 { return 0 }",
                 "bounded ranges": "type P = i64 range 0..100\nfn main() -> i64 { let p: P = 55 return p as i64 }",
                 "atomics": "fn main() -> i64 { let s = @malloc(8) @atomic_add(s, 1) @free(s) return 0 }",
+                "methods and impl blocks": "struct P { x: i64 }\nimpl P { fn get(self) -> i64 { return self.x } }\nfn main() -> i64 { let p = P { x: 3 } return p.get() }",
+                "traits with dyn dispatch": "trait A { fn a(self) -> i64 }\nstruct S { v: i64 }\nimpl A for S { fn a(self) -> i64 { return self.v } }\nfn f(x: dyn A) -> i64 { return x.a() }\nfn main() -> i64 { return f(S { v: 2 }) }",
                 "slices as a type": "fn sum(xs: []i64) -> i64 { return 0 }\nfn main() -> i64 { let a = [1,2,3] let s: []i64 = a let n = sum(s) return n }",
             }
             for claim, source in supported.items():

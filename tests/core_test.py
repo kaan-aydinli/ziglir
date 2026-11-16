@@ -2,10 +2,91 @@
 """Core-language regression gates. Requirements match backend_test.py."""
 import pathlib
 import subprocess
+import textwrap
 import tempfile
 import unittest
 
 from backend_test import COMPILER, BACKENDS, LEVELS, EXAMPLES
+
+
+class TraitConformanceTests(unittest.TestCase):
+    """Trait impls must match the declaration: a mismatched signature would be
+    dispatched through the trait but called with the wrong ABI."""
+
+    def run_lir(self, source, *args):
+        with tempfile.TemporaryDirectory(prefix="lir-trait-") as temp:
+            path = pathlib.Path(temp) / "m.lir"
+            path.write_text(textwrap.dedent(source).lstrip())
+            return subprocess.run([str(COMPILER), *args, str(path)],
+                                  capture_output=True, text=True, timeout=60)
+
+    def test_matching_impls_run(self):
+        source = """
+            trait Reader { fn read(self) -> i64 }
+            trait Writer { fn write(&mut self, v: i64) -> i64 }
+
+            struct Buf { v: i64 }
+
+            impl Reader for Buf { fn read(self) -> i64 { return self.v } }
+            impl Writer for Buf { fn write(self: *mut Buf, v: i64) -> i64 { self.v = v return self.v } }
+
+            fn main() -> i64 {
+                var b = Buf { v: 42 }
+                printInt(b.read())
+                printInt(b.write(7))
+                printInt(b.read())
+                return 0
+            }
+        """
+        result = self.run_lir(source, "run", "--backend=vm")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "42\n7\n7")
+
+    def test_wrong_return_type_is_rejected(self):
+        source = """
+            trait T { fn m(self) -> i64 }
+            struct S { v: i64 }
+            impl T for S { fn m(self) -> f64 { return 1.0 } }
+            fn main() -> i64 { return 0 }
+        """
+        result = self.run_lir(source, "check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("LIR-E3004", result.stderr)
+
+    def test_wrong_arity_is_rejected(self):
+        source = """
+            trait T { fn m(self, a: i64) -> i64 }
+            struct S { v: i64 }
+            impl T for S { fn m(self) -> i64 { return 1 } }
+            fn main() -> i64 { return 0 }
+        """
+        result = self.run_lir(source, "check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("LIR-E3005", result.stderr)
+
+    def test_mutating_receiver_needs_mut_trait_declaration(self):
+        source = """
+            trait T { fn m(self) -> i64 }
+            struct S { v: i64 }
+            impl T for S { fn m(self: *mut S) -> i64 { self.v = 1 return self.v } }
+            fn main() -> i64 { return 0 }
+        """
+        result = self.run_lir(source, "check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("LIR-E3004", result.stderr)
+
+    def test_dyn_dispatch_across_two_impls(self):
+        source = """
+            trait Shape { fn area(self) -> i64 }
+            struct Square { s: i64 }
+            struct Rect { w: i64, h: i64 }
+            impl Shape for Square { fn area(self) -> i64 { return self.s * self.s } }
+            impl Shape for Rect { fn area(self) -> i64 { return self.w * self.h } }
+            fn total(a: dyn Shape, b: dyn Shape) -> i64 { return a.area() + b.area() }
+            fn main() -> i64 { return total(Square { s: 3 }, Rect { w: 2, h: 5 }) }
+        """
+        result = self.run_lir(source, "run", "--backend=vm")
+        self.assertEqual(result.returncode, 19, result.stderr)
 
 
 class CoreTests(unittest.TestCase):
