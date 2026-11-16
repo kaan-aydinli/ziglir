@@ -449,6 +449,7 @@ LIR is licensed under the MIT License. See [LICENSE](LICENSE) for details.
 - [Generated language reference](docs/LANGUAGE_REFERENCE.md) — canonical syntax
 - [Generated cheatsheet](docs/CHEATSHEET.md) — one page, for constrained context windows
 - [LIR vs Odin](docs/ODIN_VS_LIR.md) — honest feature-by-feature comparison
+- [HYPERION / CMF assessment](docs/HYPERION_ASSESSMENT.md) — which claims are real, which are prototypes, which contradict known theorems
 - [Language Specification](docs/SPEC.md)
 - [Standard Library](docs/STDLIB.md)
 - [Canonical tour](examples/canonical-tour.lir) — every supported feature in one file

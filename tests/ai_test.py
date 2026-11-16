@@ -21,6 +21,7 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 
 COMPILER = pathlib.Path(sys.argv.pop(1) if len(sys.argv) > 1 else "zig-out/bin/lir").resolve()
@@ -423,6 +424,76 @@ class DocsClaimTests(unittest.TestCase):
                 "struct C { v: i64 }\nimpl C {\n    fn bump(self: *mut C) -> i64 {\n"
                 "        self.v = self.v + 1\n        return self.v\n    }\n}\n"
                 "fn main() -> i64 { var c = C { v: 0 } return c.bump() }"))
+
+
+class HyperionFeasibilityTests(unittest.TestCase):
+    """docs/HYPERION_ASSESSMENT.md claims that some of the proposed ideas are
+    already expressible in LIR today. Those specific claims are pinned here.
+    (The physical/theoretical refutations need no test.)"""
+
+    def test_barrier_free_task_graph_is_expressible(self):
+        """Cone-based (happens-before) scheduling needs no global epoch: LIR
+        already gives spawn/join/channels/mutexes."""
+        source = """
+fn worker(arg: i64) -> i64 { return arg * 2 }
+
+fn main() -> i64 {
+    let a = @thread_create("worker", 3)
+    let b = @thread_create("worker", 4)
+    let ch = @chan_new(1)
+    @chan_send(ch, 5)
+    let via_chan = @chan_recv(ch)
+    @chan_close(ch)
+    return @thread_join(a) + @thread_join(b) + via_chan
+}
+"""
+        self._assert_vm_exit(source, 3 * 2 + 4 * 2 + 5)
+
+    def test_pure_functions_can_be_used_for_speculation_safely(self):
+        """Only #[pure] bodies may be speculatively evaluated; impure ones are
+        rejected, which is exactly the safety boundary the doc demands."""
+        pure_ok = """
+#[pure]
+fn cheap(x: i64) -> i64 { return x * x }
+
+fn main() -> i64 { return cheap(7) }
+"""
+        self._assert_vm_exit(pure_ok, 49)
+        impure_rejected = """
+#[pure]
+fn not_pure(x: i64) -> i64 {
+    println("side effect")
+    return x
+}
+fn main() -> i64 { return not_pure(1) }
+"""
+        with tempfile.TemporaryDirectory(prefix="lir-hyp-") as temp:
+            path = pathlib.Path(temp) / "m.lir"
+            path.write_text(impure_rejected)
+            result = run("check", str(path), ok=None)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("pure", result.stderr.lower())
+
+    def test_zero_copy_views_of_existing_arrays(self):
+        """A slice/view is O(1) to create (no data copy) - the part of the
+        'algebraic lens' claim that is real today; range slicing is not."""
+        source = """
+fn sum(xs: []i64) -> i64 { return 0 }
+
+fn main() -> i64 {
+    let data = [1, 2, 3, 4]
+    let view: []i64 = data      // no copy
+    return sum(view) + data[3]
+}
+"""
+        self._assert_vm_exit(source, 4)
+
+    def _assert_vm_exit(self, source, expected):
+        with tempfile.TemporaryDirectory(prefix="lir-hyp-run-") as temp:
+            path = pathlib.Path(temp) / "m.lir"
+            path.write_text(textwrap.dedent(source).lstrip())
+            result = run("run", str(path), "--backend=vm", ok=None)
+            self.assertEqual(result.returncode, expected, result.stderr)
 
 
 class ScaffoldTests(unittest.TestCase):
