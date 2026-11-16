@@ -48,16 +48,38 @@ pub fn optimize(module: *IRModule, level: OptLevel) void {
 
 fn optimizeFn(module: *IRModule, fi: u32, level: OptLevel) void {
     const f = &module.fns[fi];
+    // ── -O1 Pipeline ────────────────────────────────────────────
+    // -O1 used to run local passes only, which left parameters and loop
+    // variables in memory: the same function could run 2.4x slower than at -O2.
+    // It now builds SSA (that is what actually moves values into registers) but
+    // skips the passes whose runtime payoff does not pay for their compile time:
+    // inlining, global value numbering, loop-invariant hoisting, unrolling and
+    // loop rotation.
     if (level == .O1) {
-        var iter: u32 = 0;
-        while (iter < 8) : (iter += 1) {
-            var changed = false;
-            if (localConstantFoldAndLVN(f)) changed = true;
-            if (globalCopyPropagate(f)) changed = true;
-            if (simplifyCFG(f)) changed = true;
-            if (deadCodeElimination(f, level)) changed = true;
-            if (!changed) break;
-        }
+        _ = localStoreToLoadForward(f);
+        _ = localConstantFoldAndLVN(f);
+        _ = simplifyCFG(f);
+        _ = mem2reg(f);
+        _ = simplifyTrivialPhis(f);
+        _ = ifConversion(f);
+        _ = localConstantFoldAndLVN(f);
+        _ = globalCopyPropagate(f);
+        _ = simplifyCFG(f);
+        _ = destructSSA(f);
+        _ = reorderBlocksRPO(f);
+        _ = coalesceCopiesPostSSA(f);
+        _ = localConstantFoldAndLVN(f);
+        _ = deadCodeElimination(f, .O1);
+        _ = localConstantFoldAndLVN(f);
+        _ = deadCodeElimination(f, .O1);
+        _ = simplifyCFG(f);
+        _ = deadCodeElimination(f, .O1);
+        _ = reorderBlocksRPO(f);
+        _ = unrollCountedLoops(f);
+        _ = coalesceCopiesPostSSA(f);
+        _ = propagateTrivialCopies(f);
+        _ = localConstantFoldAndLVN(f);
+        _ = deadCodeElimination(f, .O1);
         return;
     }
 
@@ -108,6 +130,7 @@ fn optimizeFn(module: *IRModule, fi: u32, level: OptLevel) void {
     _ = simplifyCFG(f);
     _ = reorderBlocksRPO(f);
     _ = unrollCountedLoops(f);
+    _ = propagateTrivialCopies(f);
 
     var post_iter: u32 = 0;
     while (post_iter < 4) : (post_iter += 1) {
@@ -132,11 +155,39 @@ fn countFnInsts(f: *const IRFn) u32 {
     return total;
 }
 
-fn fnInlineEligible(f: *const IRFn) bool {
+/// Instruction budget for inlining. The default keeps code growth modest for
+/// functions that are called from many places; a function with a single call
+/// site cannot increase total code size by more than its own body, so it gets a
+/// larger budget (a small function invoked once is pure call overhead: argument
+/// setup, prologue/epilogue, and no constant propagation into the callee). This
+/// is what lets the compiler turn `f(20000000)` into a loop with the bound as a
+/// constant instead of a parameter.
+const INLINE_MAX_INSTS = 56;
+const INLINE_MAX_INSTS_SINGLE_CALL = 120;
+
+fn countCallSites(module: *const IRModule, callee: u32) u32 {
+    var sites: u32 = 0;
+    for (0..module.fn_count) |fi| {
+        const f = &module.fns[fi];
+        for (0..f.block_count) |bi| {
+            for (0..f.blocks[bi].inst_count) |ii| {
+                const inst = f.blocks[bi].insts[ii];
+                if (inst.op == .call and inst.callee_fn_idx >= 0 and
+                    @as(u32, @intCast(inst.callee_fn_idx)) == callee)
+                {
+                    sites += 1;
+                }
+            }
+        }
+    }
+    return sites;
+}
+
+fn fnInlineEligible(f: *const IRFn, max_insts: u32) bool {
     if (f.block_count == 0 or f.block_count > 8) return false;
     if (f.total_locals > 48) return false;
     const total = countFnInsts(f);
-    if (total == 0 or total > 56) return false;
+    if (total == 0 or total > max_insts) return false;
     for (0..f.block_count) |bi| {
         const b = &f.blocks[bi];
         for (0..b.inst_count) |ii| {
@@ -151,7 +202,13 @@ fn inlineSmallFunctions(module: *IRModule) bool {
     var changed = false;
     var eligible: [ir.MAX_FNS]bool = .{false} ** ir.MAX_FNS;
     for (0..module.fn_count) |i| {
-        eligible[i] = fnInlineEligible(&module.fns[i]);
+        // A single-call-site callee is inlined even when larger, because total
+        // code size cannot shrink by keeping the call.
+        const max_insts: u32 = if (countCallSites(module, @intCast(i)) <= 1)
+            INLINE_MAX_INSTS_SINGLE_CALL
+        else
+            INLINE_MAX_INSTS;
+        eligible[i] = fnInlineEligible(&module.fns[i], max_insts);
     }
 
     var fi: u32 = 0;
@@ -2474,6 +2531,72 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
     return changed;
 }
 
+/// Replace reads of a `copy` destination with the copy source.
+///
+/// Out-of-SSA code the register allocator sees is often a chain of trivial
+/// copies (`v25 = copy v20`) because destruction has to materialise phi edges.
+/// Two-address instruction selection and the constant-divisor lowering in code
+/// generation both look at an operand's defining instruction, so a copy in the
+/// way hides a constant divisor from them: `div v24, v25` missed the
+/// magic-number path and emitted a full idiv plus guards, where `div v24, v20`
+/// lowers to a multiply (this is the whole -O1 mandelbrot regression).
+///
+/// The rewrite is only done when the destination has exactly one definition in
+/// the function, which is the ordinary non-SSA shape: with a single def, every
+/// read of the destination observes the copy source's value, so replacing the
+/// read cannot change behaviour.
+fn propagateTrivialCopies(f: *IRFn) bool {
+    var def_cnt: [MAX_TRACKED_VREGS]u16 = undefined;
+    isSingleDefVregTable(f, &def_cnt);
+    var copy_src: [MAX_TRACKED_VREGS]u16 = .{0} ** MAX_TRACKED_VREGS;
+
+    for (0..f.block_count) |bi| {
+        const b = &f.blocks[bi];
+        for (0..b.inst_count) |ii| {
+            const inst = b.insts[ii];
+            if (inst.op != .copy or inst.dest == 0 or inst.dest >= MAX_TRACKED_VREGS) continue;
+            if (inst.src1 == 0 or inst.src1 >= MAX_TRACKED_VREGS or inst.src1 == inst.dest) continue;
+            if (def_cnt[inst.dest] != 1) continue;
+            copy_src[inst.dest] = inst.src1;
+        }
+    }
+
+    // Follow chains (bounded so a malformed cycle cannot hang the pass).
+    for (0..MAX_TRACKED_VREGS) |v| {
+        if (copy_src[v] == 0) continue;
+        var cur = copy_src[v];
+        var steps: u8 = 0;
+        while (cur < MAX_TRACKED_VREGS and copy_src[cur] != 0 and steps < 8) : (steps += 1) {
+            cur = copy_src[cur];
+        }
+        copy_src[v] = cur;
+    }
+
+    var changed = false;
+    for (0..f.block_count) |bi| {
+        const b = &f.blocks[bi];
+        for (0..b.inst_count) |ii| {
+            const inst = &b.insts[ii];
+            if (inst.src1 > 0 and inst.src1 < MAX_TRACKED_VREGS and copy_src[inst.src1] != 0) {
+                inst.src1 = copy_src[inst.src1];
+                changed = true;
+            }
+            if (inst.src2 > 0 and inst.src2 < MAX_TRACKED_VREGS and copy_src[inst.src2] != 0) {
+                inst.src2 = copy_src[inst.src2];
+                changed = true;
+            }
+            for (0..@min(inst.arg_count, inst.args.len)) |ai| {
+                const a = inst.args[ai];
+                if (a > 0 and a < MAX_TRACKED_VREGS and copy_src[a] != 0) {
+                    inst.args[ai] = copy_src[a];
+                    changed = true;
+                }
+            }
+        }
+    }
+    return changed;
+}
+
 fn localStoreToLoadForward(f: *IRFn) bool {
     var changed = false;
     var slot_val: [256]u16 = undefined;
@@ -3087,6 +3210,12 @@ fn coalesceCopiesPostSSA(f: *IRFn) bool {
                     break;
                 }
             }
+            // Renaming the definition to `dst` turns it into a second definition
+            // of `dst` inside this block. That is only harmless when `dst` has no
+            // readers between the definition and the copy: otherwise those reads
+            // now see the wrong value. It also needs `dst` not to be written
+            // twice, or the block has two definitions of one name.
+            if (safe and def_cnt[dst] != 1) safe = false;
             if (safe) {
                 b.insts[di].dest = dst;
                 b.insts[j].op = .nop;
@@ -3127,6 +3256,24 @@ fn coalesceCopiesPostSSA(f: *IRFn) bool {
                 else => false,
             };
             if (!is_two_addr) continue;
+            // Writing inst0's result straight into `dst` is only valid when
+            // nothing between inst0 and inst1 still needs `dst`: it is
+            // overwritten early here, so those instructions would read the next
+            // iteration's value. Skipping this check rewrote
+            //   x = x + 1; y = x + 1; x = y + 1
+            // into
+            //   x = x + 1; y = x + 1; x = x + 1
+            // which made an unrolled loop advance one step per repetition.
+            if (def_cnt[dst] != 1) continue;
+            var dst_read_between = false;
+            for (i + 2..b.inst_count) |between| {
+                if (instReadsVreg(b.insts[between], dst) or b.insts[between].dest == dst) {
+                    dst_read_between = true;
+                    break;
+                }
+            }
+            if (dst_read_between) continue;
+
             if (inst1.src1 == tmp and inst1.src2 != dst) {
                 b.insts[i].dest = dst;
                 b.insts[i + 1].src1 = dst;
@@ -3826,6 +3973,14 @@ fn unrollCountedLoops(f: *IRFn) bool {
                 if ((!iv_read_in_body or all_iv_reads_handled) and ni.dest == iv and ni.op == .add) {
                     continue;
                 }
+                // A variable updated in place (`x = add x, k`) reads the value
+                // produced by the previous repetition, not the original vreg:
+                // the rename above only rewrites reads of the variable's original
+                // index. Record the new definition so later repetitions chain
+                // instead of all reading the first repetition's result (which
+                // advanced the loop by one step per unrolled block).
+                const reads_own_dest = ni.dest > 0 and ni.dest < MAX_TRACKED_VREGS and
+                    instReadsVreg(ni, ni.dest);
 
                 if (rep > 0 and iv_mul_const[ii] != 0 and iv_mul_fed[ii]) {
                     continue;
@@ -3841,6 +3996,10 @@ fn unrollCountedLoops(f: *IRFn) bool {
                         f.vreg_count += 1;
                         cur_map[ni.dest] = fv;
                         ni.dest = fv;
+                        // Fresh definitions are what later repetitions (and the
+                        // write-back) read; without this entry the chain keeps
+                        // reading the first repetition's vreg.
+                        cur_map[fv] = fv;
                     }
                 }
 
@@ -3874,6 +4033,11 @@ fn unrollCountedLoops(f: *IRFn) bool {
                     }
                 }
 
+                if (reads_own_dest) {
+                    // re-point the read at the fresh definition
+                    if (ni.src1 == ni.dest) ni.src1 = ni.dest;
+                    cur_map[ni.dest] = ni.dest;
+                }
                 if (w4 < MAX_INSTS_PER_BLOCK - 32) {
                     f.blocks[b_4x].insts[w4] = ni;
                     w4 += 1;
@@ -3887,12 +4051,15 @@ fn unrollCountedLoops(f: *IRFn) bool {
             w4 += 1;
         }
 
+        // One write-back per loop-carried variable. cur_map holds that variable's
+        // last definition in the unrolled body. Emitting one copy per *definition*
+        // (what this loop used to do) let a later copy overwrite an earlier one,
+        // so a variable could be written with a stale value at loop exit.
         for (0..MAX_TRACKED_VREGS) |orig_v| {
-            if (orig_v == iv and (!iv_read_in_body or all_iv_reads_handled)) continue;
-            if (cur_map[orig_v] != orig_v and blk_def_cnt[orig_v] > 0 and
-                is_loop_carried[orig_v] and
-                w4 < MAX_INSTS_PER_BLOCK - 2)
-            {
+            if (orig_v == iv) continue;
+            if (!is_loop_carried[orig_v]) continue;
+            if (cur_map[orig_v] == orig_v) continue;
+            if (w4 < MAX_INSTS_PER_BLOCK - 2) {
                 f.blocks[b_4x].insts[w4] = .{ .op = .copy, .dest = @intCast(orig_v), .src1 = cur_map[orig_v] };
                 w4 += 1;
             }

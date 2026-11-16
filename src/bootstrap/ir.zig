@@ -571,9 +571,11 @@ pub const IRModule = struct {
     }
 
     pub fn dumpModule(self: *const IRModule, source: []const u8) void {
-        var buf: [65536]u8 = undefined;
+        var buf: [256 << 10]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buf);
-        self.formatModule(source, fbs.writer()) catch {};
+        self.formatModule(source, fbs.writer()) catch |err| {
+            std.debug.print("\n[ir dump truncated: {s}]\n", .{@errorName(err)});
+        };
         util.printStr(fbs.getWritten());
     }
 };

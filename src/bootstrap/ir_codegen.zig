@@ -1061,6 +1061,39 @@ pub const IRCodegen = struct {
             if (self.vreg_def_cnt[v] != 1) self.vreg_const_known[v] = false;
         }
 
+        // A division by a constant is lowered to a multiply, but only when the
+        // divisor's defining instruction is visible. Out-of-SSA code (and the
+        // unroller) leave trivial copies such as `v25 = copy v20` in front of a
+        // constant; without this the divisor looked unknown and code generation
+        // emitted a full idiv plus guards instead of the multiply. Follow those
+        // copies so the cheaper lowering still applies.
+        {
+            var copy_src: [4096]u16 = undefined;
+            @memset(&copy_src, 0);
+            for (0..ir_fn.block_count) |bi| {
+                const blk = &ir_fn.blocks[bi];
+                for (0..blk.inst_count) |ii| {
+                    const inst = blk.insts[ii];
+                    if (inst.op != .copy) continue;
+                    if (inst.dest == 0 or inst.dest >= MAX_VREGS) continue;
+                    if (inst.src1 == 0 or inst.src1 >= MAX_VREGS or inst.src1 == inst.dest) continue;
+                    copy_src[inst.dest] = inst.src1;
+                }
+            }
+            for (0..nv) |v| {
+                if (copy_src[v] == 0 or self.vreg_def_cnt[v] != 1) continue;
+                var cur: u16 = copy_src[v];
+                var steps: u8 = 0;
+                while (steps < 8 and self.vreg_def_cnt[cur] == 1 and !self.vreg_const_known[cur] and copy_src[cur] != 0) : (steps += 1) {
+                    cur = copy_src[cur];
+                }
+                if (self.vreg_const_known[cur]) {
+                    self.vreg_const_known[v] = true;
+                    self.vreg_const_imm[v] = self.vreg_const_imm[cur];
+                }
+            }
+        }
+
         for (0..ir_fn.block_count) |bi| {
             const blk = &ir_fn.blocks[bi];
             for (0..blk.inst_count) |ii| {

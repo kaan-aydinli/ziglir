@@ -39,6 +39,60 @@ Validated status (2026-11): `zig build test` passes 115/115 unit + catalogue-con
 - [ ] Vectorization (SIMD)
 - [ ] Profile-guided optimization
 
+#### Phase 3 notes: soundness fixes and the -O1 pipeline (2026-11)
+
+Working on runtime performance surfaced three soundness bugs. All three were
+present before this branch, all three produced a wrong answer while every
+level reported success, and all three are fixed here. The fixes are the only
+reason the -O1 numbers below can be trusted at all.
+
+1. `unrollCountedLoops` advanced the induction variable once per *unrolled
+   repetition* rather than once per iteration. It also emitted one write-back
+   copy per body definition instead of one per variable, so a later copy
+   overwrote an earlier one. `while n <= 10 { count += 1; n += 1 }` printed 6
+   instead of 9 at -O2. Fixed by chaining repetitions through the vreg map and
+   writing back only the last definition of each carried variable.
+2. `coalesceCopiesPostSSA` pass B rewrote a result into a destination `dst`
+   that was still read further down the block, and pass A renamed a definition
+   into a destination that already had one. Together they turned
+   `x = x + 1; y = x + 1; x = y + 1` into `x = x + 1; y = x + 1; x = x + 1`.
+   Fixed by requiring a single definition of `dst` and no reads of `dst`
+   between the two instructions.
+3. `rotateLoops` ran on functions that still carried phis and emitted
+   ill-formed code (SIGILL at runtime). It now refuses when any phi is present.
+
+`tests/core_test.py::LoopOptimizationSoundnessTests` covers each case at all
+three levels, on the native and VM backends.
+
+With those closed, -O1 was rebuilt: it previously ran local passes only, which
+left parameters and loop variables in memory and made the same function up to
+2.4x slower than at -O2. It now builds SSA, runs if-conversion, copy
+propagation and coalescing, rotates and unrolls counted loops, and skips only
+inlining, global value numbering and loop-invariant hoisting. Code generation
+also follows trivial `copy` chains when looking for a constant divisor, so
+`x / 10000` keeps its multiply-based lowering after out-of-SSA (`mandelbrot`
+had regressed 12% purely from a `v = copy const` in front of a `div`).
+
+Paired measurement, 21 sample pairs per workload, bootstrap 95% CI, old and
+new binaries alternating within each pair (old = this branch before the
+change, same machine, same session):
+
+| Workload | old -O1 | new -O1 | ratio | stable? |
+|---|---|---|---|---|
+| `mandelbrot_fixed_2d` | 28.47 ms | 25.74 ms | 1.10x | yes |
+| `tak_recursive_27` | 29.95 ms | 26.35 ms | 1.18x | yes |
+| `branch_mix_30m` | 63.35 ms | 46.50 ms | 1.38x | yes |
+| `collatz_sequence_1m` | 315.47 ms | 212.06 ms | 1.49x | yes |
+| `bitwise_hash_20m` | 32.74 ms | 31.94 ms | 1.03x | no (CI touches 1.0) |
+| `prime_count_500k` | 42.09 ms | 41.91 ms | 1.00x | no |
+| `nested_matrix_loop_4m` | 29.88 ms | 29.88 ms | 0.99x | no |
+| `fib_mod_30m` | 103.64 ms | 107.90 ms | 0.98x | yes, 2% slower |
+
+Geometric mean of the eight ratios: **1.13x**. -O1 compile time rises from
+2.5 ms to 3.7 ms net on the 255-function module, still 2x faster than -O2 at
+7.6 ms. Only the "yes" rows are claimed; the rest are noise this machine
+cannot resolve.
+
 #### Phase 3 notes: compile-time work (2026-11)
 
 Compilation is the axis where the gains in this branch are unambiguous and

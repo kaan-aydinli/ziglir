@@ -331,5 +331,167 @@ class OptimizationEquivalenceTests(unittest.TestCase):
                                      f"{level} computed {outputs[level]}, expected {expected}\n{source}")
 
 
+def _expected_branchy_total(n):
+    total = 0
+    for i in range(1, n + 1):
+        total += i % 1009 if i % 7 == 0 else i % 97
+    return total
+
+
+def _expected_scaled_total(upto):
+    total = 0
+    for i in range(1, upto + 1):
+        t = (i * i) // 10000 + ((i + 3) * (i + 3)) // 10000
+        if i % 2 == 0:
+            total += t
+    return total
+
+
+class LoopOptimizationSoundnessTests(unittest.TestCase):
+    """Loops whose bodies update several variables must keep their trip count.
+
+    These three programs each used to print a wrong number while every level
+    reported success, because three optimizer passes were unsound in ways a
+    smoke test cannot see:
+
+      * loop unrolling advanced the induction variable once per *unrolled
+        repetition*, not once per iteration (the write-back also copied a
+        stale definition);
+      * copy coalescing wrote a result into a destination that was still read
+        further down the block, which turned `x = x + 1; y = x + 1; x = y + 1`
+        into `x = x + 1; y = x + 1; x = x + 1`;
+      * loop rotation ran on a function that still carried phis, where it
+        silently invalidated values.
+
+    Every case is checked at each level, on both backends, against a trip
+    count that is written out by hand.
+    """
+
+    def run_source(self, source, level, backend=None):
+        args = ["run", level]
+        if backend:
+            args.append(f"--backend={backend}")
+        return self.run_lir(source, *args)
+
+    def run_lir(self, source, *args):
+        with tempfile.TemporaryDirectory(prefix="lir-loop-") as temp:
+            path = pathlib.Path(temp) / "m.lir"
+            path.write_text(textwrap.dedent(source).lstrip())
+            return subprocess.run([str(COMPILER), *args, str(path)],
+                                  capture_output=True, text=True, timeout=120)
+
+    def assert_all_levels(self, source, expected):
+        for level in LEVELS:
+            for backend in (None, "vm"):
+                with self.subTest(level=level, backend=backend or "native"):
+                    result = self.run_source(source, level, backend)
+                    self.assertEqual(result.returncode, 0,
+                                     f"{level}: {result.stderr}\n{source}")
+                    self.assertEqual(result.stdout.strip(), str(expected),
+                                     f"{level} ({backend or 'native'}) printed "
+                                     f"{result.stdout.strip()}, expected {expected}\n{source}")
+
+    def test_counter_loop_trip_count(self):
+        self.assert_all_levels("""
+            fn main() -> i64 {
+                var n: i64 = 2
+                var count: i64 = 0
+                while n <= 10 {
+                    count += 1
+                    n += 1
+                }
+                printInt(count)
+                return 0
+            }
+        """, 9)
+
+    def test_two_loops_with_strided_update(self):
+        self.assert_all_levels("""
+            fn main() -> i64 {
+                var n: i64 = 2
+                var count: i64 = 0
+                while n <= 10 {
+                    count += 1
+                    n += 1
+                }
+                var acc: i64 = 0
+                while acc < 7 {
+                    acc += 2
+                }
+                printInt(count + acc)
+                return 0
+            }
+        """, 17)  # 9 iterations + acc reaching 8
+
+    def test_nested_loops_with_break_and_early_exit(self):
+        self.assert_all_levels("""
+            fn count_primes(limit: i64) -> i64 {
+                var count: i64 = 0
+                var n: i64 = 2
+                while n <= limit {
+                    var is_p: i64 = 1
+                    var d: i64 = 2
+                    while d * d <= n {
+                        if n % d == 0 {
+                            is_p = 0
+                            break
+                        }
+                        d += 1
+                    }
+                    count += is_p
+                    n += 1
+                }
+                return count
+            }
+            fn main() -> i64 {
+                printInt(count_primes(100))
+                return 0
+            }
+        """, 25)
+
+    def test_branchy_loop_accumulator(self):
+        """Accumulating from two branches into one variable (the -O1 hazard:
+        a copy coalesced into a destination that was read later)."""
+        self.assert_all_levels("""
+            fn work(n: i64) -> i64 {
+                var total: i64 = 0
+                var i: i64 = 1
+                while i <= n {
+                    if i % 7 == 0 { total += i % 1009 } else { total += i % 97 }
+                    i += 1
+                }
+                return total
+            }
+            fn main() -> i64 {
+                printInt(work(100000))
+                return 0
+            }
+        """, _expected_branchy_total(100000))
+
+    def test_division_by_constant_after_copy(self):
+        """A copy of a constant divisor must not force a real idiv path.
+
+        The observable result is the same either way; this guards the shape that
+        makes `x / 10000` lower to a multiply, which the K1 mandelbrot benchmark
+        depends on."""
+        self.assert_all_levels("""
+            fn scaled(a: i64, b: i64) -> i64 {
+                let s: i64 = 10000
+                return (a * a) / s + (b * b) / s
+            }
+            fn main() -> i64 {
+                var total: i64 = 0
+                var i: i64 = 1
+                while i < 500 {
+                    var t: i64 = scaled(i, i + 3)
+                    if i % 2 == 0 { total += t }
+                    i += 1
+                }
+                printInt(total)
+                return 0
+            }
+        """, _expected_scaled_total(499))
+
+
 if __name__ == "__main__":
     unittest.main()
