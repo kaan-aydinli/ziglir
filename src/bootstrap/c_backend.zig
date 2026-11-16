@@ -22,6 +22,7 @@ pub const CBackendError = error{
     InvalidFunction,
     OutOfMemory,
     CCompilerNotFound,
+    CrossCompilerNotFound,
     CCompileFailed,
 };
 
@@ -1568,6 +1569,10 @@ pub fn compileCWithToolchain(
         try argv.append(alloc, "cc");
         try argv.append(alloc, "-target");
         try argv.append(alloc, target.zigTriple());
+    } else if (!target.isHost()) {
+        // A host `cc` can only produce host binaries; silently emitting a host
+        // binary for a cross target would be a miscompile.
+        return error.CrossCompilerNotFound;
     } else if (host_cc) |hc| {
         try argv.append(alloc, hc);
     } else {

@@ -6,7 +6,7 @@ The implementation sequence and mandatory correctness/performance gates are spec
 
 Release blockers include unchecked capacity/offset arithmetic, process termination from reusable compiler stages, silent acceptance of unsupported syntax, invalid IR reaching code generation, incorrect ABI/register/stack behavior, and non-atomic executable output.
 
-Recent bootstrap hardening (not yet validated by a local Zig test run): unsupported top-level declarations and non-`i64` parameter/return/struct-field annotations now fail closed; AST source-span access uses overflow-safe range validation. These changes reduce silent miscompilation risk but do not constitute a complete type checker. The IR string table now checks both entry and byte capacities before writes, deduplicates only validated ranges, and causes compilation to fail explicitly on overflow. A structural IR verifier now runs before native code generation and checks function/source ranges, block and instruction counts, branch targets, string references, call argument bounds, struct layout, parameter/local slot bounds, and backend stack-frame limits. Regression tests cover malformed branch/string references, invalid local slots, and oversized stack frames. CI had exposed a test-module name-shadowing compile error; the import alias was corrected, but the latest run must confirm the full set of changes.
+Validated status (2026-11): `zig build test` passes 115/115 unit + catalogue-conformance tests, and `tests/{cli,core,call,project,ai,backend,browser}_test.py` all pass against the release build. Recent bootstrap hardening: unsupported top-level declarations and non-`i64` parameter/return/struct-field annotations now fail closed; AST source-span access uses overflow-safe range validation. These changes reduce silent miscompilation risk but do not constitute a complete type checker. The IR string table now checks both entry and byte capacities before writes, deduplicates only validated ranges, and causes compilation to fail explicitly on overflow. A structural IR verifier now runs before native code generation and checks function/source ranges, block and instruction counts, branch targets, string references, call argument bounds, struct layout, parameter/local slot bounds, and backend stack-frame limits. Regression tests cover malformed branch/string references, invalid local slots, and oversized stack frames. The earlier test-module name-shadowing compile error is fixed and covered by the current green run.
 
 ## Phase 1: Core Language
 - [x] Lexer with zero allocations
@@ -43,6 +43,8 @@ Recent bootstrap hardening (not yet validated by a local Zig test run): unsuppor
 - [x] Native OS threads (`spawn`, `@thread_create`, `@thread_join`)
 - [x] Bounded MPMC channels (`@chan_new`, `@chan_send`, `@chan_recv`, `@chan_close`)
 - [x] Mutexes (`@mutex_new`, `@mutex_lock`, `@mutex_unlock`) & atomic operations (`@atomic_add`, `@atomic_cas`)
+- [x] Join reports the thread's return value on native, C11 and IR VM backends
+- [x] Fail-closed target gate: threads/channels are rejected for `wasm32-wasi` with `LIR-E7004`
 - [ ] Data race detection (compile-time)
 - [ ] Async/await state-machine runtime
 - [ ] Work-stealing scheduler
@@ -56,6 +58,19 @@ Recent bootstrap hardening (not yet validated by a local Zig test run): unsuppor
 - [x] RISC-V backend (`riscv64-linux`)
 - [ ] Embedded targets (no_std)
 - [x] WASI support (`wasm32-wasi` native emitter, Wasmtime/Node runner, portable IR VM)
+
+## Phase 5b: AI/tooling contracts (2026-11)
+- [x] Machine-readable language catalogue (`lir lang --json`, `lir.lang.v1`) validated by tests
+- [x] Machine-readable builtin catalogue (`lir builtins --json`, `lir.builtins.v1`)
+- [x] Coded diagnostics (`lir.diagnostics.v1`) with `help` and `expect{kind,value}`
+- [x] JSON command results (`lir.check.v1`, `lir.build.v1`)
+- [x] `lir explain` topic + code knowledge base with `--json`/`--list`
+- [x] Agent scaffolding (`lir init --ai` → `AGENTS.md`, `lir.agent.json`)
+- [x] Generated reference (`lir lang --markdown` → `docs/LANGUAGE_REFERENCE.md`)
+- [x] Regression gate for the above (`tests/ai_test.py`, catalogue conformance in `zig build test`)
+- [ ] LSP server publishing `lir.diagnostics.v1` live
+- [ ] Formatter (`lir fmt`)
+- [ ] Machine-readable stdlib catalogue with per-function signatures
 
 ## Phase 6: Ecosystem (2027)
 - [ ] Package manager (lir pkg)

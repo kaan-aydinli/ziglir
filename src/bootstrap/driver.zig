@@ -70,6 +70,7 @@ pub const Compiler = struct {
     emit_ir: bool = false,
     emit_c: bool = false,
     quiet: bool = false,
+    diag_format: diag_mod.Format = .human,
     test_mode: bool = false,
     last_diag_count: u32 = 0,
     last_diag_source_id: u32 = 0,
@@ -111,11 +112,12 @@ pub const Compiler = struct {
         lexer.* = lex.Lexer.init(src);
         lexer.tokenize();
         if (lexer.overflowed) {
-            diag.addAt(.err, source_id, 1, 1, 1, "token capacity exceeded (maximum 16384 tokens)");
+            diag.addCodedAt(.lex_token_capacity, .err, source_id, 1, 1, 1, "token capacity exceeded (maximum 16384 tokens)");
             return error.TooManyTokens;
         }
         if (lexer.invalid) {
-            diag.addAt(.err, source_id, lexer.invalid_line, lexer.invalid_col, 1, "invalid character, malformed escape, or unterminated literal");
+            const lex_idx = diag.push(.lex_invalid_character, .err, source_id, lexer.invalid_line, lexer.invalid_col, 1, "invalid character, malformed escape, or unterminated literal");
+            if (lex_idx != null) diag.expectAt(diag.count - 1, "valid_token", "");
             return error.InvalidToken;
         }
 
@@ -131,11 +133,11 @@ pub const Compiler = struct {
         if (parser_inst.invalid_syntax) return error.InvalidSyntax;
         if (parser_inst.unsupported_float_literal) return error.UnsupportedFloatLiteral;
         if (ast.overflowed) {
-            diag.addAt(.err, source_id, 1, 1, 1, "AST or metadata capacity exceeded");
+            diag.addCodedAt(.limit_ast_capacity, .err, source_id, 1, 1, 1, "AST or metadata capacity exceeded");
             return error.TooManyASTNodes;
         }
         if (parser_inst.invalid_integer_literal) {
-            diag.addAt(.err, source_id, parser_inst.invalid_integer_line, parser_inst.invalid_integer_col, parser_inst.invalid_integer_len, "malformed or out-of-range i64 integer literal");
+            diag.addCodedAt(.lex_integer_literal, .err, source_id, parser_inst.invalid_integer_line, parser_inst.invalid_integer_col, parser_inst.invalid_integer_len, "malformed or out-of-range i64 integer literal");
             return error.InvalidIntegerLiteral;
         }
     }
@@ -185,7 +187,21 @@ pub const Compiler = struct {
                 std_src = stdlib_mod.lookup(mod_name);
                 break :blk mod_name;
             };
-            if (!is_explicit_path and std_src == null) continue;
+            if (!is_explicit_path and std_src == null) {
+                // An embedded-module miss is a hard error: silently ignoring the
+                // import would only surface later as unknown builtins.
+                if (!std.mem.containsAtLeast(u8, mod_name, 1, "::")) {
+                    if (stdlib_mod.suggestModule(mod_name)) |sugg| {
+                        diag.addCodedFmtAt(.module_unknown, .err, node.source_id, node.line, node.col, node.text_len, "unknown standard library module '{s}'; did you mean '{s}'?", .{ mod_name, sugg });
+                        diag.expectAt(diag.count - 1, "module", sugg);
+                    } else {
+                        diag.addCodedAt(.module_unknown, .err, node.source_id, node.line, node.col, node.text_len, "unknown standard library module");
+                    }
+                    diag.helpAt(diag.count - 1, "import one of: core, io, os, sys, net, crypto, json, math, testing, str, algo, collections, hash, fmt, time, http");
+                    return error.ImportNotFound;
+                }
+                continue;
+            }
 
             if (std_src) |embedded_src| {
                 const canonical = if (std.mem.startsWith(u8, mod_name, "std::")) mod_name["std::".len..] else mod_name;
@@ -196,7 +212,7 @@ pub const Compiler = struct {
                 }
                 if (ast.source_count >= parser_mod.SYNTH_SOURCE_ID) {
                     alloc.free(tag);
-                    diag.addAt(.err, node.source_id, node.line, node.col, node.text_len, "maximum number of source modules exceeded (63)");
+                    diag.addCodedAt(.module_capacity, .err, node.source_id, node.line, node.col, node.text_len, "maximum number of source modules exceeded (63)");
                     return error.TooManySources;
                 }
                 const sid = ast.source_count;
@@ -215,7 +231,7 @@ pub const Compiler = struct {
             }
 
             const resolved = resolveImportPath(alloc, importer_path, rel_path) catch {
-                diag.addFmtAt(.err, node.source_id, node.line, node.col, node.text_len, "cannot resolve import path '{s}'", .{rel_path});
+                diag.addCodedFmtAt(.module_unresolved, .err, node.source_id, node.line, node.col, node.text_len, "cannot resolve import path '{s}'", .{rel_path});
                 return error.ImportNotFound;
             };
             if (loaded.containsPath(entry_norm, resolved)) {
@@ -224,12 +240,12 @@ pub const Compiler = struct {
             }
             if (ast.source_count >= parser_mod.SYNTH_SOURCE_ID) {
                 alloc.free(resolved);
-                diag.addAt(.err, node.source_id, node.line, node.col, node.text_len, "maximum number of source modules exceeded (63)");
+                diag.addCodedAt(.module_capacity, .err, node.source_id, node.line, node.col, node.text_len, "maximum number of source modules exceeded (63)");
                 return error.TooManySources;
             }
 
             const mod_src = util.readFileAlloc(alloc, resolved) catch {
-                diag.addFmtAt(.err, node.source_id, node.line, node.col, node.text_len, "cannot read imported module '{s}'", .{rel_path});
+                diag.addCodedFmtAt(.module_read_failed, .err, node.source_id, node.line, node.col, node.text_len, "cannot read imported module '{s}'", .{rel_path});
                 alloc.free(resolved);
                 return error.ImportNotFound;
             };
@@ -274,7 +290,7 @@ pub const Compiler = struct {
         // Phase 2.5: Macro/Generics/Comptime/Test expansion
         try expand_mod.expand(ast, diag, self.test_mode);
         if (ast.overflowed) {
-            diag.addAt(.err, 0, 1, 1, 1, "AST or metadata capacity exceeded during expansion");
+            diag.addCodedAt(.limit_ast_capacity, .err, 0, 1, 1, 1, "AST or metadata capacity exceeded during expansion");
             return error.TooManyASTNodes;
         }
 
@@ -302,7 +318,7 @@ pub const Compiler = struct {
         ir_gen.target = self.target;
         try ir_gen.generate();
         if (ir_mod_out.string_overflowed) {
-            diag.add(.err, 1, 1, 1, "IR string table capacity exceeded");
+            diag.addCodedAt(.limit_ir_strings, .err, 0, 1, 1, 1, "IR string table capacity exceeded");
             return error.StringTableOverflow;
         }
 
@@ -340,7 +356,7 @@ pub const Compiler = struct {
         ir_module.init();
         var loaded = LoadedSources{};
         defer loaded.deinit(alloc);
-        var diag = DiagList.init();
+        var diag = DiagList.initAs(self.diag_format);
         diag.quiet = self.quiet;
         self.lowerAndVerify(ir_module, &diag, &loaded) catch |err| {
             self.emitDiag(&diag, &loaded);
@@ -357,7 +373,7 @@ pub const Compiler = struct {
         var loaded = LoadedSources{};
         defer loaded.deinit(alloc);
 
-        var diag = DiagList.init();
+        var diag = DiagList.initAs(self.diag_format);
         diag.quiet = self.quiet;
         self.lowerAndVerify(ir_module, &diag, &loaded) catch |err| {
             self.emitDiag(&diag, &loaded);
@@ -380,7 +396,7 @@ pub const Compiler = struct {
         var loaded = LoadedSources{};
         defer loaded.deinit(alloc);
 
-        var diag = DiagList.init();
+        var diag = DiagList.initAs(self.diag_format);
         diag.quiet = self.quiet;
         self.lowerAndVerify(ir_module, &diag, &loaded) catch |err| {
             self.emitDiag(&diag, &loaded);
@@ -406,7 +422,7 @@ pub const Compiler = struct {
         var loaded = LoadedSources{};
         defer loaded.deinit(alloc);
 
-        var diag = DiagList.init();
+        var diag = DiagList.initAs(self.diag_format);
         diag.quiet = self.quiet;
         self.lowerAndVerify(ir_module, &diag, &loaded) catch |err| {
             self.emitDiag(&diag, &loaded);
@@ -432,7 +448,7 @@ pub const Compiler = struct {
         var loaded = LoadedSources{};
         defer loaded.deinit(alloc);
 
-        var diag = DiagList.init();
+        var diag = DiagList.initAs(self.diag_format);
         diag.quiet = self.quiet;
         self.lowerAndVerify(ir_module, &diag, &loaded) catch |err| {
             self.emitDiag(&diag, &loaded);

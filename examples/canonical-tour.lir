@@ -1,0 +1,192 @@
+// Canonical LIR tour — every construct here is listed as "supported" by
+// `lir lang` and is exercised by tests/ai_test.py on all backends.
+//
+// Run:  lir run examples/canonical-tour.lir --backend=vm
+// Expected output is asserted in tests/ai_test.py (EXAMPLES entry).
+
+import core
+
+// ── 1. Global constant, comptime evaluation, bounded type ───────────────────
+const LIMIT: i64 = 3 ** 2
+
+type Percent = i64 range 0..100
+
+comptime fn fib(n: i64) -> i64 {
+    if n <= 1 { return n }
+    return fib(n - 1) + fib(n - 2)
+}
+
+const TENTH_FIB = fib(10)
+
+// ── 2. Attributes: pure function, contract ──────────────────────────────────
+#[pure]
+fn square(x: i64) -> i64 {
+    return x * x
+}
+
+#[pre(b != 0)]
+fn divide(a: i64, b: i64) -> i64 {
+    return a / b
+}
+
+// ── 3. Struct + impl methods ───────────────────────────────────────────────
+struct Counter {
+    value: i64
+}
+
+impl Counter {
+    fn get(self) -> i64 {
+        return self.value
+    }
+    fn bump(self: *mut Counter) -> i64 {
+        self.value = self.value + 1
+        return self.value
+    }
+}
+
+// ── 4. Enum with payloads + trait + dyn dispatch ───────────────────────────
+enum Shape {
+    Square(i64),
+    Rectangle(i64, i64),
+    Empty,
+}
+
+trait Area {
+    fn area(self) -> i64
+}
+
+struct Tile {
+    side: i64
+}
+
+impl Area for Tile {
+    fn area(self) -> i64 {
+        return self.side * self.side
+    }
+}
+
+fn measure(shape: dyn Area) -> i64 {
+    return shape.area()
+}
+
+fn describe(shape: Shape) -> i64 {
+    return match shape {
+        Shape::Square(side) => side * side,
+        Shape::Rectangle(w, h) if w == h => w * h,
+        Shape::Rectangle(w, h) => w + h,
+        Shape::Empty => 0,
+    }
+}
+
+// ── 5. Option / Result with ? propagation and ?? default ───────────────────
+fn maybe(ok: bool) -> Option<i64> {
+    if ok { return Some(7) }
+    return None
+}
+
+fn doubled(ok: bool) -> Option<i64> {
+    let v = maybe(ok)?
+    return Some(v * 2)
+}
+
+fn attempt() -> Result<i64, i64> {
+    return Ok(divide(20, 4))
+}
+
+fn main() -> i64 {
+    // control flow
+    let mut total = 0
+    for i in 1..=4 {
+        total += i
+    }
+    let mut countdown = 3
+    while countdown > 0 {
+        countdown -= 1
+    }
+    loop {
+        countdown += 1
+        if countdown == 2 { break }
+    }
+
+    // expressions, casts, ternary, interpolation
+    let label = total > 5 ? "big" : "small"
+    println("control total={total} label={label} down={countdown}")
+    println("comptime fib(10)={TENTH_FIB} limit={LIMIT}")
+    printInt(square(6))
+    printInt(300 as u8 as i64)
+    println("")
+
+    // struct methods
+    var counter = Counter { value: 0 }
+    counter.bump()
+    printInt(counter.get())
+    printInt(counter.bump())
+    println("")
+
+    // enums, traits, dyn
+    printInt(describe(Shape::Square(4)))
+    printInt(describe(Shape::Rectangle(3, 3)))
+    printInt(describe(Shape::Rectangle(2, 5)))
+    printInt(describe(Shape::Empty))
+    let tile = Tile { side: 5 }
+    printInt(measure(tile))
+    println("")
+
+    // option / result
+    let missing: ?i64 = None
+    printInt(maybe(true) ?? 0)
+    printInt(missing ?? 9)
+    printInt(match doubled(false) { Some(v) => v, None => -1 })
+    printInt(match attempt() { Ok(v) => v, Err(e) => e })
+    println("")
+
+    // closures and function values
+    let step = 3
+    let add = |x: i64| x + step
+    let seven = || 7
+    printInt(add(seven()))
+    println("")
+
+    // collections
+    let items = @array_new(4, 8)
+    @array_push(items, 4)
+    @array_push(items, 5)
+    let mut sum = 0
+    for v in items {
+        sum += v
+    }
+    let squares = [i * i for i in 0..3]
+    let map = #{ "one": 1 }
+    @map_set(map, "two", 2)
+    printInt(sum)
+    printInt(@array_len(squares))
+    printInt(@map_get(map, "one") + @map_get(map, "two"))
+    @array_free(items)
+    @array_free(squares)
+    @map_free(map)
+    println("")
+
+    // tuples
+    let pair = (4, true)
+    let (number, ok) = pair
+    if ok { printInt(number) }
+    println("")
+
+    // concurrency: atomics (threads and channels need a host target; wasm32-wasi
+    // rejects them with LIR-E7004, so the portable tour uses atomics only)
+    let slot = @malloc(8)
+    @atomic_add(slot, 40)
+    @atomic_add(slot, 2)
+    printInt(@read_u64(slot) as i64)
+    @free(slot)
+    println("")
+
+    // bounded type + defer ordering
+    let percent: Percent = 55
+    defer println("deferred-last")
+    defer println("deferred-first")
+    printInt(percent)
+    println("")
+
+    return @min(total, 100) - 10
+}

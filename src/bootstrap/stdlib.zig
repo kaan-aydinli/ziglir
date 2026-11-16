@@ -1,6 +1,7 @@
 // Embedded LIR Standard Library Modules (zero external dependencies)
 
 const std = @import("std");
+const util = @import("util.zig");
 
 pub const StdModule = struct {
     name: []const u8,
@@ -2309,6 +2310,36 @@ pub const modules = [_]StdModule{
     .{ .name = "time", .source = time_src },
     .{ .name = "http", .source = http_src },
 };
+
+/// Every module name the embedded standard library provides, for diagnostics.
+pub fn moduleNames() []const []const u8 {
+    const names = struct {
+        const list = [_][]const u8{ "core", "io", "os", "sys", "net", "crypto", "json", "math", "testing", "str", "algo", "collections", "hash", "fmt", "time", "http" };
+    };
+    return &names.list;
+}
+
+/// Closest module name (case-insensitive) for "did you mean" diagnostics.
+pub fn suggestModule(raw_name: []const u8) ?[]const u8 {
+    var name = raw_name;
+    if (std.mem.startsWith(u8, name, "std::")) name = name["std::".len..];
+    var best: ?[]const u8 = null;
+    var best_score: usize = std.math.maxInt(usize);
+    for (moduleNames()) |candidate| {
+        if (candidate.len == 0) continue;
+        const score = util.levenshteinDistance(name, candidate);
+        if (score < best_score) {
+            best_score = score;
+            best = candidate;
+        }
+    }
+    if (best == null) return null;
+    // Short names need an almost-exact match; otherwise "nope" would suggest
+    // "core" and waste a repair round-trip.
+    const limit: usize = if (name.len <= 5) 1 else if (name.len <= 8) 2 else 3;
+    if (best_score > limit) return null;
+    return best;
+}
 
 pub fn lookup(raw_name: []const u8) ?[]const u8 {
     var name = raw_name;

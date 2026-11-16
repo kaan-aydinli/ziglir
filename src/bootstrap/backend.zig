@@ -30,6 +30,7 @@ pub const BackendError = error{
     MissingMain,
     InvalidFunction,
     CCompilerNotFound,
+    CrossCompilerNotFound,
     CCompileFailed,
     OutOfMemory,
 };

@@ -641,9 +641,13 @@ pub const Parser = struct {
     }
 
     fn reportErr(self: *Parser, tok: Token, comptime fmt: []const u8, args: anytype) void {
+        self.reportCoded(.parse_syntax, tok, fmt, args);
+    }
+
+    fn reportCoded(self: *Parser, code: diag_mod.Code, tok: Token, comptime fmt: []const u8, args: anytype) void {
         self.invalid_syntax = true;
         if (self.diag) |d| {
-            d.addFmtAt(.err, self.source_id, tok.line, tok.col, tok.len, fmt, args);
+            d.addCodedFmtAt(code, .err, self.source_id, tok.line, tok.col, tok.len, fmt, args);
         } else {
             printErr("Parse error at line ");
             printErrUsize(tok.line);
@@ -655,10 +659,21 @@ pub const Parser = struct {
         }
     }
 
+    /// Declares, for the most recent diagnostic, the token kind and spelling the
+    /// parser required. Machine consumers use this to repair source without
+    /// re-parsing English prose.
+    fn expectNote(self: *Parser, kind: []const u8, value: []const u8) void {
+        if (self.diag) |d| {
+            if (d.count == 0) return;
+            d.expectAt(d.count - 1, kind, value);
+        }
+    }
+
     fn expect(self: *Parser, kind: TokenKind) Token {
         const t = self.peek();
         if (t.kind != kind) {
-            self.reportErr(t, "expected {s}, got {s}", .{ @tagName(kind), @tagName(t.kind) });
+            self.reportCoded(.parse_syntax, t, "expected {s}, got {s}", .{ @tagName(kind), @tagName(t.kind) });
+            self.expectNote("token", @tagName(kind));
             if (t.kind != .eof) _ = self.advance();
             return .{ .kind = kind, .start = t.start, .len = 0, .line = t.line, .col = t.col };
         }
@@ -798,7 +813,7 @@ pub const Parser = struct {
             } else if (self.match(.kw_mod) or self.match(.kw_extern)) {
                 self.clearPendingAttrs();
                 const t = self.peek();
-                self.reportErr(t, "unsupported top-level declaration '{s}'", .{@tagName(t.kind)});
+                self.reportCoded(.parse_unsupported_declaration, t, "unsupported top-level declaration '{s}'", .{@tagName(t.kind)});
                 _ = self.advance();
                 var brace_depth: u32 = 0;
                 while (!self.match(.eof)) {
@@ -1134,7 +1149,7 @@ pub const Parser = struct {
                 return .{ .tag = al.target_tag, .extra = al.target_extra, .elem_type = al.target_elem, .alias_idx = ai + 1 };
             }
         }
-        self.reportErr(tok, "unsupported or unknown type '{s}'", .{self.lex.text(tok)});
+        self.reportCoded(.parse_unsupported_type, tok, "unsupported or unknown type '{s}'", .{self.lex.text(tok)});
         if (tok.kind != .eof and tok.kind != .comma and tok.kind != .rparen and
             tok.kind != .lbrace and tok.kind != .assign and tok.kind != .newline and tok.kind != .semicolon)
         {
@@ -1730,7 +1745,7 @@ pub const Parser = struct {
 
     fn parseSingleStatement(self: *Parser) u32 {
         if (self.recursion_depth >= MAX_RECURSION_DEPTH) {
-            self.reportErr(self.peek(), "nesting exceeds maximum recursion depth ({d})", .{MAX_RECURSION_DEPTH});
+            self.reportCoded(.parse_recursion_depth, self.peek(), "nesting exceeds maximum recursion depth ({d})", .{MAX_RECURSION_DEPTH});
             return 0;
         }
         self.recursion_depth += 1;
@@ -1872,7 +1887,7 @@ pub const Parser = struct {
             self.match(.kw_asm) or self.match(.kw_try) or self.match(.kw_unsafe))
         {
             const t = self.peek();
-            self.reportErr(t, "unsupported statement '{s}'", .{@tagName(t.kind)});
+            self.reportCoded(.parse_unsupported_statement, t, "unsupported statement '{s}'", .{@tagName(t.kind)});
             self.skipToStmtEnd();
         } else {
             const expr = self.parseExpr();
@@ -1911,7 +1926,7 @@ pub const Parser = struct {
 
     fn parseBlock(self: *Parser) u32 {
         if (self.recursion_depth >= MAX_RECURSION_DEPTH) {
-            self.reportErr(self.peek(), "nesting exceeds maximum recursion depth ({d})", .{MAX_RECURSION_DEPTH});
+            self.reportCoded(.parse_recursion_depth, self.peek(), "nesting exceeds maximum recursion depth ({d})", .{MAX_RECURSION_DEPTH});
             return 0;
         }
         self.recursion_depth += 1;
@@ -1954,7 +1969,7 @@ pub const Parser = struct {
 
     fn parseExpr(self: *Parser) u32 {
         if (self.recursion_depth >= MAX_RECURSION_DEPTH) {
-            self.reportErr(self.peek(), "nesting exceeds maximum recursion depth ({d})", .{MAX_RECURSION_DEPTH});
+            self.reportCoded(.parse_recursion_depth, self.peek(), "nesting exceeds maximum recursion depth ({d})", .{MAX_RECURSION_DEPTH});
             return 0;
         }
         self.recursion_depth += 1;

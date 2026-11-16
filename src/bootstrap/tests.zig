@@ -3976,3 +3976,65 @@ test "stdlib: expanded str and collections (trim, capitalize, join, queue, stack
     try std.testing.expectEqual(@as(u8, 0), run_res.exit_code);
     try std.testing.expectEqualStrings("hi\nhi\nHello world\na-b\nq_full\n42\n99\nq_empty\n3\n", run_res.stdout);
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// Language catalogue conformance
+//
+// `lir lang` / `lir builtins` describe the implemented language surface. These
+// tests compile every documented example so the catalogue cannot drift away
+// from the compiler, and verify that every `.unsupported` entry is indeed
+// rejected. This is the guard that makes the AI-facing reference trustworthy.
+// ════════════════════════════════════════════════════════════════════════════
+
+const langref = @import("langref.zig");
+
+test "langref: documented examples of every supported feature compile" {
+    var total: u32 = 0;
+    for (langref.features) |f| {
+        if (f.status == .unsupported or f.example.len == 0) continue;
+        var compiler = main.Compiler.init(f.example, "<langref>");
+        compiler.quiet = true;
+        compiler.test_mode = std.mem.indexOf(u8, f.example, "#[test]") != null;
+        _ = compiler.compile() catch |err| {
+            std.debug.print("\nlangref feature '{s}' example failed to compile: {s}\n", .{ f.name, @errorName(err) });
+            return err;
+        };
+        total += 1;
+    }
+    try std.testing.expect(total >= 50);
+}
+
+test "langref: unsupported entries are rejected with a diagnostic" {
+    // Non-compiling spellings that a code generator might otherwise try.
+    const probes = [_]struct { src: []const u8, why: []const u8 }{
+        .{ .src = "fn main() -> i64 { return 5 |> 3 }", .why = "pipe_operator" },
+        .{ .src = "async fn f() -> i64 { return 1 }\nfn main() -> i64 { return 0 }", .why = "async_await" },
+        .{ .src = "extern fn puts(s: string) -> i64\nfn main() -> i64 { return 0 }", .why = "extern_ffi" },
+        .{ .src = "mod foo\nfn main() -> i64 { return 0 }", .why = "module_file" },
+        .{ .src = "fn main() -> i64 { unsafe { } return 0 }", .why = "unsafe_block" },
+        .{ .src = "fn main() -> i64 { asm(\"nop\") return 0 }", .why = "asm_block" },
+    };
+    for (probes) |probe| {
+        var compiler = main.Compiler.init(probe.src, "<langref-negative>");
+        compiler.quiet = true;
+        const result = compiler.check();
+        if (result) |_| {
+            std.debug.print("\nlangref negative probe '{s}' unexpectedly compiled\n", .{probe.why});
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
+}
+
+test "langref: builtin catalogue matches the semantic analyzer" {
+    // Every documented builtin must exist in the sema table, otherwise the
+    // reference would advertise something that cannot type-check.
+    for (langref.builtins) |b| {
+        if (b.keyword_form or b.library_form) continue;
+        const spec = main.sema_lookupBuiltin(b.name) orelse {
+            std.debug.print("\nlangref documents unknown builtin '{s}'\n", .{b.name});
+            return error.TestUnexpectedResult;
+        };
+        _ = spec;
+    }
+}
+

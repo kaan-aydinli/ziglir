@@ -222,7 +222,47 @@ pub const Target = struct {
         if (std.mem.eql(u8, spec, "aarch64-freebsd") or std.mem.eql(u8, spec, "arm64-freebsd")) {
             return .{ .arch = .aarch64, .os = .freebsd };
         }
+        // Generic `<arch>-<os>` and `<arch>-<os>-<abi>` forms, so that the
+        // triples `lir targets` prints are accepted verbatim (a well-known GCC
+        // form like x86_64-unknown-linux-gnu also resolves).
+        if (parseGenericTriple(spec)) |t| return t;
         return null;
+    }
+
+    fn archFromWord(w: []const u8) ?Arch {
+        if (std.mem.eql(u8, w, "x86_64") or std.mem.eql(u8, w, "x86-64") or std.mem.eql(u8, w, "amd64")) return .x86_64;
+        if (std.mem.eql(u8, w, "aarch64") or std.mem.eql(u8, w, "arm64")) return .aarch64;
+        if (std.mem.eql(u8, w, "riscv64")) return .riscv64;
+        if (std.mem.eql(u8, w, "wasm32")) return .wasm32;
+        return null;
+    }
+
+    fn osFromWord(w: []const u8) ?OS {
+        if (std.mem.eql(u8, w, "linux")) return .linux;
+        if (std.mem.eql(u8, w, "macos") or std.mem.eql(u8, w, "darwin") or std.mem.eql(u8, w, "osx")) return .macos;
+        if (std.mem.eql(u8, w, "windows") or std.mem.eql(u8, w, "win32") or std.mem.eql(u8, w, "mingw")) return .windows;
+        if (std.mem.eql(u8, w, "wasi")) return .wasi;
+        if (std.mem.eql(u8, w, "freebsd")) return .freebsd;
+        return null;
+    }
+
+    /// Splits `<arch>-<os>[-<abi>]`, skipping an optional vendor component.
+    fn parseGenericTriple(spec: []const u8) ?Target {
+        var it = std.mem.splitScalar(u8, spec, '-');
+        var words: [4][]const u8 = undefined;
+        var n: usize = 0;
+        while (it.next()) |w| {
+            if (w.len == 0) return null;
+            if (n == words.len) return null;
+            words[n] = w;
+            n += 1;
+        }
+        if (n < 2) return null;
+        const arch = archFromWord(words[0]) orelse return null;
+        // Try os at position 1, then 2 (vendor in between, e.g. unknown-linux).
+        var os = osFromWord(words[1]);
+        if (os == null and n >= 3) os = osFromWord(words[2]);
+        return .{ .arch = arch, .os = os orelse return null };
     }
 
     pub const supported_list_text =

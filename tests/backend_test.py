@@ -170,6 +170,27 @@ def signed_constant_division_case():
 
 CASES += (integer_edge_case(), signed_constant_division_case())
 
+# Threads: a joined thread must report its return value on every host backend.
+# (wasm32-wasi has no OS threads and is expected to reject the program.)
+THREAD_CASE = (
+    "thread_join_value",
+    """
+fn worker(arg: i64) -> i64 {
+    return arg * 2
+}
+fn main() -> i64 {
+    let h = @thread_create("worker", 21)
+    printInt(@thread_join(h))
+    let h2 = spawn { return 5 }
+    printInt(@thread_join(h2))
+    return 0
+}
+""",
+    "42\n5\n",
+    0,
+)
+
+
 
 class BackendTests(unittest.TestCase):
     def test_execution_matrix(self):
@@ -187,6 +208,36 @@ class BackendTests(unittest.TestCase):
                                 cwd=cwd, capture_output=True, text=True, timeout=30)
                             self.assertEqual(result.returncode, exit_code, result.stderr)
                             self.assertEqual(result.stdout, expected, result.stderr)
+
+    def test_thread_join_reports_child_value(self):
+        """Native/C join must return the child's value, not a wait status."""
+        name, source, expected, exit_code = THREAD_CASE
+        with tempfile.TemporaryDirectory(prefix="lir-threads-") as temp:
+            cwd = pathlib.Path(temp)
+            path = cwd / (name + ".lir")
+            path.write_text(source)
+            for backend in ("native", "vm", "c"):
+                for level in LEVELS:
+                    with self.subTest(backend=backend, level=level):
+                        result = subprocess.run(
+                            [str(COMPILER), "run", str(path), "--backend=" + backend, level],
+                            cwd=cwd, capture_output=True, text=True, timeout=60)
+                        self.assertEqual(result.returncode, exit_code, result.stderr)
+                        self.assertEqual(result.stdout, expected, result.stderr)
+
+    def test_wasm_rejects_threads_with_a_diagnostic(self):
+        """wasm32-wasi has no OS threads: fail closed instead of trapping."""
+        name, source, _expected, _exit_code = THREAD_CASE
+        with tempfile.TemporaryDirectory(prefix="lir-threads-wasm-") as temp:
+            cwd = pathlib.Path(temp)
+            path = cwd / (name + ".lir")
+            path.write_text(source)
+            result = subprocess.run(
+                [str(COMPILER), "run", str(path), "--backend=wasm", "--target=wasm32-wasi"],
+                cwd=cwd, capture_output=True, text=True, timeout=60)
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertIn("LIR-E7004", result.stderr)
+            self.assertNotIn("RuntimeError", result.stdout + result.stderr)
 
     def test_negative_runtime_exponent_traps(self):
         with tempfile.TemporaryDirectory(prefix="lir-power-trap-") as temp:

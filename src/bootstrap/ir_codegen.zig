@@ -5217,8 +5217,15 @@ pub const IRCodegen = struct {
                 self.popReg(7);
                 self.emit8(0xFF);
                 self.emit8(0xD0);
+                // The child exits with its return value (mod 256) so that
+                // @thread_join can report it: exit status lives in bits 8..15
+                // of the wait status word.
+                self.movRegReg(7, 0);
+                self.emit8(0x48);
+                self.emit8(0x83);
+                self.emit8(0xE7);
+                self.emit8(0xFF); // and rdi, 0xFF
                 self.mov64imm(0, 60);
-                self.xorReg(7, 7);
                 self.syscallInst();
                 const tc_done_pos = self.code_len;
                 self.relocs[parent_jcc].target_id = tc_done_pos;
@@ -5227,11 +5234,31 @@ pub const IRCodegen = struct {
             },
             .call_thread_join => {
                 self.loadVregToReg(inst.args[0], 7);
-                self.xorReg(6, 6);
+                // wait4(pid, &status, 0, 0): keep the status word on the stack
+                self.emit8(0x48);
+                self.emit8(0x83);
+                self.emit8(0xEC);
+                self.emit8(0x08); // sub rsp, 8
+                self.movRegReg(6, 4); // mov rsi, rsp
                 self.xorReg(2, 2);
                 self.xorReg(10, 10);
                 self.mov64imm(0, 61);
                 self.syscallInst();
+                self.emit8(0x48);
+                self.emit8(0x8B);
+                self.emit8(0x04);
+                self.emit8(0x24); // mov rax, [rsp]
+                self.emit8(0x48);
+                self.emit8(0x83);
+                self.emit8(0xC4);
+                self.emit8(0x08); // add rsp, 8
+                self.emit8(0x48);
+                self.emit8(0xC1);
+                self.emit8(0xE8);
+                self.emit8(0x08); // shr rax, 8
+                self.emit8(0x48);
+                self.emit8(0x25);
+                self.emit32(0xFF); // and rax, 0xFF
                 if (inst.dest != 0) self.storeRegToVreg(0, inst.dest);
             },
             .call_mutex_create => {

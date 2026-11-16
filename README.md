@@ -1,7 +1,13 @@
 # LIR — A Simple, Performance-First Systems Language
 
 <p align="center">
-  <b>Write simply. Compile natively. Measure every optimization.</b>
+  <b>Write simply. Compile natively. Describe itself to machines.</b>
+</p>
+
+<p align="center">
+  <a href="docs/AI.md">AI integration contract</a> ·
+  <a href="docs/LANGUAGE_REFERENCE.md">Generated language reference</a> ·
+  <a href="docs/SPEC.md">Specification</a>
 </p>
 
 ---
@@ -61,6 +67,11 @@ cd ziglir
 zig build -Doptimize=ReleaseFast
 zig build test
 
+# Ask the compiler what the language actually accepts
+./zig-out/bin/lir lang
+./zig-out/bin/lir builtins --group=string
+./zig-out/bin/lir explain ai
+
 # List supported cross-compilation targets and backends
 ./zig-out/bin/lir targets
 
@@ -84,6 +95,45 @@ cd myproject
 
 See [Project workflows](docs/PROJECTS.md) for manifest settings, directory selection,
 output paths, and the remaining application/ecosystem roadmap.
+
+## Built for AI systems and automation
+
+LIR is designed so that a code-generating agent never has to guess: the compiler
+describes itself in machine-readable form, validates what it is given, and hands
+back structured repairs.
+
+```bash
+lir lang --json                  # every feature + status + compilable example
+lir lang --keywords              # the reserved-word list (never use as names)
+lir lang --status=unsupported    # what NOT to generate, with `avoid` notes
+lir builtins --json              # every builtin signature
+lir check main.lir --json        # {"schema":"lir.check.v1","status":"ok",...}
+lir run main.lir --backend=vm    # execute anywhere, no toolchain needed
+lir explain ai                   # the agent workflow, in the terminal
+lir init demo --ai               # scaffold + AGENTS.md + lir.agent.json
+```
+
+Three properties make this trustworthy rather than aspirational:
+
+1. **Generated, not written.** `docs/LANGUAGE_REFERENCE.md` is emitted by
+   `lir lang --markdown` from `src/bootstrap/langref.zig`.
+2. **Executable.** `zig build test` compiles every `supported` example in that
+   catalogue and asserts that every `unsupported` spelling is rejected — the
+   documentation cannot drift from the compiler without failing tests.
+3. **Repairable output.** Diagnostics carry stable codes (`LIR-E3004`), a span,
+   a `help` line, and `expect{kind,value}` so a generator can fix source
+   structurally instead of parsing English:
+
+```json
+{"code":"LIR-E3002","line":1,"column":20,
+ "message":"call to undefined function 'printint'; did you mean 'printInt'?",
+ "expect":{"kind":"function","value":"printInt"}}
+```
+
+See [AI.md](docs/AI.md) for the full contract (`lir.lang.v1`,
+`lir.builtins.v1`, `lir.diagnostics.v1`, `lir.check.v1`, `lir.build.v1`,
+`lir.agent.v1`) and [LANGUAGE_REFERENCE.md](docs/LANGUAGE_REFERENCE.md) for the
+canonical syntax.
 
 ## Browser execution (initial bridge)
 
@@ -345,10 +395,15 @@ python3 bench/compare_zig.py
 
 ## Intelligent Developer Experience
 
-- **Fuzzy "Did You Mean" Suggestions:** Automatically matches mistyped identifiers, functions, structs, and struct fields using Levenshtein distance.
-- **Static Warning Analysis:** Unused variables and parameters are automatically flagged with `_` prefix hints; unreachable statements following control flow transfers are detected.
-- **Interactive Knowledge Base:** Run `lir explain <topic>` (e.g. `lir explain borrow`, `lir explain contracts`, `lir explain optimizer`) for deep conceptual explanations with code examples.
-- **AST Inspector:** Run `lir ast <file>` to inspect the structured syntax tree hierarchy.
+- **Coded diagnostics:** every message carries a stable code (`LIR-E3004`), a source span, and usually a `help:` line stating the concrete fix. `lir explain LIR-E3004` (also `e3004`, `3004`) prints cause, fix and a working example.
+- **Machine output:** `--diagnostics=short` for log scrapers, `--json` for structured diagnostics plus a JSON command result. See [AI.md](docs/AI.md).
+- **Fuzzy "Did You Mean" Suggestions:** case-insensitive Levenshtein matching for identifiers, functions, builtins, structs and fields.
+- **Static Warning Analysis:** unused variables/parameters (`_` prefix hint) and unreachable statements after control transfers.
+- **Language catalogue:** `lir lang` (human), `--json` (machines), `--markdown` (regenerates `docs/LANGUAGE_REFERENCE.md`). Every `supported` example is compiled by `zig build test`.
+- **Builtin catalogue:** `lir builtins` lists every intrinsic with its signature and traps.
+- **Reserved-word list:** `lir lang --keywords` (or `--json` → `lir.keywords.v1`) is generated from the lexer, so generators never collide with a keyword.
+- **Interactive Knowledge Base:** `lir explain <topic>` covers syntax, types, borrow, safety, contracts, purity, ranges, optimizer, concurrency, strings, collections, errors, diagnostics, `ai` and `limitations`.
+- **AST Inspector:** `lir ast <file>` prints the structured syntax tree hierarchy.
 
 ## Building from Source
 
@@ -364,7 +419,23 @@ zig build test
 
 ## Contributing
 
-We welcome contributions! Please see [CONTRIBUTING.md](docs/CONTRIBUTING.md) for guidelines.
+Two rules keep this project honest:
+
+1. **Never document a feature that the compiler does not implement.** Add it to
+   `src/bootstrap/langref.zig` with a compiling `example`, then run
+   `lir lang --markdown > docs/LANGUAGE_REFERENCE.md`.
+2. **Never merge without the gates:**
+
+```bash
+zig build test                       # unit + catalogue conformance
+python3 tests/cli_test.py  ./zig-out/bin/lir
+python3 tests/ai_test.py   ./zig-out/bin/lir   # machine contracts
+python3 tests/core_test.py ./zig-out/bin/lir
+python3 tests/backend_test.py ./zig-out/bin/lir
+```
+
+See [CONTRIBUTING.md](docs/CONTRIBUTING.md) for the full checklist, code map and
+documentation workflow.
 
 ## License
 
@@ -372,8 +443,11 @@ LIR is licensed under the MIT License. See [LICENSE](LICENSE) for details.
 
 ## Links
 
+- [AI integration contract](docs/AI.md) — machine-readable schemas and repair loop
+- [Generated language reference](docs/LANGUAGE_REFERENCE.md) — canonical syntax
 - [Language Specification](docs/SPEC.md)
-- [Standard Library Documentation](docs/STDLIB.md)
+- [Standard Library](docs/STDLIB.md)
+- [Canonical tour](examples/canonical-tour.lir) — every supported feature in one file
 - [Examples](examples/)
 - [Benchmarks](bench/)
 - [Roadmap](docs/ROADMAP.md)
