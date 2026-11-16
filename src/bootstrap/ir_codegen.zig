@@ -1031,10 +1031,14 @@ pub const IRCodegen = struct {
     }
 
     fn analyzeElidedConsts(self: *IRCodegen, ir_fn: *const IRFn) void {
-        @memset(&self.vreg_const_known, false);
-        @memset(&self.vreg_const_imm, 0);
-        @memset(&self.vreg_elided_const, false);
-        @memset(&self.vreg_def_cnt, 0);
+        // Only vregs of the function being compiled are ever inspected below and
+        // by the register allocator, so the resets cover `vreg_count` instead of
+        // all 4096 slots (this runs for every function in the module).
+        const nv: usize = @min(@as(usize, ir_fn.vreg_count) + 2, MAX_VREGS);
+        @memset(self.vreg_const_known[0..nv], false);
+        @memset(self.vreg_const_imm[0..nv], 0);
+        @memset(self.vreg_elided_const[0..nv], false);
+        @memset(self.vreg_def_cnt[0..nv], 0);
 
         for (0..ir_fn.block_count) |bi| {
             const blk = &ir_fn.blocks[bi];
@@ -1053,7 +1057,7 @@ pub const IRCodegen = struct {
         var use_cnt: [MAX_VREGS]u16 = .{0} ** MAX_VREGS;
         var non_foldable: [MAX_VREGS]bool = .{false} ** MAX_VREGS;
 
-        for (0..MAX_VREGS) |v| {
+        for (0..nv) |v| {
             if (self.vreg_def_cnt[v] != 1) self.vreg_const_known[v] = false;
         }
 
@@ -1086,7 +1090,7 @@ pub const IRCodegen = struct {
             }
         }
 
-        for (1..MAX_VREGS) |v| {
+        for (1..nv) |v| {
             if (self.vreg_const_known[v] and (!non_foldable[v] or use_cnt[v] <= 1 or fitsI32NonMin(self.vreg_const_imm[v]))) {
                 self.vreg_elided_const[v] = true;
             }
@@ -1101,14 +1105,20 @@ pub const IRCodegen = struct {
     }
 
     fn allocRegsForFn(self: *IRCodegen, ir_fn: *const IRFn) void {
-        @memset(&self.vreg_reg, NO_REG);
-        @memset(&self.vreg_spill_slot, 0);
-        @memset(&self.vreg_last_use, 0);
-        @memset(&self.vreg_start, 0xFFFF_FFFF);
-        @memset(&self.vreg_end, 0);
-        @memset(&self.vreg_crosses_call, false);
-        @memset(&self.vreg_copy_hint, 0);
-        @memset(&self.vreg_pref_hw_reg, NO_REG);
+        // Reset only the live vreg range. Every one of these arrays is indexed by
+        // a vreg belonging to the function currently being compiled (<= vreg_count),
+        // and the scans below only ever look at those entries, so clearing all
+        // MAX_VREGS (4096) slots per function was pure overhead: ~9 KB of stores
+        // for each of the module's functions, twice-filled arrays included.
+        const n_vregs: usize = @min(@as(usize, ir_fn.vreg_count) + 2, MAX_VREGS);
+        @memset(self.vreg_reg[0..n_vregs], NO_REG);
+        @memset(self.vreg_spill_slot[0..n_vregs], 0);
+        @memset(self.vreg_last_use[0..n_vregs], 0);
+        @memset(self.vreg_start[0..n_vregs], 0xFFFF_FFFF);
+        @memset(self.vreg_end[0..n_vregs], 0);
+        @memset(self.vreg_crosses_call[0..n_vregs], false);
+        @memset(self.vreg_copy_hint[0..n_vregs], 0);
+        @memset(self.vreg_pref_hw_reg[0..n_vregs], NO_REG);
 
         self.analyzeElidedConsts(ir_fn);
 
@@ -1562,6 +1572,8 @@ pub const IRCodegen = struct {
     // Compilation entry point & _start + ABI epilogues
     // ═══════════════════════════════════════════════════════════
 
+
+
     pub fn compile(self: *IRCodegen) void {
         if (@as(usize, self.ir.fn_count) > self.fns.len) {
             self.overflowed = true;
@@ -1595,6 +1607,7 @@ pub const IRCodegen = struct {
         for (0..self.fn_count) |i| {
             if (!compiled[i]) self.compileFn(@intCast(i));
         }
+
         self.text_user_end = self.code_len;
 
         if (self.overflowed) return;
@@ -10688,3 +10701,19 @@ pub const IRCodegen = struct {
         return pos;
     }
 };
+
+
+var cg_us: [8]u64 = .{0} ** 8;
+var cg_on: bool = false;
+fn cgInit() void {
+    if (cg_on) return;
+    cg_on = std.posix.getenv("LIR_CG") != null;
+}
+fn cgAdd(slot: usize, t0: i64) void {
+    if (slot < 8) cg_us[slot] += @intCast(@max(0, std.time.microTimestamp() - t0));
+}
+pub fn cgAddPub(slot: usize, t0: i64) void { cgAdd(slot, t0); }
+pub fn cgDump() void {
+    if (!cg_on) return;
+    std.debug.print("---- codegen (us): regalloc={d} emit={d} runtime_routines={d} elf={d}\n", .{ cg_us[0], cg_us[1], cg_us[2], cg_us[3] });
+}

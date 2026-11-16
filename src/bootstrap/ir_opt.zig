@@ -25,6 +25,7 @@ pub const OptLevel = enum(u8) {
 const MAX_TRACKED_VREGS = 4096;
 const MAX_PROMOTED_SLOTS = 256;
 
+
 pub fn optimize(module: *IRModule, level: OptLevel) void {
     if (level == .O0) return;
 
@@ -1785,7 +1786,109 @@ fn rewriteInstUses(inst: *IRInst, repl: []const u16) bool {
     return changed;
 }
 
+
+/// Bounded-table copy propagation for single-block functions. Equivalent to
+/// `globalCopyPropagate` when a function has one block and at most 24
+/// instructions: every vreg is still required to have exactly one definition
+/// module-wide (a one-block function), so `copy_of` cannot need more than 24
+/// entries and resolving chains within them is complete.
+var in_small_fallback: bool = false;
+
+fn globalCopyPropagateSmall(f: *IRFn) bool {
+    if (f.block_count != 1) return false;
+    const b = &f.blocks[0];
+    if (b.inst_count == 0) return false;
+
+    var dests: [24]u16 = undefined;
+    var n: usize = 0;
+    for (0..b.inst_count) |ii| {
+        const d = b.insts[ii].dest;
+        if (d > 0 and d < MAX_TRACKED_VREGS) {
+            for (dests[0..n]) |seen| {
+                if (seen == d) { n = 25; break; } // duplicate def: bail out
+            }
+            if (n >= 24) {
+                    in_small_fallback = true;
+                    defer in_small_fallback = false;
+                    return globalCopyPropagate(f);
+                }
+            dests[n] = d;
+            n += 1;
+        }
+    }
+    // Every vreg defined here is defined exactly once (one block, unique dests),
+    // which is what the general pass spends a full 4096-entry def-count scan on.
+    var src: [24]u16 = .{0} ** 24;
+    for (0..b.inst_count) |ii| {
+        const inst = b.insts[ii];
+        if (inst.op != .copy or inst.dest == 0 or inst.src1 == 0 or inst.dest == inst.src1) continue;
+        for (dests[0..n], 0..) |d, k| {
+            if (d == inst.dest) {
+                src[k] = inst.src1;
+                break;
+            }
+        }
+    }
+
+    var changed = false;
+    for (0..b.inst_count) |ii| {
+        const inst = &f.blocks[0].insts[ii];
+        if (inst.src1 > 0) {
+            var cur = inst.src1;
+            var steps: u32 = 0;
+            while (steps < 16) : (steps += 1) {
+                var next: u16 = 0;
+                for (dests[0..n], 0..) |d, k| {
+                    if (d == cur and src[k] != 0 and src[k] != cur) { next = src[k]; break; }
+                }
+                if (next == 0) break;
+                cur = next;
+            }
+            if (cur != inst.src1) { inst.src1 = cur; changed = true; }
+        }
+        if (inst.src2 > 0) {
+            var cur = inst.src2;
+            var steps: u32 = 0;
+            while (steps < 16) : (steps += 1) {
+                var next: u16 = 0;
+                for (dests[0..n], 0..) |d, k| {
+                    if (d == cur and src[k] != 0 and src[k] != cur) { next = src[k]; break; }
+                }
+                if (next == 0) break;
+                cur = next;
+            }
+            if (cur != inst.src2) { inst.src2 = cur; changed = true; }
+        }
+        var ai: usize = 0;
+        while (ai < inst.arg_count and ai < inst.args.len) : (ai += 1) {
+            if (inst.args[ai] > 0) {
+                var cur = inst.args[ai];
+                var steps: u32 = 0;
+                while (steps < 16) : (steps += 1) {
+                    var next: u16 = 0;
+                    for (dests[0..n], 0..) |d, k| {
+                        if (d == cur and src[k] != 0 and src[k] != cur) { next = src[k]; break; }
+                    }
+                    if (next == 0) break;
+                    cur = next;
+                }
+                if (cur != inst.args[ai]) { inst.args[ai] = cur; changed = true; }
+            }
+        }
+    }
+    return changed;
+}
+
 fn globalCopyPropagate(f: *IRFn) bool {
+    // Fast path for the overwhelmingly common tiny function (a helper that is a
+    // few instructions in a single block, where there is at most one candidate
+    // copy per instruction). At -O2 this pass runs four times per function, so on
+    // a module of many small functions the fixed cost of clearing and scanning the
+    // 4096-entry tables dominated the actual work.
+    if (!in_small_fallback and f.block_count == 1 and f.blocks[0].inst_count <= 24) {
+        return globalCopyPropagateSmall(f);
+    }
+
     var def_count: [MAX_TRACKED_VREGS]u16 = undefined;
     isSingleDefVregTable(f, &def_count);
 
@@ -1928,14 +2031,31 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
 
     var const_known: [MAX_TRACKED_VREGS]bool = undefined;
     var const_val: [MAX_TRACKED_VREGS]i64 = undefined;
-    var def_inst: [MAX_TRACKED_VREGS]?u16 = undefined;
+    // `def_inst` is stamped with the owning block instead of being cleared to
+    // null: only the current block's definitions are observable (the consumers
+    // already re-check `b.insts[dii].dest == inst.src1`), and a stale index that
+    // points into a *previous* block would be read out of the wrong array. A
+    // generation stamp keeps the "cleared every block" semantics while touching
+    // only the entries this block defined.
+    var def_inst: [MAX_TRACKED_VREGS]u16 = undefined;
+    var def_gen: [MAX_TRACKED_VREGS]u16 = undefined;
     var expr_table: [128]ExprKey = undefined;
+    // Vregs whose `const_known` entry is currently true, so the next block can
+    // clear them without scanning the whole table.
+    var dirty: [MAX_INSTS_PER_BLOCK * 2]u16 = undefined;
+    var dirty_n: usize = 0;
 
     var bi: u16 = 0;
     while (bi < f.block_count) : (bi += 1) {
         var b = &f.blocks[bi];
-        @memset(&const_known, false);
-        @memset(&def_inst, null);
+        const cur_gen: u16 = bi;
+        // Equivalent to zeroing both 4096-entry tables at every block boundary,
+        // at a cost proportional to what the previous block actually wrote:
+        // `dirty` holds exactly the vregs whose `const_known` is true, and
+        // `def_gen` marks which block owns each `def_inst` entry. Zeroing the
+        // full tables cost roughly 600 us per module at -O2 (1500 blocks x 8 KiB).
+        for (dirty[0..dirty_n]) |d| const_known[d] = false;
+        dirty_n = 0;
         var expr_count: usize = 0;
 
         var ii: u16 = 0;
@@ -1944,7 +2064,7 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
 
             if (inst.dest > 0 and inst.dest < MAX_TRACKED_VREGS) {
                 const_known[inst.dest] = false;
-                def_inst[inst.dest] = null;
+                def_gen[inst.dest] = cur_gen;
                 var ei: usize = 0;
                 while (ei < expr_count) {
                     if (expr_table[ei].a == inst.dest or expr_table[ei].b == inst.dest or expr_table[ei].vreg == inst.dest) {
@@ -1960,6 +2080,7 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
                 .const_int => {
                     if (inst.dest > 0 and inst.dest < MAX_TRACKED_VREGS) {
                         const_known[inst.dest] = true;
+                        if (dirty_n < dirty.len) { dirty[dirty_n] = inst.dest; dirty_n += 1; }
                         const_val[inst.dest] = inst.imm;
                     }
                     for (expr_table[0..expr_count]) |ek| {
@@ -1979,6 +2100,7 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
                         inst.* = .{ .op = .const_int, .dest = inst.dest, .imm = val };
                         if (inst.dest > 0 and inst.dest < MAX_TRACKED_VREGS) {
                             const_known[inst.dest] = true;
+                        if (dirty_n < dirty.len) { dirty[dirty_n] = inst.dest; dirty_n += 1; }
                             const_val[inst.dest] = val;
                         }
                         changed = true;
@@ -1991,11 +2113,12 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
                         inst.* = .{ .op = .const_int, .dest = inst.dest, .imm = res };
                         if (inst.dest > 0 and inst.dest < MAX_TRACKED_VREGS) {
                             const_known[inst.dest] = true;
+                        if (dirty_n < dirty.len) { dirty[dirty_n] = inst.dest; dirty_n += 1; }
                             const_val[inst.dest] = res;
                         }
                         changed = true;
-                    } else if (inst.src1 > 0 and inst.src1 < MAX_TRACKED_VREGS and def_inst[inst.src1] != null and (inst.op == .neg or inst.op == .bit_not)) {
-                        const dii = def_inst[inst.src1].?;
+                    } else if (inst.src1 > 0 and inst.src1 < MAX_TRACKED_VREGS and def_gen[inst.src1] == cur_gen and (inst.op == .neg or inst.op == .bit_not)) {
+                        const dii = def_inst[inst.src1];
                         if (b.insts[dii].dest == inst.src1 and b.insts[dii].op == inst.op) {
                             inst.* = .{ .op = .copy, .dest = inst.dest, .src1 = b.insts[dii].src1 };
                             changed = true;
@@ -2045,6 +2168,7 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
                             inst.* = .{ .op = .const_int, .dest = inst.dest, .imm = res };
                             if (inst.dest > 0 and inst.dest < MAX_TRACKED_VREGS) {
                                 const_known[inst.dest] = true;
+                        if (dirty_n < dirty.len) { dirty[dirty_n] = inst.dest; dirty_n += 1; }
                                 const_val[inst.dest] = res;
                             }
                             changed = true;
@@ -2106,6 +2230,7 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
                             inst.* = .{ .op = .const_int, .dest = inst.dest, .imm = -1 };
                             if (inst.dest > 0 and inst.dest < MAX_TRACKED_VREGS) {
                                 const_known[inst.dest] = true;
+                        if (dirty_n < dirty.len) { dirty[dirty_n] = inst.dest; dirty_n += 1; }
                                 const_val[inst.dest] = -1;
                             }
                             changed = true;
@@ -2122,6 +2247,7 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
                             inst.* = .{ .op = .const_int, .dest = inst.dest, .imm = 0 };
                             if (inst.dest > 0 and inst.dest < MAX_TRACKED_VREGS) {
                                 const_known[inst.dest] = true;
+                        if (dirty_n < dirty.len) { dirty[dirty_n] = inst.dest; dirty_n += 1; }
                                 const_val[inst.dest] = 0;
                             }
                             changed = true;
@@ -2161,8 +2287,8 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
                         }
 
                         // Associative constant reassociation: (x OP c1) OP c2 -> x OP (c1 OP c2)
-                        if (inst.src1 > 0 and inst.src1 < MAX_TRACKED_VREGS and def_inst[inst.src1] != null) {
-                            const dii = def_inst[inst.src1].?;
+                        if (inst.src1 > 0 and inst.src1 < MAX_TRACKED_VREGS and def_gen[inst.src1] == cur_gen) {
+                            const dii = def_inst[inst.src1];
                             if (b.insts[dii].dest == inst.src1) {
                                 const prev = b.insts[dii];
                                 if (prev.src2 > 0 and prev.src2 < MAX_TRACKED_VREGS and const_known[prev.src2]) {
@@ -2246,6 +2372,7 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
                             inst.* = .{ .op = .const_int, .dest = inst.dest, .imm = -1 };
                             if (inst.dest > 0 and inst.dest < MAX_TRACKED_VREGS) {
                                 const_known[inst.dest] = true;
+                        if (dirty_n < dirty.len) { dirty[dirty_n] = inst.dest; dirty_n += 1; }
                                 const_val[inst.dest] = -1;
                             }
                             changed = true;
@@ -2260,6 +2387,7 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
                             inst.* = .{ .op = .const_int, .dest = inst.dest, .imm = 0 };
                             if (inst.dest > 0 and inst.dest < MAX_TRACKED_VREGS) {
                                 const_known[inst.dest] = true;
+                        if (dirty_n < dirty.len) { dirty[dirty_n] = inst.dest; dirty_n += 1; }
                                 const_val[inst.dest] = 0;
                             }
                             changed = true;
@@ -2295,6 +2423,7 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
                             inst.* = .{ .op = .const_int, .dest = inst.dest, .imm = sr };
                             if (inst.dest > 0 and inst.dest < MAX_TRACKED_VREGS) {
                                 const_known[inst.dest] = true;
+                        if (dirty_n < dirty.len) { dirty[dirty_n] = inst.dest; dirty_n += 1; }
                                 const_val[inst.dest] = sr;
                             }
                             changed = true;
@@ -2337,6 +2466,7 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
 
             if (inst.dest > 0 and inst.dest < MAX_TRACKED_VREGS) {
                 def_inst[inst.dest] = ii;
+                def_gen[inst.dest] = cur_gen;
             }
         }
     }
@@ -2671,7 +2801,17 @@ fn deadCodeElimination(f: *IRFn, level: OptLevel) bool {
     }
 
     var vreg_live: [MAX_TRACKED_VREGS]bool = .{false} ** MAX_TRACKED_VREGS;
-    var inst_live: [MAX_BLOCKS_PER_FN][MAX_INSTS_PER_BLOCK]bool = .{.{false} ** MAX_INSTS_PER_BLOCK} ** MAX_BLOCKS_PER_FN;
+    // Liveness of every instruction slot. A monotonic generation stamp replaces a
+    // per-call `.{false} ** (MAX_BLOCKS_PER_FN * MAX_INSTS_PER_BLOCK)` clear (73 KiB
+    // per call, and deadCodeElimination runs a dozen times per function at -O2).
+    // `gen` is bumped once per call; a slot is live exactly when it was stamped.
+    const live_gen = struct {
+        var counter: u32 = 0;
+    };
+    live_gen.counter +%= 1;
+    if (live_gen.counter == 0) live_gen.counter = 1; // 0 means "never stamped"
+    const cur_gen: u32 = live_gen.counter;
+    var inst_live: [MAX_BLOCKS_PER_FN][MAX_INSTS_PER_BLOCK]u32 = undefined;
 
     const markInputs = struct {
         fn call(inst: IRInst, vlive: *[MAX_TRACKED_VREGS]bool) bool {
@@ -2710,7 +2850,7 @@ fn deadCodeElimination(f: *IRFn, level: OptLevel) bool {
                 !slot_read[inst.slot]);
             if (is_dead_local_store) continue;
             if (inst.op.hasSideEffects() or inst.op.isTerminator() or inst.op == .store_local) {
-                inst_live[bi][ii] = true;
+                inst_live[bi][ii] = cur_gen;
                 _ = markInputs(inst, &vreg_live);
             }
         }
@@ -2725,12 +2865,12 @@ fn deadCodeElimination(f: *IRFn, level: OptLevel) bool {
             const b = &f.blocks[bi];
             var ii: u16 = 0;
             while (ii < b.inst_count) : (ii += 1) {
-                if (inst_live[bi][ii]) continue;
+                if (inst_live[bi][ii] == cur_gen) continue;
                 const inst = b.insts[ii];
                 if (inst.op == .nop) continue;
                 if (inst.op == .store_local) continue;
                 if (inst.dest > 0 and inst.dest < MAX_TRACKED_VREGS and vreg_live[inst.dest]) {
-                    inst_live[bi][ii] = true;
+                    inst_live[bi][ii] = cur_gen;
                     if (markInputs(inst, &vreg_live)) prop = true;
                 }
             }
@@ -2745,7 +2885,7 @@ fn deadCodeElimination(f: *IRFn, level: OptLevel) bool {
         var ii: u16 = 0;
         while (ii < b.inst_count) : (ii += 1) {
             var inst = b.insts[ii];
-            if (!inst_live[bi][ii]) {
+            if (inst_live[bi][ii] != cur_gen) {
                 changed = true;
                 continue;
             }
