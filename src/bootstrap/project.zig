@@ -21,6 +21,7 @@ pub const agent_guide =
     \\```sh
     \\lir lang --json                 # every feature: status + compilable example
     \\lir lang --keywords             # reserved words: never use these as names
+    \\lir lang --cheatsheet           # whole language on one page
     \\lir lang <feature>              # canonical syntax, notes, "avoid" list
     \\lir builtins --json             # every builtin + signature
     \\lir explain ai                  # agent integration workflow

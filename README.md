@@ -105,6 +105,7 @@ back structured repairs.
 ```bash
 lir lang --json                  # every feature + status + compilable example
 lir lang --keywords              # the reserved-word list (never use as names)
+lir lang --cheatsheet            # one generated page that fits a small context window
 lir lang --status=unsupported    # what NOT to generate, with `avoid` notes
 lir builtins --json              # every builtin signature
 lir check main.lir --json        # {"schema":"lir.check.v1","status":"ok",...}
@@ -445,6 +446,7 @@ LIR is licensed under the MIT License. See [LICENSE](LICENSE) for details.
 
 - [AI integration contract](docs/AI.md) — machine-readable schemas and repair loop
 - [Generated language reference](docs/LANGUAGE_REFERENCE.md) — canonical syntax
+- [Generated cheatsheet](docs/CHEATSHEET.md) — one page, for constrained context windows
 - [Language Specification](docs/SPEC.md)
 - [Standard Library](docs/STDLIB.md)
 - [Canonical tour](examples/canonical-tour.lir) — every supported feature in one file

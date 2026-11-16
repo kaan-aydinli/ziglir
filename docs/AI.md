@@ -23,6 +23,7 @@ lir lang --keywords --json      # reserved words        → schema lir.keywords.
 lir lang --status=unsupported --short   # what NOT to generate
 lir lang <feature>              # one feature with a compilable example
 lir lang --markdown             # regenerate docs/LANGUAGE_REFERENCE.md
+lir lang --cheatsheet           # regenerate docs/CHEATSHEET.md (one page, 20 KB)
 lir builtins --json             # builtin signatures    → schema lir.builtins.v1
 lir explain --list --json       # conceptual topics + diagnostic codes
 lir explain ai                  # the same guidance, in the terminal

@@ -151,12 +151,29 @@ class CatalogueTests(unittest.TestCase):
                 self.assertNotEqual(run("check", str(path), ok=None).returncode, 0,
                                     f"reserved word '{word}' was accepted as an identifier")
 
+    def test_cheatsheet_is_generated_and_complete(self):
+        repo = COMPILER.parent.parent.parent
+        generated = run("lang", "--cheatsheet").stdout
+        # The checked-in copy must match the compiler (CI diffs it too).
+        checked_in = (repo / "docs" / "CHEATSHEET.md").read_text()
+        self.assertEqual(checked_in, generated,
+                         "docs/CHEATSHEET.md is stale: regenerate with 'lir lang --cheatsheet'")
+        doc = json.loads(run("lang", "--json").stdout)
+        for feature in doc["features"]:
+            self.assertIn(f"`{feature['name']}`", generated)
+        for keyword in doc["keywords"]:
+            self.assertIn(f"`{keyword}`", generated)
+        for builtin in json.loads(run("builtins", "--json").stdout)["builtins"]:
+            self.assertIn(f"`{builtin['name']}`", generated)
+
     def test_builtins_json_contract(self):
         doc = json.loads(run("builtins", "--json").stdout)
         self.assertEqual(doc["schema"], "lir.builtins.v1")
         names = [b["name"] for b in doc["builtins"]]
-        self.assertGreaterEqual(len(names), 80)
+        self.assertGreaterEqual(len(names), 120)
         self.assertEqual(len(names), len(set(names)))
+        groups = {b["group"] for b in doc["builtins"]}
+        self.assertGreaterEqual(len(groups), 12)
         for b in doc["builtins"]:
             self.assertTrue(b["signature"].endswith("-> " + b["signature"].rsplit("-> ", 1)[-1]))
             self.assertIn("->", b["signature"])

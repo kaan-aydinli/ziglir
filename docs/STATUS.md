@@ -54,6 +54,7 @@ see the known gaps below.
 | `lir explain` (`--list`, `--json`, codes) | implemented |
 | `lir init --ai` (`AGENTS.md`, `lir.agent.json`) | implemented |
 | Embedded stdlib (16 modules, 226 functions) | implemented; see [STDLIB.md](STDLIB.md) |
+| Builtins (131 intrinsics in 14 groups) | implemented; `lir builtins --json` |
 | Native debug info | **not implemented** (no DWARF) |
 | Package manager / registry | **not implemented** (local imports only) |
 | LSP / formatter | **not implemented** |
