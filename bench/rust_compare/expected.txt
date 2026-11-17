@@ -7,7 +7,7 @@
 05_collatz.lir	131434272
 06_fib_mod.lir	577847172
 07_prime_count.lir	148933
-08_bitmix.lir	9999447383289
+08_bitmix.lir	1335377554
 09_tak.lir	9
 10_isqrt.lir	1884618085
 11_kmeans.lir	22216541

@@ -1,5 +1,5 @@
 // splitmix64-style mixing over 20,000,000 values plus popcount accumulation.
-// LIR twin: ../08_bitmix.lir (prints 9999447383289 / 629985005).
+// LIR twin: ../08_bitmix.lir (prints 1335377554 / 639992236).
 const ITERS: i64 = 20_000_000;
 
 fn mix(z0: i64) -> i64 {

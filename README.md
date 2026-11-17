@@ -430,6 +430,7 @@ machine resources rather than to flatter either side.
 
 ```bash
 python3 bench/rust_compare/run_all.py        # builds and times both sides
+python3 bench/rust_compare/run_c.py          # LIR vs C twins (see below)
 ```
 
 Each side is checked against `expected.txt` before anything is timed, so a
@@ -438,6 +439,51 @@ missing the script still verifies and times all eleven LIR programs and states
 that Rust timings are unavailable, rather than quietly printing half a
 comparison. These workloads are what found the six miscompiles documented in
 [ROADMAP Phase 3](docs/ROADMAP.md).
+
+### Measured: LIR `-O2` vs LLVM `-O3` vs gcc `-O2`
+
+`run_c.py` times three binaries per workload. The Rust sources could **not** be
+compiled here — this environment has no `rustc`/`cargo` and cannot reach any
+toolchain download host — so the C columns are **hand-written C twins** of the
+Rust files (`bench/rust_compare/c/`), not Rust. The `zig cc -O3 -march=native`
+column is the closer stand-in because rustc emits LLVM IR and shares LLVM's
+optimiser and x86-64 backend; `gcc -O2` is an independent second reference.
+
+All three sides print the identical `expected.txt` value before a single
+millisecond is recorded, and each LIR program was additionally confirmed at
+`-O0`, `-O1`, `-O2` and `--backend=vm`.
+
+Median of 13 interleaved rounds, 2-core Xeon @ 2.60 GHz (shared VM):
+
+| workload | LIR ms | LLVM C ms | gcc ms | LIR/LLVM | LIR/gcc |
+|---|---:|---:|---:|---:|---:|
+| 01_matrix_mul | 11.37 | 2.12 | 2.13 | 5.36 | 5.34 |
+| 02_nbody | 112.43 | 14.44 | 18.04 | 7.79 | 6.23 |
+| 03_sieve | 71.83 | 30.32 | 28.56 | 2.37 | 2.52 |
+| 04_mandelbrot | 178.28 | 52.24 | 54.38 | 3.41 | 3.28 |
+| 05_collatz | 516.85 | 137.26 | 276.50 | 3.77 | 1.87 |
+| 06_fib_mod | 70.54 | 30.14 | 32.81 | 2.34 | 2.15 |
+| 07_prime_count | 181.77 | 174.16 | 277.59 | 1.04 | 0.65 |
+| 08_bitmix | 100.04 | 42.18 | 82.35 | 2.37 | 1.21 |
+| 09_tak | 5.10 | 5.41 | 5.41 | 0.94 | 0.94 |
+| 10_isqrt | 125.28 | 98.90 | 105.53 | 1.27 | 1.19 |
+| 11_kmeans | 75.88 | 9.70 | 15.27 | 7.82 | 4.97 |
+| **geomean** | | | | **2.75** | **2.16** |
+
+Read this as "LIR's `-O2` machine code is about 2.7x the runtime of an
+LLVM `-O3` build of the same arithmetic". It is not a Rust-vs-LIR result: no Rust
+compiler ran. The gap is concentrated where the backend is weakest — inner-loop
+addressing (`01`, `11`), call-heavy loops (`02`) and dependent multiply chains
+(`04`) — and disappears where the work is dominated by division and
+unpredictable branches (`07`, `09`, `10`), which the backend already handles at
+parity.
+
+A note on `08_bitmix`: this workload originally disagreed with its C twin by
+7.4e12. The benchmark was at fault, not the compiler — the LIR source shifted a
+signed value (arithmetic `>>`) while the Rust twin casts to `u64` first
+(logical `>>`), so the two were not computing the same function. The LIR side now
+bridges through `u64` explicitly and all three implementations agree on
+`1335377554`.
 
 ## Intelligent Developer Experience
 
