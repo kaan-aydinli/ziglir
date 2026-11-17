@@ -543,6 +543,70 @@ class LoopOptimizationSoundnessTests(unittest.TestCase):
             }
         """, "50\n34\n-7\n6")
 
+    def test_phi_merge_survives_copy_propagation(self):
+        """A phi whose two arms define different values must keep both.
+
+        `b` is `t - m` on one arm and `t` on the other, so the merge needs a phi.
+        Copy propagation used to rewrite the phi's second operand to the copy's
+        *source* (v9, the pre-branch sum) instead of the value defined on that
+        edge, so the merge read a stale register and the recurrence exploded into
+        garbage while -O0/-O1 stayed correct. Same bug class: mem2reg also used to
+        leave an unrenamed, operand-less phi behind when a slot was rolled back.
+        """
+        self.assert_all_levels("""
+            fn main() -> i64 {
+                const m: i64 = 100
+                var a: i64 = 0
+                var b: i64 = 1
+                var i: i64 = 0
+                while i < 130 {
+                    let t = a + b
+                    if t >= m {
+                        a = b
+                        b = t - m
+                    } else {
+                        a = b
+                        b = t
+                    }
+                    i = i + 1
+                }
+                printInt(a)
+                printInt(b)
+                println("")
+                return 0
+            }
+        """, "15\n69")
+
+    def test_phi_over_two_loop_variables(self):
+        """Two mutually recursive phi-carried values (the fib-mod recurrence).
+
+        Every iteration has to write both phi operands; collapsing either one
+        makes the sum grow without the modulus being applied.
+        """
+        self.assert_all_levels("""
+            fn main() -> i64 {
+                const iters: i64 = 1000
+                const m: i64 = 2147483647
+                var a: i64 = 0
+                var b: i64 = 1
+                var i: i64 = 0
+                while i < iters {
+                    let t = a + b
+                    if t >= m {
+                        a = b
+                        b = t - m
+                    } else {
+                        a = b
+                        b = t
+                    }
+                    i = i + 1
+                }
+                printInt(a)
+                println("")
+                return 0
+            }
+        """, 1266365735)
+
     def test_division_by_constant_after_copy(self):
         """A copy of a constant divisor must not force a real idiv path.
 

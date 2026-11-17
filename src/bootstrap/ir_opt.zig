@@ -622,7 +622,15 @@ fn mem2reg(f: *IRFn) bool {
     }
 
     // Compute IDF and place phis (track per-block phi insertion count before mutating blocks)
-    var phi_slots: [MAX_BLOCKS_PER_FN][32]u16 = undefined;
+    //
+    // Only slots whose phi set is complete may reach the insertion phase below:
+    // renameBlock() reads `promotable[]`, so a rollback (capacity overflow on a
+    // later slot) has to withdraw the slot's pending phis here, not just flip the
+    // flag. Leaving an unrenamed, operand-less phi behind made every block that
+    // read the slot see a vreg that is never defined.
+    var placed: [MAX_BLOCKS_PER_FN][32]u16 = undefined;
+    var placed_cnt: [MAX_BLOCKS_PER_FN]u8 = .{0} ** MAX_BLOCKS_PER_FN;
+    var pending: [MAX_BLOCKS_PER_FN][32]u16 = undefined;
     var phi_cnt: [MAX_BLOCKS_PER_FN]u8 = .{0} ** MAX_BLOCKS_PER_FN;
 
     for (1..f.total_locals + 1) |s| {
@@ -648,7 +656,7 @@ fn mem2reg(f: *IRFn) bool {
                         ok = false;
                         break;
                     }
-                    phi_slots[y][phi_cnt[y]] = @intCast(s);
+                    pending[y][phi_cnt[y]] = @intCast(s);
                     phi_cnt[y] += 1;
                     if ((def_blocks[s] & (@as(u128, 1) << y)) == 0) {
                         work |= (@as(u128, 1) << y);
@@ -658,19 +666,30 @@ fn mem2reg(f: *IRFn) bool {
             if (!ok) break;
         }
         if (!ok) {
-            // Roll back this slot's pending phis and disqualify slot
+            // Drop this slot's pending phis; it stays memory resident.
             promotable[s] = false;
             for (0..f.block_count) |bi| {
                 var k: u8 = 0;
                 while (k < phi_cnt[bi]) {
-                    if (phi_slots[bi][k] == s) {
+                    if (pending[bi][k] == s) {
                         phi_cnt[bi] -= 1;
-                        phi_slots[bi][k] = phi_slots[bi][phi_cnt[bi]];
+                        pending[bi][k] = pending[bi][phi_cnt[bi]];
                     } else {
                         k += 1;
                     }
                 }
             }
+            continue;
+        }
+        // This slot's phi set is complete: commit it.
+        for (0..f.block_count) |bi| {
+            for (0..phi_cnt[bi]) |k| {
+                if (placed_cnt[bi] < placed[bi].len) {
+                    placed[bi][placed_cnt[bi]] = pending[bi][k];
+                    placed_cnt[bi] += 1;
+                }
+            }
+            phi_cnt[bi] = 0;
         }
     }
 
@@ -685,7 +704,7 @@ fn mem2reg(f: *IRFn) bool {
 
     // Insert pending .phi instructions at the start of each block
     for (1..f.block_count) |bi| {
-        const pc = phi_cnt[bi];
+        const pc = placed_cnt[bi];
         if (pc == 0) continue;
         var b = &f.blocks[bi];
         if (@as(u32, b.inst_count) + pc >= MAX_INSTS_PER_BLOCK or
@@ -702,7 +721,7 @@ fn mem2reg(f: *IRFn) bool {
             b.insts[k] = .{
                 .op = .phi,
                 .dest = pv,
-                .slot = phi_slots[bi][k], // temporarily tracks slot during renaming
+                .slot = placed[bi][k], // temporarily tracks slot during renaming
                 .arg_count = 0,
             };
         }
@@ -828,6 +847,38 @@ fn hasAnyPhi(f: *const IRFn) bool {
     return false;
 }
 
+/// True when `v` is already defined on entry to block `bi` (by an earlier
+/// instruction of `bi`, or by a block that dominates it). Used to decide whether
+/// a phi can be rewritten as a plain copy: the copy is only equivalent if the
+/// value is live at that point on *every* path, which a phi guarantees for free.
+fn definedBefore(f: *IRFn, bi: u16, ii: usize, v: u16) bool {
+    const b = &f.blocks[bi];
+    var k: usize = 0;
+    while (k < ii) : (k += 1) {
+        if (b.insts[k].dest == v) return true;
+    }
+    if (bi == 0) return false;
+    // Cheap dominance test: walk up from every predecessor; if any path can reach
+    // `bi` without passing a definition of v, the copy would read a stale value.
+    // Conservatively answer "no" unless the definition is in a predecessor of
+    // every incoming edge.
+    var cfg: CFGInfo = undefined;
+    buildCFGInfo(f, &cfg);
+    var d: u16 = 0;
+    while (d < f.block_count) : (d += 1) {
+        if (d == bi) continue;
+        var defines = false;
+        for (f.blocks[d].insts[0..f.blocks[d].inst_count]) |inst| {
+            if (inst.dest == v) {
+                defines = true;
+                break;
+            }
+        }
+        if (defines and dominates(&cfg, d, bi)) return true;
+    }
+    return false;
+}
+
 fn simplifyTrivialPhis(f: *IRFn) bool {
     var changed = false;
     for (0..f.block_count) |bi| {
@@ -856,8 +907,15 @@ fn simplifyTrivialPhis(f: *IRFn) bool {
                 if (unique) |u| {
                     if (u == 0) {
                         inst.* = .{ .op = .const_int, .dest = inst.dest, .imm = 0 };
-                    } else {
+                    } else if (definedBefore(f, @intCast(bi), ii, u)) {
+                        // Replacing a phi by a copy is only sound when the value is
+                        // already live at the phi's position: a phi is defined on
+                        // *every* incoming edge, a copy only where it is executed.
+                        // Collapsing a phi whose operand is defined further down
+                        // (or only on some path) turns a merge into a stale read.
                         inst.* = .{ .op = .copy, .dest = inst.dest, .src1 = u };
+                    } else {
+                        continue;
                     }
                 } else {
                     inst.* = .{ .op = .const_int, .dest = inst.dest, .imm = 0 };
@@ -1983,6 +2041,18 @@ fn globalCopyPropagate(f: *IRFn) bool {
         const b = &f.blocks[bi];
         var ii: u16 = 0;
         while (ii < b.inst_count) : (ii += 1) {
+            // A phi operand is not a plain use of the value: it names the value
+            // that is live on one *specific* incoming edge. Rewriting it to the
+            // copy's source drops the "defined on this edge" guarantee and makes
+            // the merge read whatever the source happens to hold - the -O2 bug
+            // where a phi {16, 18} collapsed to {16, 9} and read a stale v9.
+            if (b.insts[ii].op == .phi) {
+                var bad = false;
+                for (b.insts[ii].args[0..b.insts[ii].arg_count]) |arg| {
+                    if (arg > 0 and arg < MAX_TRACKED_VREGS and copy_of[arg] != 0) bad = true;
+                }
+                if (bad) continue;
+            }
             if (rewriteInstUses(&b.insts[ii], &copy_of)) changed = true;
         }
     }

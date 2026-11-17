@@ -1,4 +1,4 @@
-// N-body style pairwise force accumulation over 500 bodies, 200 steps.
+// N-body style pairwise force accumulation over 300 bodies, 60 steps.
 //
 // Positions live in a malloc'd flat block of doubles-as-integers, so the
 // arithmetic stays in the integer pipeline: this measures loop overhead and
@@ -6,8 +6,8 @@
 import "common.lir"
 
 fn main() -> i64 {
-    const n: i64 = 500
-    const steps: i64 = 200
+    const n: i64 = 300
+    const steps: i64 = 60
     let px = @malloc(n * 8)
     let py = @malloc(n * 8)
     let vx = @malloc(n * 8)

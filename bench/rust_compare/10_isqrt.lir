@@ -1,0 +1,49 @@
+// Integer square root by Newton's method, summed over every value below
+// 2,000,000, then a floating-free integer cube root as a second kernel.
+//
+// isqrt is the classic divergence stress test: the iteration count depends on
+// the input, so the inner loop's trip count is not statically known. The
+// division `n / x` in the update is the expensive part and is the reason this
+// belongs in a division-heavy suite.
+import "common.lir"
+
+fn isqrt(n: i64) -> i64 {
+    if n < 2 { return n }
+    var x = n
+    var y = (x + 1) / 2
+    while y < x {
+        x = y
+        y = (x + n / x) / 2
+    }
+    return x
+}
+
+fn icbrt(n: i64) -> i64 {
+    if n < 8 { return n }
+    var x = n / 3 + 1
+    while true {
+        let y = (2 * x + n / (x * x)) / 3
+        if y >= x { return x }
+        x = y
+    }
+}
+
+fn main() -> i64 {
+    const limit: i64 = 2000000
+    var sum: i64 = 0
+    var i: i64 = 0
+    while i < limit {
+        sum = sum + isqrt(i)
+        i = i + 1
+    }
+    var cube_sum: i64 = 0
+    var j: i64 = 0
+    while j < 300000 {
+        cube_sum = cube_sum + icbrt(j)
+        j = j + 1
+    }
+    printInt(sum)
+    printInt(cube_sum)
+    println("")
+    return 0
+}

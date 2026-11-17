@@ -1,0 +1,50 @@
+// Sieve of Eratosthenes up to 2,000,000, repeated 5 times.
+//
+// The bit array is a malloc'd byte buffer where 1 = "still prime". Marking
+// composites with a stride of p is the innermost loop, so this measures the
+// store-through-pointer path plus the integer loop. Each repetition re-inits
+// the buffer because the marking pass is destructive.
+import "common.lir"
+
+fn main() -> i64 {
+    const limit: i64 = 2000000
+    const passes: i64 = 5
+    let sieve = @malloc(limit + 1)
+    var total: i64 = 0
+
+    var pass: i64 = 0
+    while pass < passes {
+        var i: i64 = 0
+        while i <= limit {
+            @write_u8(@ptr_add(sieve, i), 1)
+            i = i + 1
+        }
+        @write_u8(sieve, 0)
+        @write_u8(@ptr_add(sieve, 1), 0)
+
+        var p: i64 = 2
+        while p * p <= limit {
+            if (@read_u8(@ptr_add(sieve, p)) == 1) {
+                var m: i64 = p * p
+                while m <= limit {
+                    @write_u8(@ptr_add(sieve, m), 0)
+                    m = m + p
+                }
+            }
+            p = p + 1
+        }
+
+        var count: i64 = 0
+        var q: i64 = 0
+        while q <= limit {
+            count = count + (@read_u8(@ptr_add(sieve, q)) as i64)
+            q = q + 1
+        }
+        total = total + count
+        pass = pass + 1
+    }
+    printInt(total)
+    println("")
+    @free(sieve)
+    return 0
+}
