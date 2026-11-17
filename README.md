@@ -407,6 +407,38 @@ Reproduce with:
 python3 bench/compare_zig.py
 ```
 
+## Heavy Math Workloads: LIR vs Rust
+
+`bench/rust_compare/` holds eleven heavier integer programs, each written twice:
+once in LIR and once in Rust, byte-for-byte equivalent (same constants, same
+order of operations, same printed value). They are chosen to hit different
+machine resources rather than to flatter either side.
+
+| # | kernel | stresses |
+|---|---|---|
+| 01 | 60x60 integer matmul | memory traffic, inner-loop addressing |
+| 02 | 300-body pairwise forces x 60 steps | nested loops with two divisions in the body |
+| 03 | sieve to 2,000,000 x 5 | stride stores, tight counting loop |
+| 04 | 800x800 16.16 fixed-point Mandelbrot | dependent multiply chain, data-dependent exit |
+| 05 | Collatz total stopping times below 1,000,000 | unpredictable branches, divide-by-two |
+| 06 | Fibonacci mod 2^31-1, 30M iterations | tightest possible loop body |
+| 07 | pi(2,000,000) by trial division | division, early exits |
+| 08 | splitmix64 x 20M + popcount | multiplies, shifts, popcount |
+| 09 | tak(24,16,8) | call overhead, deep recursion |
+| 10 | isqrt x 2M + icbrt x 300k | division with input-dependent trip count |
+| 11 | 1-D k-means, 100k points, k=8, 15 iterations | pointer loads/stores |
+
+```bash
+python3 bench/rust_compare/run_all.py        # builds and times both sides
+```
+
+Each side is checked against `expected.txt` before anything is timed, so a
+miscompile shows up as a wrong answer instead of a fast program. If `rustc` is
+missing the script still verifies and times all eleven LIR programs and states
+that Rust timings are unavailable, rather than quietly printing half a
+comparison. These workloads are what found the six miscompiles documented in
+[ROADMAP Phase 3](docs/ROADMAP.md).
+
 ## Intelligent Developer Experience
 
 - **Coded diagnostics:** every message carries a stable code (`LIR-E3004`), a source span, and usually a `help:` line stating the concrete fix. `lir explain LIR-E3004` (also `e3004`, `3004`) prints cause, fix and a working example.

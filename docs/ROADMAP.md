@@ -93,6 +93,54 @@ Geometric mean of the eight ratios: **1.13x**. -O1 compile time rises from
 7.6 ms. Only the "yes" rows are claimed; the rest are noise this machine
 cannot resolve.
 
+#### Phase 3 notes: six more wrong-answer bugs found by heavier workloads (2026-11)
+
+Writing the LIR-vs-Rust math suite (`bench/rust_compare`, eleven programs) was
+worth more as a bug hunt than as a benchmark: six further miscompiles surfaced,
+none of which the existing corpus reached. All shared one property - they only
+appear when a program combines constructs the small tests keep apart - and all
+produced a plausible-looking number rather than a crash.
+
+Two were in code generation, and both were register-allocation assumptions:
+
+1. The constant-divisor `%` / `/` fast path parks the magic multiplier in `rcx`
+   and remembers it in `cur_rcx_const`, which codegen used to hoist the load
+   out of loops. But `rcx` is the implicit divisor register for `div`: a runtime
+   `div` in the same loop (`mov %rdi,%rcx; div %ecx`) overwrote the parked
+   magic, so the next iteration multiplied by the runtime divisor.
+   `((i*13)%100)` plus `100000000/d2` in one loop printed -7284561654821
+   instead of -10000000000. Hoisting removed; each division loads its magic
+   inline. Measured cost: none (geomean 0.99x over `bench/speed_compare`).
+2. The same path used `r10` as scratch when the dividend was spilled. `r10` is
+   in `CALLER_SAVED_POOL` and can hold a live vreg - in a nested loop it held
+   the outer induction variable, which the inner `% 100` destroyed. It now uses
+   `r11`, which really is reserved (rax/rcx/rdx/rsp/rbp/r11).
+
+Four more were in the optimizer, all about phis:
+
+3. `mem2reg` placed phis for every slot before inserting any of them, and
+   renaming consults a per-slot `promotable[]` flag. A slot rolled back for
+   block-capacity reasons could still have its names in the shared pool, so an
+   operand-less phi reached the CFG and the vreg it defined was never assigned.
+   Placement now commits per slot (`pending` -> `placed`).
+4. `simplifyTrivialPhis` rewrote a phi as `dest = copy v` unconditionally. A
+   phi is defined on *every* incoming edge, a copy only where it executes.
+   The rewrite now requires `definedBefore` (real dominators).
+5. `globalCopyPropagate` rewrote phi *operands*. An operand names the value live
+   on one specific edge; replacing `{16, 18}` with `{16, 9}` because some block
+   contained `copy 18, 9` makes the merge read a stale register. This is what
+   turned `a = b; b = t - m | b = t` into an exploding recurrence at -O2 on the
+   native *and* VM backends (06_fib_mod printed 735302655874374793 instead of
+   577847172). Phi operands are now left alone.
+6. The `-O0` build disagreed with -O1/-O2 on literal modulo (`1234 % 100`
+   printed -666) because of (2).
+
+`tests/core_test.py::LoopOptimizationSoundnessTests` now has seven cases; the
+three added here and the phi pair added with the benchmark suite all fail on the
+parent commit and pass after these fixes. 16 benchmark programs (10 in
+`speed_compare`, 6 at the time of the fix in `rust_compare`) are identical
+across -O0/-O1/-O2.
+
 #### Phase 3 notes: compile-time work (2026-11)
 
 Compilation is the axis where the gains in this branch are unambiguous and

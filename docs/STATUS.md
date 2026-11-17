@@ -80,3 +80,10 @@ see the known gaps below.
 6. Cross-targets through the C11 backend need `zig` (or a matching `CC`) on
    PATH; without it the compiler fails with `CrossCompilerNotFound` and a hint
    instead of emitting a host binary.
+7. The IR structural verifier (`ir_verify.zig`) checks shapes, indices and
+   branch targets, but not def-before-use ordering or dominance. Six
+   wrong-answer bugs in codegen and in the phi handling of `mem2reg` /
+   `simplifyTrivialPhis` / `globalCopyPropagate` were found by hand in
+   2026-11 (see [ROADMAP Phase 3](ROADMAP.md)); a real dominance-checking
+   verifier would have caught four of them automatically. It is the next
+   soundness item, ahead of any further optimization work.
