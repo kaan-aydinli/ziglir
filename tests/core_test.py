@@ -468,6 +468,81 @@ class LoopOptimizationSoundnessTests(unittest.TestCase):
             }
         """, _expected_branchy_total(100000))
 
+    def test_runtime_divisor_does_not_clobber_div_magic(self):
+        """A loop that hoists a constant-divisor `%` magic into rcx must not
+        reuse that register for a runtime divisor.
+
+        The signed div/mod lowering parks the magic multiplier in rcx and
+        `imul rcx` against it. A later `div` in the same loop loads its runtime
+        divisor into rcx, so if the magic survives that instruction the next
+        iteration multiplies by the runtime divisor instead. Only the shape that
+        combines both (a `% 100` and a `100000000 / d2`) used to go wrong, and
+        only at -O2 on the native backend.
+        """
+        self.assert_all_levels("""
+            fn work(n: i64, m: i64, off: i64) -> i64 {
+                var i: i64 = 0
+                var fx: i64 = 0
+                while i < n {
+                    let x = ((i * 13) % 100) - off
+                    let d2 = (x * x + x * x) / m + 1
+                    let inv = 100000000 / d2
+                    fx = fx + x * inv
+                    i = i + 1
+                }
+                return fx
+            }
+            fn main() -> i64 {
+                printInt(work(200, 1000000, 50))
+                println("")
+                return 0
+            }
+        """, -10000000000)
+
+    def test_constant_mod_in_nested_loop_keeps_outer_induction(self):
+        """The constant-divisor path must not borrow an allocator register.
+
+        It used r10 as its scratch for the dividend, but r10 belongs to the
+        register allocator: in this nested loop the outer induction variable
+        lives in r10 and was overwritten by the inner `% 100` / `/ 1000`,
+        which corrupted the outer loop bounds and printed a wrong total.
+        """
+        self.assert_all_levels("""
+            fn work(n: i64, m: i64, off: i64) -> i64 {
+                var total: i64 = 0
+                var a: i64 = 0
+                while a < n {
+                    var fx: i64 = 0
+                    var b: i64 = 0
+                    while b < n {
+                        let x = ((b * 13) % 100) - off
+                        fx = fx + x * (100000000 / ((x * x + x * x) / m + 1))
+                        b = b + 1
+                    }
+                    total = total + fx % 1000
+                    a = a + 1
+                }
+                return total
+            }
+            fn main() -> i64 {
+                printInt(work(100, 1000, 50))
+                println("")
+                return 0
+            }
+        """, -30000)
+
+    def test_literal_constant_mod_matches_division(self):
+        """`a % b` for two literals must agree with `a - (a / b) * b` at -O0."""
+        self.assert_all_levels("""
+            fn main() -> i64 {
+                printInt(50 % 100)
+                printInt(1234 % 100)
+                printInt(-7 % 10)
+                printInt(1000 % 7)
+                return 0
+            }
+        """, "50\n34\n-7\n6")
+
     def test_division_by_constant_after_copy(self):
         """A copy of a constant divisor must not force a real idiv path.
 

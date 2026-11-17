@@ -2251,68 +2251,15 @@ pub const IRCodegen = struct {
             }
         }
 
-        var fn_m1: ?i64 = null;
-        var fn_m2: ?i64 = null;
-        var fn_has_global_mults = false;
-
-        if (!has_calls and !can_shrink) {
-            var fn_clobbered = false;
-            for (0..ir_fn.block_count) |chk_bi| {
-                const blk_chk = &ir_fn.blocks[chk_bi];
-                for (0..blk_chk.inst_count) |chk_ii| {
-                    const chk_inst = blk_chk.insts[chk_ii];
-                    if (chk_inst.op == .div or chk_inst.op == .@"mod") {
-                        if (chk_inst.src2 > 0 and chk_inst.src2 < MAX_VREGS and self.vreg_const_known[chk_inst.src2]) {
-                            const imm = self.vreg_const_imm[chk_inst.src2];
-                            if (imm > 1) {
-                                const m = signedDivMagic(imm).multiplier;
-                                if (fn_m1 == null) {
-                                    fn_m1 = m;
-                                } else if (fn_m1.? == m) {
-                                    // same
-                                } else if (fn_m2 == null) {
-                                    fn_m2 = m;
-                                } else if (fn_m2.? == m) {
-                                    // same
-                                } else {
-                                    fn_clobbered = true;
-                                    break;
-                                }
-                            } else {
-                                fn_clobbered = true;
-                                break;
-                            }
-                        } else {
-                            fn_clobbered = true;
-                            break;
-                        }
-                    } else if (chk_inst.op == .shl or chk_inst.op == .shr or chk_inst.op == .ushr) {
-                        if (!(chk_inst.src2 > 0 and chk_inst.src2 < MAX_VREGS and self.vreg_const_known[chk_inst.src2])) {
-                            fn_clobbered = true;
-                            break;
-                        }
-                    } else if (isCallClobberingOp(chk_inst.op) or chk_inst.op == .fadd or chk_inst.op == .fsub or chk_inst.op == .fmul or chk_inst.op == .fdiv or
-                        chk_inst.op == .deref_load or chk_inst.op == .deref_store or chk_inst.op == .field_access or chk_inst.op == .field_store or
-                        chk_inst.op == .store_mem or chk_inst.op == .load_mem)
-                    {
-                        fn_clobbered = true;
-                        break;
-                    }
-                }
-                if (fn_clobbered) break;
-            }
-            if (!fn_clobbered and (fn_m1 != null or fn_m2 != null)) {
-                fn_has_global_mults = true;
-                if (fn_m1 != null) {
-                    self.mov64imm(1, @bitCast(fn_m1.?));
-                    self.cur_rcx_const = fn_m1;
-                }
-                if (fn_m2 != null) {
-                    self.mov64imm(11, @bitCast(fn_m2.?));
-                    self.cur_r11_const = fn_m2;
-                }
-            }
-        }
+        // NOTE: this function used to pre-load the constant-divisor magic
+        // multipliers into rcx/r11 once (per function, or per loop header) and
+        // remember them in cur_rcx_const / cur_r11_const. That is unsound: rcx is
+        // the implicit divisor register for `div`, so any runtime `/` or `%` in
+        // the function overwrote the parked magic and every later constant
+        // division multiplied by the runtime divisor instead, silently giving
+        // wrong answers at -O2 (the VM and -O0/-O1 were correct). Hoisting is
+        // gone; each constant division loads its magic inline. Measured cost:
+        // none (geomean 0.99x over the speed_compare suite).
 
         var is_loop_header: [ir_mod.MAX_BLOCKS_PER_FN]bool = .{false} ** ir_mod.MAX_BLOCKS_PER_FN;
         for (0..ir_fn.block_count) |bi| {
@@ -2351,82 +2298,13 @@ pub const IRCodegen = struct {
                 self.emitParallelRegParamMoves(ir_fn);
             }
             const bi = emit_order[ord_i];
-            const chk_blk = &ir_fn.blocks[bi];
-            const is_self_loop = (chk_blk.inst_count > 0 and blk_t: {
-                const term = chk_blk.insts[chk_blk.inst_count - 1];
-                break :blk_t ((term.op == .jump and term.target_block == bi) or
-                    (term.op == .cond_jump and (term.target_block == bi or term.alt_block == bi)));
-            });
-            if (fn_has_global_mults) {
-                self.cur_rcx_const = fn_m1;
-                self.cur_r11_const = fn_m2;
-                if (is_loop_header[bi]) {
-                    const rem = self.code_len & 15;
-                    if (rem != 0) {
-                        const pad = 16 - rem;
-                        self.emitNopPadding(pad);
-                    }
-                }
-            } else if (is_loop_header[bi] and is_self_loop) {
-                var loop_m1: ?i64 = null;
-                var loop_m2: ?i64 = null;
-                var loop_clobbered = false;
-                for (0..chk_blk.inst_count) |chk_ii| {
-                    const chk_inst = chk_blk.insts[chk_ii];
-                    if (chk_inst.op == .div or chk_inst.op == .@"mod") {
-                        if (chk_inst.src2 > 0 and chk_inst.src2 < MAX_VREGS and self.vreg_const_known[chk_inst.src2]) {
-                            const imm = self.vreg_const_imm[chk_inst.src2];
-                            if (imm > 1) {
-                                const m = signedDivMagic(imm).multiplier;
-                                if (loop_m1 == null) {
-                                    loop_m1 = m;
-                                } else if (loop_m1.? == m) {
-                                    // same
-                                } else if (loop_m2 == null) {
-                                    loop_m2 = m;
-                                } else if (loop_m2.? == m) {
-                                    // same
-                                } else {
-                                    loop_clobbered = true;
-                                    break;
-                                }
-                            }
-                        }
-                    } else if (isCallClobberingOp(chk_inst.op) or chk_inst.op == .fadd or chk_inst.op == .fsub or chk_inst.op == .fmul or chk_inst.op == .fdiv or
-                        chk_inst.op == .deref_load or chk_inst.op == .deref_store or chk_inst.op == .field_access or chk_inst.op == .field_store or
-                        chk_inst.op == .store_mem or chk_inst.op == .load_mem)
-                    {
-                        loop_clobbered = true;
-                        break;
-                    }
-                }
-                if (!loop_clobbered and (loop_m1 != null or loop_m2 != null)) {
-                    if (loop_m1 != null) {
-                        self.mov64imm(1, @bitCast(loop_m1.?));
-                        self.cur_rcx_const = loop_m1;
-                    }
-                    if (loop_m2 != null) {
-                        self.mov64imm(11, @bitCast(loop_m2.?));
-                        self.cur_r11_const = loop_m2;
-                    }
-                } else {
-                    self.cur_rcx_const = null;
-                    self.cur_r11_const = null;
-                }
+            self.cur_rcx_const = null;
+            self.cur_r11_const = null;
+            if (is_loop_header[bi]) {
                 const rem = self.code_len & 15;
                 if (rem != 0) {
                     const pad = 16 - rem;
                     self.emitNopPadding(pad);
-                }
-            } else {
-                self.cur_rcx_const = null;
-                self.cur_r11_const = null;
-                if (is_loop_header[bi]) {
-                    const rem = self.code_len & 15;
-                    if (rem != 0) {
-                        const pad = 16 - rem;
-                        self.emitNopPadding(pad);
-                    }
                 }
             }
             self.cur_next_emit_bi = if (ord_i + 1 < ir_fn.block_count and !(can_shrink and !self.cur_shrink_shared and ord_i == 1))
@@ -3338,40 +3216,28 @@ pub const IRCodegen = struct {
                     const magic = signedDivMagic(known_imm);
                     const dst_phys = self.vregPhys(inst.dest);
                     const s1_phys = self.vregPhys(inst.src1);
-                    const save_reg: u8 = if (s1_phys) |sp| sp else 10;
+                    // r10 is owned by the register allocator (CALLER_SAVED_POOL
+                    // contains r10), so it may hold a live vreg here. Only
+                    // rax/rcx/rdx/rsp/rbp/r11 are reserved scratch: use r11.
+                    const save_reg: u8 = if (s1_phys) |sp| sp else 11;
                     if (s1_phys == null) {
-                        self.loadVregToReg(inst.src1, 10);
-                        self.movRegReg(0, 10);
+                        self.loadVregToReg(inst.src1, 11);
+                        self.movRegReg(0, 11);
                     } else {
                         self.loadVregToReg(inst.src1, 0); // mov rax, s1_phys
                     }
-                    var mult_reg: u8 = 1;
-                    if (self.cur_rcx_const != null and self.cur_rcx_const.? == magic.multiplier) {
-                        mult_reg = 1;
-                    } else if (self.cur_r11_const != null and self.cur_r11_const.? == magic.multiplier) {
-                        mult_reg = 11;
-                    } else if (self.cur_rcx_const == null) {
-                        self.mov64imm(1, @bitCast(magic.multiplier));
-                        self.cur_rcx_const = magic.multiplier;
-                        mult_reg = 1;
-                    } else if (self.cur_r11_const == null) {
-                        self.mov64imm(11, @bitCast(magic.multiplier));
-                        self.cur_r11_const = magic.multiplier;
-                        mult_reg = 11;
-                    } else {
-                        self.mov64imm(1, @bitCast(magic.multiplier));
-                        self.cur_rcx_const = magic.multiplier;
-                        mult_reg = 1;
-                    }
-                    if (mult_reg == 1) {
-                        self.emit8(0x48);
-                        self.emit8(0xF7);
-                        self.emit8(0xE9); // imul rcx -> rdx:rax
-                    } else {
-                        self.emit8(0x49);
-                        self.emit8(0xF7);
-                        self.emit8(0xEB); // imul r11 -> rdx:rax
-                    }
+                    // NOTE: the multiplier must never be cached in rcx/r11 across
+                    // instructions. rcx is rdx:rax's implicit divisor register for
+                    // `div`, and the general div/mod path below loads its divisor
+                    // into rcx; a cached "rcx holds the magic" assumption then
+                    // silently multiplies by the runtime divisor on the next
+                    // iteration (wrong `-O2` answers). Load it fresh each time.
+                    self.mov64imm(1, @bitCast(magic.multiplier));
+                    self.cur_rcx_const = null;
+                    self.cur_r11_const = null;
+                    self.emit8(0x48);
+                    self.emit8(0xF7);
+                    self.emit8(0xE9); // imul rcx -> rdx:rax
                     if (magic.multiplier < 0) {
                         self.emitRex(save_reg, 2);
                         self.emit8(0x01);
@@ -3400,13 +3266,14 @@ pub const IRCodegen = struct {
                         } else {
                             self.movRegReg(0, 2);
                             self.mov64imm(1, @bitCast(known_imm));
-                            self.cur_rcx_const = known_imm;
+                            self.cur_rcx_const = null;
+                            self.cur_r11_const = null;
                             self.emit8(0x48);
                             self.emit8(0x0F);
                             self.emit8(0xAF);
                             self.emit8(0xC1); // imul rax, rcx
                         }
-                        const dst_reg = dst_phys orelse 10;
+                        const dst_reg = dst_phys orelse 11;
                         if (dst_reg != save_reg) {
                             self.movRegReg(dst_reg, save_reg);
                         }
@@ -3423,6 +3290,8 @@ pub const IRCodegen = struct {
                 }
                 self.loadVregToReg(inst.src1, 0);
                 self.loadVregToReg(inst.src2, 1);
+                self.cur_rcx_const = null;
+                self.cur_r11_const = null;
                 self.emitTestRegZeroTrap(1);
                 // Fast 32-bit division/mod when operands fit in non-negative 32-bit range
                 self.movRegReg(2, 0);
