@@ -1,0 +1,18 @@
+import "../src/math.lir"
+fn main() -> i64 {
+    let n: i64 = 96
+    let sz = n * n * 8
+    let a = @malloc(sz)
+    let b = @malloc(sz)
+    let c = @malloc(sz)
+    var i: i64 = 0
+    while i < n * n {
+        @write_u64(@ptr_add(a, i*8), ((i % 13) as i64 * 42949673) as u64)
+        @write_u64(@ptr_add(b, i*8), ((i % 7) as i64 * 42949673) as u64)
+        i = i + 1
+    }
+    matmul(a, b, c, n)
+    printInt(to_int(l1_norm(c, n * n)))
+    println("")
+    return 0
+}

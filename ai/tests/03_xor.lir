@@ -1,0 +1,73 @@
+// SEL test 03 — XOR.
+//
+// Tek doğrusal katman XOR'u çözemez (klasik sonuç: XOR doğrusal ayrılabilir
+// değil). Bu test, SEL'in doğrusal olmayan problemi gerçekten çözdüğünü
+// kanıtlar: 24 nöronlu sabit bir gizli katman + eikonal (NLMS) çıktı katmanı.
+//
+// Mimarî: 2 girdi -> 24 gizli (K=2 seyrek, sabit ağırlık, lrelu) -> 1 çıktı
+// (24 bağlantı, eğitilebilir). Gizli katman öğrenmiyor; görevi yalnız
+// girdi uzayını yüksek boyuta, sıfır-olmayan tabanla taşımak.
+//
+// Beklenen: 4   (4 desenin 4'ü de doğru)
+import "../src/fixed.lir"
+import "../src/ledger.lir"
+
+fn main() -> i64 {
+    let h = block_new(2, 24, 2, 3)
+    let o = block_new(24, 1, 24, 5)
+    let x  = @malloc(2 * 8)
+    let hv = @malloc(24 * 8)
+    let to = @malloc(8)
+
+    let eta = div(from_int(9), from_int(10))
+    var ep: i64 = 0
+    while ep < 3000 {
+        var pat: i64 = 0
+        while pat < 4 {
+            let a = (pat / 2) % 2
+            let b = pat % 2
+            @write_u64(@ptr_add(x, 0), (if a == 1 { ONE } else { 0 }) as u64)
+            @write_u64(@ptr_add(x, 8), (if b == 1 { ONE } else { 0 }) as u64)
+            forward(h, x)
+            var q: i64 = 0
+            while q < 24 {
+                @write_u64(@ptr_add(hv, q * 8), @read_u64(@ptr_add(h.out, q * 8)))
+                q = q + 1
+            }
+            forward(o, hv)
+            let want: i64 = if a != b { ONE } else { 0 }
+            @write_u64(@ptr_add(to, 0), want as u64)
+            learn(o, hv, to, eta)
+            pat = pat + 1
+        }
+        ep = ep + 1
+    }
+
+    // Değerlendirme: 1/2 eşiğiyle sınıflandır.
+    var correct: i64 = 0
+    var pat: i64 = 0
+    while pat < 4 {
+        let a = (pat / 2) % 2
+        let b = pat % 2
+        @write_u64(@ptr_add(x, 0), (if a == 1 { ONE } else { 0 }) as u64)
+        @write_u64(@ptr_add(x, 8), (if b == 1 { ONE } else { 0 }) as u64)
+        forward(h, x)
+        var q: i64 = 0
+        while q < 24 {
+            @write_u64(@ptr_add(hv, q * 8), @read_u64(@ptr_add(h.out, q * 8)))
+            q = q + 1
+        }
+        forward(o, hv)
+        let got = @read_u64(@ptr_add(o.out, 0)) as i64
+        let want: i64 = if a != b { ONE } else { 0 }
+        let gv: i64 = if got > HALF { 1 } else { 0 }
+        let wv: i64 = if want == ONE { 1 } else { 0 }
+        if gv == wv {
+            correct = correct + 1
+        }
+        pat = pat + 1
+    }
+    printInt(correct)
+    println("")
+    return 0
+}

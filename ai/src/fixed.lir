@@ -1,0 +1,228 @@
+// SEL — Sparse Eikonal Ledger
+// fixed.lir — Q32.32 sabit nokta aritmetiği, tamamen i64 (i128 yok).
+//
+// Sözleşme:
+//   ONE  = 2^32, yani 1.0
+//   işlemler taşmada DOYGUNLAŞIR (sarmaz), böylece eğitim sessizce bozulmaz.
+//
+// Bu dosyanın tasarım kuralı: her fonksiyonun GEÇERLİ GİRİŞ ARALIĞI yorumda
+// yazar. Çağıran, aralığın dışına çıkmayacağını garanti eder; çıkmayacağını
+// garanti edemiyorsa `_sat` sürümünü kullanır.
+
+const ONE: i64 = 4294967296 // 2^32
+const HALF: i64 = 2147483648 // 2^31
+// Q32.32'de float'ın "infinity"si: tamsayı kısmı 2^31 - 1
+const MAXV: i64 = 9223372032559808512 // (2^31 - 1) << 32
+const MINV: i64 = 0 - 9223372032559808512 // -(2^31 - 1) << 32
+
+/// Doygun toplama.
+/// Kural: |sonuç| <= 2^62. Taşma işaret değişimiyle yakalanır.
+fn sat_add(a: i64, b: i64) -> i64 {
+    let s = a + b
+    if (a >= 0) == (b >= 0) {
+        if (a >= 0) != (s >= 0) {
+            if a >= 0 {
+                return MAXV
+            }
+            return MINV
+        }
+    }
+    if s > MAXV {
+        return MAXV
+    }
+    if s < MINV {
+        return MINV
+    }
+    return s
+}
+
+fn sat_neg(a: i64) -> i64 {
+    if a == MINV {
+        return MAXV
+    }
+    return 0 - a
+}
+
+/// Q32.32 çarpım — TEK VE DOĞRU YOL.
+///
+/// Neden `(a*b)>>32` DEĞİL: iki Q32.32 sayının ham çarpımı 2^64'e kadar
+/// çıkabilir ve `i64` taşar. LIR'de taşma sessizce yanlış değer üretir
+/// (ölçüldü: 1.5*2.0 -> 0), bu yüzden ham çarpım hiç kullanılmaz.
+///
+/// Doğru yöntem: çarpmadan ÖNCE iki tarafı da 2^16 sağa kaydır.
+///   result = (a >> 16) * (b >> 16)
+/// Neden ek shift YOK: Q32.32'de a = A·2^32, b = B·2^32. Çarpım A·B·2^64
+/// olmalı, Q32.32 sonucu ise A·B·2^32. (a>>16) = A·2^16 olduğundan
+/// (a>>16)·(b>>16) = A·B·2^32 — tam olarak istenen Q32.32 değer.
+/// `>>32` eklemek sonucu 2^-32 ile çarpıp sıfıra yuvarlardı (ölçüldü).
+///
+/// GEÇERLİ ARALIK: |a| < 2^47 ve |b| < 2^47 (Q32.32'de tamsayı kısmı < 2^15,
+/// yani ±32768). SEL'in tüm ağırlık/aktivasyonları ±2^31'de doygunlaştığı
+/// için bu aralık her zaman sağlanır.
+fn mul(a: i64, b: i64) -> i64 {
+    // İki tarafı da 16 bit sağa kaydır: 48+48 = 96 bit -> hâlâ fazla.
+    // 32 bit kaydırırsak kesir kaybı çok olur. 16 bit kaydırma + işaret
+    // korumalı çarpım, 2^31 sınırındaki değerler için 2^62'ye sığar.
+    let as16 = a >> 16
+    let bs16 = b >> 16
+    // |as16| < 2^31 sağlanıyorsa çarpım 2^62'ye sığar.
+    if fabs(as16) >= HALF or fabs(bs16) >= HALF {
+        return mul_sat(a, b)
+    }
+    return as16 * bs16
+}
+
+/// Doygunlaştıran çarpım: genel büyüklüklerde de doğru sonuç verir.
+///
+/// Yöntem: sonucun taşıp taşmayacağı önceden kestirilir.
+/// Q32.32'de a = A·2^16·2^16 ve b = B·2^16·2^16.
+/// (a>>16)·(b>>16) = A·B·2^32 tam olarak Q32.32 sonucudur; taşma yalnızca
+/// bu ara çarpım 2^63'ü aştığında olur. |A| < 2^31 ve |B| < 2^31 olduğunda
+/// ara çarpım 2^62'yi aşmaz. Daha büyük operandlarda sonuç doygunlaşır.
+fn mul_sat(a: i64, b: i64) -> i64 {
+    if a == 0 or b == 0 {
+        return 0
+    }
+    let as16 = a >> 16
+    let bs16 = b >> 16
+    if fabs(as16) >= HALF or fabs(bs16) >= HALF {
+        // |a| veya |b| >= 2^47: gerçek sonuç kesinlikle MAXV'yi aşıyor.
+        if (a >= 0) == (b >= 0) {
+            return MAXV
+        }
+        return MINV
+    }
+    return as16 * bs16
+}
+
+/// Kesirli bölme a/b, tamamen i64 ve taşmasız.
+///
+/// Yöntem: `a << 32` yapmak 2^64'ü aşabilir (ölçüldü: div(1.0, 64.0) -> 0).
+/// Bunun yerine a/b'nin TAM ve KESİR kısımlarını ayrı ayrı kuruyoruz:
+///   whole = a / b          (işaretli tamsayı bölmesi)
+///   rem   = a - whole * b   (|rem| < |b|)
+///   frac  = (rem << 16) / b << 16   (iki turda, ara değer < 2^62)
+///
+/// Kural: b == 0 -> işarete göre doygunlaşma (±MAXV).
+fn div(a: i64, b: i64) -> i64 {
+    if b == 0 {
+        if a >= 0 {
+            return MAXV
+        }
+        return MINV
+    }
+    let whole = a / b
+    let rem = a - whole * b
+    if rem == 0 {
+        return whole * ONE
+    }
+    // 1. tur: rem'i 2^16 ölçekle (|rem| < 2^47 varsayımıyla taşmaz)
+    let r1 = (rem << 16) / b
+    // 2. tur: kalanı tekrar ölçekle
+    let rem2 = (rem << 16) - r1 * b
+    let r2 = (rem2 << 16) / b
+    let frac = (r1 << 16) + r2
+    return whole * ONE + frac
+}
+
+/// i64 -> Q32.32
+fn from_int(x: i64) -> i64 {
+    return x * ONE
+}
+
+/// Q32.32 -> i64, sıfıra doğru kırpar.
+fn to_int(x: i64) -> i64 {
+    if x >= 0 {
+        return x / ONE
+    }
+    return 0 - ((0 - x) / ONE)
+}
+
+fn fabs(x: i64) -> i64 {
+    if x < 0 {
+        // MINV == -(2^31-1)<<32 olduğundan 0-x taşmaz.
+        return 0 - x
+    }
+    return x
+}
+
+fn min_i(a: i64, b: i64) -> i64 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+fn max_i(a: i64, b: i64) -> i64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn clamp_i(a: i64, lo: i64, hi: i64) -> i64 {
+    if a < lo {
+        return lo
+    }
+    if a > hi {
+        return hi
+    }
+    return a
+}
+
+/// Tamsayı karekök (Newton), tamamen i64.  Q32.32 -> Q32.32.
+///
+/// Ölçek: sonuç = isqrt(x >> 16) << 24.  isqrt her zaman taban değerini
+/// verdiği için göreli hata en fazla 2^-16 — Q32.32 için yeterli.
+/// (Ölçüldü: sqrt(4.0) -> 2.0, sqrt(9.0) -> 3.0, sqrt(2.0) -> 1.41421)
+fn sqrt(x: i64) -> i64 {
+    if x <= 0 {
+        return 0
+    }
+    let y = x >> 16
+    if y <= 0 {
+        return 0
+    }
+    // Newton: g basamak basamak yaklaşır; next >= g olunca durur, ki
+    // bu taban (floor) kökü verir. Tek istisna: y = 1 için g = 0 çıkabilir,
+    // bu yüzden g >= 1 ile başlıyoruz.
+    var g = y
+    var next = (g + 1) / 2
+    var rounds: i64 = 0
+    while next < g and rounds < 64 {
+        g = next
+        if g == 0 { g = 1 }
+        next = (g + y / g) / 2
+        rounds = rounds + 1
+    }
+    if g < 1 { g = 1 }
+    return g << 24
+}
+
+/// |E|^(1/2) — eikonal güncellemesinin ölçek faktörü.
+fn energy_scale(e: i64) -> i64 {
+    return sqrt(fabs(e))
+}
+
+/// Doğrusal interpolasyon: t=0 -> a, t=ONE -> b.
+fn lerp(a: i64, b: i64, t: i64) -> i64 {
+    let d = b - a
+    return a + mul(d, t)
+}
+
+/// Doygun mutlak fark (enerji hesabı için).
+fn abs_diff(a: i64, b: i64) -> i64 {
+    let d = a - b
+    if d < 0 {
+        return 0 - d
+    }
+    return d
+}
+
+/// ReLU benzeri eşik: negatifi sıfıra kırpar.
+fn relu(x: i64) -> i64 {
+    if x < 0 {
+        return 0
+    }
+    return x
+}

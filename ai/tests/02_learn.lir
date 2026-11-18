@@ -1,0 +1,48 @@
+// SEL test 02 — tek blok öğrenme.
+// Enerji düşmeli ve çıktı hedefe yaklaşmalı. Eşik: bağıl hata < %2.
+import "../src/fixed.lir"
+import "../src/ledger.lir"
+
+fn main() -> i64 {
+    let b = block_new(8, 4, 4, 1)
+    let x = @malloc(8 * 8)
+    let t = @malloc(4 * 8)
+    var i: i64 = 0
+    while i < 8 { @write_u64(@ptr_add(x, i * 8), 0 as u64)  i = i + 1 }
+    @write_u64(@ptr_add(x, 0), ONE as u64)
+    @write_u64(@ptr_add(x, 4), ONE as u64)
+    i = 0
+    while i < 4 { @write_u64(@ptr_add(t, i * 8), 0 as u64)  i = i + 1 }
+    @write_u64(@ptr_add(t, 0), ONE as u64)
+
+    let eta = div(from_int(1), from_int(64))
+    var epoch: i64 = 0
+    var e_first: i64 = 0
+    var e_last: i64 = 0
+    while epoch < 400 {
+        forward(b, x)
+        let e = learn(b, x, t, eta)
+        if epoch == 0 { e_first = e }
+        e_last = e
+        epoch = epoch + 1
+    }
+    forward(b, x)
+    let out0 = @read_u64(@ptr_add(b.out, 0)) as i64
+    let err = fabs(ONE - out0)
+    // 1) enerji kesin düştü mü
+    printInt(e_last < e_first)
+    // 2) bağıl hata %2'nin altında mı  (err < 0.02 * ONE)
+    printInt(err < div(ONE, from_int(50)))
+    // 3) diğer çıkışlar hâlâ sıfıra yakın mı
+    printInt(to_int(@read_u64(@ptr_add(b.out, 1)) as i64))
+    // 4) enerji kaç kat düştü (kaba, log2)
+    var ratio: i64 = 0
+    var cur = e_first
+    while cur > e_last and ratio < 64 {
+        cur = cur / 2
+        ratio = ratio + 1
+    }
+    printInt(ratio)
+    println("")
+    return 0
+}

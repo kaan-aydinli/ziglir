@@ -1,0 +1,149 @@
+// SEL — Sparse Eikonal Ledger
+// search.lir — yerel ters indeks ve tamsayı skorlama.
+//
+// Bu bir "web search" DEĞİL. Ağ erişimi olmadan çalışan bir arama
+// arayüzüdür: bir belge koleksiyonu, ters indeks, BM25 benzeri tamsayı
+// skorlama. SEL'in araç katmanı bu arayüzü kullanır.
+//
+// Neden BM25 değil de tamsayı skor: karekök ve bölme float'ta yapılır;
+// burada hepsi i64. Sonuç, deterministik ve backend'den bağımsız.
+
+import "fixed.lir"
+
+// Ters indeks düzeni (tek @malloc bloğu):
+//   [0]              : belge sayısı n_docs
+//   [1]              : terim sayısı n_terms
+//   [2]              : gönderi (posting) sayısı n_post
+//   [3 .. 3+2T)      : her terim için (offset, count)  -- T = n_terms
+//   [.. ]            : gönderiler: (doc_id, tf) çiftleri
+//
+// Basitlik bilinçli: hash tablosu yok, terim kimliği çağıran tarafından
+// verilir (SEL'de terim = hash çekirdeğinin çıktısı).
+
+struct Index {
+    data: *u8
+    n_docs: i64
+    n_terms: i64
+    n_post: i64
+}
+
+fn index_new(n_docs: i64, n_terms: i64, n_post: i64) -> Index {
+    let cells = 3 + n_terms * 2 + n_post * 2
+    let idx = Index {
+        data: @malloc(cells * 8)
+        n_docs: n_docs
+        n_terms: n_terms
+        n_post: n_post
+    }
+    @write_u64(@ptr_add(idx.data, 0), n_docs as u64)
+    @write_u64(@ptr_add(idx.data, 8), n_terms as u64)
+    @write_u64(@ptr_add(idx.data, 16), n_post as u64)
+    return idx
+}
+
+fn idx_term_offset(ix: Index, t: i64) -> i64 {
+    return @read_u64(@ptr_add(ix.data, (3 + t * 2) * 8)) as i64
+}
+fn idx_term_count(ix: Index, t: i64) -> i64 {
+    return @read_u64(@ptr_add(ix.data, (3 + t * 2 + 1) * 8)) as i64
+}
+fn idx_set_term(ix: Index, t: i64, off: i64, cnt: i64) {
+    @write_u64(@ptr_add(ix.data, (3 + t * 2) * 8), off as u64)
+    @write_u64(@ptr_add(ix.data, (3 + t * 2 + 1) * 8), cnt as u64)
+}
+fn idx_post_base(ix: Index) -> i64 {
+    return 3 + ix.n_terms * 2
+}
+fn idx_post_doc(ix: Index, p: i64) -> i64 {
+    return @read_u64(@ptr_add(ix.data, (idx_post_base(ix) + p * 2) * 8)) as i64
+}
+fn idx_post_tf(ix: Index, p: i64) -> i64 {
+    return @read_u64(@ptr_add(ix.data, (idx_post_base(ix) + p * 2 + 1) * 8)) as i64
+}
+fn idx_set_post(ix: Index, p: i64, doc: i64, tf: i64) {
+    @write_u64(@ptr_add(ix.data, (idx_post_base(ix) + p * 2) * 8), doc as u64)
+    @write_u64(@ptr_add(ix.data, (idx_post_base(ix) + p * 2 + 1) * 8), tf as u64)
+}
+
+/// Skor tablosunu sıfırla. `scores` n_docs elemanlı Q32.32 vektör.
+fn scores_clear(scores: *u8, n: i64) {
+    var i: i64 = 0
+    while i < n {
+        @write_u64(@ptr_add(scores, i * 8), 0 as u64)
+        i = i + 1
+    }
+}
+
+/// Tek bir terim için skor ekle.
+/// IDF yaklaşımı: (n_docs - df) / n_docs, tamsayı Q32.32.
+/// tf katkısı: 1 + ln1p(tf) yerine tf/(tf+1) — monoton, tamsayı, taşmasız.
+/// İkisinin çarpımı skora eklenir.
+fn add_term_score(ix: Index, scores: *u8, t: i64, weight: i64) {
+    if t < 0 or t >= ix.n_terms {
+        return
+    }
+    let off = idx_term_offset(ix, t)
+    let cnt = idx_term_count(ix, t)
+    if cnt <= 0 {
+        return
+    }
+    let df = cnt
+    // idf = (n_docs - df + 1) / (df + 1) , sıfırdan büyük
+    let idf = div(from_int(ix.n_docs - df + 1), from_int(df + 1))
+    var p: i64 = 0
+    while p < cnt {
+        let doc = idx_post_doc(ix, off + p)
+        let tf = idx_post_tf(ix, off + p)
+        if doc >= 0 and doc < ix.n_docs {
+            // tf/(tf+1)
+            let tfn = div(from_int(tf), from_int(tf + 1))
+            let add = mul(mul(idf, tfn), weight)
+            let cur = @read_u64(@ptr_add(scores, doc * 8)) as i64
+            @write_u64(@ptr_add(scores, doc * 8), sat_add(cur, add) as u64)
+        }
+        p = p + 1
+    }
+}
+
+/// Skorları azalan sırala ve en iyi `k` belge kimliğini `out`'a yaz.
+/// Basit seçim sıralaması: k küçük olduğunda (tipik k=10) O(n·k) yeterli.
+fn top_k(scores: *u8, n: i64, out: *u8, k: i64) -> i64 {
+    var filled: i64 = 0
+    var i: i64 = 0
+    while i < k {
+        @write_u64(@ptr_add(out, i * 8), 0 as u64)
+        i = i + 1
+    }
+    // Her adımda en yüksek skoru seç, seçileni "kullanıldı" işaretle.
+    var used = @malloc(n * 8)
+    var z: i64 = 0
+    while z < n {
+        @write_u64(@ptr_add(used, z * 8), 0 as u64)
+        z = z + 1
+    }
+    var rank: i64 = 0
+    while rank < k {
+        var best: i64 = 0 - 1
+        var bestv: i64 = 0 - 1
+        var d: i64 = 0
+        while d < n {
+            let taken = @read_u64(@ptr_add(used, d * 8)) as i64
+            if taken == 0 {
+                let v = @read_u64(@ptr_add(scores, d * 8)) as i64
+                if v > bestv {
+                    bestv = v
+                    best = d
+                }
+            }
+            d = d + 1
+        }
+        if best >= 0 {
+            @write_u64(@ptr_add(used, best * 8), 1 as u64)
+            @write_u64(@ptr_add(out, rank * 8), best as u64)
+            filled = filled + 1
+        }
+        rank = rank + 1
+    }
+    @free(used)
+    return filled
+}
