@@ -1,0 +1,47 @@
+// SEL test 08 — araç yönlendirici.
+//
+// İki durum vektörü iki farklı aracı gerektiriyor. Yönlendirici bunu
+// öğrenmeli ve doğru aracı seçmeli. Bu, "tool use" katmanının
+// kanıtıdır: model değil, öğrenilmiş bir sınıflandırıcı.
+//
+// Beklenen: 1 1  (iki durumda da doğru araç)
+import "../src/fixed.lir"
+import "../src/ledger.lir"
+import "../src/agent.lir"
+
+fn main() -> i64 {
+    // durum: 16 boyutlu, 5 araca yönlendirme, K=16
+    let r = block_new(16, 5, 16, 11)
+    let s1 = @malloc(128)   // "matematik" durumu
+    let s2 = @malloc(128)   // "arama" durumu
+    let tgt = @malloc(40)
+
+    var i: i64 = 0
+    while i < 16 {
+        @write_u64(@ptr_add(s1, i * 8), (if i < 8 { ONE } else { 0 }) as u64)
+        @write_u64(@ptr_add(s2, i * 8), (if i >= 8 { ONE } else { 0 }) as u64)
+        i = i + 1
+    }
+
+    let eta = div(from_int(9), from_int(10))
+    var round: i64 = 0
+    while round < 800 {
+        make_onehot(TOOL_MATH, tgt)
+        forward(r, s1)
+        learn(r, s1, tgt, eta)
+        make_onehot(TOOL_SEARCH, tgt)
+        forward(r, s2)
+        learn(r, s2, tgt, eta)
+        round = round + 1
+    }
+
+    // Değerlendir
+    forward(r, s1)
+    let got1 = route(r.out, N_TOOLS)
+    forward(r, s2)
+    let got2 = route(r.out, N_TOOLS)
+    printInt(got1 == TOOL_MATH)
+    printInt(got2 == TOOL_SEARCH)
+    println("")
+    return 0
+}

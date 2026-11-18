@@ -248,6 +248,23 @@ CPU eğitimi isteniyorsa sıcak döngülerde `@read_u64` yerine daha az
 erişimli bir düzen (kenar verisini tek blokta tutmak, yeniden kullanmak)
 gerekir. Bu, gelecekteki iş olarak açık kalıyor.
 
+## 5.6 LIR'in sınırları — kod yazarken öğrenilenler
+
+Bu çekirdeği yazarken dile dair altı sınır bulundu. Hepsi ölçüldü ve
+tasarımı doğrudan etkiledi; belgelenmemiş bir tuzağa düşmemek için burada:
+
+| sınır | ne oldu | çözüm |
+|---|---|---|
+| `i128` yok (sözdizimde var, uygulanmadı) | `mul`/`div` 2^64'te sessizce yanlış verdi | 32-bit yarılara ayırma, `>>16` ölçekleme |
+| `@bitcast_i64`/`@bitcast_f64` yok | f64 bit deseni okunamıyor | `union Bits { i: i64 f: f64 }` |
+| tamsayı **taşması sessiz** | `1.5 * 2.0` ham çarpımda 0 verdi | çarpmadan önce ölçekle |
+| import edilen `struct` parametre tipi olarak **kullanılamıyor** | `fn f(b: SelBlock)` → LIR-E2005 | alanları düz argüman geçir |
+| aynı fonksiyonda **aynı isimle ikinci `var`** | sessiz çökme (çıktı yok, hata yok) | isimleri ayrı tut |
+| `@malloc(n)` tam sınırda | 48 baytlık bloğa 48. bayta yazınca çökme | boyutu bir hücre fazla ver |
+
+Son üçü özellikle tehlikeli çünkü hata mesajı yok: program sessizce
+hiçbir şey yazdırmıyor. Yanlış cevap vermekten iyidir, ama teşhisi zor.
+
 ## 6. Ne iddia edilmiyor
 
 Bu belge şunları **iddia etmez**:

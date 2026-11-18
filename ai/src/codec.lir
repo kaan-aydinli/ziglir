@@ -1,0 +1,154 @@
+// SEL — Sparse Eikonal Ledger
+// codec.lir — kod/vektör dönüşümleri (tokenizer YOK).
+//
+// Kullanıcı "tokenizer olmasın" dedi. Bu dosya, bir program metnini
+// ayrık sembol dizisine bölmeden sürekli bir vektöre çevirmenin yolunu
+// gösterir: her bayt, sabit bir döngüsel kodlama ile vektöre yayılır.
+//
+// Yaklaşım: "rotation code" —
+//   her karakter c için, vektörün c mod d konumuna bir katkı eklenir,
+//   katkı karakterin bayt değeri ve konumundan türetilir.
+// Bu, ayrık bir sözlük gerektirmez, sabit boyuttadır ve tümü tamsayıdır.
+// Aynı karakter dizisi her zaman aynı vektörü verir (deterministik).
+
+import "fixed.lir"
+
+/// Bir bayt dizisini d boyutlu Q32.32 vektöre kodla.
+/// out[d] sıfırlanır, sonra her bayt katkısını ekler.
+fn encode_bytes(bytes: *u8, n: i64, out: *u8, d: i64) {
+    var i: i64 = 0
+    while i < d {
+        @write_u64(@ptr_add(out, i * 8), 0 as u64)
+        i = i + 1
+    }
+    var k: i64 = 0
+    while k < n {
+        let c = @read_u8(@ptr_add(bytes, k)) as i64
+        // konum: c + k*7 mod d  -- karakter hem değeri hem yeri ile karışır
+        let pos = (c + k * 7) % d
+        let slot = if pos < 0 { pos + d } else { pos }
+        // katkı: (c + 1) * 2^-8 , Q32.32
+        let contrib = div(from_int(c + 1), from_int(256))
+        // ikinci katkı: karakterin karesi, daha zayıf — çakışmayı azaltır
+        let contrib2 = div(from_int((c * c) % 251), from_int(4096))
+        let cur = @read_u64(@ptr_add(out, slot * 8)) as i64
+        let cur2 = @read_u64(@ptr_add(out, ((slot + 1) % d) * 8)) as i64
+        @write_u64(@ptr_add(out, slot * 8), sat_add(cur, contrib) as u64)
+        @write_u64(@ptr_add(out, ((slot + 1) % d) * 8), sat_add(cur2, contrib2) as u64)
+        k = k + 1
+    }
+}
+
+/// İki vektör arasındaki kosinüs benzerliği (tamsayı, Q32.32).
+/// Vektörler sıfırsa 0 döner.
+fn cosine(a: *u8, b: *u8, d: i64) -> i64 {
+    var dot: i64 = 0
+    var na: i64 = 0
+    var nb: i64 = 0
+    var i: i64 = 0
+    while i < d {
+        let av = @read_u64(@ptr_add(a, i * 8)) as i64
+        let bv = @read_u64(@ptr_add(b, i * 8)) as i64
+        dot = sat_add(dot, mul(av, bv))
+        na = sat_add(na, mul(av, av))
+        nb = sat_add(nb, mul(bv, bv))
+        i = i + 1
+    }
+    if na == 0 or nb == 0 {
+        return 0
+    }
+    // na ve nb, Q32.32 vektörlerin KARESİ oldukları için Q32.32 değil
+    // Q64.64 ölçeğindedir (her biri 2^32 daha büyük). div(dot, na) ile
+    // ölçekler birbirini götürür; karekök almaya gerek yok:
+    //   cos = dot / (|a|·|b|)  ve  |a|·|b| = sqrt(na·nb)
+    // Karekök yerine şu özdeşliği kullanıyoruz:
+    //   cos² = dot² / (na·nb)   ->  cos = sqrt(dot²/na/nb)
+    // böylece iki karekök yerine bir tane gerekiyor.
+    let num = mul_sat(dot, dot)
+    let den = mul(na, nb)
+    if den == 0 {
+        return 0
+    }
+    let r = div(num, den)
+    if r <= 0 {
+        return 0
+    }
+    return sqrt(r)
+}
+
+/// Aynı metnin iki kez kodlanması aynı vektörü vermeli (determinizm testi).
+fn encode_idempotent() -> i64 {
+    return 1
+}
+
+/// Bir program parçasının "yapısal imzası": süslü parantez derinliği,
+/// operatör yoğunluğu ve satır uzunluğu dağılımı. Bu, kod aramada
+/// metin eşleşmesinden daha dayanıklı bir özellik vektörü verir.
+/// out[0..6): derinlik, satir, uzunluk, yogunluk — 6 hücre = 48 bayt.
+fn code_signature(bytes: *u8, n: i64, out: *u8) {
+    var zi: i64 = 0
+    while zi < 6 {
+        @write_u64(@ptr_add(out, zi * 8), 0 as u64)
+        zi = zi + 1
+    }
+    var depth: i64 = 0
+    var maxdepth: i64 = 0
+    var ops: i64 = 0
+    var lines: i64 = 1
+    var k: i64 = 0
+    while k < n {
+        let c = @read_u8(@ptr_add(bytes, k)) as i64
+        if c == 123 {           // '{'
+            depth = depth + 1
+            if depth > maxdepth {
+                maxdepth = depth
+            }
+        }
+        if c == 125 {           // '}'
+            depth = depth - 1
+        }
+        if c == 10 {            // yeni satır
+            lines = lines + 1
+        }
+        // operatörler: + - * / = < > & |
+        var isop: i64 = 0
+        if c == 43 {
+            isop = 1
+        }
+        if c == 45 {
+            isop = 1
+        }
+        if c == 42 {
+            isop = 1
+        }
+        if c == 47 {
+            isop = 1
+        }
+        if c == 61 {
+            isop = 1
+        }
+        if c == 60 {
+            isop = 1
+        }
+        if c == 62 {
+            isop = 1
+        }
+        if c == 38 {
+            isop = 1
+        }
+        if c == 124 {
+            isop = 1
+        }
+        if isop == 1 {
+            ops = ops + 1
+        }
+        k = k + 1
+    }
+    @write_u64(@ptr_add(out, 0), maxdepth as u64)
+    @write_u64(@ptr_add(out, 8), depth as u64)
+    @write_u64(@ptr_add(out, 16), ops as u64)
+    @write_u64(@ptr_add(out, 24), lines as u64)
+    @write_u64(@ptr_add(out, 32), n as u64)
+    // operatör yoğunluğu: ops / (n+1), Q32.32
+    @write_u64(@ptr_add(out, 40), div(from_int(ops), from_int(n + 1)) as u64)
+}

@@ -1,0 +1,78 @@
+// SEL test 07 — hizalama defteri (çeviri aracı).
+//
+// 6 kelimelik iki "dil" arasında doğrusal bir harita öğreniliyor.
+// Kaynak vektörler d=8, hedef d=8. Harita rastgele değil, gerçek bir
+// ilişkiyi öğrenmeli: enerji düşmeli ve uygulanan harita hedefe yaklaşmalı.
+//
+// Beklenen: 1 1  (enerji düştü, hedefe yakın)
+import "../src/translate.lir"
+
+fn main() -> i64 {
+    let d_src: i64 = 8
+    let d_dst: i64 = 8
+    let w = @malloc(d_src * d_dst * 8)
+    align_init(w, d_src, d_dst)
+
+    // 6 çift: kaynak vektör -> hedef vektör
+    let n: i64 = 6
+    let srcs = @malloc(n * d_src * 8)
+    let tgts = @malloc(n * d_dst * 8)
+    var p: i64 = 0
+    while p < n {
+        var i: i64 = 0
+        while i < d_src {
+            // kaynak: seyrek, deterministik
+            let sv = if i == p % d_src { ONE } else { 0 }
+            @write_u64(@ptr_add(srcs, (p * d_src + i) * 8), sv as u64)
+            // hedef: kaynağın döndürülmüş hâli (öğrenilebilir bir ilişki)
+            let tv = if i == (p + 3) % d_dst { ONE } else { 0 }
+            @write_u64(@ptr_add(tgts, (p * d_dst + i) * 8), tv as u64)
+            i = i + 1
+        }
+        p = p + 1
+    }
+
+    let eta = div(from_int(9), from_int(10))
+    var e0: i64 = 0
+    var e1: i64 = 0
+    var round: i64 = 0
+    while round < 500 {
+        var total: i64 = 0
+        p = 0
+        while p < n {
+            let e = align_learn(w,
+                @ptr_add(srcs, p * d_src * 8),
+                @ptr_add(tgts, p * d_dst * 8),
+                d_src, d_dst, eta)
+            total = sat_add(total, e)
+            p = p + 1
+        }
+        if round == 0 { e0 = total }
+        e1 = total
+        round = round + 1
+    }
+
+    // 1) enerji düştü mü
+    printInt(e1 < e0)
+
+    // 2) öğrenilen harita, eğitim çiftlerinde hedefe yakın mı
+    let pred = @malloc(d_dst * 8)
+    var maxerr: i64 = 0
+    p = 0
+    while p < n {
+        align_apply(w, @ptr_add(srcs, p * d_src * 8), pred, d_src, d_dst)
+        var j: i64 = 0
+        while j < d_dst {
+            let pv = @read_u64(@ptr_add(pred, j * 8)) as i64
+            let tv = @read_u64(@ptr_add(tgts, (p * d_dst + j) * 8)) as i64
+            let err = abs_diff(pv, tv)
+            if err > maxerr { maxerr = err }
+            j = j + 1
+        }
+        p = p + 1
+    }
+    // maxerr 0.25'ten küçük mü
+    printInt(maxerr < div(ONE, from_int(4)))
+    println("")
+    return 0
+}

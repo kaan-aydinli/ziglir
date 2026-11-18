@@ -24,11 +24,16 @@ birebir aynı sonucu veriyor: **15/15**.
 | `03_xor` | doğrusal olmayan problem çözülüyor | **4/4** |
 | `04_search` | ters indeks + sıralama | belge 4, sonra 3 |
 | `05_math` | gcd, mod_pow, mod_inv, is_prime, fpow | 8 değer birebir |
+| `06_codec` | tokenizer'sız kodlama + kod imzası | 5/5 |
+| `07_translate` | hizalama defteri (çeviri) yakınsıyor | 2/2 |
+| `08_agent` | araç yönlendirici doğru aracı seçiyor | 2/2 |
+
+**8 test × 3 backend = 24/24.**
 
 ```bash
 export PATH=/tmp/zv13/ziglang:$PATH
 zig build -Doptimize=ReleaseFast
-python3 ai/run_tests.py          # 15/15
+python3 ai/run_tests.py          # 24/24
 python3 ai/bench/run.py          # ölçüm tablosu
 ```
 
@@ -66,6 +71,17 @@ edilmiyor. GPT seviyesi, mimariden değil **veri ve hesaplama ölçeğinden**
 gelir. Buradaki şey, o ölçeğe çıkabilecek *mekanizmanın* kendisi: taşınabilir,
 deterministik, sıfır bağımlılıklı bir eğitim çekirdeği.
 
-Sohbet, matematik, kod, çeviri, araç kullanımı ve arama — bunlar için gereken
-arayüzler `ai/src/` altında var (`math.lir`, `search.lir`) veya protokol
-olarak tanımlı (`docs/DESIGN.md` §4).
+## Yetenek katmanları
+
+| istenen yetenek | bu depodaki karşılığı | durum |
+|---|---|---|
+| matematik | `src/math.lir` — gcd, mod_pow, mod_inv, is_prime, fpow | çalışıyor, test 05 |
+| arama | `src/search.lir` — ters indeks, top-k | çalışıyor, test 04 |
+| kod | `src/codec.lir` — rotation-encode + yapısal imza | çalışıyor, test 06 |
+| çeviri | `src/translate.lir` — hizalama defteri (NLMS matris) | çalışıyor, test 07 |
+| araç kullanımı | `src/agent.lir` — öğrenilmiş araç yönlendirici | çalışıyor, test 08 |
+| sohbet | çekirdek + yönlendirici; diyalog verisi gerekir | mekanizma var |
+
+Sohbet, diğerlerinden farklı: bir mekanizma sorunu değil, **veri** sorunu.
+Çekirdek (ledger + eikonal + kodlama) hazır; diyalog kalitesi, bu depoda
+bulunmayan bir veri kümesini gerektirir. Bunu abartmıyorum.

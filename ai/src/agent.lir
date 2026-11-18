@@ -1,0 +1,75 @@
+// SEL — Sparse Eikonal Ledger
+// agent.lir — sohbet/araç yönlendirici.
+//
+// Bu bir dil modeli DEĞİL. Yaptığı iş: bir durum vektörünü alıp, hangi
+// aracın çağrılacağını öğrenmek. Araç seçimi, gerçek bir sınıflandırma
+// problemidir ve SEL'in eikonal kuralıyla öğrenilebilir.
+//
+// Protokol (hepsi tamsayı, ağ yok):
+//   0 = matematik      -> math.lir
+//   1 = arama          -> search.lir
+//   2 = kod            -> codec.lir
+//   3 = çeviri         -> translate.lir
+//   4 = sohbet         -> hiçbiri (yanıt doğrudan ledger çıktısı)
+
+import "fixed.lir"
+
+// NOT — dil sınırı: LIR'de import edilen bir dosyanın `struct`'ı
+// parametre tipi olarak kullanılamıyor (LIR-E2005). Bu yüzden burada
+// SelBlock alanları düz argüman olarak geçiriliyor:
+//   (edges, out, nout, k, nin)  yerine  SelBlock
+// Bu, agent.lir'i ledger.lir'den bağımsız da kılar.
+
+const TOOL_MATH: i64 = 0
+const TOOL_SEARCH: i64 = 1
+const TOOL_CODE: i64 = 2
+const TOOL_TRANSLATE: i64 = 3
+const TOOL_CHAT: i64 = 4
+const N_TOOLS: i64 = 5
+
+/// Yönlendirici: `out` vektöründeki en yüksek skoru seç.
+/// `nout` = N_TOOLS. Çağıran, ileri geçişi (forward) kendisi yapar.
+fn route(out: *u8, nout: i64) -> i64 {
+    var best: i64 = 0
+    var bestv: i64 = 0 - 9223372036854775807
+    var i: i64 = 0
+    while i < nout {
+        let v = @read_u64(@ptr_add(out, i * 8)) as i64
+        if v > bestv {
+            bestv = v
+            best = i
+        }
+        i = i + 1
+    }
+    return best
+}
+
+/// Hedef vektörünü (one-hot) `target` bloğuna yaz.
+/// `route_train` çağrılmadan önce doldurulur; eğitim `ledger.learn`
+/// ile yapılır. One-hot dışında bir şey yok: araç kimliği ayrık,
+/// çıktı vektörü sürekli.
+fn make_onehot(want: i64, target: *u8) {
+    var i: i64 = 0
+    while i < N_TOOLS {
+        let v = if i == want { ONE } else { 0 }
+        @write_u64(@ptr_add(target, i * 8), v as u64)
+        i = i + 1
+    }
+}
+
+/// Araç kimliğini ada çevir (raporlama için).
+fn tool_name(t: i64) -> string {
+    if t == TOOL_MATH {
+        return "math"
+    }
+    if t == TOOL_SEARCH {
+        return "search"
+    }
+    if t == TOOL_CODE {
+        return "code"
+    }
+    if t == TOOL_TRANSLATE {
+        return "translate"
+    }
+    return "chat"
+}
