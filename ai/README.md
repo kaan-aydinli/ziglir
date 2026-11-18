@@ -53,7 +53,7 @@ Tam belge: [`docs/DESIGN.md`](docs/DESIGN.md).
 
 | iş | SEL | LLVM C ikizi | oran |
 |---|---:|---:|---:|
-| 3 katmanlı ağ (2112 kenar × 2000 adım) | 124.7 ms | 7.9 ms | 15.5x |
+| 3 katmanlı ağ (2112 kenar × 2000 adım) | 126 ms | 6.1 ms | 20.6x |
 | Q32.32 matmul 96³ | 17.3 ms | — | — |
 | XOR eğitimi (12.000 güncelleme) | 45.0 ms | — | — |
 

@@ -210,7 +210,7 @@ doğrular.
 | forward (24 kenar, 100k) | 53.8 ms | 538 ns / çağrı |
 | forward+learn (24 kenar, 100k) | 180 ms | 1.8 µs / güncelleme |
 | **XOR (12.000 güncelleme)** | **45.0 ms** | 3.7 µs / güncelleme, **4/4 doğru** |
-| 3 katmanlı ağ (2112 kenar, 2000 adım) | 124.7 ms | 62 µs / adım, 29 ns / kenar |
+| 3 katmanlı ağ (2112 kenar, 2000 adım) | 126 ms | 63 µs / adım, 30 ns / kenar |
 | search (1M gönderi, 1 sorgu) | 11.9 ms | |
 | Q32.32 matmul 96³ | 17.3 ms | |
 
@@ -220,9 +220,12 @@ doğrular.
 
 | | süre | ns/kenar |
 |---|---:|---:|
-| SEL (LIR) | 124.7 ms | 29.0 |
-| LLVM C ikizi (`gcc -O2`) | 7.9 ms | 1.9 |
-| **oran** | **15.5x** | |
+| SEL (LIR) | 126 ms | 30.0 |
+| LLVM C ikizi (`gcc -O2`) | 6.1 ms | 1.4 |
+| **oran** | **20.6x** | |
+
+(Ölçüm: 9 tur, medyan, 2 çekirdek Xeon @2.60 GHz. Oran üç ayrı
+koşuda 19.8x / 21.4x / 20.5x çıktı; tabloda ortadaki değer var.)
 
 **Bu fark nereden geliyor — ölçüldü:** LIR'in `@read_u64`/`@write_u64`
 builtin'leri her erişimde bir *sınır kontrolü* çağrısı yapıyor
@@ -234,7 +237,7 @@ Karşılaştırma yalnızca C ile yapılmıştır ve öyle etiketlenmiştir.
 
 ### Neden bu hâlâ kullanışlı
 
-15.5x, bir çekirdek için kabul edilebilir bir sabit maliyettir çünkü:
+~20x, bir çekirdek için kabul edilebilir bir sabit maliyettir çünkü:
 
 1. **Tamsayı olduğu için** float'ın 13x yavaşlığından kaçınılıyor
    (bkz. §0 — f64 döngüsü 5.19 ns, tamsayı MAC 0.40 ns).
@@ -243,7 +246,7 @@ Karşılaştırma yalnızca C ile yapılmıştır ve öyle etiketlenmiştir.
 3. **Doğrusal ölçekleme**: 24 kenarda 538 ns, 2112 kenarda 29 ns/kenar —
    yani sabit yük amortize oluyor.
 
-Ama dürüst olmak gerekirse: 15.5x, "C kadar hızlı" demek değildir. Hızlı
+Ama dürüst olmak gerekirse: 20x, "C kadar hızlı" demek değildir. Hızlı
 CPU eğitimi isteniyorsa sıcak döngülerde `@read_u64` yerine daha az
 erişimli bir düzen (kenar verisini tek blokta tutmak, yeniden kullanmak)
 gerekir. Bu, gelecekteki iş olarak açık kalıyor.
