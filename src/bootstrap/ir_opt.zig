@@ -80,6 +80,7 @@ fn optimizeFn(module: *IRModule, fi: u32, level: OptLevel) void {
         _ = propagateTrivialCopies(f);
         _ = localConstantFoldAndLVN(f);
         _ = deadCodeElimination(f, .O1);
+        _ = sinkCompareToConsumer(f);
         return;
     }
 
@@ -143,6 +144,9 @@ fn optimizeFn(module: *IRModule, fi: u32, level: OptLevel) void {
         if (!changed) break;
     }
     _ = reorderBlocksRPO(f);
+    // Codegen fuses `cmp` + `select`/`cond_jump` into one cmov/jcc only when the
+    // pair is adjacent. Run last, after every pass that could re-separate them.
+    _ = sinkCompareToConsumer(f);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -940,6 +944,93 @@ fn isCmpOp(op: IROp) bool {
         .ucmp_lt, .ucmp_le, .ucmp_gt, .ucmp_ge => true,
         else => false,
     };
+}
+
+/// Move a compare down to sit immediately before its only consumer.
+///
+/// x86 sets flags as a side effect, so codegen can only turn `cmp` + `select`
+/// into a single `cmov` (and `cmp` + `cond_jump` into a `jcc`) when the two are
+/// adjacent. IRGen emits the compare where the source expression ended, which is
+/// often *above* the arithmetic that the select's arms depend on, so a perfectly
+/// fusable pair arrives with an instruction wedged between them:
+///
+///   v12 = cmp_ge v9, v11      v12 = cmp_ge v9, v11
+///   v16 = sub v9, v11    ->   v16 = sub v9, v11
+///   v32 = select v12 ? ...    v32 = select v12 ? ...
+///
+/// Without this, the compare materialises a 0/1 value (setcc + movzbq) and the
+/// select becomes test + cmov. Moving the compare down is safe when its result
+/// is `cond` itself (false == 0, so a `cond_jump` falls through on the same
+/// cases) and every instruction being crossed does not read `cond`.
+fn sinkCompareToConsumer(f: *IRFn) bool {
+    var changed = false;
+    var bi: u16 = 0;
+    while (bi < f.block_count) : (bi += 1) {
+        var b = &f.blocks[bi];
+        var ii: u16 = 0;
+        while (ii < b.inst_count) : (ii += 1) {
+            const inst = b.insts[ii];
+            if (!isCmpOp(inst.op) or inst.dest == 0) continue;
+
+            // Count uses inside this block and locate the last one.
+            var use_idx: i16 = -1;
+            var uses: u16 = 0;
+            var ji: u16 = ii + 1;
+            while (ji < b.inst_count) : (ji += 1) {
+                const other = b.insts[ji];
+                if (other.op == .select or other.op == .cond_jump) {
+                    if (!instReadsVreg(other, inst.dest)) continue;
+                    uses += 1;
+                    use_idx = @intCast(ji);
+                    continue;
+                }
+                if (instReadsVreg(other, inst.dest)) {
+                    uses = 2;
+                    break;
+                }
+            }
+
+            if (uses != 1 or use_idx < 0) continue;
+            const target_i: u16 = @intCast(use_idx);
+            if (target_i == ii + 1) continue; // already adjacent
+            const consumer = b.insts[target_i];
+            // Only a compare that is consumed purely as a condition can move:
+            // `select`/`cond_jump` test it against zero, so reordering the
+            // producing compare below other instructions cannot change the
+            // value that is observed.
+            const cond = consumer.src1;
+            if (cond != inst.dest) continue;
+            if (consumer.op == .cond_jump and consumer.arg_count == 0) {
+                // cond_jump treats `cond` as a boolean; safe.
+            } else if (consumer.op != .select) continue;
+
+            // Every instruction between the compare and its consumer must be
+            // unable to observe the compare result, and the compare must not
+            // read anything those instructions redefine.
+            var k: u16 = ii + 1;
+            var ok = true;
+            while (k < target_i) : (k += 1) {
+                const mid = b.insts[k];
+                if (instReadsVreg(mid, inst.dest)) { ok = false; break; }
+                if (mid.dest != 0 and (mid.dest == inst.src1 or mid.dest == inst.src2 or mid.dest == inst.dest)) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok) continue;
+
+            // Shift [ii+1 .. target_i) up by one and drop the compare in front
+            // of the consumer.
+            var m: u16 = ii;
+            while (m < target_i) : (m += 1) {
+                b.insts[m] = b.insts[m + 1];
+            }
+            b.insts[target_i - 1] = inst;
+            changed = true;
+            // Re-examine the instruction now occupying `ii`.
+        }
+    }
+    return changed;
 }
 
 fn ifConversion(f: *IRFn) bool {
@@ -2219,6 +2310,30 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
                     } else if (inst.dest > 0 and expr_count < expr_table.len) {
                         expr_table[expr_count] = .{ .op = .const_int, .a = 0, .b = 0, .imm = inst.imm, .vreg = inst.dest };
                         expr_count += 1;
+                    }
+                },
+                // select with both arms equal is just that value: `select c ? x : x`
+                // -> x. ifConversion turns every if/else on a *single* variable
+                // into one select per assigned local, so a diamond that assigns
+                // one variable in each arm (the common recurrence case, e.g.
+                // `a = b` in both arms of the Fibonacci loop) produces a select
+                // whose arms are identical. Leaving it in place also keeps the
+                // compare alive, and a compare with two users is exactly what
+                // stops codegen from fusing it into `cmov`/`jcc` -- one dead
+                // select made the whole inner loop run un-fused.
+                .select => {
+                    const true_v = inst.src2;
+                    const false_v = if (inst.arg_count > 0) inst.args[0] else 0;
+                    if (true_v == false_v) {
+                        inst.* = .{ .op = .copy, .dest = inst.dest, .src1 = true_v };
+                        changed = true;
+                        continue;
+                    }
+                    // A known condition folds to the taken arm.
+                    if (inst.src1 > 0 and inst.src1 < MAX_TRACKED_VREGS and const_known[inst.src1]) {
+                        inst.* = .{ .op = .copy, .dest = inst.dest, .src1 = if (const_val[inst.src1] != 0) true_v else false_v };
+                        changed = true;
+                        continue;
                     }
                 },
                 .copy => {
