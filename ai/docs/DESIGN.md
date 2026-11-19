@@ -270,6 +270,39 @@ amortize olmuyor.
 Rust ölçümü **yoktur**: bu ortamda Rust derleyicisi çalıştırılamıyor.
 Karşılaştırma yalnızca C ile yapılmıştır ve öyle etiketlenmiştir.
 
+#### İnlining: yardımcı fonksiyonlar artık gerçekten gövdeye giriyor
+
+Hoisting tek başına yetmiyordu, çünkü `mul`/`sat_add` hâlâ gerçek `call`
+olarak kalıyordu. Sebep ölçüldü: `fnInlineEligible` **çağrı içeren hiçbir
+fonksiyonu** inline etmiyordu, `mul` de `fabs` ve `mul_sat`'ı çağırıyor.
+Yani Q32.32 çekirdeğinin tamamı çağrı-duvarının arkasındaydı.
+
+Elenen kodun elle açılmış hâli **2.17x** daha hızlıydı (18.69 → 8.62 ms,
+`b_forward`, kenar başına 4.20 ns). Bu yüzden `computeLeafClosure` eklendi:
+çağrılarının **tamamı** yaprak fonksiyonlara giden fonksiyonlar, kendi
+çağrıları inline edildikten sonra yaprak olur; sabit-nokta ile hesaplanıyor.
+Bunlar için blok sayısı tavanı kaldırıldı (phi/alloca/addr_of hâlâ elenir),
+çünkü söz konusu gövdeler blok ayrımı gerektirmiyor.
+
+| iş | önce | sonra | oran |
+|---|---:|---:|---:|
+| `b_matmul` | 12.7 | 3.9 | 3.25x |
+| `b_forward` | 45.3 | 16.8 | 2.70x |
+| `b_net3` | 96.5 | 40.9 | 2.36x |
+| `b_learn` | 118.6 | 51.6 | 2.30x |
+| `b_train` | 496.7 | 218.8 | 2.27x |
+| XOR | 37.1 | 21.3 | 1.75x |
+| `b_fixed_ops` | 6.1 | 4.6 | 1.31x |
+| **19 iş yükü toplamı** | **1903.6** | **1438.8** | **1.32x** |
+
+`b_train` / C ikizi: **218.8 / 18.5 = 11.8x**. (Aynı makinede C ikizi 18.5 ms;
+ölçüm `gcc -O2`, aynı kenar düzeni, aynı aritmetik.)
+
+**Reddedilen deneme:** tek çağrı yerli fonksiyonları boyut sınırı olmadan
+inline etmek. `b_net3` 1.30x oldu ama `b_learn` **0.44x**'e düştü (68 → 156 ms):
+`forward` + `learn` aynı döngü gövdesine girince komut önbelleği taşıyor.
+Geri alındı; kural "yaprak kapanışı + 8 blok" olarak kaldı.
+
 ### Neden bu hâlâ kullanışlı
 
 ~10x, bir çekirdek için kabul edilebilir bir sabit maliyettir çünkü:
