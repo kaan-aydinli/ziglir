@@ -4421,77 +4421,109 @@ const MAX_PURE_FNS = 8192;
 /// graph: `a` is read-only only if everything `a` calls is read-only too.
 fn computePureFns(module: *IRModule, pure: *[MAX_PURE_FNS]bool) void {
     const n = @min(module.fn_count, MAX_PURE_FNS);
-    for (0..n) |i| pure[i] = true;
+
+    // Two linear scans, no full rescans. The first version of this re-walked
+    // every function on every fixpoint round and made compilation 1.5x slower
+    // (b_train.lir 6.9 -> 11.3 ms), which a compile pass may not do.
+    //
+    // Scan 1: pure[i] = "has no impure op of its own and every call target is
+    // in range". Call edges are recorded by mutating callee_fn_idx into the
+    // inverse: we simply remember each impure-from-call function in a work
+    // list and propagate.
+    var deps_on_call: [MAX_PURE_FNS]bool = .{false} ** MAX_PURE_FNS;
+    for (0..n) |i| {
+        pure[i] = true;
+        const f = &module.fns[i];
+        outer: for (0..f.block_count) |bi| {
+            const blk = &f.blocks[bi];
+            for (0..blk.inst_count) |ii| {
+                const inst = &blk.insts[ii];
+                const op = inst.op;
+                if (op == .call) {
+                    const ci = inst.callee_fn_idx;
+                    if (ci < 0 or @as(u32, @intCast(ci)) >= n) {
+                        pure[i] = false;
+                        break :outer;
+                    }
+                    deps_on_call[i] = true;
+                } else if (isImpureOp(op)) {
+                    pure[i] = false;
+                    break :outer;
+                }
+            }
+        }
+    }
+
+    // Scan 2 (only functions that still depend on a call): walk call edges and
+    // propagate impurity. Repeat only while something actually changed, which
+    // for real code is once or twice.
     var changed = true;
     var rounds: u32 = 0;
     while (changed and rounds < 64) : (rounds += 1) {
         changed = false;
         for (0..n) |i| {
-            if (!pure[i]) continue;
+            if (!pure[i] or !deps_on_call[i]) continue;
             const f = &module.fns[i];
-            outer: for (0..f.block_count) |bi| {
+            outer2: for (0..f.block_count) |bi| {
                 const blk = &f.blocks[bi];
                 for (0..blk.inst_count) |ii| {
                     const inst = &blk.insts[ii];
-                    const op = inst.op;
-                    if (op == .call) {
-                        const ci = inst.callee_fn_idx;
-                        if (ci < 0) {
-                            pure[i] = false;
-                        } else if (@as(u32, @intCast(ci)) >= n or !pure[@intCast(ci)]) {
-                            pure[i] = false;
-                        }
-                    } else switch (op) {
-                        // A function that writes through any pointer might be
-                        // writing into the buffer the caller's loop indexes, so
-                        // it is not a safe barrier to hoist across.
-                        .field_store,
-                        .deref_store,
-                        .store_mem,
-                        .call_write_u32,
-                        .call_write_u64,
-                        .call_write_byte,
-                        .call_write,
-                        .call_memcpy,
-                        .call_memset,
-                        .call_indirect,
-                        .call_malloc,
-                        .call_free,
-                        .call_syscall,
-                        .call_exit,
-                        .call_panic,
-                        .call_print,
-                        .call_println,
-                        .call_print_int,
-                        .call_printptr,
-                        .call_assert,
-                        .call_assert_eq,
-                        .call_array_new,
-                        .call_array_push,
-                        .call_array_set,
-                        .call_array_free,
-                        .call_array_get,
-                        .call_string_new,
-                        .call_map_new,
-                        .call_map_set,
-                        .call_map_del,
-                        .call_map_free,
-                        .call_chan_new,
-                        .call_chan_send,
-                        .call_chan_close,
-                        => {
-                            pure[i] = false;
-                        },
-                        else => {},
-                    }
-                    if (!pure[i]) {
+                    if (inst.op != .call) continue;
+                    const ci: u32 = @intCast(inst.callee_fn_idx);
+                    if (ci >= n or !pure[ci]) {
+                        pure[i] = false;
                         changed = true;
-                        break :outer;
+                        break :outer2;
                     }
                 }
             }
         }
     }
+}
+
+fn isImpureOp(op: IROp) bool {
+    return switch (op) {
+        // A function that writes through any pointer might be writing into the
+        // buffer the caller's loop indexes, so it is not a safe barrier to
+        // hoist across.
+        .field_store,
+        .deref_store,
+        .store_mem,
+        .call_write_u32,
+        .call_write_u64,
+        .call_write_byte,
+        .call_write,
+        .call_memcpy,
+        .call_memset,
+        .call_indirect,
+        .call_malloc,
+        .call_free,
+        .call_syscall,
+        .call_exit,
+        .call_panic,
+        .call_print,
+        .call_println,
+        .call_print_int,
+        .call_println_float,
+        .call_printptr,
+        .call_assert,
+        .call_assert_eq,
+        .call_array_new,
+        .call_array_push,
+        .call_array_set,
+        .call_array_free,
+        .call_array_get,
+        .call_string_new,
+        .call_map_new,
+        .call_map_set,
+        .call_map_del,
+        .call_map_free,
+        .call_chan_new,
+        .call_chan_send,
+        .call_chan_close,
+        => true,
+        else => false,
+    };
 }
 
 fn callIsMemoryPure(f: *const IRFn, inst: *const IRInst, module: *IRModule, pure: *const [MAX_PURE_FNS]bool) bool {

@@ -216,20 +216,20 @@ doğrular.
 
 ### C ikizi karşılaştırması
 
-`ai/bench/c_twin.c` — aynı Q32.32 aritmetiği, aynı kenar düzeni, aynı iş.
+**Geçmiş ölçüm (hatalı).** Bu bölümdeki eski tablo `ai/bench/c_twin.c`
+kullanıyordu. O ikiz **yalnızca `forward()`** yapıyor, `learn()` hiç yok; LIR
+tarafı ise 5000 adımda `learn`'i de çalıştırıyordu. Yani tablodaki **20.6x**
+elmayla-armut karşılaştırmasıydı. Aşağıdaki *düzeltilmiş* bölüm aynı işi yapan
+`ai/bench/c_twin_train.c` ikizini kullanıyor; doğru rakam **9.6x**.
 
-Sınır kontrolü hoisting'i (`-O2`, commit `44574bf` + ardılı) **öncesi**:
+Yine de eski tablodaki 1.4 ns/kenar → 30.0 ns/kenar farkının **kaynağı**
+doğru teşhis edilmişti: her `@read_u64`/`@write_u64` çağrısında ~22 komutluk
+sınır kontrolü. Aşağıdaki hoisting ve inlining işi tam olarak bunu kaldırdı.
 
-| | süre | ns/kenar |
-|---|---:|---:|
-| SEL (LIR) | 126 ms | 30.0 |
-| LLVM C ikizi (`gcc -O2`) | 6.1 ms | 1.4 |
-| **oran** | **20.6x** | |
-
-**Bu fark nereden geliyordu — ölçüldü:** LIR'in `@read_u64`/`@write_u64`
-builtin'leri her erişimde bir *sınır kontrolü* çağrısı yapıyordu
-(disassembly'de ~22 komut: adres karşılaştırması, alt sınır, üst sınır,
-canary testi, trap dalı). C ikizinde bu kontrol yok.
+**Fark nereden geliyordu — ölçüldü:** LIR'in `@read_u64`/`@write_u64`
+builtin'leri her erişimde bir *sınır kontrolü* yapıyordu (disassembly'de
+~22 komut: adres karşılaştırması, alt sınır, üst sınır, canary testi, trap
+dalı). Düzeltilmiş C ikizinde bu kontrol yok.
 
 #### Kapanan kısım: döngü dışına taşıma (hoisting)
 
@@ -295,8 +295,30 @@ Bunlar için blok sayısı tavanı kaldırıldı (phi/alloca/addr_of hâlâ elen
 | `b_fixed_ops` | 6.1 | 4.6 | 1.31x |
 | **19 iş yükü toplamı** | **1903.6** | **1438.8** | **1.32x** |
 
-`b_train` / C ikizi: **218.8 / 18.5 = 11.8x**. (Aynı makinede C ikizi 18.5 ms;
-ölçüm `gcc -O2`, aynı kenar düzeni, aynı aritmetik.)
+`b_train` / C ikizi: **227.5 / 23.7 = 9.6x** (`ai/bench/c_twin_train.c`, aynı 3
+katman, aynı 5000 adım, aynı `forward` **ve aynı `learn`**).
+
+> **Düzeltme.** Bu belgede daha önce yazan **20.6x** yanlış bir
+> karşılaştırmaydı: `ai/bench/c_twin.c` yalnızca `forward()` yapıyor, `learn()`
+> hiç yok — LIR tarafı ise 5000 adım boyunca `learn`'i de çalıştırıyordu. Aynı
+> işi yapan C ikizi (`c_twin_train.c`) 23.7 ms'de bitiyor, yani gerçek oran
+> o zaman da ~9x'ti. Ölçüm hatası düzeltildi, rakam yukarıda.
+
+Kalan farkın nerede olduğu da ölçüldü, tahmin edilmedi:
+
+| parça | maliyet | nasıl ölçüldü |
+|---|---:|---|
+| katman kopyalama döngüleri (512 eleman/adım) | 51.1 ms (%22) | `_s_full` vs `_s_nocopy` |
+| aynı `forward`, C ile izole karşılaştırma | 1.86x | 20 000 kenarlık darboğaz programı |
+| struct alanı + çağrı sarmalayıcı | 5.18x | aynı döngü, `SelBlock` geçirgen |
+| **toplam `b_train`** | **9.6x** | |
+
+Sarmalayıcı maliyetinin kaynağı disassembly'de görülebiliyor: hoisting
+`forward`'un iç döngüsünü temizliyor (3 erişim, 1 guard) ama
+`while o < nout` döngüsünde kalan `@read_u64(out, o*8)` ve
+`@read_u64(bias, o*8)` kontrolleri *hâlâ* döngü içinde — tabanları alan
+erişimiyle döngü içinde yükleniyor, bu yüzden preheader'a taşınamıyorlar.
+Bunları taşımak döngü-değişmez kod hareketi (LICM) gerektiriyor; denenmedi.
 
 **Reddedilen deneme:** tek çağrı yerli fonksiyonları boyut sınırı olmadan
 inline etmek. `b_net3` 1.30x oldu ama `b_learn` **0.44x**'e düştü (68 → 156 ms):
