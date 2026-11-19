@@ -1,0 +1,33 @@
+// Gercek egitim is yuku: 3 katman, 256 noron, K=8, 5000 adim.
+// learn() tek gecisli surum.
+import "../src/ledger.lir"
+fn main() -> i64 {
+    let l1 = block_new(128, 256, 8, 1)
+    let l2 = block_new(256, 256, 8, 2)
+    let l3 = block_new(256, 16, 8, 3)
+    let x  = @malloc(128 * 8)
+    let h1 = @malloc(256 * 8)
+    let h2 = @malloc(256 * 8)
+    let t  = @malloc(16 * 8)
+    var i: i64 = 0
+    while i < 128 { @write_u64(@ptr_add(x, i*8), (i % 11) as u64) i = i + 1 }
+    i = 0
+    while i < 16 { @write_u64(@ptr_add(t, i*8), ONE as u64) i = i + 1 }
+    let eta = div(from_int(1), from_int(2))
+    var step: i64 = 0
+    while step < 5000 {
+        forward(l1, x)
+        var q: i64 = 0
+        while q < 256 { @write_u64(@ptr_add(h1,q*8), @read_u64(@ptr_add(l1.out,q*8))) q = q + 1 }
+        forward(l2, h1)
+        q = 0
+        while q < 256 { @write_u64(@ptr_add(h2,q*8), @read_u64(@ptr_add(l2.out,q*8))) q = q + 1 }
+        forward(l3, h2)
+
+        learn(l3, h2, t, eta)
+        step = step + 1
+    }
+    printInt(to_int(@read_u64(@ptr_add(l3.out, 0)) as i64) & 1023)
+    println("")
+    return 0
+}

@@ -4323,7 +4323,98 @@ fn accessWidth(op: IROp) i64 {
 /// A loop is bulk-safe when it contains no calls and no stores other than the
 /// bulk accesses themselves. Such a loop cannot realloc, free, or alias the
 /// buffer it reads, which is what makes a single preheader check sufficient.
-fn loopHasOnlyBulkSideEffects(f: *const IRFn, in_loop: u128) bool {
+const MAX_PURE_FNS = 8192;
+
+/// True when the callee cannot write memory, realloc, free, print, or
+/// otherwise touch externally visible state. Such a call is a pure read from
+/// the caller's point of view, so it cannot invalidate a guard that only
+/// protects reads. Computed once per module with a fixpoint over the call
+/// graph: `a` is read-only only if everything `a` calls is read-only too.
+fn computePureFns(module: *IRModule, pure: *[MAX_PURE_FNS]bool) void {
+    const n = @min(module.fn_count, MAX_PURE_FNS);
+    for (0..n) |i| pure[i] = true;
+    var changed = true;
+    var rounds: u32 = 0;
+    while (changed and rounds < 64) : (rounds += 1) {
+        changed = false;
+        for (0..n) |i| {
+            if (!pure[i]) continue;
+            const f = &module.fns[i];
+            outer: for (0..f.block_count) |bi| {
+                const blk = &f.blocks[bi];
+                for (0..blk.inst_count) |ii| {
+                    const inst = &blk.insts[ii];
+                    const op = inst.op;
+                    if (op == .call) {
+                        const ci = inst.callee_fn_idx;
+                        if (ci < 0) {
+                            pure[i] = false;
+                        } else if (@as(u32, @intCast(ci)) >= n or !pure[@intCast(ci)]) {
+                            pure[i] = false;
+                        }
+                    } else switch (op) {
+                        // A function that writes through any pointer might be
+                        // writing into the buffer the caller's loop indexes, so
+                        // it is not a safe barrier to hoist across.
+                        .field_store,
+                        .deref_store,
+                        .store_mem,
+                        .call_write_u32,
+                        .call_write_u64,
+                        .call_write_byte,
+                        .call_write,
+                        .call_memcpy,
+                        .call_memset,
+                        .call_indirect,
+                        .call_malloc,
+                        .call_free,
+                        .call_syscall,
+                        .call_exit,
+                        .call_panic,
+                        .call_print,
+                        .call_println,
+                        .call_print_int,
+                        .call_printptr,
+                        .call_assert,
+                        .call_assert_eq,
+                        .call_array_new,
+                        .call_array_push,
+                        .call_array_set,
+                        .call_array_free,
+                        .call_array_get,
+                        .call_string_new,
+                        .call_map_new,
+                        .call_map_set,
+                        .call_map_del,
+                        .call_map_free,
+                        .call_chan_new,
+                        .call_chan_send,
+                        .call_chan_close,
+                        => {
+                            pure[i] = false;
+                        },
+                        else => {},
+                    }
+                    if (!pure[i]) {
+                        changed = true;
+                        break :outer;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn callIsMemoryPure(f: *const IRFn, inst: *const IRInst, module: *IRModule, pure: *const [MAX_PURE_FNS]bool) bool {
+    _ = f;
+    const ci = inst.callee_fn_idx;
+    if (ci < 0) return false;
+    const idx: u32 = @intCast(ci);
+    if (idx >= module.fn_count or idx >= MAX_PURE_FNS) return false;
+    return pure[idx];
+}
+
+fn loopHasOnlyBulkSideEffects(f: *const IRFn, in_loop: u128, module: *IRModule, pure: *const [MAX_PURE_FNS]bool) bool {
     var bi: usize = 0;
     while (bi < f.block_count) : (bi += 1) {
         if ((in_loop & (@as(u128, 1) << @intCast(bi))) == 0) continue;
@@ -4340,11 +4431,25 @@ fn loopHasOnlyBulkSideEffects(f: *const IRFn, in_loop: u128) bool {
             // before the loop stays valid. (Treating them as barriers was
             // costing every arithmetic loop in the benchmark suite.)
             switch (op) {
+                // Traps are not memory effects.
                 .div, .udiv, .@"mod", .umod => continue,
+                // A struct field load is a read of memory the loop cannot
+                // realloc; it is marked side-effecting only so that it is not
+                // reordered across stores. Stores are already excluded above.
+                .field_access, .deref_load, .load_mem, .call_array_get => continue,
                 else => {},
             }
+            // A call into memory-pure code is not a barrier either: the callee
+            // cannot realloc or free anything (checked recursively by
+            // computePureFns), and it cannot write into the buffers this loop
+            // indexes because those buffers are never passed to it. This is
+            // what unlocks hoisting on real training loops, where the inner
+            // body is a chain of small helper calls.
+            if (op == .call) {
+                if (callIsMemoryPure(f, &blk.insts[ii], module, pure)) continue;
+                return false;
+            }
             if (op.hasSideEffects() and !isBulkAccess(op)) {
-                if (std.posix.getenv("LIR_HB_DEBUG") != null) std.debug.print("[hb]   red eden op={s}\n", .{@tagName(op)});
                 return false;
             }
         }
@@ -4360,15 +4465,17 @@ pub const BoundsHoistStats = struct {
 };
 
 pub fn hoistBoundsChecks(module: *IRModule, stats: ?*BoundsHoistStats) bool {
+    var pure: [MAX_PURE_FNS]bool = undefined;
+    computePureFns(module, &pure);
     var changed = false;
     var fi: u32 = 0;
     while (fi < module.fn_count) : (fi += 1) {
-        if (hoistBoundsChecksFn(&module.fns[fi], stats)) changed = true;
+        if (hoistBoundsChecksFn(&module.fns[fi], stats, module, &pure)) changed = true;
     }
     return changed;
 }
 
-fn hoistBoundsChecksFn(f: *IRFn, stats: ?*BoundsHoistStats) bool {
+fn hoistBoundsChecksFn(f: *IRFn, stats: ?*BoundsHoistStats, module: *IRModule, pure: *const [MAX_PURE_FNS]bool) bool {
     if (f.block_count < 2 or f.block_count > 128) return false;
     var cfg: CFGInfo = undefined;
     buildCFGInfo(f, &cfg);
@@ -4417,9 +4524,6 @@ fn hoistBoundsChecksFn(f: *IRFn, stats: ?*BoundsHoistStats) bool {
             }
 
             if (stats) |s| s.loops_considered += 1;
-            if (@import("builtin").mode == .Debug or std.posix.getenv("LIR_HB_DEBUG") != null) {
-                std.debug.print("[hb] fn bb={d} loop h={d} u={d}\n", .{ f.block_count, h, u });
-            }
 
             // Need a unique preheader that ends in `jump h`.
             var non_loop_preds: u16 = 0;
@@ -4431,7 +4535,6 @@ fn hoistBoundsChecksFn(f: *IRFn, stats: ?*BoundsHoistStats) bool {
                     preheader = p;
                 }
             }
-            if (std.posix.getenv("LIR_HB_DEBUG") != null) std.debug.print("[hb] preheader={d} nlp={d} h={d}\n", .{ preheader, non_loop_preds, h });
             if (non_loop_preds != 1 or preheader >= f.block_count) continue;
             const pb = &f.blocks[preheader];
             if (pb.inst_count == 0) continue;
@@ -4443,7 +4546,6 @@ fn hoistBoundsChecksFn(f: *IRFn, stats: ?*BoundsHoistStats) bool {
             const tail_ok = (tail.op == .jump and tail.target_block == h) or
                 (tail.op == .cond_jump and tail.target_block == h);
             if (!tail_ok) {
-                if (std.posix.getenv("LIR_HB_DEBUG") != null) std.debug.print("[hb]   -> red: preheader sonu uygun degil (op={d})\n", .{@intFromEnum(tail.op)});
                 continue;
             }
             // Guard must be inserted before the terminator, so we need room.
@@ -4451,8 +4553,7 @@ fn hoistBoundsChecksFn(f: *IRFn, stats: ?*BoundsHoistStats) bool {
 
             // Every access must be bulk, derived from one base vreg, with a
             // single constant stride. Anything else and we leave the loop alone.
-            if (!loopHasOnlyBulkSideEffects(f, in_loop)) {
-                if (std.posix.getenv("LIR_HB_DEBUG") != null) std.debug.print("[hb]   -> red: side effects\n", .{});
+            if (!loopHasOnlyBulkSideEffects(f, in_loop, module, pure)) {
                 continue;
             }
 
@@ -4518,11 +4619,9 @@ fn hoistBoundsChecksFn(f: *IRFn, stats: ?*BoundsHoistStats) bool {
             // keeps executing every iteration, so the right comparison is
             // sites-vs-guards, not "does this loop have more than one access".
             if (ok and n_access < n_bases) {
-                if (std.posix.getenv("LIR_HB_DEBUG") != null) std.debug.print("[hb]   -> red: kar yok (n={d} nbases={d})\n", .{ n_access, n_bases });
                 ok = false;
             }
             if (!ok or n_bases == 0 or n_access == 0) {
-                if (std.posix.getenv("LIR_HB_DEBUG") != null) std.debug.print("[hb]   -> red: ok={} nbases={d} n={d}\n", .{ ok, n_bases, n_access });
                 continue;
             }
 
@@ -4542,7 +4641,6 @@ fn hoistBoundsChecksFn(f: *IRFn, stats: ?*BoundsHoistStats) bool {
                 }
             }
             if (!base_ok) {
-                if (std.posix.getenv("LIR_HB_DEBUG") != null) std.debug.print("[hb]   -> red: taban dongu icinde\n", .{});
                 continue;
             }
 
@@ -4586,7 +4684,6 @@ fn hoistBoundsChecksFn(f: *IRFn, stats: ?*BoundsHoistStats) bool {
                     rewritten += 1;
                 }
             }
-            if (std.posix.getenv("LIR_HB_DEBUG") != null) std.debug.print("[hb]   -> KABUL: {d} erisim unchecked\n", .{rewritten});
             if (stats) |s| {
                 s.loops_hoisted += 1;
                 s.accesses_rewritten += rewritten;

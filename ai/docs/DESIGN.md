@@ -216,7 +216,9 @@ doğrular.
 
 ### C ikizi karşılaştırması
 
-`ai/bench/c_twin.c` — aynı Q32.32 aritmetiği, aynı kenar düzeni, aynı iş:
+`ai/bench/c_twin.c` — aynı Q32.32 aritmetiği, aynı kenar düzeni, aynı iş.
+
+Sınır kontrolü hoisting'i (`-O2`, commit `44574bf` + ardılı) **öncesi**:
 
 | | süre | ns/kenar |
 |---|---:|---:|
@@ -224,32 +226,60 @@ doğrular.
 | LLVM C ikizi (`gcc -O2`) | 6.1 ms | 1.4 |
 | **oran** | **20.6x** | |
 
-(Ölçüm: 9 tur, medyan, 2 çekirdek Xeon @2.60 GHz. Oran üç ayrı
-koşuda 19.8x / 21.4x / 20.5x çıktı; tabloda ortadaki değer var.)
+**Bu fark nereden geliyordu — ölçüldü:** LIR'in `@read_u64`/`@write_u64`
+builtin'leri her erişimde bir *sınır kontrolü* çağrısı yapıyordu
+(disassembly'de ~22 komut: adres karşılaştırması, alt sınır, üst sınır,
+canary testi, trap dalı). C ikizinde bu kontrol yok.
 
-**Bu fark nereden geliyor — ölçüldü:** LIR'in `@read_u64`/`@write_u64`
-builtin'leri her erişimde bir *sınır kontrolü* çağrısı yapıyor
-(disassembly'de 30+ komut, adres karşılaştırması, canary testi). Bu, dilin
-bellek güvenliği sözleşmesinin bedeli. C ikizinde bu kontrol yok.
+#### Kapanan kısım: döngü dışına taşıma (hoisting)
+
+`hoistBoundsChecks` artık sayaçlı bir döngüdeki toplu erişimleri döngü
+girişine taşıyor: bir kez doğrula, döngü boyunca kontrolsüz oku/yaz. Üç
+koşul aranıyor:
+
+1. Döngünün tek bir dışarıdan girişi (preheader) olmalı.
+2. Döngü gövdesinde bellek ayıran/serbest bırakan/engelleyen işlem olmamalı.
+   **Çağrılar da bu kurala dahil:** modül genelinde bir *salt-okunur*
+   sabit-nokta analizi (`computePureFns`) hangi fonksiyonların belleğe hiç
+   yazmadığını çıkarır; böyle bir çağrı bariyer sayılmaz. Gerçek eğitim
+   döngülerinde gövde küçük yardımcı çağrılardan oluştuğu için bu şart.
+3. Her erişim tek bir taban işaretçiden sabit adımla türemeli.
+
+Ölçüm (9 tur, medyan, aynı makine, aynı çıktı):
+
+| iş | önce | sonra | oran |
+|---|---:|---:|---:|
+| `b_train` 3 katman 5000 adım | 481.5 ms | **198.2 ms** | **2.43x** |
+| `b_forward` | 44.9 | 24.3 | 1.85x |
+| `b_learn` | 142.7 | 68.5 | 2.08x |
+| `b_net3` | 102.6 | 49.5 | 2.07x |
+| `b_matmul` 96³ | 12.6 | 4.6 | 2.73x |
+| XOR eğitimi | 37.7 | 23.7 | 1.59x |
+| 19 iş yükü toplamı | 1927.5 | 1469.2 | **1.31x** |
+
+Regresyon yok: en kötü iş yükü `09_tak` 0.96x, ki o 3.9 ms'lik bir
+programda 0.2 ms'lik gürültüdür. Doğrulama: 24/24 AI testi, 11/11
+rust-compare çıktısı birebir, `zig build test` temiz.
+
+`b_train` için kalan fark **198 ms / 18.5 ms = 10.7x** (C ikizi
+`/tmp/trainc.c`). Kalan farkın kaynağı ölçüldü: iç döngüdeki `mul`/`sat_add`
+çağrıları hâlâ gerçek `call` (inlining `forward`'u çok büyüttüğü için
+yapılmıyor) ve döngü başına bir kez ödenen guard maliyeti 4224 kenarda
+amortize olmuyor.
 
 Rust ölçümü **yoktur**: bu ortamda Rust derleyicisi çalıştırılamıyor.
 Karşılaştırma yalnızca C ile yapılmıştır ve öyle etiketlenmiştir.
 
 ### Neden bu hâlâ kullanışlı
 
-~20x, bir çekirdek için kabul edilebilir bir sabit maliyettir çünkü:
+~10x, bir çekirdek için kabul edilebilir bir sabit maliyettir çünkü:
 
 1. **Tamsayı olduğu için** float'ın 13x yavaşlığından kaçınılıyor
    (bkz. §0 — f64 döngüsü 5.19 ns, tamsayı MAC 0.40 ns).
 2. **Sıfır bağımlılık**: tek `i64` aritmetiği, SIMD/GPU yok, her backend'de
-   aynı sonuç (15/15 test, 3 backend).
-3. **Doğrusal ölçekleme**: 24 kenarda 538 ns, 2112 kenarda 29 ns/kenar —
-   yani sabit yük amortize oluyor.
-
-Ama dürüst olmak gerekirse: 20x, "C kadar hızlı" demek değildir. Hızlı
-CPU eğitimi isteniyorsa sıcak döngülerde `@read_u64` yerine daha az
-erişimli bir düzen (kenar verisini tek blokta tutmak, yeniden kullanmak)
-gerekir. Bu, gelecekteki iş olarak açık kalıyor.
+   aynı sonuç (24/24 test, 3 backend).
+3. **Doğrusal ölçekleme**: hoisting sonrası maliyet döngü başına bir kez
+   ödenen guard + kontrolsüz gövde.
 
 ## 5.6 LIR'in sınırları — kod yazarken öğrenilenler
 
