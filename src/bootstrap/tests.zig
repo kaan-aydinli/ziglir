@@ -4159,3 +4159,131 @@ test "langref: builtin catalogue matches the semantic analyzer" {
     }
 }
 
+
+// --- bounds-check hoisting and leaf-closure inlining ---------------------
+//
+// These two passes are what make int arithmetic in loops competitive: without
+// them every @read_u64 carries a ~22-instruction range test and every call to a
+// Q32.32 helper stays a real call. Both fail *silently* (correct code, slower
+// code), so they get direct assertions on the IR instead of only end-to-end
+// timing.
+
+const ir_opt = @import("ir_opt.zig");
+
+fn buildHoistLoopModule(module: *ir_mod.IRModule) void {
+    module.init();
+    // fn f(ptr, n) { while (i < n) { read_u64(ptr + i*8) } }
+    //
+    //   blk0 entry/preheader : ptr_add ... ; cond_jump(h=1, exit=3)
+    //   blk1 h (preheader)   : cond_jump(body=2, exit=3)
+    //   blk2 body            : read_u64 ; jump h
+    //   blk3 exit            : ret
+    var f = &module.fns[0];
+    ir_mod.IRModule.initFnSlot(f, 0, 1, 0, 0, 0);
+    f.block_count = 4;
+    f.vreg_count = 12;
+
+    f.blocks[0].label = 0;
+    f.blocks[0].inst_count = 2;
+    // The base pointer must have a definition outside the loop, exactly as the
+    // real prologue provides it.
+    f.blocks[0].insts[0] = .{ .op = .copy, .dest = 1, .src1 = 20 };
+    f.blocks[0].insts[1] = .{ .op = .jump, .target_block = 1 };
+
+    f.blocks[1].label = 1;
+    f.blocks[1].inst_count = 1;
+    f.blocks[1].insts[0] = .{ .op = .cond_jump, .src1 = 6, .target_block = 2, .alt_block = 3 };
+
+    f.blocks[2].label = 2;
+    f.blocks[2].inst_count = 3;
+    f.blocks[2].insts[0] = .{ .op = .call_ptr_add, .dest = 7, .args = .{ 1, 8, 0, 0, 0, 0, 0, 0 }, .arg_count = 2 };
+    f.blocks[2].insts[1] = .{ .op = .call_read_u64, .dest = 9, .args = .{ 7, 0, 0, 0, 0, 0, 0, 0 }, .arg_count = 1 };
+    f.blocks[2].insts[2] = .{ .op = .jump, .target_block = 1 };
+
+    f.blocks[3].label = 3;
+    f.blocks[3].inst_count = 1;
+    f.blocks[3].insts[0] = .{ .op = .ret };
+    module.fn_count = 1;
+}
+
+test "hoisting rewrites bulk accesses in a counted loop" {
+    const module = try std.testing.allocator.create(ir_mod.IRModule);
+    defer std.testing.allocator.destroy(module);
+    buildHoistLoopModule(module);
+
+    var stats = ir_opt.BoundsHoistStats{};
+    _ = ir_opt.hoistBoundsChecks(module, &stats);
+
+    try std.testing.expect(stats.accesses_rewritten > 0);
+    try std.testing.expect(module.fns[0].blocks[2].insts[1].unchecked_access);
+}
+
+test "hoisting marks nothing when a loop contains a call that may write" {
+    const module = try std.testing.allocator.create(ir_mod.IRModule);
+    defer std.testing.allocator.destroy(module);
+    buildHoistLoopModule(module);
+
+    // Give the module a callee that stores through a pointer, and call it from
+    // the loop body: the buffer could be reallocated or overwritten, so the
+    // guard must not be hoisted.
+    var g = &module.fns[1];
+    ir_mod.IRModule.initFnSlot(g, 1, 1, 0, 0, 0);
+    g.block_count = 1;
+    g.vreg_count = 4;
+    g.blocks[0].label = 0;
+    g.blocks[0].inst_count = 2;
+    g.blocks[0].insts[0] = .{ .op = .deref_store, .src1 = 1, .src2 = 2 };
+    g.blocks[0].insts[1] = .{ .op = .ret };
+    module.fn_count = 2;
+
+    // Insert the call *before* the loop's back edge: appending it after the
+    // `jump` would leave it as dead code and the test would pass for the
+    // wrong reason.
+    var body = &module.fns[0].blocks[2];
+    body.insts[3] = body.insts[2]; // move the back edge out of the way
+    body.insts[2] = .{ .op = .call, .dest = 0, .callee_fn_idx = 1, .arg_count = 0 };
+    body.inst_count = 4;
+
+    var stats = ir_opt.BoundsHoistStats{};
+    _ = ir_opt.hoistBoundsChecks(module, &stats);
+
+    try std.testing.expectEqual(@as(u32, 0), stats.accesses_rewritten);
+    try std.testing.expect(!module.fns[0].blocks[2].insts[1].unchecked_access);
+}
+
+test "a read-only callee does not block hoisting" {
+    // (Both fns deliberately keep name_len 1/name_start 0: the pass resolves
+    // callees by callee_fn_idx, not by name, so the names are irrelevant here.)
+    const module = try std.testing.allocator.create(ir_mod.IRModule);
+    defer std.testing.allocator.destroy(module);
+    buildHoistLoopModule(module);
+
+    // Same shape, but the callee only reads: it cannot touch the caller's
+    // buffer, so hoisting must still happen. This is the property that makes
+    // the training loops fast.
+    var g = &module.fns[1];
+    // Distinct name range: the synthetic module has one shared (empty) source,
+    // so both functions would otherwise look alike to anything that falls back
+    // to name matching.
+    ir_mod.IRModule.initFnSlot(g, 1, 1, 0, 0, 0);
+    g.block_count = 1;
+    g.vreg_count = 4;
+    g.blocks[0].label = 0;
+    g.blocks[0].inst_count = 2;
+    g.blocks[0].insts[0] = .{ .op = .call_read_u64, .dest = 3, .args = .{ 1, 0, 0, 0, 0, 0, 0, 0 }, .arg_count = 1 };
+    g.blocks[0].insts[1] = .{ .op = .ret };
+    module.fn_count = 2;
+
+    // Insert the call *before* the loop's back edge: appending it after the
+    // `jump` would leave it as dead code and the test would pass for the
+    // wrong reason.
+    var body = &module.fns[0].blocks[2];
+    body.insts[3] = body.insts[2]; // move the back edge out of the way
+    body.insts[2] = .{ .op = .call, .dest = 0, .callee_fn_idx = 1, .arg_count = 0 };
+    body.inst_count = 4;
+
+    var stats = ir_opt.BoundsHoistStats{};
+    _ = ir_opt.hoistBoundsChecks(module, &stats);
+
+    try std.testing.expect(stats.accesses_rewritten > 0);
+}
