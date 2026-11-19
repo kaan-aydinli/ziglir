@@ -51,15 +51,27 @@ Tam belge: [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## Ölçülen hız
 
-| iş | SEL | LLVM C ikizi | oran |
+| iş | önce | sonra | kazanç |
 |---|---:|---:|---:|
-| 3 katmanlı ağ (2112 kenar × 2000 adım) | 126 ms | 6.1 ms | 20.6x |
-| Q32.32 matmul 96³ | 17.3 ms | — | — |
-| XOR eğitimi (12.000 güncelleme) | 45.0 ms | — | — |
+| `b_train` (3 katman, K=8, 5000 adım) | 496.7 ms | **227.5 ms** | **2.18x** |
+| `b_forward` | 45.3 ms | **16.8 ms** | **2.70x** |
+| `b_learn` | 118.6 ms | **51.6 ms** | **2.30x** |
+| `b_net3` | 96.5 ms | **40.9 ms** | **2.36x** |
+| `b_matmul` 96³ | 12.7 ms | **3.9 ms** | **3.25x** |
+| XOR eğitimi | 37.1 ms | **21.3 ms** | **1.75x** |
+| 19 iş yükü toplamı | 1903.6 ms | **1438.8 ms** | **1.32x** |
 
 Farkın kaynağı ölçüldü: LIR'in `@read_u64`/`@write_u64` builtin'leri her
-erişimde sınır kontrolü yapıyor. Bu, dilin bellek güvenliği sözleşmesinin
-bedeli — gizlenmiyor.
+erişimde sınır kontrolü yapıyordu. Derleyici artık bunları sayaçlı
+döngülerin dışına taşıyor (hoisting) ve Q32.32 yardımcılarını (`mul`,
+`sat_add`, `fabs`) gerçekten gövdeye alıyor (leaf-closure inlining).
+Ayrıntı ve ölçümler: `docs/DESIGN.md` §5.5.
+
+**C karşılaştırması — düzeltilmiş.** Eski tabloda **20.6x** yazıyordu; o
+karşılaştırma hatalıydı, çünkü C ikizi (`bench/c_twin.c`) yalnızca `forward`
+yapıyor, `learn` hiç yok, LIR tarafı ise ikisini birden çalıştırıyordu. Aynı
+işi yapan `bench/c_twin_train.c` ile ölçülen gerçek oran **9.6x**'tir
+(227.5 ms / 23.7 ms). Kalan farkın dağılımı DESIGN.md §5.5'te ölçülmüştür.
 
 **Rust ölçümü yoktur**; bu ortamda Rust çalıştırılamıyor. Karşılaştırma
 yalnızca C ile ve öyle etiketlenerek yapılmıştır.

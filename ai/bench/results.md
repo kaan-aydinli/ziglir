@@ -2,6 +2,11 @@
 
 Üretim: `python3 ai/bench/run.py --write` · 2026-11-18 13:00
 
+> **Not:** Bu tablo sınır-kontrolü hoisting'i (commit `44574bf`),
+> memory-pure hoisting (`90a0eb7`) ve leaf-closure inlining (`b1f07b9`)
+> **öncesine** aittir. Güncel rakamlar için `ai/README.md` ve
+> `ai/docs/DESIGN.md` §5.5'e bakın.
+
 | iş | süre (ms) | açıklama |
 |---|---:|---|
 | fixed ops | 8.35 | mul + div + sat_add, 1M yineleme |
