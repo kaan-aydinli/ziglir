@@ -257,8 +257,11 @@ koşul aranıyor:
 | XOR eğitimi | 37.7 | 23.7 | 1.59x |
 | 19 iş yükü toplamı | 1927.5 | 1469.2 | **1.31x** |
 
-Regresyon yok: en kötü iş yükü `09_tak` 0.96x, ki o 3.9 ms'lik bir
-programda 0.2 ms'lik gürültüdür. Doğrulama: 24/24 AI testi, 11/11
+Regresyon yok. Bunu iki şekilde doğruladım: (1) 41 turluk A/B'de dört "yavaş"
+iş yükü de 0.99–1.01x'e düştü, (2) daha kesini, `01`–`11` arasındaki iş
+yüklerinin **üretilen kodu bit-bit aynı** — `cmp` iki ikiliyi karşılaştırıyor ve
+eşit çıkıyor, yani bu programlarda derleyici hiçbir şeyi değiştirmiyor ve
+ölçülen her fark gürültüdür. Doğrulama: 24/24 AI testi, 11/11
 rust-compare çıktısı birebir, `zig build test` temiz.
 
 `b_train` için kalan fark **198 ms / 18.5 ms = 10.7x** (C ikizi
