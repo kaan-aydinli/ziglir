@@ -148,6 +148,10 @@ pub const IROp = enum {
     call_malloc,
     call_free,
     call_ptr_add,
+    // Bounds-hoist guard: args[0] = base ptr vreg. Emitted in a loop preheader
+    // by hoistBoundsChecks; succeeds only when the whole buffer the loop will
+    // touch provably lies inside the heap. Purely a codegen marker.
+    bounds_hoist_guard,
     call_read_byte,
     call_write_byte,
     call_array_new,
@@ -379,6 +383,8 @@ pub const IRInst = struct {
     arg_count: u8 = 0,
     slot: u16 = 0, // stack slot for load_local / store_local / addr_of / alloca
     field_offset: u16 = 0, // for field_access / field_store
+    // Set by hoistBoundsChecks when a bulk access runs under a preheader guard.
+    unchecked_access: bool = false,
 };
 
 pub const MAX_INSTS_PER_BLOCK: u32 = 384;
@@ -571,9 +577,11 @@ pub const IRModule = struct {
     }
 
     pub fn dumpModule(self: *const IRModule, source: []const u8) void {
-        var buf: [65536]u8 = undefined;
+        var buf: [256 << 10]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buf);
-        self.formatModule(source, fbs.writer()) catch {};
+        self.formatModule(source, fbs.writer()) catch |err| {
+            std.debug.print("\n[ir dump truncated: {s}]\n", .{@errorName(err)});
+        };
         util.printStr(fbs.getWritten());
     }
 };

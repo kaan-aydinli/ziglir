@@ -1,0 +1,13 @@
+# Expected first-line output of each workload, produced by the LIR -O2 build.
+# Both the LIR and the Rust twin must print this exact line.
+01_matrix_mul.lir	403973
+02_nbody.lir	-199280
+03_sieve.lir	744665
+04_mandelbrot.lir	18388003
+05_collatz.lir	131434272
+06_fib_mod.lir	577847172
+07_prime_count.lir	148933
+08_bitmix.lir	1335377554
+09_tak.lir	9
+10_isqrt.lir	1884618085
+11_kmeans.lir	22216541

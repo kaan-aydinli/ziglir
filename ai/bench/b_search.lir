@@ -1,0 +1,26 @@
+import "../src/search.lir"
+fn main() -> i64 {
+    let n_docs: i64 = 1000
+    let n_terms: i64 = 100
+    let per: i64 = 1000
+    let ix = index_new(n_docs, n_terms, n_terms * per)
+    var t: i64 = 0
+    while t < n_terms {
+        idx_set_term(ix, t, t * per, per)
+        var p: i64 = 0
+        while p < per {
+            idx_set_post(ix, t * per + p, (p * 7 + t) % n_docs, 1 + (p % 5))
+            p = p + 1
+        }
+        t = t + 1
+    }
+    let scores = @malloc(n_docs * 8)
+    scores_clear(scores, n_docs)
+    var q: i64 = 0
+    while q < n_terms { add_term_score(ix, scores, q, ONE)  q = q + 1 }
+    let out = @malloc(10 * 8)
+    let found = top_k(scores, n_docs, out, 10)
+    printInt(found)
+    println("")
+    return 0
+}

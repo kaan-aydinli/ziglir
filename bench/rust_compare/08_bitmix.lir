@@ -1,0 +1,39 @@
+// splitmix64-style bit mixing over 20,000,000 values, with a data-dependent
+// accumulate that avoids a trivially vectorisable reduction.
+//
+// This is the branch-light end of the suite: shifts, xors and multiplies only,
+// so it measures multiplier latency and how well the register allocator keeps
+// the four live temporaries in registers. All arithmetic must stay in 64-bit, so
+// @wrapping_mul is used explicitly.
+//
+// The mix works on the u64 bit pattern (like the Rust twin, which converts with
+// `z as u64`), so >> must be a *logical* shift. LIR has no unsigned shift
+// operator: the operand is typed u64 and the value is bridged back to i64 only
+// where @wrapping_mul demands it, which keeps the shift logical.
+import "common.lir"
+
+fn mix(z0: i64) -> i64 {
+    var z = z0 as u64
+    var a = @wrapping_mul((z ^ (z >> 30)) as i64, -4658895280553007687)
+    var au = a as u64
+    var b = @wrapping_mul((au ^ (au >> 27)) as i64, -7723592293110705685)
+    var bu = b as u64
+    return (bu ^ (bu >> 31)) as i64
+}
+
+fn main() -> i64 {
+    const iters: i64 = 20000000
+    var acc: i64 = 0
+    var bits: i64 = 0
+    var i: i64 = 0
+    while i < iters {
+        let z = mix(i)
+        acc = acc + (z % 1000003)
+        bits = bits + @popcount(z as u64)
+        i = i + 1
+    }
+    printInt(acc)
+    printInt(bits)
+    println("")
+    return 0
+}

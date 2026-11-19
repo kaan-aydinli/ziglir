@@ -1,0 +1,21 @@
+// Takeuchi function tak(24, 16, 8): 121 million calls, the deep-recursion end of
+// the suite.
+//
+// tak is the standard CPU benchmark for call overhead: it makes three recursive
+// calls per invocation and cannot be unrolled or vectorised. Rust and LIR both
+// have to pay for a real call, which makes this the fairest possible comparison
+// of calling convention and frame setup.
+import "common.lir"
+
+fn tak(x: i64, y: i64, z: i64) -> i64 {
+    if y >= x {
+        return z
+    }
+    return tak(tak(x - 1, y, z), tak(y - 1, z, x), tak(z - 1, x, y))
+}
+
+fn main() -> i64 {
+    printInt(tak(24, 16, 8))
+    println("")
+    return 0
+}

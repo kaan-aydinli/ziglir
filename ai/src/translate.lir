@@ -1,0 +1,108 @@
+// SEL — Sparse Eikonal Ledger
+// translate.lir — çeviri aracı, tokenizer'sız.
+//
+// Bu bir makine çevirisi modeli DEĞİL. Burada olan: bir *hizalama
+// defteri* (alignment ledger). Kaynak ve hedef dillerin vektör uzayları
+// arasındaki dönüşüm, eikonal kuralla öğrenilen bir doğrusal haritadır.
+//
+// Neden tokenizer yok: kaynak metin, codec.lir'deki gibi doğrudan
+// sürekli bir vektöre kodlanır. Kelime sınırı, sözlük, BPE yok.
+//
+// Neden bu işe yarar: iki dil arasındaki ilişki, büyük ölçüde düşük
+// ranklı bir dönüşümdür. Doğrusal bir harita + yeterli örnek çifti,
+// kelime çevirisini yakalayabilir. Cümle yeniden sıralaması gerekirse
+// bu haritanın üstüne ikinci bir katman gerekir; burada o yok.
+
+import "fixed.lir"
+
+// Hizalama defteri: her giriş bir (kaynak vektör, hedef vektör) çiftinin
+// katkısını taşır. W matrisi d_src x d_dst.
+//
+// W, güncelleme sırasında yerinde düzeltilir:
+//   hata = hedef - W·kaynak
+//   W   += eta · hata ⊗ kaynak / (|kaynak|²+1)
+// Bu, ledger.lir'deki NLMS kuralının matris biçimidir.
+
+/// W matrisini (d_src x d_dst) sıfırla.
+fn align_init(w: *u8, d_src: i64, d_dst: i64) {
+    var i: i64 = 0
+    while i < d_src * d_dst {
+        @write_u64(@ptr_add(w, i * 8), 0 as u64)
+        i = i + 1
+    }
+}
+
+/// İleri: dst = W · src.  dst d_dst elemanlı.
+fn align_apply(w: *u8, src: *u8, dst: *u8, d_src: i64, d_dst: i64) {
+    var o: i64 = 0
+    while o < d_dst {
+        var acc: i64 = 0
+        var i: i64 = 0
+        while i < d_src {
+            let wv = @read_u64(@ptr_add(w, (o * d_src + i) * 8)) as i64
+            let sv = @read_u64(@ptr_add(src, i * 8)) as i64
+            acc = sat_add(acc, mul(wv, sv))
+            i = i + 1
+        }
+        @write_u64(@ptr_add(dst, o * 8), acc as u64)
+        o = o + 1
+    }
+}
+
+/// Tek bir çift ile hizalamayı güncelle (NLMS matris biçimi).
+/// Dönen değer: kalan enerji (Q32.32), öğrenmenin düştüğünü görmek için.
+fn align_learn(w: *u8, src: *u8, target: *u8, d_src: i64, d_dst: i64, eta: i64) -> i64 {
+    // |src|² + 1
+    var nrm: i64 = ONE
+    var i: i64 = 0
+    while i < d_src {
+        let sv = @read_u64(@ptr_add(src, i * 8)) as i64
+        nrm = sat_add(nrm, mul(sv, sv))
+        i = i + 1
+    }
+    let inv = div(ONE, nrm)
+    var total_e: i64 = 0
+    var o: i64 = 0
+    while o < d_dst {
+        // mevcut tahmin
+        var pred: i64 = 0
+        var j: i64 = 0
+        while j < d_src {
+            let wv = @read_u64(@ptr_add(w, (o * d_src + j) * 8)) as i64
+            let sv = @read_u64(@ptr_add(src, j * 8)) as i64
+            pred = sat_add(pred, mul(wv, sv))
+            j = j + 1
+        }
+        let tv = @read_u64(@ptr_add(target, o * 8)) as i64
+        let d = tv - pred
+        total_e = sat_add(total_e, mul_sat(d, d))
+        let g = mul(mul(eta, d), inv)
+        var j2: i64 = 0
+        while j2 < d_src {
+            let off = (o * d_src + j2) * 8
+            let wv = @read_u64(@ptr_add(w, off)) as i64
+            let sv = @read_u64(@ptr_add(src, j2 * 8)) as i64
+            @write_u64(@ptr_add(w, off), sat_add(wv, mul(g, sv)) as u64)
+            j2 = j2 + 1
+        }
+        o = o + 1
+    }
+    return total_e
+}
+
+/// En yakın hedef vektörü bul: verilen tahmin vektörüne kosinüs
+/// benzerliği en yüksek olan sözlük girişi. Kelime seçimi buradan gelir.
+fn nearest(scores: *u8, n: i64) -> i64 {
+    var best: i64 = 0
+    var bestv: i64 = 0 - 9223372036854775807
+    var i: i64 = 0
+    while i < n {
+        let v = @read_u64(@ptr_add(scores, i * 8)) as i64
+        if v > bestv {
+            bestv = v
+            best = i
+        }
+        i = i + 1
+    }
+    return best
+}

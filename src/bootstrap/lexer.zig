@@ -190,6 +190,89 @@ fn isHexDigit(ch: u8) bool {
     return isDigit(ch) or (ch >= 'a' and ch <= 'f') or (ch >= 'A' and ch <= 'F');
 }
 
+/// Every reserved word with the token it lexes to. `lir lang --keywords` and
+/// `lir.lang.v1` publish this list so generators can avoid reserved words
+/// without guessing (a reserved word is never a valid identifier).
+pub const KeywordEntry = struct {
+word: []const u8,
+kind: TokenKind,
+};
+
+pub const keyword_entries = [_]KeywordEntry{
+.{ .word = "fn", .kind = .kw_fn },
+.{ .word = "let", .kind = .kw_let },
+.{ .word = "var", .kind = .kw_var },
+.{ .word = "mut", .kind = .kw_mut },
+.{ .word = "const", .kind = .kw_const },
+.{ .word = "struct", .kind = .kw_struct },
+.{ .word = "enum", .kind = .kw_enum },
+.{ .word = "trait", .kind = .kw_trait },
+.{ .word = "impl", .kind = .kw_impl },
+.{ .word = "loop", .kind = .kw_loop },
+.{ .word = "match", .kind = .kw_match },
+.{ .word = "if", .kind = .kw_if },
+.{ .word = "else", .kind = .kw_else },
+.{ .word = "while", .kind = .kw_while },
+.{ .word = "for", .kind = .kw_for },
+.{ .word = "unless", .kind = .kw_unless },
+.{ .word = "until", .kind = .kw_until },
+.{ .word = "guard", .kind = .kw_guard },
+.{ .word = "proc", .kind = .kw_fn },
+.{ .word = "in", .kind = .kw_in },
+.{ .word = "return", .kind = .kw_return },
+.{ .word = "break", .kind = .kw_break },
+.{ .word = "continue", .kind = .kw_continue },
+.{ .word = "defer", .kind = .kw_defer },
+.{ .word = "pub", .kind = .kw_pub },
+.{ .word = "mod", .kind = .kw_mod },
+.{ .word = "use", .kind = .kw_use },
+.{ .word = "import", .kind = .kw_import },
+.{ .word = "type", .kind = .kw_type },
+.{ .word = "extern", .kind = .kw_extern },
+.{ .word = "self", .kind = .kw_self },
+.{ .word = "true", .kind = .kw_true },
+.{ .word = "false", .kind = .kw_false },
+.{ .word = "null", .kind = .kw_null },
+.{ .word = "comptime", .kind = .kw_comptime },
+.{ .word = "try", .kind = .kw_try },
+.{ .word = "panic", .kind = .kw_panic },
+.{ .word = "elif", .kind = .kw_elif },
+.{ .word = "and", .kind = .and_and },
+.{ .word = "or", .kind = .pipe_pipe },
+.{ .word = "i8", .kind = .kw_i8 },
+.{ .word = "i16", .kind = .kw_i16 },
+.{ .word = "i32", .kind = .kw_i32 },
+.{ .word = "i64", .kind = .kw_i64 },
+.{ .word = "u8", .kind = .kw_u8 },
+.{ .word = "u16", .kind = .kw_u16 },
+.{ .word = "u32", .kind = .kw_u32 },
+.{ .word = "u64", .kind = .kw_u64 },
+.{ .word = "f32", .kind = .kw_f32 },
+.{ .word = "f64", .kind = .kw_f64 },
+.{ .word = "bool", .kind = .kw_bool },
+.{ .word = "string", .kind = .kw_string },
+.{ .word = "void", .kind = .kw_void },
+.{ .word = "unsafe", .kind = .kw_unsafe },
+.{ .word = "volatile", .kind = .kw_volatile },
+.{ .word = "asm", .kind = .kw_asm },
+.{ .word = "align", .kind = .kw_align },
+.{ .word = "packed", .kind = .kw_packed },
+.{ .word = "union", .kind = .kw_union },
+.{ .word = "unreachable", .kind = .kw_unreachable },
+.{ .word = "as", .kind = .kw_as },
+.{ .word = "isize", .kind = .kw_isize },
+.{ .word = "usize", .kind = .kw_usize },
+.{ .word = "i128", .kind = .kw_i128 },
+.{ .word = "u128", .kind = .kw_u128 },
+.{ .word = "never", .kind = .kw_never },
+.{ .word = "dyn", .kind = .kw_dyn },
+.{ .word = "spawn", .kind = .kw_spawn },
+.{ .word = "async", .kind = .kw_async },
+.{ .word = "await", .kind = .kw_await },
+.{ .word = "where", .kind = .kw_where },
+};
+
+
 pub const Lexer = struct {
     src: []const u8,
     pos: u32,
@@ -588,22 +671,10 @@ pub const Lexer = struct {
     }
 
     // Static comptime string map for O(1) keyword lookups
-    const keyword_map = std.StaticStringMap(TokenKind).initComptime(&[_]struct { []const u8, TokenKind }{
-        .{ "fn", .kw_fn },                   .{ "let", .kw_let },       .{ "var", .kw_var },       .{ "mut", .kw_mut },           .{ "const", .kw_const },
-        .{ "struct", .kw_struct },           .{ "enum", .kw_enum },     .{ "trait", .kw_trait },   .{ "impl", .kw_impl },         .{ "loop", .kw_loop },
-        .{ "match", .kw_match },             .{ "if", .kw_if },         .{ "else", .kw_else },     .{ "while", .kw_while },       .{ "for", .kw_for },
-        .{ "unless", .kw_unless },           .{ "until", .kw_until },   .{ "guard", .kw_guard },   .{ "proc", .kw_fn },
-        .{ "in", .kw_in },                   .{ "return", .kw_return }, .{ "break", .kw_break },   .{ "continue", .kw_continue }, .{ "defer", .kw_defer },
-        .{ "pub", .kw_pub },                 .{ "mod", .kw_mod },       .{ "use", .kw_use },       .{ "import", .kw_import },     .{ "type", .kw_type },
-        .{ "extern", .kw_extern },           .{ "self", .kw_self },     .{ "true", .kw_true },     .{ "false", .kw_false },       .{ "null", .kw_null },
-        .{ "comptime", .kw_comptime },       .{ "try", .kw_try },       .{ "panic", .kw_panic },   .{ "elif", .kw_elif },         .{ "and", .and_and },
-        .{ "or", .pipe_pipe },               .{ "i8", .kw_i8 },         .{ "i16", .kw_i16 },       .{ "i32", .kw_i32 },           .{ "i64", .kw_i64 },
-        .{ "u8", .kw_u8 },                   .{ "u16", .kw_u16 },       .{ "u32", .kw_u32 },       .{ "u64", .kw_u64 },           .{ "f32", .kw_f32 },
-        .{ "f64", .kw_f64 },                 .{ "bool", .kw_bool },     .{ "string", .kw_string }, .{ "void", .kw_void },         .{ "unsafe", .kw_unsafe },
-        .{ "volatile", .kw_volatile },       .{ "asm", .kw_asm },       .{ "align", .kw_align },   .{ "packed", .kw_packed },     .{ "union", .kw_union },
-        .{ "unreachable", .kw_unreachable }, .{ "as", .kw_as },         .{ "isize", .kw_isize },   .{ "usize", .kw_usize },       .{ "i128", .kw_i128 },
-        .{ "u128", .kw_u128 },               .{ "never", .kw_never },   .{ "dyn", .kw_dyn },       .{ "spawn", .kw_spawn },       .{ "async", .kw_async },
-        .{ "await", .kw_await },             .{ "where", .kw_where },
+    const keyword_map = std.StaticStringMap(TokenKind).initComptime(blk: {
+        var tuples: [keyword_entries.len]struct { []const u8, TokenKind } = undefined;
+        for (keyword_entries, 0..) |e, i| tuples[i] = .{ e.word, e.kind };
+        break :blk tuples;
     });
 
     fn keywordOrIdent(word: []const u8) TokenKind {

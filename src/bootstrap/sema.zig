@@ -307,14 +307,14 @@ const ConstEntry = struct {
     is_float: bool = false,
 };
 
-const BuiltinSpec = struct {
+pub const BuiltinSpec = struct {
     name: []const u8,
     min_args: u8,
     max_args: u8,
     ret: SemaType,
 };
 
-const builtins = [_]BuiltinSpec{
+pub const builtins = [_]BuiltinSpec{
     .{ .name = "@rotl", .min_args = 2, .max_args = 2, .ret = SemaType.i64_t },
     .{ .name = "@rotr", .min_args = 2, .max_args = 2, .ret = SemaType.i64_t },
     .{ .name = "@bit_reverse", .min_args = 1, .max_args = 1, .ret = SemaType.i64_t },
@@ -556,6 +556,7 @@ pub const Sema = struct {
     first_error: ?SemaError = null,
     cur_fn_is_pure: bool = false,
     cur_fn_node_idx: u32 = 0,
+    msg_buf: [diag_mod.MAX_MSG]u8 = undefined,
 
     const MAX_EXPR_DEPTH: u32 = 256;
 
@@ -578,13 +579,119 @@ pub const Sema = struct {
         return self.ast.nodeTextSrcFrom(start, len, source_id);
     }
 
+    /// Human- and machine-readable spelling of a semantic type. Used so that a
+    /// type error names *both* sides ("expected i64, found string"), which is
+    /// what a developer or an automated fixer needs to act on.
+    fn typeName(self: *const Sema, ty: SemaType) []const u8 {
+        return switch (ty) {
+            .int => |i| if (i.unsigned) switch (i.bits) {
+                8 => "u8",
+                16 => "u16",
+                32 => "u32",
+                else => "u64",
+            } else switch (i.bits) {
+                8 => "i8",
+                16 => "i16",
+                32 => "i32",
+                else => "i64",
+            },
+            .float => |bits| if (bits == 32) "f32" else "f64",
+            .bool => "bool",
+            .string => "string",
+            .ptr => "*T",
+            .ptr_struct => "*struct",
+            .ptr_float => "*f",
+            .ptr_byte => "*byte",
+            .null_t => "null",
+            .array => "[]T",
+            .fixed_array => "[N]T",
+            .struct_t => |i| if (i < self.ast.struct_count)
+                self.srcText(self.ast.struct_defs[i].name_start, self.ast.struct_defs[i].name_len, self.ast.struct_defs[i].source_id)
+            else
+                "struct",
+            .enum_t => |i| if (i < self.ast.enum_count)
+                self.srcText(self.ast.enum_defs[i].name_start, self.ast.enum_defs[i].name_len, self.ast.enum_defs[i].source_id)
+            else
+                "enum",
+            .fn_t => "fn",
+            .tuple_t => "tuple",
+            .dyn_trait => "dyn Trait",
+            .map_t => "map",
+            .chan_t => "chan",
+            .void => "void",
+            .never => "never",
+            .unknown => "unknown",
+        };
+    }
+
     fn fail(self: *Sema, err: SemaError, line: u32, col: u32, span_len: u32, comptime fmt: []const u8, args: anytype) void {
         self.failAt(err, 0, line, col, span_len, fmt, args);
     }
 
+    /// Stable diagnostic code for a semantic error kind. Every error raised by
+    /// the type checker is addressable by code, which keeps the machine-readable
+    /// output (`--diagnostics=json`) contract stable even when wording changes.
+    fn codeFor(err: SemaError) diag_mod.Code {
+        return switch (err) {
+            error.UndefinedVariable => .sema_undefined_variable,
+            error.UndefinedFunctionCall => .sema_undefined_function,
+            error.UndefinedStruct => .sema_undefined_struct,
+            error.UnknownField => .sema_unknown_field,
+            error.DuplicateDeclaration => .sema_duplicate_declaration,
+            error.InvalidArgumentCount, error.TooManyArguments => .sema_argument_count,
+            error.LoopControlOutsideLoop => .sema_loop_control,
+            error.InvalidAssignmentTarget => .sema_invalid_assignment,
+            error.InvalidAddressOf => .sema_invalid_address_of,
+            error.TooManySymbols => .sema_symbol_capacity,
+            error.TypeMismatch => .sema_type_mismatch,
+        };
+    }
+
+    /// Attaches the conventional machine hint for an error kind: what the
+    /// consumer most likely has to change. Detailed call sites may override it
+    /// with `helpAt`.
+    fn defaultExpectKind(err: SemaError) []const u8 {
+        return switch (err) {
+            error.UndefinedVariable => "identifier",
+            error.UndefinedFunctionCall => "function",
+            error.UndefinedStruct => "struct",
+            error.UnknownField => "field",
+            error.DuplicateDeclaration => "unique_name",
+            error.InvalidArgumentCount, error.TooManyArguments => "argument_count",
+            error.LoopControlOutsideLoop => "loop",
+            error.InvalidAssignmentTarget => "assignable_location",
+            error.InvalidAddressOf => "addressable_expression",
+            error.TooManySymbols => "smaller_program",
+            error.TypeMismatch => "type",
+        };
+    }
+
+    /// Concrete, actionable fix for an error family, used when the call site
+    /// does not override it. Agents repair from this line rather than the prose.
+    fn defaultHelp(err: SemaError) []const u8 {
+        return switch (err) {
+            error.UndefinedVariable => "declare it first ('let name = ...'), or import the module that defines it",
+            error.UndefinedFunctionCall => "declare the function with 'fn', or import the module that defines it ('lir builtins' lists intrinsics)",
+            error.UndefinedStruct => "define the struct/type before use, or fix the spelling",
+            error.UnknownField => "use a field declared in the struct, or add it to the struct definition",
+            error.DuplicateDeclaration => "rename one declaration; to shadow deliberately, open a nested block",
+            error.InvalidArgumentCount, error.TooManyArguments => "match the declared parameter list (trailing parameters may have defaults)",
+            error.LoopControlOutsideLoop => "move 'break'/'continue' into a loop body",
+            error.InvalidAssignmentTarget => "assign to a variable, field, index or '*ptr'; immutable bindings need 'let mut'",
+            error.InvalidAddressOf => "take the address of a variable, field or index ('&x'), and declare it 'let mut' for '&mut'",
+            error.TooManySymbols => "split the program into modules to stay within the fixed compiler budgets",
+            error.TypeMismatch => "make both sides the same type, or convert explicitly with 'as'",
+        };
+    }
+
     fn failAt(self: *Sema, err: SemaError, source_id: u32, line: u32, col: u32, span_len: u32, comptime fmt: []const u8, args: anytype) void {
         if (self.first_error == null) self.first_error = err;
-        self.diag.addFmtAt(.err, source_id, line, col, span_len, fmt, args);
+        var buf: [diag_mod.MAX_MSG]u8 = undefined;
+        const message = std.fmt.bufPrint(&buf, fmt, args) catch buf[0..];
+        if (self.diag.push(codeFor(err), .err, source_id, line, col, span_len, message)) |_| {
+            self.diag.expectAt(self.diag.count - 1, defaultExpectKind(err), "");
+            self.diag.helpAt(self.diag.count - 1, defaultHelp(err));
+        }
     }
 
     fn checkCrossNamespaceConflict(self: *Sema, name: []const u8, allow_kind: enum { struct_k, enum_k, alias_k, const_k, fn_k }, source_id: u32, line: u32, col: u32) void {
@@ -803,6 +910,17 @@ pub const Sema = struct {
 
         const max_dist: usize = if (name.len <= 4) 2 else @min(@as(usize, 3), name.len / 2 + 1);
         return util.findSimilarName(name, cands[0..cand_count], max_dist);
+    }
+
+    /// Suggests a close builtin spelling when an unknown identifier looks like a
+    /// builtin (for example `printint` → `printInt`). Builtins are declared in
+    /// one table, so this stays correct as the table grows.
+    fn suggestBuiltin(self: *const Sema, name: []const u8) ?[]const u8 {
+        _ = self;
+        if (name.len < 3) return null;
+        var cands: [builtins.len][]const u8 = undefined;
+        for (builtins, 0..) |b, i| cands[i] = b.name;
+        return util.findSimilarName(name, cands[0..], 1);
     }
 
     fn suggestFunction(self: *const Sema, name: []const u8) ?[]const u8 {
@@ -1583,12 +1701,40 @@ pub const Sema = struct {
                 if (sig.param_count == 0 and owner > 0 and std.mem.eql(u8, self.text(p), "self")) {
                     if ((pn.flags & 1) != 0) sig.self_is_mut = true;
                     if ((pn.flags & 2) != 0) sig.self_is_ref = true;
+
                 }
                 sig.param_count += 1;
             }
             self.fns[self.fn_count] = sig;
             self.fn_count += 1;
         }
+    }
+
+    /// Trait parameters must line up exactly; `self` keeps its declared
+    /// mutability so `self` vs `self: *mut Self` is a mismatch.
+    /// The receiver must use exactly the convention the trait declares; other
+    /// parameters must line up in both directions.
+    /// Checks only the receiver convention; the concrete struct identity is
+    /// already fixed by `impl Trait for S`.
+    fn traitReceiverMatches(impl_fn: FnSig, want_self: parser_mod.SelfConvention) bool {
+        const have = impl_fn.param_types[0];
+        switch (want_self) {
+            // `self` / `self: S`: value receiver, or a read-only pointer copy.
+            .by_value => return have == .struct_t or (have == .ptr_struct and !impl_fn.self_is_mut),
+            .ptr_mut => return have == .ptr_struct and impl_fn.self_is_mut,
+            .ptr_ref => return have == .ptr_struct and !impl_fn.self_is_mut,
+            .none => return true,
+        }
+    }
+
+    fn traitTypeMatches(self: *const Sema, want: SemaType, impl_fn: FnSig, param_index: usize, want_self: parser_mod.SelfConvention) bool {
+        _ = self;
+        const have = impl_fn.param_types[param_index];
+        if (param_index == 0 and want_self != .none) return traitReceiverMatches(impl_fn, want_self);
+        if (have == .ptr_struct or want == .ptr_struct) {
+            return have == .ptr_struct and want == .ptr_struct and have.ptr_struct == want.ptr_struct;
+        }
+        return have.compatibleWith(want) and want.compatibleWith(have);
     }
 
     fn checkTraits(self: *Sema) void {
@@ -1603,8 +1749,36 @@ pub const Sema = struct {
             for (0..td.method_count) |mi| {
                 const tm = td.methods[mi];
                 const mname = self.srcText(tm.name.start, tm.name.len, tm.name.source_id);
-                if (self.findFn(mname, imp.struct_idx + 1) == null) {
+                const impl_fn = self.findFn(mname, imp.struct_idx + 1) orelse {
                     self.failAt(error.UndefinedFunctionCall, sd.source_id, sd.line, 1, @intCast(@max(mname.len, 1)), "impl '{s}' for '{s}' is missing required method '{s}'", .{ tname, sname, mname });
+                    continue;
+                };
+                // The implementation must match the trait's declaration, in both
+                // directions: a differing signature would dispatch through the
+                // trait but be called with the wrong ABI/count.
+                if (impl_fn.param_count != tm.param_count) {
+                    self.failAt(error.InvalidArgumentCount, sd.source_id, impl_fn.line, 1, @intCast(@max(mname.len, 1)), "method '{s}' in impl '{s}' for '{s}' takes {d} parameter(s) but the trait declares {d}", .{ mname, tname, sname, impl_fn.param_count, tm.param_count });
+                    self.diag.helpAt(self.diag.count - 1, "match the trait's parameter list exactly ('self' counts as the first parameter)");
+                    continue;
+                }
+                var mismatch: ?u8 = null;
+                for (0..tm.param_count) |pi| {
+                    const want = SemaType.fromTypeTag(tm.param_tags[pi], tm.param_extras[pi], tm.param_elems[pi]);
+                    if (!self.traitTypeMatches(want, impl_fn, pi, tm.self_tag)) {
+                        mismatch = @intCast(pi);
+                        break;
+                    }
+                }
+                if (mismatch == null) {
+                    const want_ret = SemaType.fromTypeTag(tm.ret_tag, tm.ret_extra, tm.ret_elem);
+                    if (!(impl_fn.ret_type.compatibleWith(want_ret) or want_ret.compatibleWith(impl_fn.ret_type)) or impl_fn.ret_type == .unknown or want_ret == .unknown) {
+                        self.failAt(error.TypeMismatch, sd.source_id, impl_fn.line, 1, @intCast(@max(mname.len, 1)), "method '{s}' in impl '{s}' for '{s}' returns a type the trait does not declare", .{ mname, tname, sname });
+                        self.diag.helpAt(self.diag.count - 1, "the return type must be identical to the one in the trait declaration");
+                    }
+                } else {
+                    const pi: usize = mismatch.?;
+                    self.failAt(error.TypeMismatch, sd.source_id, impl_fn.line, 1, @intCast(@max(mname.len, 1)), "parameter {d} of method '{s}' in impl '{s}' for '{s}' does not match the trait declaration", .{ pi + 1, mname, tname, sname });
+                    self.diag.helpAt(self.diag.count - 1, "trait methods are called through dynamic dispatch, so parameter types must match exactly");
                 }
             }
         }
@@ -2259,7 +2433,13 @@ pub const Sema = struct {
                 if (n.type_tag != .none) {
                     const ann = SemaType.fromTypeTag(n.type_tag, n.extra, n.elem_type);
                     if (n.child0 != 0 and !self.isExprCompatible(ann, ty, n.child0)) {
-                        self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, n.text_len, "initializer type is incompatible with annotation on '{s}'", .{var_name});
+                        const want = self.typeName(ann);
+                        const found = self.typeName(ty);
+                        if (self.diag.push(.sema_type_mismatch, .err, n.source_id, n.line, n.col, n.text_len, std.fmt.bufPrint(&self.msg_buf, "annotation on '{s}' is '{s}' but the initializer has type '{s}'", .{ var_name, want, found }) catch "type mismatch")) |_| {
+                            self.diag.expectAt(self.diag.count - 1, "type", want);
+                            self.diag.helpFmtAt(self.diag.count - 1, "make the initializer a '{s}', or annotate the variable as '{s}', or add 'as {s}'", .{ want, found, want });
+                        }
+                        if (self.first_error == null) self.first_error = error.TypeMismatch;
                     }
                     self.tagTraitImplIfDyn(ann, ty, n.child0);
                     ty = ann;
@@ -2713,6 +2893,7 @@ pub const Sema = struct {
                 const cond_ty = self.analyzeExpr(n.child0);
                 if (cond_ty != .bool and cond_ty != .unknown and cond_ty != .never) {
                     self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, 2, "if condition must be a bool", .{});
+                    self.diag.helpAt(self.diag.count - 1, "compare instead of testing truthiness: 'if x != 0 { ... }'");
                 }
                 const saved_vc = self.var_count;
                 var pre_states: [512]ResState = undefined;
@@ -2751,6 +2932,7 @@ pub const Sema = struct {
                 const cond_ty = self.analyzeExpr(n.child0);
                 if (cond_ty != .bool and cond_ty != .unknown and cond_ty != .never) {
                     self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, 5, "while condition must be a bool", .{});
+                    self.diag.helpAt(self.diag.count - 1, "write the comparison explicitly: 'while i < n { ... }'");
                 }
                 self.checkWhileSpinSafety(stmt_idx);
                 const pre_vc = self.var_count;
@@ -3202,6 +3384,11 @@ pub const Sema = struct {
                 }
                 if (self.suggestIdentifier(name)) |sugg| {
                     self.failAt(error.UndefinedVariable, n.source_id, n.line, n.col, n.text_len, "use of undeclared identifier '{s}'; did you mean '{s}'?", .{ name, sugg });
+                    self.diag.expectAt(self.diag.count - 1, "identifier", sugg);
+                } else if (self.suggestBuiltin(name)) |sugg| {
+                    // `printInt` was used without `import core`: name the module.
+                    self.failAt(error.UndefinedVariable, n.source_id, n.line, n.col, n.text_len, "unknown builtin name '{s}'; did you mean '{s}'?", .{ name, sugg });
+                    self.diag.expectAt(self.diag.count - 1, "builtin", sugg);
                 } else {
                     self.failAt(error.UndefinedVariable, n.source_id, n.line, n.col, n.text_len, "use of undeclared identifier '{s}'", .{name});
                 }
@@ -3462,6 +3649,7 @@ pub const Sema = struct {
                         const guard_ty = self.analyzeExpr(self.ast.nodes[arm].extra);
                         if (guard_ty != .bool and guard_ty != .never and guard_ty != .unknown) {
                             self.failAt(error.TypeMismatch, n.source_id, self.ast.nodes[arm].line, self.ast.nodes[arm].col, 1, "match guard must be bool", .{});
+                            self.diag.helpAt(self.diag.count - 1, "'if' after the pattern needs a boolean expression, e.g. 'Shape::Square(s) if s > 0 =>'");
                         }
                     }
                     const arm_body = self.ast.nodes[arm].child1;
@@ -3485,6 +3673,7 @@ pub const Sema = struct {
                     if (!arm_exits and arm_ty != .never) {
                         if (result_ty == .unknown) result_ty = arm_ty else if (!self.isExprCompatible(result_ty, arm_ty, arm_body)) {
                             self.failAt(error.TypeMismatch, n.source_id, self.ast.nodes[arm].line, self.ast.nodes[arm].col, 1, "match arms have incompatible result types", .{});
+                            self.diag.helpAt(self.diag.count - 1, "every arm must yield the same type; wrap differing arms with 'as' or return a tuple");
                         }
                     }
                 }
@@ -3512,6 +3701,7 @@ pub const Sema = struct {
                     if (!def_exits and def_ty != .never) {
                         if (result_ty == .unknown) result_ty = def_ty else if (!self.isExprCompatible(result_ty, def_ty, n.child2)) {
                             self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, 5, "match arms have incompatible result types", .{});
+                            self.diag.helpAt(self.diag.count - 1, "every arm must yield the same type; wrap differing arms with 'as' or return a tuple");
                         }
                     }
                 }
@@ -3597,6 +3787,7 @@ pub const Sema = struct {
                 const cond_ty = self.analyzeExpr(n.child0);
                 if (cond_ty != .bool and cond_ty != .unknown and cond_ty != .never) {
                     self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, 2, "if condition must be a bool", .{});
+                    self.diag.helpAt(self.diag.count - 1, "compare instead of testing truthiness: 'if x != 0 { ... }'");
                 }
                 if (n.child2 == 0) {
                     self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, 2, "if expression requires an 'else' branch", .{});
@@ -3890,6 +4081,7 @@ pub const Sema = struct {
                 const pty = self.analyzeExpr(n.child0);
                 if (!pty.isPointer() and pty != .unknown and pty != .never) {
                     self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, 1, "cannot dereference non-pointer value", .{});
+                    self.diag.helpAt(self.diag.count - 1, "only '*T'/'*mut T' values dereference; take an address with '&x' or allocate with '@malloc'");
                 }
                 self.checkConstPtrValid(n.child0, false, "dereference");
                 self.checkHeapBounds(n.child0, 8, idx);
@@ -4635,6 +4827,7 @@ pub const Sema = struct {
                         {
                             if (!arg_types[0].isPointer() and arg_types[0] != .unknown and arg_types[0] != .never) {
                                 self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, fn_node.text_len, "'{s}' expects a pointer argument", .{cname});
+                                self.diag.helpAt(self.diag.count - 1, "pass a pointer value ('&x', '*T' or the result of '@malloc'/'@array_new')");
                             }
                             self.checkConstPtrValid(arg_nodes[0], false, cname);
                             self.checkHeapBounds(arg_nodes[0], 1, idx);
@@ -4648,6 +4841,7 @@ pub const Sema = struct {
                         } else if ((std.mem.eql(u8, cname, "@read_u32") or std.mem.eql(u8, cname, "@write_u32")) and argc >= 1) {
                             if (!arg_types[0].isPointer() and arg_types[0] != .unknown and arg_types[0] != .never) {
                                 self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, fn_node.text_len, "'{s}' expects a pointer argument", .{cname});
+                                self.diag.helpAt(self.diag.count - 1, "pass a pointer value ('&x', '*T' or the result of '@malloc'/'@array_new')");
                             }
                             self.checkConstPtrValid(arg_nodes[0], false, cname);
                             self.checkHeapBounds(arg_nodes[0], 4, idx);
@@ -4661,6 +4855,7 @@ pub const Sema = struct {
                         } else if ((std.mem.eql(u8, cname, "@read_u64") or std.mem.eql(u8, cname, "@write_u64")) and argc >= 1) {
                             if (!arg_types[0].isPointer() and arg_types[0] != .unknown and arg_types[0] != .never) {
                                 self.failAt(error.TypeMismatch, n.source_id, n.line, n.col, fn_node.text_len, "'{s}' expects a pointer argument", .{cname});
+                                self.diag.helpAt(self.diag.count - 1, "pass a pointer value ('&x', '*T' or the result of '@malloc'/'@array_new')");
                             }
                             self.checkConstPtrValid(arg_nodes[0], false, cname);
                             self.checkHeapBounds(arg_nodes[0], 8, idx);
@@ -4927,8 +5122,15 @@ pub const Sema = struct {
 
                     if (self.suggestFunction(cname)) |sugg| {
                         self.failAt(error.UndefinedFunctionCall, fn_node.source_id, fn_node.line, fn_node.col, fn_node.text_len, "call to undefined function '{s}'; did you mean '{s}'?", .{ cname, sugg });
+                        self.diag.expectAt(self.diag.count - 1, "function", sugg);
+                    } else if (self.suggestBuiltin(cname)) |sugg| {
+                        // Builtins live in a fixed table; an exact-but-differently
+                        // spelled name is by far the most common mistake.
+                        self.failAt(error.UndefinedFunctionCall, fn_node.source_id, fn_node.line, fn_node.col, fn_node.text_len, "call to unknown builtin '{s}'; did you mean '{s}'?", .{ cname, sugg });
+                        self.diag.expectAt(self.diag.count - 1, "builtin", sugg);
                     } else {
                         self.failAt(error.UndefinedFunctionCall, fn_node.source_id, fn_node.line, fn_node.col, fn_node.text_len, "call to undefined function '{s}'", .{cname});
+                        self.diag.helpAt(self.diag.count - 1, "declare the function with 'fn', or import the module that defines it");
                     }
                     break :blk .unknown;
                 } else {

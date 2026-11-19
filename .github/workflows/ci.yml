@@ -66,6 +66,13 @@ jobs:
             exit 1
           fi
 
+      - name: Generated docs are up to date
+        run: |
+          ./zig-out/bin/lir lang --markdown > /tmp/LANGUAGE_REFERENCE.md
+          diff -u docs/LANGUAGE_REFERENCE.md /tmp/LANGUAGE_REFERENCE.md
+          ./zig-out/bin/lir lang --cheatsheet > /tmp/CHEATSHEET.md
+          diff -u docs/CHEATSHEET.md /tmp/CHEATSHEET.md
+
       - name: Setup Node for WASI execution tests
         uses: actions/setup-node@v4
         with:
@@ -85,6 +92,9 @@ jobs:
 
       - name: Manifest project workflow tests
         run: python3 tests/project_test.py ./zig-out/bin/lir
+
+      - name: AI/tooling machine-contract tests
+        run: python3 tests/ai_test.py ./zig-out/bin/lir
 
       - name: Browser Wasm host conformance and execution
         run: python3 tests/browser_test.py ./zig-out/bin/lir

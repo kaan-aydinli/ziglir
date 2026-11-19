@@ -1,0 +1,48 @@
+// Shared helpers for the math workloads in this directory.
+//
+// Soundness note: every modular routine here assumes a modulus below 2^31.
+// With 0 <= a, b < m < 2^31 the product a*b is below 2^62, so a single signed
+// 64-bit multiply followed by `%` is exact and cannot wrap. Wider moduli would
+// need the 64x64 -> 128 path, which is deliberately out of scope for this
+// comparison; the workloads below never use one.
+
+fn _mm_mulmod(a: i64, b: i64, m: i64) -> i64 {
+    return (a * b) % m
+}
+
+fn _mm_powmod(base: i64, exp: i64, m: i64) -> i64 {
+    var b = base % m
+    var e = exp
+    var acc: i64 = 1
+    while e > 0 {
+        if e % 2 == 1 {
+            acc = (acc * b) % m
+        }
+        b = (b * b) % m
+        e = e >> 1
+    }
+    return acc
+}
+
+fn _mm_isqrt(n: i64) -> i64 {
+    if n < 2 { return n }
+    var x = n
+    var y = (x + 1) / 2
+    while y < x {
+        x = y
+        y = (x + n / x) / 2
+    }
+    return x
+}
+
+fn _mm_gcd(a: i64, b: i64) -> i64 {
+    var x = a
+    var y = b
+    while y != 0 {
+        let t = x % y
+        x = y
+        y = t
+    }
+    if x < 0 { return -x }
+    return x
+}

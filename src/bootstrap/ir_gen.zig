@@ -36,6 +36,9 @@ pub const IRGenError = error{
     UndefinedFunctionCall,
     CapacityOverflow,
     InvalidConstruct,
+    /// The program uses a construct the selected target cannot provide.
+    Unsupported,
+    MissingMain,
 };
 
 pub const IRGen = struct {
@@ -96,10 +99,21 @@ pub const IRGen = struct {
         self.recordErrorAt(err, 0, line, col, fmt, args);
     }
 
+    /// Stable diagnostic code for the lowering failures a user can trigger.
+    fn codeFor(err: IRGenError) diag_mod.Code {
+        return switch (err) {
+            error.Unsupported => .target_missing_builtin,
+            error.MissingMain => .driver_missing_main,
+            else => .internal,
+        };
+    }
+
     fn recordErrorAt(self: *IRGen, err: IRGenError, source_id: u32, line: u32, col: u32, comptime fmt: []const u8, args: anytype) void {
         if (self.first_error == null) self.first_error = err;
         if (self.diag) |d| {
-            d.addFmtAt(.err, source_id, line, col, 1, fmt, args);
+            var buf: [192]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, fmt, args) catch buf[0..];
+            _ = d.push(codeFor(err), .err, source_id, line, col, 1, msg);
         } else {
             util.printErr("IR error at line ");
             util.printErrUsize(line);
@@ -3549,6 +3563,22 @@ pub const IRGen = struct {
                 .call_time_ns
             else
                 null;
+
+            // Target capability gate: the wasm32-wasi runtime provides no OS
+            // threads or blocking channel primitives. Fail closed with an
+            // explicit diagnostic instead of emitting a program that traps.
+            if (self.target.os == .wasi and builtin_op != null) {
+                const needs_os_threads = switch (builtin_op.?) {
+                    .call_thread_create, .call_thread_join, .call_chan_new, .call_chan_send, .call_chan_recv, .call_chan_close => true,
+                    else => false,
+                };
+                if (needs_os_threads) {
+                    self.recordErrorAt(error.Unsupported, name_node.source_id, name_node.line, name_node.col, "'{s}' is not available for target wasm32-wasi (no OS threads or blocking channels); use --target=x86_64-linux, the C11 backend for another host thread target, or --backend=vm", .{name});
+                    const zero = self.allocVreg();
+                    self.emit(.{ .op = .const_int, .dest = zero, .imm = 0 });
+                    return 0;
+                }
+            }
 
             if (builtin_op) |bop| {
                 if (bop == .call_assert_eq and ac >= 2) {

@@ -1,0 +1,13 @@
+import "../src/ledger.lir"
+fn main() -> i64 {
+    let o = block_new(24, 1, 24, 5)
+    let hv = @malloc(192)
+    let t = @malloc(8)
+    @write_u64(@ptr_add(hv, 0), ONE as u64)
+    let eta = div(from_int(9), from_int(10))
+    var i: i64 = 0
+    while i < 100000 { forward(o, hv) learn(o, hv, t, eta)  i = i + 1 }
+    printInt(i)
+    println("")
+    return 0
+}

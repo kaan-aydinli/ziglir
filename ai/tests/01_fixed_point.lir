@@ -1,0 +1,23 @@
+// SEL test 01 — fixed.lir'in her fonksiyonu, bilinen değerlerle.
+// Beklenen: ai/tests/01_fixed_point.expected
+import "../src/fixed.lir"
+
+fn main() -> i64 {
+    printInt(to_int(sat_add(ONE, ONE)))                  // 2    (1+1)
+    printInt(to_int(mul(ONE + HALF, ONE * 2)))           // 3    (1.5*2)
+    printInt(to_int(div(from_int(7), from_int(2))))      // 3    (7/2=3.5)
+    printInt(to_int(sqrt(from_int(4))))                  // 2    (sqrt 4)
+    printInt(to_int(sqrt(from_int(2))))                  // 1    (sqrt 2)
+    var f = from_int(1)
+    var i: i64 = 2
+    while i <= 5 {
+        f = mul(f, from_int(i))
+        i = i + 1
+    }
+    printInt(to_int(f))                                  // 120  (5!)
+    printInt(to_int(mul_sat(from_int(100000), from_int(100000)))) // 2147483647 (doygun)
+    printInt(sat_add(MAXV, MAXV) == MAXV)                // 1    (doygunluk)
+    printInt(to_int(mul(from_int(0) - from_int(2), from_int(3)))) // -6
+    println("")
+    return 0
+}

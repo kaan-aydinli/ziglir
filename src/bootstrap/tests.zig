@@ -3976,3 +3976,314 @@ test "stdlib: expanded str and collections (trim, capitalize, join, queue, stack
     try std.testing.expectEqual(@as(u8, 0), run_res.exit_code);
     try std.testing.expectEqualStrings("hi\nhi\nHello world\na-b\nq_full\n42\n99\nq_empty\n3\n", run_res.stdout);
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// Language catalogue conformance
+//
+// `lir lang` / `lir builtins` describe the implemented language surface. These
+// tests compile every documented example so the catalogue cannot drift away
+// from the compiler, and verify that every `.unsupported` entry is indeed
+// rejected. This is the guard that makes the AI-facing reference trustworthy.
+// ════════════════════════════════════════════════════════════════════════════
+
+const langref = @import("langref.zig");
+
+test "langref: documented examples of every supported feature compile" {
+    var total: u32 = 0;
+    for (langref.features) |f| {
+        if (f.status == .unsupported or f.example.len == 0) continue;
+        var compiler = main.Compiler.init(f.example, "<langref>");
+        compiler.quiet = true;
+        compiler.test_mode = std.mem.indexOf(u8, f.example, "#[test]") != null;
+        _ = compiler.compile() catch |err| {
+            std.debug.print("\nlangref feature '{s}' example failed to compile: {s}\n", .{ f.name, @errorName(err) });
+            return err;
+        };
+        total += 1;
+    }
+    try std.testing.expect(total >= 50);
+}
+
+test "cmf: the example field is accepted and every bloom variant verifies" {
+    const cmf = @import("cmf.zig");
+    const source =
+        \\morph Cell =<< u8 u16 u32 u64 i64 >>=
+        \\field ledger: u64[1024] ?exclusive
+        \\claim exclusive_writer over ledger check uniqueness
+        \\
+        \\bloom narrow: morph Cell {
+        \\fn main() -> i64 {
+        \\    let cell: @witness = 200
+        \\    return cell as i64
+        \\}
+        \\}
+    ;
+    const ir = cmf.parseField(source);
+    try std.testing.expectEqual(@as(usize, 0), ir.violation_count);
+    try std.testing.expectEqual(@as(usize, 5), ir.variant_count);
+    for (ir.variants[0..ir.variant_count]) |v| {
+        try std.testing.expect(v.verified);
+        try std.testing.expect(!v.vacuous);
+    }
+}
+
+test "cmf: an unverifiable witness is refused and never becomes a variant" {
+    const cmf = @import("cmf.zig");
+    const source =
+        \\morph Cell =<< u8 bool >>=
+        \\bloom narrow: morph Cell {
+        \\fn main() -> i64 {
+        \\    let cell: @witness = 200
+        \\    return 7
+        \\}
+        \\}
+    ;
+    const ir = cmf.parseField(source);
+    try std.testing.expect(ir.violation_count > 0);
+    try std.testing.expectEqual(@as(usize, 2), ir.variant_count);
+    var verified: usize = 0;
+    for (ir.variants[0..ir.variant_count]) |v| {
+        if (v.verified) verified += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), verified);
+}
+
+test "cmf: nested blocks and one-line bodies are extracted verbatim" {
+    const cmf = @import("cmf.zig");
+    const source =
+        \\morph Cell =<< u8 u16 >>=
+        \\bloom nested: morph Cell {
+        \\fn main() -> i64 {
+        \\    var total: i64 = 0
+        \\    if true {
+        \\        let cell: @witness = 1
+        \\        total = cell as i64
+        \\    }
+        \\    return total
+        \\}
+        \\}
+    ;
+    const ir = cmf.parseField(source);
+    try std.testing.expectEqual(@as(usize, 1), ir.body_count);
+    for (ir.variants[0..ir.variant_count]) |v| {
+        try std.testing.expect(v.verified);
+        try std.testing.expect(!v.vacuous);
+    }
+}
+
+test "cmf: HYPERION surface declares offload machines without claiming them" {
+    const cmf = @import("cmf.zig");
+    const source =
+        \\morph Cell =<< u8 u16 >>=
+        \\field ledger: u64[104] ?exclusive ?contiguous
+        \\lens back: reverse(ledger) as backwards
+        \\lens pivot: transpose(ledger*104) as pivot
+        \\machine local: local implemented
+        \\machine pim: pim planned
+        \\telemetry cache: every 100tick
+        \\tune narrow: morph Cell under compressible
+        \\claim writer over ledger check uniqueness
+        \\claim use over ledger for 4tick runtime local
+        \\bloom narrow: morph Cell {
+        \\fn main() -> i64 {
+        \\    let cell: @witness = 7
+        \\    return cell as i64
+        \\}
+        \\}
+    ;
+    const ir = cmf.parseField(source);
+    try std.testing.expectEqual(@as(usize, 0), ir.violation_count);
+    try std.testing.expectEqual(@as(usize, 1), ir.morph_count);
+    try std.testing.expectEqual(@as(usize, 1), ir.field_count);
+    try std.testing.expectEqual(@as(usize, 2), ir.lens_count);
+    // A planned machine never becomes an implemented one.
+    const pim = ir.machineNamed("pim") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!pim.implemented);
+    // Element cost is reported, not assumed: the transpose view is strided.
+    const pivot = ir.lensNamed("pivot") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(cmf.LensCost.strided, pivot.cost);
+    const back = ir.lensNamed("backwards") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(cmf.LensCost.sequential, back.cost);
+    // Variants are measured, so the count of executed instances is exact.
+    try std.testing.expectEqual(@as(usize, 2), ir.variant_count);
+    for (ir.variants[0..ir.variant_count]) |v| {
+        try std.testing.expect(v.verified);
+        try std.testing.expect(v.ran);
+        try std.testing.expect(v.instructions > 0);
+    }
+}
+
+test "cmf: a claim on a planned machine is refused, not downgraded" {
+    const cmf = @import("cmf.zig");
+    const source =
+        \\machine oram: oram planned
+        \\field ledger: u64[8]
+        \\claim secret over ledger for 4tick runtime oram
+    ;
+    const ir = cmf.parseField(source);
+    try std.testing.expect(ir.violation_count > 0);
+    try std.testing.expect(std.mem.indexOf(u8, ir.violations[0].text(), "not implemented") != null);
+}
+
+test "langref: unsupported entries are rejected with a diagnostic" {
+    // Non-compiling spellings that a code generator might otherwise try.
+    const probes = [_]struct { src: []const u8, why: []const u8 }{
+        .{ .src = "fn main() -> i64 { return 5 |> 3 }", .why = "pipe_operator" },
+        .{ .src = "async fn f() -> i64 { return 1 }\nfn main() -> i64 { return 0 }", .why = "async_await" },
+        .{ .src = "extern fn puts(s: string) -> i64\nfn main() -> i64 { return 0 }", .why = "extern_ffi" },
+        .{ .src = "mod foo\nfn main() -> i64 { return 0 }", .why = "module_file" },
+        .{ .src = "fn main() -> i64 { unsafe { } return 0 }", .why = "unsafe_block" },
+        .{ .src = "fn main() -> i64 { asm(\"nop\") return 0 }", .why = "asm_block" },
+    };
+    for (probes) |probe| {
+        var compiler = main.Compiler.init(probe.src, "<langref-negative>");
+        compiler.quiet = true;
+        const result = compiler.check();
+        if (result) |_| {
+            std.debug.print("\nlangref negative probe '{s}' unexpectedly compiled\n", .{probe.why});
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
+}
+
+test "langref: builtin catalogue matches the semantic analyzer" {
+    // Every documented builtin must exist in the sema table, otherwise the
+    // reference would advertise something that cannot type-check.
+    for (langref.builtins) |b| {
+        if (b.keyword_form or b.library_form) continue;
+        const spec = main.sema_lookupBuiltin(b.name) orelse {
+            std.debug.print("\nlangref documents unknown builtin '{s}'\n", .{b.name});
+            return error.TestUnexpectedResult;
+        };
+        _ = spec;
+    }
+}
+
+
+// --- bounds-check hoisting and leaf-closure inlining ---------------------
+//
+// These two passes are what make int arithmetic in loops competitive: without
+// them every @read_u64 carries a ~22-instruction range test and every call to a
+// Q32.32 helper stays a real call. Both fail *silently* (correct code, slower
+// code), so they get direct assertions on the IR instead of only end-to-end
+// timing.
+
+const ir_opt = @import("ir_opt.zig");
+
+fn buildHoistLoopModule(module: *ir_mod.IRModule) void {
+    module.init();
+    // fn f(ptr, n) { while (i < n) { read_u64(ptr + i*8) } }
+    //
+    //   blk0 entry/preheader : ptr_add ... ; cond_jump(h=1, exit=3)
+    //   blk1 h (preheader)   : cond_jump(body=2, exit=3)
+    //   blk2 body            : read_u64 ; jump h
+    //   blk3 exit            : ret
+    var f = &module.fns[0];
+    ir_mod.IRModule.initFnSlot(f, 0, 1, 0, 0, 0);
+    f.block_count = 4;
+    f.vreg_count = 12;
+
+    f.blocks[0].label = 0;
+    f.blocks[0].inst_count = 2;
+    // The base pointer must have a definition outside the loop, exactly as the
+    // real prologue provides it.
+    f.blocks[0].insts[0] = .{ .op = .copy, .dest = 1, .src1 = 20 };
+    f.blocks[0].insts[1] = .{ .op = .jump, .target_block = 1 };
+
+    f.blocks[1].label = 1;
+    f.blocks[1].inst_count = 1;
+    f.blocks[1].insts[0] = .{ .op = .cond_jump, .src1 = 6, .target_block = 2, .alt_block = 3 };
+
+    f.blocks[2].label = 2;
+    f.blocks[2].inst_count = 3;
+    f.blocks[2].insts[0] = .{ .op = .call_ptr_add, .dest = 7, .args = .{ 1, 8, 0, 0, 0, 0, 0, 0 }, .arg_count = 2 };
+    f.blocks[2].insts[1] = .{ .op = .call_read_u64, .dest = 9, .args = .{ 7, 0, 0, 0, 0, 0, 0, 0 }, .arg_count = 1 };
+    f.blocks[2].insts[2] = .{ .op = .jump, .target_block = 1 };
+
+    f.blocks[3].label = 3;
+    f.blocks[3].inst_count = 1;
+    f.blocks[3].insts[0] = .{ .op = .ret };
+    module.fn_count = 1;
+}
+
+test "hoisting rewrites bulk accesses in a counted loop" {
+    const module = try std.testing.allocator.create(ir_mod.IRModule);
+    defer std.testing.allocator.destroy(module);
+    buildHoistLoopModule(module);
+
+    var stats = ir_opt.BoundsHoistStats{};
+    _ = ir_opt.hoistBoundsChecks(module, &stats);
+
+    try std.testing.expect(stats.accesses_rewritten > 0);
+    try std.testing.expect(module.fns[0].blocks[2].insts[1].unchecked_access);
+}
+
+test "hoisting marks nothing when a loop contains a call that may write" {
+    const module = try std.testing.allocator.create(ir_mod.IRModule);
+    defer std.testing.allocator.destroy(module);
+    buildHoistLoopModule(module);
+
+    // Give the module a callee that stores through a pointer, and call it from
+    // the loop body: the buffer could be reallocated or overwritten, so the
+    // guard must not be hoisted.
+    var g = &module.fns[1];
+    ir_mod.IRModule.initFnSlot(g, 1, 1, 0, 0, 0);
+    g.block_count = 1;
+    g.vreg_count = 4;
+    g.blocks[0].label = 0;
+    g.blocks[0].inst_count = 2;
+    g.blocks[0].insts[0] = .{ .op = .deref_store, .src1 = 1, .src2 = 2 };
+    g.blocks[0].insts[1] = .{ .op = .ret };
+    module.fn_count = 2;
+
+    // Insert the call *before* the loop's back edge: appending it after the
+    // `jump` would leave it as dead code and the test would pass for the
+    // wrong reason.
+    var body = &module.fns[0].blocks[2];
+    body.insts[3] = body.insts[2]; // move the back edge out of the way
+    body.insts[2] = .{ .op = .call, .dest = 0, .callee_fn_idx = 1, .arg_count = 0 };
+    body.inst_count = 4;
+
+    var stats = ir_opt.BoundsHoistStats{};
+    _ = ir_opt.hoistBoundsChecks(module, &stats);
+
+    try std.testing.expectEqual(@as(u32, 0), stats.accesses_rewritten);
+    try std.testing.expect(!module.fns[0].blocks[2].insts[1].unchecked_access);
+}
+
+test "a read-only callee does not block hoisting" {
+    // (Both fns deliberately keep name_len 1/name_start 0: the pass resolves
+    // callees by callee_fn_idx, not by name, so the names are irrelevant here.)
+    const module = try std.testing.allocator.create(ir_mod.IRModule);
+    defer std.testing.allocator.destroy(module);
+    buildHoistLoopModule(module);
+
+    // Same shape, but the callee only reads: it cannot touch the caller's
+    // buffer, so hoisting must still happen. This is the property that makes
+    // the training loops fast.
+    var g = &module.fns[1];
+    // Distinct name range: the synthetic module has one shared (empty) source,
+    // so both functions would otherwise look alike to anything that falls back
+    // to name matching.
+    ir_mod.IRModule.initFnSlot(g, 1, 1, 0, 0, 0);
+    g.block_count = 1;
+    g.vreg_count = 4;
+    g.blocks[0].label = 0;
+    g.blocks[0].inst_count = 2;
+    g.blocks[0].insts[0] = .{ .op = .call_read_u64, .dest = 3, .args = .{ 1, 0, 0, 0, 0, 0, 0, 0 }, .arg_count = 1 };
+    g.blocks[0].insts[1] = .{ .op = .ret };
+    module.fn_count = 2;
+
+    // Insert the call *before* the loop's back edge: appending it after the
+    // `jump` would leave it as dead code and the test would pass for the
+    // wrong reason.
+    var body = &module.fns[0].blocks[2];
+    body.insts[3] = body.insts[2]; // move the back edge out of the way
+    body.insts[2] = .{ .op = .call, .dest = 0, .callee_fn_idx = 1, .arg_count = 0 };
+    body.inst_count = 4;
+
+    var stats = ir_opt.BoundsHoistStats{};
+    _ = ir_opt.hoistBoundsChecks(module, &stats);
+
+    try std.testing.expect(stats.accesses_rewritten > 0);
+}

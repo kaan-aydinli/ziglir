@@ -1,0 +1,45 @@
+// SEL test 06 — kodlama (tokenizer YOK) ve kod imzası.
+//
+// Kanıtlanan: bir metin sürekli bir vektöre kodlanıyor, aynı metin aynı
+// vektörü veriyor, farklı metin farklı vektör veriyor.
+//
+// Beklenen: 1 1 0 1 1
+import "../src/codec.lir"
+
+fn main() -> i64 {
+    let d: i64 = 64
+    let va = @malloc(d * 8)
+    let vb = @malloc(d * 8)
+    let vc = @malloc(d * 8)
+
+    let s1: string = "fn main() { return 42 }"
+    let s2: string = "fn main() { return 42 }"
+    let s3: string = "struct Point { x: i64 }"
+    let n1: i64 = 23
+    let n3: i64 = 24
+
+    encode_bytes(s1 as *u8, n1, va, d)
+    encode_bytes(s2 as *u8, n1, vb, d)
+    encode_bytes(s3 as *u8, n3, vc, d)
+
+    // 1) aynı metin aynı vektör mü  (kosinüs == 1.0)
+    let same = cosine(va, vb, d)
+    printInt(same == ONE)
+
+    // 2) kendisiyle kosinüs 1.0
+    printInt(cosine(va, va, d) == ONE)
+
+    // 3) farklı metin daha düşük benzerlik vermeli
+    let diff = cosine(va, vc, d)
+    printInt(diff < same)
+
+    // 4) kod imzası: derinlik ve operatör sayısı
+    let sig = @malloc(48)
+    code_signature(s1 as *u8, n1, sig)
+    let maxd = @read_u64(sig) as i64
+    let ops  = @read_u64(@ptr_add(sig, 16)) as i64
+    printInt(maxd == 1)     // tek süslü parantez bloğu
+    printInt(ops == 0)      // bu metinde gerçek operatör yok
+    println("")
+    return 0
+}

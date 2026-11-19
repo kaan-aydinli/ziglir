@@ -1,0 +1,714 @@
+#!/usr/bin/env python3
+"""Machine-contract regression gate for AI/tooling integrations.
+
+Everything an automated consumer relies on is asserted here:
+
+* `lir lang --json` / `lir builtins --json` parse, are complete and internally
+  consistent (unique names, every builtin signature well formed).
+* Every `supported` catalogue example is a valid program (`lir check` passes)
+  and every `unsupported` entry really is rejected.
+* `lir check --json` keeps a single JSON object on stdout and emits
+  `lir.diagnostics.v1` on stderr with stable codes and `expect` metadata.
+* `lir build --json` describes the artifact.
+* `lir explain` resolves topics, aliases and diagnostic codes.
+* `lir init --ai` produces AGENTS.md + lir.agent.json that reference real
+  commands.
+
+Usage: python3 tests/ai_test.py [path/to/lir]
+"""
+import json
+import pathlib
+import subprocess
+import sys
+import tempfile
+import textwrap
+import unittest
+
+COMPILER = pathlib.Path(sys.argv.pop(1) if len(sys.argv) > 1 else "zig-out/bin/lir").resolve()
+
+
+def run(*args, cwd=None, ok=True):
+    result = subprocess.run([str(COMPILER), *args], cwd=cwd,
+                            capture_output=True, text=True, timeout=60)
+    if ok is True:
+        assert result.returncode == 0, f"{args} failed: {result.stderr}"
+    elif ok is False:
+        assert result.returncode != 0, f"{args} unexpectedly succeeded: {result.stdout}"
+    # ok=None: caller inspects the exit status itself
+    return result
+
+
+class CatalogueTests(unittest.TestCase):
+    def test_lang_json_contract(self):
+        doc = json.loads(run("lang", "--json").stdout)
+        self.assertEqual(doc["schema"], "lir.lang.v1")
+        self.assertEqual(doc["language"], "lir")
+        features = doc["features"]
+        self.assertGreaterEqual(len(features), 60)
+        names = [f["name"] for f in features]
+        self.assertEqual(len(names), len(set(names)), "duplicate feature names")
+        statuses = {f["status"] for f in features}
+        self.assertTrue(statuses <= {"supported", "partial", "legacy", "unsupported"})
+        for f in features:
+            for key in ("name", "status", "category", "syntax", "notes"):
+                self.assertIn(key, f, f"feature {f.get('name')} missing {key}")
+            if f["status"] == "supported":
+                self.assertIn("example", f, f"supported feature {f['name']} has no example")
+        # counts block must agree with the list
+        counted = {}
+        for f in features:
+            counted[f["status"]] = counted.get(f["status"], 0) + 1
+        for status, n in counted.items():
+            self.assertEqual(doc["counts"][status], n, status)
+
+    def test_unsupported_entries_document_what_to_avoid(self):
+        doc = json.loads(run("lang", "--json", "--status=unsupported").stdout)
+        self.assertGreaterEqual(len(doc["features"]), 5)
+        for f in doc["features"]:
+            self.assertIn("avoid", f, f"{f['name']} must name what not to write")
+            self.assertNotIn("example", f)
+
+    def test_every_supported_example_checks(self):
+        doc = json.loads(run("lang", "--json", "--status=supported").stdout)
+        with tempfile.TemporaryDirectory(prefix="lir-ai-") as temp:
+            for f in doc["features"]:
+                example = f.get("example")
+                if not example:
+                    continue
+                path = pathlib.Path(temp) / f"{f['name']}.lir"
+                path.write_text(example + "\n")
+                result = run("check", str(path), ok=None)
+                self.assertEqual(result.returncode, 0,
+                                 f"{f['name']} example rejected:\n{result.stderr}")
+
+    def test_unsupported_spellings_are_rejected(self):
+        probes = {
+            "pipe": "fn main() -> i64 { return 5 |> 3 }",
+            "async": "async fn f() -> i64 { return 1 }\nfn main() -> i64 { return 0 }",
+            "extern": "extern fn puts(s: string) -> i64\nfn main() -> i64 { return 0 }",
+            "mod": "mod foo\nfn main() -> i64 { return 0 }",
+            "unsafe": "fn main() -> i64 { unsafe { } return 0 }",
+            "asm": 'fn main() -> i64 { asm("nop") return 0 }',
+            "i128": "fn main() -> i64 { let x: i128 = 5 return 0 }",
+            "not_kw": "fn main() -> i64 { if not false { return 1 } return 0 }",
+            "nested_fn": "fn main() -> i64 { fn inner() -> i64 { return 1 } return inner() }",
+            "labelled": "fn main() -> i64 { 'outer: for i in 0..3 { break } return 0 }",
+            "index_pair": "fn main() -> i64 { let a = [1,2] for i, v in a { } return 0 }",
+            "pure_fn": "pure fn f(x: i64) -> i64 { return x }\nfn main() -> i64 { return 0 }",
+            "requires": "fn f(a: i64) -> i64 requires a > 0 { return a }\nfn main() -> i64 { return 0 }",
+            "println_num": "fn main() -> i64 { println(42) return 0 }",
+            "struct_field": "struct A { b: B }\nstruct B { v: i64 }\nfn main() -> i64 { return 0 }",
+            "nested_generic": "fn f() -> Option<Option<i64>> { return None }\nfn main() -> i64 { return 0 }",
+        }
+        with tempfile.TemporaryDirectory(prefix="lir-ai-neg-") as temp:
+            for name, source in probes.items():
+                path = pathlib.Path(temp) / f"{name}.lir"
+                path.write_text(source + "\n")
+                result = run("check", str(path), ok=None)
+                self.assertNotEqual(result.returncode, 0,
+                                    f"{name} unexpectedly compiled: {source}")
+
+    def test_every_stdlib_module_imports(self):
+        modules = ["core", "io", "os", "sys", "net", "crypto", "json", "math",
+                   "testing", "str", "algo", "collections", "hash", "fmt",
+                   "time", "http"]
+        with tempfile.TemporaryDirectory(prefix="lir-ai-std-") as temp:
+            for module in modules:
+                path = pathlib.Path(temp) / f"{module}.lir"
+                path.write_text(f"import {module}\nfn main() -> i64 {{ return 0 }}\n")
+                result = run("check", str(path), ok=None)
+                self.assertEqual(result.returncode, 0,
+                                 f"import {module} failed:\n{result.stderr}")
+
+    def test_unknown_module_is_a_hard_error_with_suggestion(self):
+        with tempfile.TemporaryDirectory(prefix="lir-ai-imp-") as temp:
+            path = pathlib.Path(temp) / "bad.lir"
+            path.write_text("import Str\nfn main() -> i64 { return 0 }\n")
+            result = run("check", str(path), "--json", ok=False)
+            diag = json.loads(result.stderr)
+            first = diag["diagnostics"][0]
+            self.assertEqual(first["code"], "LIR-E4004")
+            self.assertEqual(first["expect"], {"kind": "module", "value": "str"})
+
+    def test_keyword_list_is_published_and_accurate(self):
+        doc = json.loads(run("lang", "--json").stdout)
+        keywords = doc["keywords"]
+        self.assertGreaterEqual(len(keywords), 60)
+        self.assertEqual(len(keywords), len(set(keywords)))
+        for required in ("fn", "let", "mut", "match", "spawn", "comptime",
+                         "i128", "unsafe", "asm", "extern", "async", "await"):
+            self.assertIn(required, keywords)
+        only = json.loads(run("lang", "--keywords", "--json").stdout)
+        self.assertEqual(only["schema"], "lir.keywords.v1")
+        self.assertEqual(sorted(only["keywords"]), sorted(keywords))
+        self.assertEqual(only["count"], len(keywords))
+        short = run("lang", "--keywords", "--short").stdout.split()
+        self.assertEqual(sorted(short), sorted(keywords))
+        # No reserved word may be usable as an identifier.
+        with tempfile.TemporaryDirectory(prefix="lir-ai-kw-") as temp:
+            for word in keywords:
+                path = pathlib.Path(temp) / "kw.lir"
+                path.write_text(f"fn main() -> i64 {{ let {word} = 1 return 0 }}\n")
+                self.assertNotEqual(run("check", str(path), ok=None).returncode, 0,
+                                    f"reserved word '{word}' was accepted as an identifier")
+
+    def test_cheatsheet_is_generated_and_complete(self):
+        repo = COMPILER.parent.parent.parent
+        generated = run("lang", "--cheatsheet").stdout
+        # The checked-in copy must match the compiler (CI diffs it too).
+        checked_in = (repo / "docs" / "CHEATSHEET.md").read_text()
+        self.assertEqual(checked_in, generated,
+                         "docs/CHEATSHEET.md is stale: regenerate with 'lir lang --cheatsheet'")
+        doc = json.loads(run("lang", "--json").stdout)
+        for feature in doc["features"]:
+            self.assertIn(f"`{feature['name']}`", generated)
+        for keyword in doc["keywords"]:
+            self.assertIn(f"`{keyword}`", generated)
+        for builtin in json.loads(run("builtins", "--json").stdout)["builtins"]:
+            self.assertIn(f"`{builtin['name']}`", generated)
+
+    def test_builtins_json_contract(self):
+        doc = json.loads(run("builtins", "--json").stdout)
+        self.assertEqual(doc["schema"], "lir.builtins.v1")
+        names = [b["name"] for b in doc["builtins"]]
+        self.assertGreaterEqual(len(names), 120)
+        self.assertEqual(len(names), len(set(names)))
+        groups = {b["group"] for b in doc["builtins"]}
+        self.assertGreaterEqual(len(groups), 12)
+        for b in doc["builtins"]:
+            self.assertTrue(b["signature"].endswith("-> " + b["signature"].rsplit("-> ", 1)[-1]))
+            self.assertIn("->", b["signature"])
+            self.assertTrue(b["group"])
+        for required in ("print", "println", "printInt", "printlnFloat",
+                         "@array_new", "@array_push", "@map_get", "@string_len",
+                         "@malloc", "@thread_create", "@chan_new", "@sqrt",
+                         "@random_u64", "@syscall"):
+            self.assertIn(required, names)
+
+    def test_lang_selectors_and_filters(self):
+        for feature in ("fn", "closure", "match", "option", "closure"):
+            out = run("lang", feature).stdout
+            self.assertIn("status:", out)
+            self.assertIn("example:", out)
+        short = run("lang", "--short").stdout.splitlines()
+        self.assertTrue(all(len(line.split(" ")) == 3 for line in short))
+        only_supported = run("lang", "--short", "--status=supported").stdout.splitlines()
+        self.assertTrue(all(line.split(" ")[1] == "supported" for line in only_supported))
+
+
+class DiagnosticsContractTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="lir-ai-diag-")
+        self.addCleanup(self.temp.cleanup)
+        self.dir = pathlib.Path(self.temp.name)
+
+    def write(self, name, source):
+        path = self.dir / name
+        path.write_text(source)
+        return path
+
+    def test_check_ok_envelope(self):
+        good = self.write("ok.lir", "fn main() -> i64 { return 0 }\n")
+        result = run("check", str(good), "--json")
+        doc = json.loads(result.stdout)
+        self.assertEqual(doc["schema"], "lir.check.v1")
+        self.assertEqual(doc["status"], "ok")
+        self.assertEqual(doc["target"], "x86_64-linux")
+        self.assertEqual(result.stderr.strip(), "")
+
+    def test_error_envelopes_and_expect_metadata(self):
+        bad = self.write("bad.lir", "fn main() -> i64 { printint(3) return 0 }\n")
+        result = run("check", str(bad), "--json", ok=False)
+        # stdout: exactly one JSON object
+        out = json.loads(result.stdout)
+        self.assertEqual(out["schema"], "lir.check.v1")
+        self.assertEqual(out["status"], "error")
+        # stderr: diagnostics document
+        diag = json.loads(result.stderr)
+        self.assertEqual(diag["schema"], "lir.diagnostics.v1")
+        self.assertEqual(diag["status"], "error")
+        self.assertEqual(diag["errors"], 1)
+        first = diag["diagnostics"][0]
+        self.assertEqual(first["code"], "LIR-E3002")
+        self.assertEqual(first["severity"], "error")
+        self.assertEqual(first["line"], 1)
+        self.assertEqual(first["column"], 20)
+        self.assertEqual(first["expect"]["kind"], "function")
+        self.assertEqual(first["expect"]["value"], "printInt")
+
+    def test_short_format_is_line_oriented(self):
+        bad = self.write("bad2.lir", 'fn main() -> i64 { let x: i64 = "s" return x }\n')
+        result = run("check", str(bad), "--diagnostics=short", ok=False)
+        line = result.stderr.splitlines()[0]
+        self.assertTrue(line.startswith("LIR-E3004 "))
+        self.assertIn("error", line)
+        self.assertIn("type", line)
+
+    def test_help_line_present_for_actionable_errors(self):
+        bad = self.write("bad3.lir", 'fn main() -> i64 { let x: i64 = "s" return x }\n')
+        result = run("check", str(bad), ok=False)
+        self.assertIn("error[LIR-E3004]", result.stderr)
+        self.assertIn("= help:", result.stderr)
+        self.assertIn("'string'", result.stderr)
+        self.assertIn("'i64'", result.stderr)
+
+    def test_codes_are_explained(self):
+        for query in ("LIR-E3004", "e3001", "3002", "LIR-2001"):
+            out = run("explain", query).stdout
+            self.assertIn("===", out)
+        listed = json.loads(run("explain", "--list", "--json").stdout)
+        self.assertEqual(listed["schema"], "lir.explain.v1")
+        self.assertGreaterEqual(len(listed["topics"]), 12)
+        self.assertGreaterEqual(len(listed["codes"]), 10)
+
+    def test_build_json_envelope(self):
+        src = self.write("app.lir", "fn main() -> i64 { return 3 }\n")
+        target = self.dir / "app.out"
+        doc = json.loads(run("build", str(src), "-o", str(target), "--json").stdout)
+        self.assertEqual(doc["schema"], "lir.build.v1")
+        self.assertEqual(doc["status"], "ok")
+        self.assertEqual(doc["backend"], "native-elf")
+        self.assertGreater(doc["bytes"], 0)
+        self.assertTrue(target.exists())
+
+    def test_explain_ai_mentions_contracts(self):
+        out = run("explain", "ai").stdout
+        for needle in ("lir lang --json", "lir check", "lir.diagnostics", "--backend=vm"):
+            self.assertIn(needle, out)
+        limitations = run("explain", "limitations").stdout
+        for needle in ("async", "unsafe", "extern", "i128", "char"):
+            self.assertIn(needle, limitations)
+
+
+class CanonicalTourTests(unittest.TestCase):
+    """The tour is the reference program: every documented feature in one file.
+
+    It must run identically on the IR VM, the native ELF backend and the C11
+    backend — that is the cross-backend semantic baseline for generated code.
+    """
+
+    EXPECTED = """control total=10 label=big down=2
+comptime fib(10)=55 limit=9
+36
+44
+
+1
+2
+
+16
+9
+7
+0
+25
+
+7
+9
+-1
+5
+
+10
+
+9
+3
+3
+
+4
+
+42
+
+55
+
+deferred-first
+deferred-last
+"""
+
+    def test_tour_is_consistent_across_backends(self):
+        repo = COMPILER.parent.parent.parent
+        tour = repo / "examples" / "canonical-tour.lir"
+        self.assertTrue(tour.exists(), f"missing {tour}")
+        for backend in ("vm", "native", "c"):
+            with self.subTest(backend=backend):
+                result = run("run", str(tour), f"--backend={backend}")
+                self.assertEqual(result.stdout, self.EXPECTED,
+                                 f"{backend} output diverged")
+                self.assertEqual(result.returncode, 0)
+
+    def test_tour_exit_code(self):
+        repo = COMPILER.parent.parent.parent
+        tour = repo / "examples" / "canonical-tour.lir"
+        # main returns min(total,100)-10 == 0
+        self.assertEqual(run("run", str(tour), "--backend=vm").returncode, 0)
+
+
+class DocsClaimTests(unittest.TestCase):
+    """Documentation must not drift: every LIR snippet in the hand-written docs
+    is compiled (and, when it has no side effects on ordering, executed)."""
+
+    DOCS = ("docs/ODIN_VS_LIR.md", "docs/AI.md", "docs/SPEC.md",
+            "docs/CONTRIBUTING.md", "docs/STDLIB.md")
+
+    def test_lir_snippets_in_docs_compile(self):
+        import re
+        repo = COMPILER.parent.parent.parent
+        checked = 0
+        with tempfile.TemporaryDirectory(prefix="lir-docs-") as temp:
+            for doc in self.DOCS:
+                path = repo / doc
+                if not path.exists():
+                    continue
+                text = path.read_text()
+                for index, block in enumerate(re.findall(r"```lir\n(.*?)```", text, re.S)):
+                    # Only complete programs are compiled; syntax sketches
+                    # (`fn name(p: T) -> T { ... }`) are fragments by design.
+                    if "fn main" not in block:
+                        continue
+                    with self.subTest(doc=doc, block=index):
+                        src = pathlib.Path(temp) / "doc.lir"
+                        src.write_text(block)
+                        result = run("check", str(src), ok=None)
+                        self.assertEqual(result.returncode, 0,
+                                         f"{doc} block {index} does not compile:\n{result.stderr}")
+                        checked += 1
+        self.assertGreaterEqual(checked, 8, "no LIR snippets were checked")
+
+    def test_odin_comparison_matches_reality(self):
+        """The comparison table makes specific LIR claims; keep them true."""
+        import re
+        repo = COMPILER.parent.parent.parent
+        doc = (repo / "docs" / "ODIN_VS_LIR.md").read_text()
+        with tempfile.TemporaryDirectory(prefix="lir-odin-") as temp:
+            def attempt(source):
+                path = pathlib.Path(temp) / "claim.lir"
+                path.write_text(source + "\n")
+                return run("check", str(path), ok=None).returncode == 0
+
+            # Claims of the form "LIR rejects X".
+            rejected = {
+                "range slicing": "fn main() -> i64 { let a = [1,2,3,4] let s = a[1..3] return 0 }",
+                "distinct types": "type C = distinct i64\nfn main() -> i64 { return 0 }",
+                "zero-init struct": "struct P { x: i64, y: i64 }\nfn main() -> i64 { let p: P = P { } return p.x }",
+                "for &x in xs": "fn main() -> i64 { let mut a = [1,2] for &x in a { } return 0 }",
+                "vector/matrix types": "fn main() -> i64 { let m: matrix[2,2]f32 = 0 return 0 }",
+                "extern FFI": 'extern fn puts(s: string) -> i64\nfn main() -> i64 { return 0 }',
+                "method on alias": "type Meters = i64\nimpl Meters { fn d(self) -> i64 { return 1 } }\nfn main() -> i64 { return 0 }",
+                "println with a number": "fn main() -> i64 { println(42) return 0 }",
+                "inheritance": "struct A { x: i64 }\nstruct B : A { y: i64 }\nfn main() -> i64 { return 0 }",
+                "embedding with using": "struct A { x: i64 }\nstruct B { using a: A }\nfn main() -> i64 { return 0 }",
+                "operator overloading": "struct V { x: i64 }\nimpl V { fn add(self, o: V) -> V { return V { x: 1 } } }\nfn main() -> i64 { let a = V { x: 1 } let b = V { x: 2 } return (a + b).x }",
+                "trait as a value": "trait T { fn m(self) -> i64 }\nstruct S { v: i64 }\nimpl T for S { fn m(self) -> i64 { return 1 } }\nfn main() -> i64 { let t: T = S { v: 0 } return 0 }",
+                "default trait body": "trait T { fn m(self) -> i64 { return 7 } }\nstruct S { v: i64 }\nimpl T for S { }\nfn main() -> i64 { return 0 }",
+                "impl on an enum": "enum E { A, B }\nimpl E { fn m(self) -> i64 { return 1 } }\nfn main() -> i64 { return 0 }",
+            }
+            for claim, source in rejected.items():
+                with self.subTest(claim=claim):
+                    self.assertFalse(attempt(source), f"doc claims LIR rejects {claim}")
+
+            # Claims of the form "LIR supports X".
+            supported = {
+                "closures": "fn main() -> i64 { let k = 3 let f = |x: i64| x + k return f(4) }",
+                "multiple returns": "fn d(a: i64, b: i64) -> (i64, i64) { return (a / b, a % b) }\nfn main() -> i64 { let (q, r) = d(7, 2) return q + r }",
+                "traits and dyn dispatch": "trait T { fn m(self) -> i64 }\nstruct S { v: i64 }\nimpl T for S { fn m(self) -> i64 { return self.v } }\nfn f(x: dyn T) -> i64 { return x.m() }\nfn main() -> i64 { let s = S { v: 4 } return f(s) }",
+                "Result and ?": "fn g() -> Result<i64, i64> { return Ok(1) }\nfn h() -> Result<i64, i64> { let v = g()? return Ok(v) }\nfn main() -> i64 { return 0 }",
+                "bounded ranges": "type P = i64 range 0..100\nfn main() -> i64 { let p: P = 55 return p as i64 }",
+                "atomics": "fn main() -> i64 { let s = @malloc(8) @atomic_add(s, 1) @free(s) return 0 }",
+                "methods and impl blocks": "struct P { x: i64 }\nimpl P { fn get(self) -> i64 { return self.x } }\nfn main() -> i64 { let p = P { x: 3 } return p.get() }",
+                "traits with dyn dispatch": "trait A { fn a(self) -> i64 }\nstruct S { v: i64 }\nimpl A for S { fn a(self) -> i64 { return self.v } }\nfn f(x: dyn A) -> i64 { return x.a() }\nfn main() -> i64 { return f(S { v: 2 }) }",
+                "slices as a type": "fn sum(xs: []i64) -> i64 { return 0 }\nfn main() -> i64 { let a = [1,2,3] let s: []i64 = a let n = sum(s) return n }",
+            }
+            for claim, source in supported.items():
+                with self.subTest(claim=claim):
+                    self.assertTrue(attempt(source), f"doc claims LIR supports {claim}")
+
+            # And the "method on a struct" claim used in the comparison snippet.
+            self.assertTrue(attempt(
+                "struct C { v: i64 }\nimpl C {\n    fn bump(self: *mut C) -> i64 {\n"
+                "        self.v = self.v + 1\n        return self.v\n    }\n}\n"
+                "fn main() -> i64 { var c = C { v: 0 } return c.bump() }"))
+
+
+class HyperionFeasibilityTests(unittest.TestCase):
+    """docs/HYPERION_ASSESSMENT.md claims that some of the proposed ideas are
+    already expressible in LIR today. Those specific claims are pinned here.
+    (The physical/theoretical refutations need no test.)"""
+
+    def test_barrier_free_task_graph_is_expressible(self):
+        """Cone-based (happens-before) scheduling needs no global epoch: LIR
+        already gives spawn/join/channels/mutexes."""
+        source = """
+fn worker(arg: i64) -> i64 { return arg * 2 }
+
+fn main() -> i64 {
+    let a = @thread_create("worker", 3)
+    let b = @thread_create("worker", 4)
+    let ch = @chan_new(1)
+    @chan_send(ch, 5)
+    let via_chan = @chan_recv(ch)
+    @chan_close(ch)
+    return @thread_join(a) + @thread_join(b) + via_chan
+}
+"""
+        self._assert_vm_exit(source, 3 * 2 + 4 * 2 + 5)
+
+    def test_pure_functions_can_be_used_for_speculation_safely(self):
+        """Only #[pure] bodies may be speculatively evaluated; impure ones are
+        rejected, which is exactly the safety boundary the doc demands."""
+        pure_ok = """
+#[pure]
+fn cheap(x: i64) -> i64 { return x * x }
+
+fn main() -> i64 { return cheap(7) }
+"""
+        self._assert_vm_exit(pure_ok, 49)
+        impure_rejected = """
+#[pure]
+fn not_pure(x: i64) -> i64 {
+    println("side effect")
+    return x
+}
+fn main() -> i64 { return not_pure(1) }
+"""
+        with tempfile.TemporaryDirectory(prefix="lir-hyp-") as temp:
+            path = pathlib.Path(temp) / "m.lir"
+            path.write_text(impure_rejected)
+            result = run("check", str(path), ok=None)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("pure", result.stderr.lower())
+
+    def test_zero_copy_views_of_existing_arrays(self):
+        """A slice/view is O(1) to create (no data copy) - the part of the
+        'algebraic lens' claim that is real today; range slicing is not."""
+        source = """
+fn sum(xs: []i64) -> i64 { return 0 }
+
+fn main() -> i64 {
+    let data = [1, 2, 3, 4]
+    let view: []i64 = data      // no copy
+    return sum(view) + data[3]
+}
+"""
+        self._assert_vm_exit(source, 4)
+
+    def _assert_vm_exit(self, source, expected):
+        with tempfile.TemporaryDirectory(prefix="lir-hyp-run-") as temp:
+            path = pathlib.Path(temp) / "m.lir"
+            path.write_text(textwrap.dedent(source).lstrip())
+            result = run("run", str(path), "--backend=vm", ok=None)
+            self.assertEqual(result.returncode, expected, result.stderr)
+
+
+CMF_EXAMPLE = """
+# Shapes, substrate, commitments, expression. No classes anywhere.
+morph Cell =<< u8 u16 u32 u64 i64 >>=
+field ledger: u64[1024] ?exclusive
+claim exclusive_writer over ledger check uniqueness
+
+bloom narrow: morph Cell {
+fn main() -> i64 {
+    let cell: @witness = 200
+    return cell as i64
+}
+}
+"""
+
+
+class CmfTests(unittest.TestCase):
+    """`lir cmf` is the second paradigm: a program is a field of claims, and a
+    bloom is constructed (one real compilation per witness), not declared. These
+    tests pin both directions: what is accepted, and what is refused."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="lir-cmf-")
+        self.addCleanup(self.temp.cleanup)
+        self.dir = pathlib.Path(self.temp.name)
+
+    def write_cmf(self, text, name="field.cmf"):
+        path = self.dir / name
+        path.write_text(textwrap.dedent(text).lstrip())
+        return path
+
+    def test_field_with_verified_variants_is_accepted(self):
+        path = self.write_cmf(CMF_EXAMPLE)
+        result = run("cmf", str(path), ok=None)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for witness in ("u8", "u16", "u32", "u64", "i64"):
+            self.assertIn(f"narrow/{witness}  verified", result.stdout)
+        self.assertIn("5 witness instances advertised, 5 constructed and verified", result.stdout)
+
+    def test_json_envelope_is_machine_readable(self):
+        path = self.write_cmf(CMF_EXAMPLE)
+        doc = json.loads(run("cmf", str(path), "--json").stdout)
+        self.assertEqual(doc["schema"], "lir.cmf.v1")
+        self.assertEqual(doc["status"], "ok")
+        self.assertEqual(len(doc["variants"]), 5)
+        self.assertTrue(all(v["status"] == "verified" for v in doc["variants"]))
+        self.assertEqual(doc["fields"][0]["access"], "exclusive")
+        self.assertEqual(doc["claims"][0]["judgment"], "checked")
+
+    def test_a_witness_that_does_not_verify_is_refused(self):
+        """'bool' cannot hold 200, so that instance is refused and never emitted."""
+        path = self.write_cmf("""
+            morph Cell =<< u8 bool >>=
+            bloom narrow: morph Cell {
+            fn main() -> i64 {
+                let cell: @witness = 200
+                return 7
+            }
+            }
+        """)
+        result = run("cmf", str(path), ok=None)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("narrow/bool  rejected (never emitted)", result.stdout)
+        self.assertIn("narrow/u8  verified", result.stdout)
+        self.assertIn("LIR-E8008", result.stderr)
+
+    def test_unfalsifiable_claims_are_errors(self):
+        path = self.write_cmf("""
+            field ledger: u64[64]
+            claim vibes over ledger check charisma
+            claim telepathy over ghost for 9tick
+        """)
+        result = run("cmf", str(path), ok=None)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("no checker implements", result.stderr)
+        self.assertIn("names no adjudicator", result.stderr)
+
+    def test_bloom_over_undeclared_morph_fails_closed(self):
+        path = self.write_cmf("bloom nowhere: morph Ghost\n")
+        result = run("cmf", str(path), ok=None)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("LIR-E8007", result.stderr)
+
+    def test_vacuous_variant_is_reported_not_hidden(self):
+        path = self.write_cmf("""
+            morph Cell =<< u8 u16 >>=
+            bloom narrow: morph Cell {
+            fn main() -> i64 { return 1 }
+            }
+        """)
+        result = run("cmf", str(path), ok=None)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("vacuous", result.stdout)
+
+    HYPERION_FIELD = """
+        morph Cell =<< u8 u16 u32 u64 >>=
+        field ledger: u64[104] ?exclusive ?contiguous
+        field sorted: u64[104] ?shared ?ordered
+        lens back: reverse(ledger) as backwards
+        lens hot: filter(ledger where > 9) as hot
+        lens pivot: transpose(ledger*104) as pivot
+        machine local: local implemented
+        machine pim: pim planned
+        telemetry cache: every 100tick
+        tune narrow: morph Cell under compressible
+        claim exclusive_writer over ledger check uniqueness
+        claim linear_use over ledger for 4tick runtime local
+        bloom narrow: morph Cell {
+        fn main() -> i64 {
+            let cell: @witness = 200
+            return cell as i64
+        }
+        }
+    """
+
+    def test_lenses_report_element_cost_instead_of_zero_cost(self):
+        path = self.write_cmf(self.HYPERION_FIELD)
+        out = run("cmf", str(path)).stdout
+        self.assertIn("O(1) to create, not free to walk", out)
+        self.assertIn("pivot = transpose(ledger)  element cost: strided", out)
+        self.assertIn("backwards = reverse(ledger)  element cost: sequential", out)
+
+    def test_variants_are_measured_not_predicted(self):
+        path = self.write_cmf(self.HYPERION_FIELD)
+        doc = json.loads(run("cmf", str(path), "--json").stdout)
+        verified = [v for v in doc["variants"] if v["status"] == "verified"]
+        self.assertEqual(len(verified), 4)
+        for v in verified:
+            self.assertTrue(v["ran"])
+            self.assertGreater(v["instructions_measured"], 0)
+            self.assertEqual(v["exit_code"], 200)
+
+    def test_planned_machine_cannot_discharge_a_claim(self):
+        path = self.write_cmf("""
+            machine pim: pim planned
+            field ledger: u64[104]
+            claim offloaded over ledger for 4tick runtime pim
+        """)
+        result = run("cmf", str(path), ok=None)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("not implemented in this compiler", result.stderr)
+
+    def test_a_machine_class_cannot_lie_about_being_implemented(self):
+        path = self.write_cmf("machine fhe: fhe implemented\n")
+        result = run("cmf", str(path), ok=None)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("LIR-E8010", result.stderr)
+
+    def test_applied_fields_surface_is_smaller_than_advertised(self):
+        """Unimplemented lenses/machines stay declarable but never silently count."""
+        path = self.write_cmf("""
+            morph Only =<< u8 >>=
+            morph Unused =<< u8 u16 u32 >>=
+            bloom one: morph Only {
+            fn main() -> i64 { return 1 }
+            }
+        """)
+        doc = json.loads(run("cmf", str(path), "--json").stdout)
+        self.assertEqual(doc["variant_surface"], 1)
+
+    def test_lens_that_breaks_an_ordered_field_is_refused(self):
+        path = self.write_cmf("""
+            field sorted: u64[104] ?ordered
+            lens bad: transpose(sorted*104) as broken
+        """)
+        result = run("cmf", str(path), ok=None)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("permutation would break the ordering", result.stderr)
+
+    def test_telemetry_without_a_consumer_is_refused(self):
+        path = self.write_cmf("telemetry cache: every 100tick\n")
+        result = run("cmf", str(path), ok=None)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("no 'tune' rule consumes it", result.stderr)
+
+    def test_help_and_explain_cover_the_new_codes(self):
+        self.assertIn("cmf <file.cmf>", run("--help").stdout)
+        self.assertIn("morph", run("cmf", "--help").stdout)
+        for code in ("LIR-E8001", "LIR-E8005", "LIR-E8008", "LIR-E8009", "LIR-E8010", "LIR-E8011", "LIR-E8012"):
+            out = run("explain", code).stdout
+            self.assertIn("CMF" if code == "LIR-E8001" else "===", out)
+
+    def test_every_example_field_is_accepted(self):
+        repo = COMPILER.parent.parent.parent
+        examples = sorted((repo / "examples" / "cmf").glob("*.cmf"))
+        self.assertTrue(examples, "no example fields found")
+        for example in examples:
+            with self.subTest(example=example.name):
+                result = run("cmf", str(example), ok=None)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class ScaffoldTests(unittest.TestCase):
+    def test_init_ai_writes_agent_files(self):
+        with tempfile.TemporaryDirectory(prefix="lir-ai-init-") as temp:
+            result = run("init", "demo", "--ai", cwd=temp)
+            root = pathlib.Path(temp) / "demo"
+            self.assertTrue((root / "AGENTS.md").exists())
+            manifest_path = root / "lir.agent.json"
+            self.assertTrue(manifest_path.exists())
+            manifest = json.loads(manifest_path.read_text())
+            self.assertEqual(manifest["schema"], "lir.agent.v1")
+            self.assertTrue(manifest["validate_before_claiming_success"])
+            guide = (root / "AGENTS.md").read_text()
+            for needle in ("lir lang --json", "lir check", "lir builtins",
+                           "lir lang --keywords"):
+                self.assertIn(needle, guide)
+            # The scaffolded project must build, run and test cleanly.
+            self.assertEqual(run("check", cwd=root).returncode, 0)
+            self.assertIn("Hello from LIR", run("run", cwd=root).stdout)
+            self.assertIn("PASS", run("test", cwd=root).stdout)
+            self.assertIn("AGENTS.md", result.stdout)
+
+
+if __name__ == "__main__":
+    # `ok=None` means "accept any exit status"; run() only asserts when ok is bool.
+    unittest.main(verbosity=2)

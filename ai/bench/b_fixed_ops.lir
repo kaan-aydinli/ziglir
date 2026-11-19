@@ -1,0 +1,13 @@
+import "../src/fixed.lir"
+fn main() -> i64 {
+    var s: i64 = ONE
+    var k: i64 = 0
+    while k < 1000000 {
+        s = sat_add(s, mul(s, from_int(1) / 2))
+        s = div(s, from_int(3))
+        k = k + 1
+    }
+    printInt(to_int(s))
+    println("")
+    return 0
+}

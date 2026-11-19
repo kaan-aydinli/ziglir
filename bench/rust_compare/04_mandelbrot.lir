@@ -1,0 +1,44 @@
+// Integer fixed-point Mandelbrot escape-time count, 800x800 grid, 400 max iter.
+//
+// All arithmetic is 16.16 fixed point in i64 (the value 65536 stands for 1.0).
+// This is the integer kernel an optimizer can reason about: the inner loop is a
+// dependent chain of multiplies, shifts and compares with no calls in it.
+import "common.lir"
+
+fn main() -> i64 {
+    const w: i64 = 800
+    const h: i64 = 800
+    const max_iter: i64 = 400
+    const one: i64 = 65536
+
+    var total: i64 = 0
+    var y: i64 = 0
+    while y < h {
+        let ci = (y * 262144) / h - 131072
+        var x: i64 = 0
+        while x < w {
+            let cr = (x * 393216) / w - 262144
+            var zr: i64 = 0
+            var zi: i64 = 0
+            var it: i64 = 0
+            var alive: i64 = 1
+            while it < max_iter and alive == 1 {
+                let zr2 = (zr * zr) / one
+                let zi2 = (zi * zi) / one
+                if zr2 + zi2 > (4 * one) {
+                    alive = 0
+                } else {
+                    zi = (2 * ((zr * zi) / one)) + ci
+                    zr = zr2 - zi2 + cr
+                }
+                it = it + 1
+            }
+            total = total + it
+            x = x + 1
+        }
+        y = y + 1
+    }
+    printInt(total % 1000000007)
+    println("")
+    return 0
+}

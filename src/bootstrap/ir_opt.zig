@@ -25,6 +25,7 @@ pub const OptLevel = enum(u8) {
 const MAX_TRACKED_VREGS = 4096;
 const MAX_PROMOTED_SLOTS = 256;
 
+
 pub fn optimize(module: *IRModule, level: OptLevel) void {
     if (level == .O0) return;
 
@@ -43,20 +44,49 @@ pub fn optimize(module: *IRModule, level: OptLevel) void {
     while (fi < module.fn_count) : (fi += 1) {
         optimizeFn(module, fi, level);
     }
+
+    // Bounds-check hoisting runs exactly once, after every function has been
+    // through the whole pipeline. Running it inside optimizeFn meant a second
+    // pass over the same function (inlining is iterative) rewrote instructions
+    // and dropped the marks the first run had set — 8 accesses marked, 5 left.
+    if (level == .O2) _ = hoistBoundsChecks(module, null);
 }
 
 fn optimizeFn(module: *IRModule, fi: u32, level: OptLevel) void {
     const f = &module.fns[fi];
+    // ── -O1 Pipeline ────────────────────────────────────────────
+    // -O1 used to run local passes only, which left parameters and loop
+    // variables in memory: the same function could run 2.4x slower than at -O2.
+    // It now builds SSA (that is what actually moves values into registers) but
+    // skips the passes whose runtime payoff does not pay for their compile time:
+    // inlining, global value numbering, loop-invariant hoisting, unrolling and
+    // loop rotation.
     if (level == .O1) {
-        var iter: u32 = 0;
-        while (iter < 8) : (iter += 1) {
-            var changed = false;
-            if (localConstantFoldAndLVN(f)) changed = true;
-            if (globalCopyPropagate(f)) changed = true;
-            if (simplifyCFG(f)) changed = true;
-            if (deadCodeElimination(f, level)) changed = true;
-            if (!changed) break;
-        }
+        _ = localStoreToLoadForward(f);
+        _ = localConstantFoldAndLVN(f);
+        _ = simplifyCFG(f);
+        _ = mem2reg(f);
+        _ = simplifyTrivialPhis(f);
+        _ = ifConversion(f);
+        _ = localConstantFoldAndLVN(f);
+        _ = globalCopyPropagate(f);
+        _ = simplifyCFG(f);
+        _ = destructSSA(f);
+        _ = reorderBlocksRPO(f);
+        _ = coalesceCopiesPostSSA(f);
+        _ = localConstantFoldAndLVN(f);
+        _ = deadCodeElimination(f, .O1);
+        _ = localConstantFoldAndLVN(f);
+        _ = deadCodeElimination(f, .O1);
+        _ = simplifyCFG(f);
+        _ = deadCodeElimination(f, .O1);
+        _ = reorderBlocksRPO(f);
+        _ = unrollCountedLoops(f);
+        _ = coalesceCopiesPostSSA(f);
+        _ = propagateTrivialCopies(f);
+        _ = localConstantFoldAndLVN(f);
+        _ = deadCodeElimination(f, .O1);
+        _ = sinkCompareToConsumer(f);
         return;
     }
 
@@ -107,6 +137,7 @@ fn optimizeFn(module: *IRModule, fi: u32, level: OptLevel) void {
     _ = simplifyCFG(f);
     _ = reorderBlocksRPO(f);
     _ = unrollCountedLoops(f);
+    _ = propagateTrivialCopies(f);
 
     var post_iter: u32 = 0;
     while (post_iter < 4) : (post_iter += 1) {
@@ -119,6 +150,13 @@ fn optimizeFn(module: *IRModule, fi: u32, level: OptLevel) void {
         if (!changed) break;
     }
     _ = reorderBlocksRPO(f);
+    // Bounds-check hoisting runs after every loop transformation, so the loop
+    // shape it reasons about is final: rotation and unrolling change trip
+    // counts and preheaders, and hoisting before them would target a preheader
+    // that no longer exists.
+    // Codegen fuses `cmp` + `select`/`cond_jump` into one cmov/jcc only when the
+    // pair is adjacent. Run last, after every pass that could re-separate them.
+    _ = sinkCompareToConsumer(f);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -131,11 +169,116 @@ fn countFnInsts(f: *const IRFn) u32 {
     return total;
 }
 
-fn fnInlineEligible(f: *const IRFn) bool {
+/// Instruction budget for inlining. The default keeps code growth modest for
+/// functions that are called from many places; a function with a single call
+/// site cannot increase total code size by more than its own body, so it gets a
+/// larger budget (a small function invoked once is pure call overhead: argument
+/// setup, prologue/epilogue, and no constant propagation into the callee). This
+/// is what lets the compiler turn `f(20000000)` into a loop with the bound as a
+/// constant instead of a parameter.
+const INLINE_MAX_INSTS = 56;
+const INLINE_MAX_INSTS_SINGLE_CALL = 120;
+
+fn countCallSites(module: *const IRModule, callee: u32) u32 {
+    var sites: u32 = 0;
+    for (0..module.fn_count) |fi| {
+        const f = &module.fns[fi];
+        for (0..f.block_count) |bi| {
+            for (0..f.blocks[bi].inst_count) |ii| {
+                const inst = f.blocks[bi].insts[ii];
+                if (inst.op == .call and inst.callee_fn_idx >= 0 and
+                    @as(u32, @intCast(inst.callee_fn_idx)) == callee)
+                {
+                    sites += 1;
+                }
+            }
+        }
+    }
+    return sites;
+}
+
+/// True when `f` contains no call at all and nothing it could call is
+/// reachable from it. Such a function can be inlined into an arbitrary caller
+/// without dragging a call site along with it, so it is always small enough in
+/// the only sense that matters for a leaf: its own instruction count.
+fn isCallFreeLeaf(f: *const IRFn) bool {
+    for (0..f.block_count) |bi| {
+        const b = &f.blocks[bi];
+        for (0..b.inst_count) |ii| {
+            const op = b.insts[ii].op;
+            if (op == .call or op == .call_indirect) return false;
+        }
+    }
+    return true;
+}
+
+/// Functions that become call-free once their callees are inlined, computed as
+/// a fixpoint: a function is in the set if every call it makes targets a member
+/// of the set. `mul` calls `fabs` and `mul_sat`; `mul_sat` calls `fabs`; so all
+/// three are in the closure even though only `fabs` is a leaf today.
+fn computeLeafClosure(module: *const IRModule, out: *[ir.MAX_FNS]bool) void {
+    for (0..module.fn_count) |i| out[i] = isCallFreeLeaf(&module.fns[i]);
+    var changed = true;
+    var rounds: u32 = 0;
+    while (changed and rounds < 32) : (rounds += 1) {
+        changed = false;
+        for (0..module.fn_count) |i| {
+            if (out[i]) continue;
+            const f = &module.fns[i];
+            var ok = true;
+            outer: for (0..f.block_count) |bi| {
+                const b = &f.blocks[bi];
+                for (0..b.inst_count) |ii| {
+                    const inst = b.insts[ii];
+                    if (inst.op == .call_indirect) {
+                        ok = false;
+                        break :outer;
+                    }
+                    if (inst.op != .call) continue;
+                    const ci = inst.callee_fn_idx;
+                    if (ci < 0) {
+                        ok = false;
+                        break :outer;
+                    }
+                    const idx: u32 = @intCast(ci);
+                    if (idx >= module.fn_count or !out[idx]) {
+                        ok = false;
+                        break :outer;
+                    }
+                }
+            }
+            if (ok) {
+                out[i] = true;
+                changed = true;
+            }
+        }
+    }
+}
+
+/// Same check as `fnInlineEligible` but tolerant of calls: a function in the
+/// leaf closure will itself become call-free once its own callees are inlined,
+/// so the "must not contain a call" rule does not apply. Everything that makes
+/// splicing hard (phis, stack slots, address-taken locals) still does.
+fn fnInlineEligibleLeaf(f: *const IRFn, max_insts: u32) bool {
     if (f.block_count == 0 or f.block_count > 8) return false;
     if (f.total_locals > 48) return false;
     const total = countFnInsts(f);
-    if (total == 0 or total > 56) return false;
+    if (total == 0 or total > max_insts) return false;
+    for (0..f.block_count) |bi| {
+        const b = &f.blocks[bi];
+        for (0..b.inst_count) |ii| {
+            const op = b.insts[ii].op;
+            if (op == .phi or op == .alloca or op == .addr_of or op == .call_indirect) return false;
+        }
+    }
+    return true;
+}
+
+fn fnInlineEligible(f: *const IRFn, max_insts: u32) bool {
+    if (f.block_count == 0 or f.block_count > 8) return false;
+    if (f.total_locals > 48) return false;
+    const total = countFnInsts(f);
+    if (total == 0 or total > max_insts) return false;
     for (0..f.block_count) |bi| {
         const b = &f.blocks[bi];
         for (0..b.inst_count) |ii| {
@@ -149,8 +292,26 @@ fn fnInlineEligible(f: *const IRFn) bool {
 fn inlineSmallFunctions(module: *IRModule) bool {
     var changed = false;
     var eligible: [ir.MAX_FNS]bool = .{false} ** ir.MAX_FNS;
+    var leaves: [ir.MAX_FNS]bool = .{false} ** ir.MAX_FNS;
+    computeLeafClosure(module, &leaves);
     for (0..module.fn_count) |i| {
-        eligible[i] = fnInlineEligible(&module.fns[i]);
+        // A single-call-site callee is inlined even when larger, because total
+        // code size cannot shrink by keeping the call.
+        const max_insts: u32 = if (countCallSites(module, @intCast(i)) <= 1)
+            INLINE_MAX_INSTS_SINGLE_CALL
+        else
+            INLINE_MAX_INSTS;
+        eligible[i] = fnInlineEligible(&module.fns[i], max_insts);
+        // A function that only calls call-free leaves becomes call-free once
+        // those are inlined, so the block-splitting ceiling does not apply and
+        // only the instruction budget does. Without this, helpers like Q32.32
+        // `mul` (which calls `fabs` and `mul_sat`) are never inlined and every
+        // multiply in a hot loop stays a real call: measured at 4.2 ns/edge,
+        // 2.17x on `b_forward`.
+        if (!eligible[i] and leaves[i]) {
+            eligible[i] = fnInlineEligibleLeaf(&module.fns[i], INLINE_MAX_INSTS_SINGLE_CALL);
+        }
+
     }
 
     var fi: u32 = 0;
@@ -564,7 +725,15 @@ fn mem2reg(f: *IRFn) bool {
     }
 
     // Compute IDF and place phis (track per-block phi insertion count before mutating blocks)
-    var phi_slots: [MAX_BLOCKS_PER_FN][32]u16 = undefined;
+    //
+    // Only slots whose phi set is complete may reach the insertion phase below:
+    // renameBlock() reads `promotable[]`, so a rollback (capacity overflow on a
+    // later slot) has to withdraw the slot's pending phis here, not just flip the
+    // flag. Leaving an unrenamed, operand-less phi behind made every block that
+    // read the slot see a vreg that is never defined.
+    var placed: [MAX_BLOCKS_PER_FN][32]u16 = undefined;
+    var placed_cnt: [MAX_BLOCKS_PER_FN]u8 = .{0} ** MAX_BLOCKS_PER_FN;
+    var pending: [MAX_BLOCKS_PER_FN][32]u16 = undefined;
     var phi_cnt: [MAX_BLOCKS_PER_FN]u8 = .{0} ** MAX_BLOCKS_PER_FN;
 
     for (1..f.total_locals + 1) |s| {
@@ -590,7 +759,7 @@ fn mem2reg(f: *IRFn) bool {
                         ok = false;
                         break;
                     }
-                    phi_slots[y][phi_cnt[y]] = @intCast(s);
+                    pending[y][phi_cnt[y]] = @intCast(s);
                     phi_cnt[y] += 1;
                     if ((def_blocks[s] & (@as(u128, 1) << y)) == 0) {
                         work |= (@as(u128, 1) << y);
@@ -600,19 +769,30 @@ fn mem2reg(f: *IRFn) bool {
             if (!ok) break;
         }
         if (!ok) {
-            // Roll back this slot's pending phis and disqualify slot
+            // Drop this slot's pending phis; it stays memory resident.
             promotable[s] = false;
             for (0..f.block_count) |bi| {
                 var k: u8 = 0;
                 while (k < phi_cnt[bi]) {
-                    if (phi_slots[bi][k] == s) {
+                    if (pending[bi][k] == s) {
                         phi_cnt[bi] -= 1;
-                        phi_slots[bi][k] = phi_slots[bi][phi_cnt[bi]];
+                        pending[bi][k] = pending[bi][phi_cnt[bi]];
                     } else {
                         k += 1;
                     }
                 }
             }
+            continue;
+        }
+        // This slot's phi set is complete: commit it.
+        for (0..f.block_count) |bi| {
+            for (0..phi_cnt[bi]) |k| {
+                if (placed_cnt[bi] < placed[bi].len) {
+                    placed[bi][placed_cnt[bi]] = pending[bi][k];
+                    placed_cnt[bi] += 1;
+                }
+            }
+            phi_cnt[bi] = 0;
         }
     }
 
@@ -627,7 +807,7 @@ fn mem2reg(f: *IRFn) bool {
 
     // Insert pending .phi instructions at the start of each block
     for (1..f.block_count) |bi| {
-        const pc = phi_cnt[bi];
+        const pc = placed_cnt[bi];
         if (pc == 0) continue;
         var b = &f.blocks[bi];
         if (@as(u32, b.inst_count) + pc >= MAX_INSTS_PER_BLOCK or
@@ -644,7 +824,7 @@ fn mem2reg(f: *IRFn) bool {
             b.insts[k] = .{
                 .op = .phi,
                 .dest = pv,
-                .slot = phi_slots[bi][k], // temporarily tracks slot during renaming
+                .slot = placed[bi][k], // temporarily tracks slot during renaming
                 .arg_count = 0,
             };
         }
@@ -770,6 +950,38 @@ fn hasAnyPhi(f: *const IRFn) bool {
     return false;
 }
 
+/// True when `v` is already defined on entry to block `bi` (by an earlier
+/// instruction of `bi`, or by a block that dominates it). Used to decide whether
+/// a phi can be rewritten as a plain copy: the copy is only equivalent if the
+/// value is live at that point on *every* path, which a phi guarantees for free.
+fn definedBefore(f: *IRFn, bi: u16, ii: usize, v: u16) bool {
+    const b = &f.blocks[bi];
+    var k: usize = 0;
+    while (k < ii) : (k += 1) {
+        if (b.insts[k].dest == v) return true;
+    }
+    if (bi == 0) return false;
+    // Cheap dominance test: walk up from every predecessor; if any path can reach
+    // `bi` without passing a definition of v, the copy would read a stale value.
+    // Conservatively answer "no" unless the definition is in a predecessor of
+    // every incoming edge.
+    var cfg: CFGInfo = undefined;
+    buildCFGInfo(f, &cfg);
+    var d: u16 = 0;
+    while (d < f.block_count) : (d += 1) {
+        if (d == bi) continue;
+        var defines = false;
+        for (f.blocks[d].insts[0..f.blocks[d].inst_count]) |inst| {
+            if (inst.dest == v) {
+                defines = true;
+                break;
+            }
+        }
+        if (defines and dominates(&cfg, d, bi)) return true;
+    }
+    return false;
+}
+
 fn simplifyTrivialPhis(f: *IRFn) bool {
     var changed = false;
     for (0..f.block_count) |bi| {
@@ -798,8 +1010,15 @@ fn simplifyTrivialPhis(f: *IRFn) bool {
                 if (unique) |u| {
                     if (u == 0) {
                         inst.* = .{ .op = .const_int, .dest = inst.dest, .imm = 0 };
-                    } else {
+                    } else if (definedBefore(f, @intCast(bi), ii, u)) {
+                        // Replacing a phi by a copy is only sound when the value is
+                        // already live at the phi's position: a phi is defined on
+                        // *every* incoming edge, a copy only where it is executed.
+                        // Collapsing a phi whose operand is defined further down
+                        // (or only on some path) turns a merge into a stale read.
                         inst.* = .{ .op = .copy, .dest = inst.dest, .src1 = u };
+                    } else {
+                        continue;
                     }
                 } else {
                     inst.* = .{ .op = .const_int, .dest = inst.dest, .imm = 0 };
@@ -824,6 +1043,93 @@ fn isCmpOp(op: IROp) bool {
         .ucmp_lt, .ucmp_le, .ucmp_gt, .ucmp_ge => true,
         else => false,
     };
+}
+
+/// Move a compare down to sit immediately before its only consumer.
+///
+/// x86 sets flags as a side effect, so codegen can only turn `cmp` + `select`
+/// into a single `cmov` (and `cmp` + `cond_jump` into a `jcc`) when the two are
+/// adjacent. IRGen emits the compare where the source expression ended, which is
+/// often *above* the arithmetic that the select's arms depend on, so a perfectly
+/// fusable pair arrives with an instruction wedged between them:
+///
+///   v12 = cmp_ge v9, v11      v12 = cmp_ge v9, v11
+///   v16 = sub v9, v11    ->   v16 = sub v9, v11
+///   v32 = select v12 ? ...    v32 = select v12 ? ...
+///
+/// Without this, the compare materialises a 0/1 value (setcc + movzbq) and the
+/// select becomes test + cmov. Moving the compare down is safe when its result
+/// is `cond` itself (false == 0, so a `cond_jump` falls through on the same
+/// cases) and every instruction being crossed does not read `cond`.
+fn sinkCompareToConsumer(f: *IRFn) bool {
+    var changed = false;
+    var bi: u16 = 0;
+    while (bi < f.block_count) : (bi += 1) {
+        var b = &f.blocks[bi];
+        var ii: u16 = 0;
+        while (ii < b.inst_count) : (ii += 1) {
+            const inst = b.insts[ii];
+            if (!isCmpOp(inst.op) or inst.dest == 0) continue;
+
+            // Count uses inside this block and locate the last one.
+            var use_idx: i16 = -1;
+            var uses: u16 = 0;
+            var ji: u16 = ii + 1;
+            while (ji < b.inst_count) : (ji += 1) {
+                const other = b.insts[ji];
+                if (other.op == .select or other.op == .cond_jump) {
+                    if (!instReadsVreg(other, inst.dest)) continue;
+                    uses += 1;
+                    use_idx = @intCast(ji);
+                    continue;
+                }
+                if (instReadsVreg(other, inst.dest)) {
+                    uses = 2;
+                    break;
+                }
+            }
+
+            if (uses != 1 or use_idx < 0) continue;
+            const target_i: u16 = @intCast(use_idx);
+            if (target_i == ii + 1) continue; // already adjacent
+            const consumer = b.insts[target_i];
+            // Only a compare that is consumed purely as a condition can move:
+            // `select`/`cond_jump` test it against zero, so reordering the
+            // producing compare below other instructions cannot change the
+            // value that is observed.
+            const cond = consumer.src1;
+            if (cond != inst.dest) continue;
+            if (consumer.op == .cond_jump and consumer.arg_count == 0) {
+                // cond_jump treats `cond` as a boolean; safe.
+            } else if (consumer.op != .select) continue;
+
+            // Every instruction between the compare and its consumer must be
+            // unable to observe the compare result, and the compare must not
+            // read anything those instructions redefine.
+            var k: u16 = ii + 1;
+            var ok = true;
+            while (k < target_i) : (k += 1) {
+                const mid = b.insts[k];
+                if (instReadsVreg(mid, inst.dest)) { ok = false; break; }
+                if (mid.dest != 0 and (mid.dest == inst.src1 or mid.dest == inst.src2 or mid.dest == inst.dest)) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok) continue;
+
+            // Shift [ii+1 .. target_i) up by one and drop the compare in front
+            // of the consumer.
+            var m: u16 = ii;
+            while (m < target_i) : (m += 1) {
+                b.insts[m] = b.insts[m + 1];
+            }
+            b.insts[target_i - 1] = inst;
+            changed = true;
+            // Re-examine the instruction now occupying `ii`.
+        }
+    }
+    return changed;
 }
 
 fn ifConversion(f: *IRFn) bool {
@@ -1785,7 +2091,109 @@ fn rewriteInstUses(inst: *IRInst, repl: []const u16) bool {
     return changed;
 }
 
+
+/// Bounded-table copy propagation for single-block functions. Equivalent to
+/// `globalCopyPropagate` when a function has one block and at most 24
+/// instructions: every vreg is still required to have exactly one definition
+/// module-wide (a one-block function), so `copy_of` cannot need more than 24
+/// entries and resolving chains within them is complete.
+var in_small_fallback: bool = false;
+
+fn globalCopyPropagateSmall(f: *IRFn) bool {
+    if (f.block_count != 1) return false;
+    const b = &f.blocks[0];
+    if (b.inst_count == 0) return false;
+
+    var dests: [24]u16 = undefined;
+    var n: usize = 0;
+    for (0..b.inst_count) |ii| {
+        const d = b.insts[ii].dest;
+        if (d > 0 and d < MAX_TRACKED_VREGS) {
+            for (dests[0..n]) |seen| {
+                if (seen == d) { n = 25; break; } // duplicate def: bail out
+            }
+            if (n >= 24) {
+                    in_small_fallback = true;
+                    defer in_small_fallback = false;
+                    return globalCopyPropagate(f);
+                }
+            dests[n] = d;
+            n += 1;
+        }
+    }
+    // Every vreg defined here is defined exactly once (one block, unique dests),
+    // which is what the general pass spends a full 4096-entry def-count scan on.
+    var src: [24]u16 = .{0} ** 24;
+    for (0..b.inst_count) |ii| {
+        const inst = b.insts[ii];
+        if (inst.op != .copy or inst.dest == 0 or inst.src1 == 0 or inst.dest == inst.src1) continue;
+        for (dests[0..n], 0..) |d, k| {
+            if (d == inst.dest) {
+                src[k] = inst.src1;
+                break;
+            }
+        }
+    }
+
+    var changed = false;
+    for (0..b.inst_count) |ii| {
+        const inst = &f.blocks[0].insts[ii];
+        if (inst.src1 > 0) {
+            var cur = inst.src1;
+            var steps: u32 = 0;
+            while (steps < 16) : (steps += 1) {
+                var next: u16 = 0;
+                for (dests[0..n], 0..) |d, k| {
+                    if (d == cur and src[k] != 0 and src[k] != cur) { next = src[k]; break; }
+                }
+                if (next == 0) break;
+                cur = next;
+            }
+            if (cur != inst.src1) { inst.src1 = cur; changed = true; }
+        }
+        if (inst.src2 > 0) {
+            var cur = inst.src2;
+            var steps: u32 = 0;
+            while (steps < 16) : (steps += 1) {
+                var next: u16 = 0;
+                for (dests[0..n], 0..) |d, k| {
+                    if (d == cur and src[k] != 0 and src[k] != cur) { next = src[k]; break; }
+                }
+                if (next == 0) break;
+                cur = next;
+            }
+            if (cur != inst.src2) { inst.src2 = cur; changed = true; }
+        }
+        var ai: usize = 0;
+        while (ai < inst.arg_count and ai < inst.args.len) : (ai += 1) {
+            if (inst.args[ai] > 0) {
+                var cur = inst.args[ai];
+                var steps: u32 = 0;
+                while (steps < 16) : (steps += 1) {
+                    var next: u16 = 0;
+                    for (dests[0..n], 0..) |d, k| {
+                        if (d == cur and src[k] != 0 and src[k] != cur) { next = src[k]; break; }
+                    }
+                    if (next == 0) break;
+                    cur = next;
+                }
+                if (cur != inst.args[ai]) { inst.args[ai] = cur; changed = true; }
+            }
+        }
+    }
+    return changed;
+}
+
 fn globalCopyPropagate(f: *IRFn) bool {
+    // Fast path for the overwhelmingly common tiny function (a helper that is a
+    // few instructions in a single block, where there is at most one candidate
+    // copy per instruction). At -O2 this pass runs four times per function, so on
+    // a module of many small functions the fixed cost of clearing and scanning the
+    // 4096-entry tables dominated the actual work.
+    if (!in_small_fallback and f.block_count == 1 and f.blocks[0].inst_count <= 24) {
+        return globalCopyPropagateSmall(f);
+    }
+
     var def_count: [MAX_TRACKED_VREGS]u16 = undefined;
     isSingleDefVregTable(f, &def_count);
 
@@ -1823,6 +2231,18 @@ fn globalCopyPropagate(f: *IRFn) bool {
         const b = &f.blocks[bi];
         var ii: u16 = 0;
         while (ii < b.inst_count) : (ii += 1) {
+            // A phi operand is not a plain use of the value: it names the value
+            // that is live on one *specific* incoming edge. Rewriting it to the
+            // copy's source drops the "defined on this edge" guarantee and makes
+            // the merge read whatever the source happens to hold - the -O2 bug
+            // where a phi {16, 18} collapsed to {16, 9} and read a stale v9.
+            if (b.insts[ii].op == .phi) {
+                var bad = false;
+                for (b.insts[ii].args[0..b.insts[ii].arg_count]) |arg| {
+                    if (arg > 0 and arg < MAX_TRACKED_VREGS and copy_of[arg] != 0) bad = true;
+                }
+                if (bad) continue;
+            }
             if (rewriteInstUses(&b.insts[ii], &copy_of)) changed = true;
         }
     }
@@ -1928,14 +2348,31 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
 
     var const_known: [MAX_TRACKED_VREGS]bool = undefined;
     var const_val: [MAX_TRACKED_VREGS]i64 = undefined;
-    var def_inst: [MAX_TRACKED_VREGS]?u16 = undefined;
+    // `def_inst` is stamped with the owning block instead of being cleared to
+    // null: only the current block's definitions are observable (the consumers
+    // already re-check `b.insts[dii].dest == inst.src1`), and a stale index that
+    // points into a *previous* block would be read out of the wrong array. A
+    // generation stamp keeps the "cleared every block" semantics while touching
+    // only the entries this block defined.
+    var def_inst: [MAX_TRACKED_VREGS]u16 = undefined;
+    var def_gen: [MAX_TRACKED_VREGS]u16 = undefined;
     var expr_table: [128]ExprKey = undefined;
+    // Vregs whose `const_known` entry is currently true, so the next block can
+    // clear them without scanning the whole table.
+    var dirty: [MAX_INSTS_PER_BLOCK * 2]u16 = undefined;
+    var dirty_n: usize = 0;
 
     var bi: u16 = 0;
     while (bi < f.block_count) : (bi += 1) {
         var b = &f.blocks[bi];
-        @memset(&const_known, false);
-        @memset(&def_inst, null);
+        const cur_gen: u16 = bi;
+        // Equivalent to zeroing both 4096-entry tables at every block boundary,
+        // at a cost proportional to what the previous block actually wrote:
+        // `dirty` holds exactly the vregs whose `const_known` is true, and
+        // `def_gen` marks which block owns each `def_inst` entry. Zeroing the
+        // full tables cost roughly 600 us per module at -O2 (1500 blocks x 8 KiB).
+        for (dirty[0..dirty_n]) |d| const_known[d] = false;
+        dirty_n = 0;
         var expr_count: usize = 0;
 
         var ii: u16 = 0;
@@ -1944,7 +2381,7 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
 
             if (inst.dest > 0 and inst.dest < MAX_TRACKED_VREGS) {
                 const_known[inst.dest] = false;
-                def_inst[inst.dest] = null;
+                def_gen[inst.dest] = cur_gen;
                 var ei: usize = 0;
                 while (ei < expr_count) {
                     if (expr_table[ei].a == inst.dest or expr_table[ei].b == inst.dest or expr_table[ei].vreg == inst.dest) {
@@ -1960,6 +2397,7 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
                 .const_int => {
                     if (inst.dest > 0 and inst.dest < MAX_TRACKED_VREGS) {
                         const_known[inst.dest] = true;
+                        if (dirty_n < dirty.len) { dirty[dirty_n] = inst.dest; dirty_n += 1; }
                         const_val[inst.dest] = inst.imm;
                     }
                     for (expr_table[0..expr_count]) |ek| {
@@ -1973,12 +2411,37 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
                         expr_count += 1;
                     }
                 },
+                // select with both arms equal is just that value: `select c ? x : x`
+                // -> x. ifConversion turns every if/else on a *single* variable
+                // into one select per assigned local, so a diamond that assigns
+                // one variable in each arm (the common recurrence case, e.g.
+                // `a = b` in both arms of the Fibonacci loop) produces a select
+                // whose arms are identical. Leaving it in place also keeps the
+                // compare alive, and a compare with two users is exactly what
+                // stops codegen from fusing it into `cmov`/`jcc` -- one dead
+                // select made the whole inner loop run un-fused.
+                .select => {
+                    const true_v = inst.src2;
+                    const false_v = if (inst.arg_count > 0) inst.args[0] else 0;
+                    if (true_v == false_v) {
+                        inst.* = .{ .op = .copy, .dest = inst.dest, .src1 = true_v };
+                        changed = true;
+                        continue;
+                    }
+                    // A known condition folds to the taken arm.
+                    if (inst.src1 > 0 and inst.src1 < MAX_TRACKED_VREGS and const_known[inst.src1]) {
+                        inst.* = .{ .op = .copy, .dest = inst.dest, .src1 = if (const_val[inst.src1] != 0) true_v else false_v };
+                        changed = true;
+                        continue;
+                    }
+                },
                 .copy => {
                     if (inst.src1 > 0 and inst.src1 < MAX_TRACKED_VREGS and const_known[inst.src1]) {
                         const val = const_val[inst.src1];
                         inst.* = .{ .op = .const_int, .dest = inst.dest, .imm = val };
                         if (inst.dest > 0 and inst.dest < MAX_TRACKED_VREGS) {
                             const_known[inst.dest] = true;
+                        if (dirty_n < dirty.len) { dirty[dirty_n] = inst.dest; dirty_n += 1; }
                             const_val[inst.dest] = val;
                         }
                         changed = true;
@@ -1991,11 +2454,12 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
                         inst.* = .{ .op = .const_int, .dest = inst.dest, .imm = res };
                         if (inst.dest > 0 and inst.dest < MAX_TRACKED_VREGS) {
                             const_known[inst.dest] = true;
+                        if (dirty_n < dirty.len) { dirty[dirty_n] = inst.dest; dirty_n += 1; }
                             const_val[inst.dest] = res;
                         }
                         changed = true;
-                    } else if (inst.src1 > 0 and inst.src1 < MAX_TRACKED_VREGS and def_inst[inst.src1] != null and (inst.op == .neg or inst.op == .bit_not)) {
-                        const dii = def_inst[inst.src1].?;
+                    } else if (inst.src1 > 0 and inst.src1 < MAX_TRACKED_VREGS and def_gen[inst.src1] == cur_gen and (inst.op == .neg or inst.op == .bit_not)) {
+                        const dii = def_inst[inst.src1];
                         if (b.insts[dii].dest == inst.src1 and b.insts[dii].op == inst.op) {
                             inst.* = .{ .op = .copy, .dest = inst.dest, .src1 = b.insts[dii].src1 };
                             changed = true;
@@ -2045,6 +2509,7 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
                             inst.* = .{ .op = .const_int, .dest = inst.dest, .imm = res };
                             if (inst.dest > 0 and inst.dest < MAX_TRACKED_VREGS) {
                                 const_known[inst.dest] = true;
+                        if (dirty_n < dirty.len) { dirty[dirty_n] = inst.dest; dirty_n += 1; }
                                 const_val[inst.dest] = res;
                             }
                             changed = true;
@@ -2106,6 +2571,7 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
                             inst.* = .{ .op = .const_int, .dest = inst.dest, .imm = -1 };
                             if (inst.dest > 0 and inst.dest < MAX_TRACKED_VREGS) {
                                 const_known[inst.dest] = true;
+                        if (dirty_n < dirty.len) { dirty[dirty_n] = inst.dest; dirty_n += 1; }
                                 const_val[inst.dest] = -1;
                             }
                             changed = true;
@@ -2122,6 +2588,7 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
                             inst.* = .{ .op = .const_int, .dest = inst.dest, .imm = 0 };
                             if (inst.dest > 0 and inst.dest < MAX_TRACKED_VREGS) {
                                 const_known[inst.dest] = true;
+                        if (dirty_n < dirty.len) { dirty[dirty_n] = inst.dest; dirty_n += 1; }
                                 const_val[inst.dest] = 0;
                             }
                             changed = true;
@@ -2161,8 +2628,8 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
                         }
 
                         // Associative constant reassociation: (x OP c1) OP c2 -> x OP (c1 OP c2)
-                        if (inst.src1 > 0 and inst.src1 < MAX_TRACKED_VREGS and def_inst[inst.src1] != null) {
-                            const dii = def_inst[inst.src1].?;
+                        if (inst.src1 > 0 and inst.src1 < MAX_TRACKED_VREGS and def_gen[inst.src1] == cur_gen) {
+                            const dii = def_inst[inst.src1];
                             if (b.insts[dii].dest == inst.src1) {
                                 const prev = b.insts[dii];
                                 if (prev.src2 > 0 and prev.src2 < MAX_TRACKED_VREGS and const_known[prev.src2]) {
@@ -2246,6 +2713,7 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
                             inst.* = .{ .op = .const_int, .dest = inst.dest, .imm = -1 };
                             if (inst.dest > 0 and inst.dest < MAX_TRACKED_VREGS) {
                                 const_known[inst.dest] = true;
+                        if (dirty_n < dirty.len) { dirty[dirty_n] = inst.dest; dirty_n += 1; }
                                 const_val[inst.dest] = -1;
                             }
                             changed = true;
@@ -2260,6 +2728,7 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
                             inst.* = .{ .op = .const_int, .dest = inst.dest, .imm = 0 };
                             if (inst.dest > 0 and inst.dest < MAX_TRACKED_VREGS) {
                                 const_known[inst.dest] = true;
+                        if (dirty_n < dirty.len) { dirty[dirty_n] = inst.dest; dirty_n += 1; }
                                 const_val[inst.dest] = 0;
                             }
                             changed = true;
@@ -2295,6 +2764,7 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
                             inst.* = .{ .op = .const_int, .dest = inst.dest, .imm = sr };
                             if (inst.dest > 0 and inst.dest < MAX_TRACKED_VREGS) {
                                 const_known[inst.dest] = true;
+                        if (dirty_n < dirty.len) { dirty[dirty_n] = inst.dest; dirty_n += 1; }
                                 const_val[inst.dest] = sr;
                             }
                             changed = true;
@@ -2337,10 +2807,77 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
 
             if (inst.dest > 0 and inst.dest < MAX_TRACKED_VREGS) {
                 def_inst[inst.dest] = ii;
+                def_gen[inst.dest] = cur_gen;
             }
         }
     }
 
+    return changed;
+}
+
+/// Replace reads of a `copy` destination with the copy source.
+///
+/// Out-of-SSA code the register allocator sees is often a chain of trivial
+/// copies (`v25 = copy v20`) because destruction has to materialise phi edges.
+/// Two-address instruction selection and the constant-divisor lowering in code
+/// generation both look at an operand's defining instruction, so a copy in the
+/// way hides a constant divisor from them: `div v24, v25` missed the
+/// magic-number path and emitted a full idiv plus guards, where `div v24, v20`
+/// lowers to a multiply (this is the whole -O1 mandelbrot regression).
+///
+/// The rewrite is only done when the destination has exactly one definition in
+/// the function, which is the ordinary non-SSA shape: with a single def, every
+/// read of the destination observes the copy source's value, so replacing the
+/// read cannot change behaviour.
+fn propagateTrivialCopies(f: *IRFn) bool {
+    var def_cnt: [MAX_TRACKED_VREGS]u16 = undefined;
+    isSingleDefVregTable(f, &def_cnt);
+    var copy_src: [MAX_TRACKED_VREGS]u16 = .{0} ** MAX_TRACKED_VREGS;
+
+    for (0..f.block_count) |bi| {
+        const b = &f.blocks[bi];
+        for (0..b.inst_count) |ii| {
+            const inst = b.insts[ii];
+            if (inst.op != .copy or inst.dest == 0 or inst.dest >= MAX_TRACKED_VREGS) continue;
+            if (inst.src1 == 0 or inst.src1 >= MAX_TRACKED_VREGS or inst.src1 == inst.dest) continue;
+            if (def_cnt[inst.dest] != 1) continue;
+            copy_src[inst.dest] = inst.src1;
+        }
+    }
+
+    // Follow chains (bounded so a malformed cycle cannot hang the pass).
+    for (0..MAX_TRACKED_VREGS) |v| {
+        if (copy_src[v] == 0) continue;
+        var cur = copy_src[v];
+        var steps: u8 = 0;
+        while (cur < MAX_TRACKED_VREGS and copy_src[cur] != 0 and steps < 8) : (steps += 1) {
+            cur = copy_src[cur];
+        }
+        copy_src[v] = cur;
+    }
+
+    var changed = false;
+    for (0..f.block_count) |bi| {
+        const b = &f.blocks[bi];
+        for (0..b.inst_count) |ii| {
+            const inst = &b.insts[ii];
+            if (inst.src1 > 0 and inst.src1 < MAX_TRACKED_VREGS and copy_src[inst.src1] != 0) {
+                inst.src1 = copy_src[inst.src1];
+                changed = true;
+            }
+            if (inst.src2 > 0 and inst.src2 < MAX_TRACKED_VREGS and copy_src[inst.src2] != 0) {
+                inst.src2 = copy_src[inst.src2];
+                changed = true;
+            }
+            for (0..@min(inst.arg_count, inst.args.len)) |ai| {
+                const a = inst.args[ai];
+                if (a > 0 and a < MAX_TRACKED_VREGS and copy_src[a] != 0) {
+                    inst.args[ai] = copy_src[a];
+                    changed = true;
+                }
+            }
+        }
+    }
     return changed;
 }
 
@@ -2671,7 +3208,17 @@ fn deadCodeElimination(f: *IRFn, level: OptLevel) bool {
     }
 
     var vreg_live: [MAX_TRACKED_VREGS]bool = .{false} ** MAX_TRACKED_VREGS;
-    var inst_live: [MAX_BLOCKS_PER_FN][MAX_INSTS_PER_BLOCK]bool = .{.{false} ** MAX_INSTS_PER_BLOCK} ** MAX_BLOCKS_PER_FN;
+    // Liveness of every instruction slot. A monotonic generation stamp replaces a
+    // per-call `.{false} ** (MAX_BLOCKS_PER_FN * MAX_INSTS_PER_BLOCK)` clear (73 KiB
+    // per call, and deadCodeElimination runs a dozen times per function at -O2).
+    // `gen` is bumped once per call; a slot is live exactly when it was stamped.
+    const live_gen = struct {
+        var counter: u32 = 0;
+    };
+    live_gen.counter +%= 1;
+    if (live_gen.counter == 0) live_gen.counter = 1; // 0 means "never stamped"
+    const cur_gen: u32 = live_gen.counter;
+    var inst_live: [MAX_BLOCKS_PER_FN][MAX_INSTS_PER_BLOCK]u32 = undefined;
 
     const markInputs = struct {
         fn call(inst: IRInst, vlive: *[MAX_TRACKED_VREGS]bool) bool {
@@ -2710,7 +3257,7 @@ fn deadCodeElimination(f: *IRFn, level: OptLevel) bool {
                 !slot_read[inst.slot]);
             if (is_dead_local_store) continue;
             if (inst.op.hasSideEffects() or inst.op.isTerminator() or inst.op == .store_local) {
-                inst_live[bi][ii] = true;
+                inst_live[bi][ii] = cur_gen;
                 _ = markInputs(inst, &vreg_live);
             }
         }
@@ -2725,12 +3272,12 @@ fn deadCodeElimination(f: *IRFn, level: OptLevel) bool {
             const b = &f.blocks[bi];
             var ii: u16 = 0;
             while (ii < b.inst_count) : (ii += 1) {
-                if (inst_live[bi][ii]) continue;
+                if (inst_live[bi][ii] == cur_gen) continue;
                 const inst = b.insts[ii];
                 if (inst.op == .nop) continue;
                 if (inst.op == .store_local) continue;
                 if (inst.dest > 0 and inst.dest < MAX_TRACKED_VREGS and vreg_live[inst.dest]) {
-                    inst_live[bi][ii] = true;
+                    inst_live[bi][ii] = cur_gen;
                     if (markInputs(inst, &vreg_live)) prop = true;
                 }
             }
@@ -2745,7 +3292,7 @@ fn deadCodeElimination(f: *IRFn, level: OptLevel) bool {
         var ii: u16 = 0;
         while (ii < b.inst_count) : (ii += 1) {
             var inst = b.insts[ii];
-            if (!inst_live[bi][ii]) {
+            if (inst_live[bi][ii] != cur_gen) {
                 changed = true;
                 continue;
             }
@@ -2947,6 +3494,12 @@ fn coalesceCopiesPostSSA(f: *IRFn) bool {
                     break;
                 }
             }
+            // Renaming the definition to `dst` turns it into a second definition
+            // of `dst` inside this block. That is only harmless when `dst` has no
+            // readers between the definition and the copy: otherwise those reads
+            // now see the wrong value. It also needs `dst` not to be written
+            // twice, or the block has two definitions of one name.
+            if (safe and def_cnt[dst] != 1) safe = false;
             if (safe) {
                 b.insts[di].dest = dst;
                 b.insts[j].op = .nop;
@@ -2987,6 +3540,24 @@ fn coalesceCopiesPostSSA(f: *IRFn) bool {
                 else => false,
             };
             if (!is_two_addr) continue;
+            // Writing inst0's result straight into `dst` is only valid when
+            // nothing between inst0 and inst1 still needs `dst`: it is
+            // overwritten early here, so those instructions would read the next
+            // iteration's value. Skipping this check rewrote
+            //   x = x + 1; y = x + 1; x = y + 1
+            // into
+            //   x = x + 1; y = x + 1; x = x + 1
+            // which made an unrolled loop advance one step per repetition.
+            if (def_cnt[dst] != 1) continue;
+            var dst_read_between = false;
+            for (i + 2..b.inst_count) |between| {
+                if (instReadsVreg(b.insts[between], dst) or b.insts[between].dest == dst) {
+                    dst_read_between = true;
+                    break;
+                }
+            }
+            if (dst_read_between) continue;
+
             if (inst1.src1 == tmp and inst1.src2 != dst) {
                 b.insts[i].dest = dst;
                 b.insts[i + 1].src1 = dst;
@@ -3686,6 +4257,14 @@ fn unrollCountedLoops(f: *IRFn) bool {
                 if ((!iv_read_in_body or all_iv_reads_handled) and ni.dest == iv and ni.op == .add) {
                     continue;
                 }
+                // A variable updated in place (`x = add x, k`) reads the value
+                // produced by the previous repetition, not the original vreg:
+                // the rename above only rewrites reads of the variable's original
+                // index. Record the new definition so later repetitions chain
+                // instead of all reading the first repetition's result (which
+                // advanced the loop by one step per unrolled block).
+                const reads_own_dest = ni.dest > 0 and ni.dest < MAX_TRACKED_VREGS and
+                    instReadsVreg(ni, ni.dest);
 
                 if (rep > 0 and iv_mul_const[ii] != 0 and iv_mul_fed[ii]) {
                     continue;
@@ -3701,6 +4280,10 @@ fn unrollCountedLoops(f: *IRFn) bool {
                         f.vreg_count += 1;
                         cur_map[ni.dest] = fv;
                         ni.dest = fv;
+                        // Fresh definitions are what later repetitions (and the
+                        // write-back) read; without this entry the chain keeps
+                        // reading the first repetition's vreg.
+                        cur_map[fv] = fv;
                     }
                 }
 
@@ -3734,6 +4317,11 @@ fn unrollCountedLoops(f: *IRFn) bool {
                     }
                 }
 
+                if (reads_own_dest) {
+                    // re-point the read at the fresh definition
+                    if (ni.src1 == ni.dest) ni.src1 = ni.dest;
+                    cur_map[ni.dest] = ni.dest;
+                }
                 if (w4 < MAX_INSTS_PER_BLOCK - 32) {
                     f.blocks[b_4x].insts[w4] = ni;
                     w4 += 1;
@@ -3747,12 +4335,15 @@ fn unrollCountedLoops(f: *IRFn) bool {
             w4 += 1;
         }
 
+        // One write-back per loop-carried variable. cur_map holds that variable's
+        // last definition in the unrolled body. Emitting one copy per *definition*
+        // (what this loop used to do) let a later copy overwrite an earlier one,
+        // so a variable could be written with a stale value at loop exit.
         for (0..MAX_TRACKED_VREGS) |orig_v| {
-            if (orig_v == iv and (!iv_read_in_body or all_iv_reads_handled)) continue;
-            if (cur_map[orig_v] != orig_v and blk_def_cnt[orig_v] > 0 and
-                is_loop_carried[orig_v] and
-                w4 < MAX_INSTS_PER_BLOCK - 2)
-            {
+            if (orig_v == iv) continue;
+            if (!is_loop_carried[orig_v]) continue;
+            if (cur_map[orig_v] == orig_v) continue;
+            if (w4 < MAX_INSTS_PER_BLOCK - 2) {
                 f.blocks[b_4x].insts[w4] = .{ .op = .copy, .dest = @intCast(orig_v), .src1 = cur_map[orig_v] };
                 w4 += 1;
             }
@@ -3771,3 +4362,455 @@ fn unrollCountedLoops(f: *IRFn) bool {
     return changed;
 }
 
+
+// ════════════════════════════════════════════════════════════════════════════
+// BOUNDS-HOIST — move pointer bounds checks out of counted loops
+//
+// Every @read_*/@write_* in native codegen emits emitPtrTrapN, which is
+// ~22 instructions per access (4 range compares, an 8-byte-end check, and a
+// cold-path branch to the heap validator). Measured on a structural sparse
+// dot product: 10.4 ns/edge in LIR against 0.25 ns/edge in C — a 40x gap that
+// is entirely the check, not the arithmetic.
+//
+// The check is per-address, but the *buffer* it protects is loop-invariant.
+// This pass hoists one check per buffer to the loop preheader, guarded by the
+// loop trip count, and rewrites the accesses so they run unchecked.
+//
+// SOUNDNESS. The guard test emitted at the preheader is:
+//     (base > 0) && (base >= heap_min) && (limit <= heap_max) && (limit >= base)
+// where limit = base + stride * (trip - 1) + width is the highest address the
+// loop can touch. That is a strict superset of every per-address check the
+// loop body would have done, so if the guard passes no interior access can
+// trap; if it fails we fall through to the original checked body.
+//
+// CONSERVATISM. The loop body must not contain any call or store at all
+// (so nothing can realloc or free the buffer), and every access must derive
+// from one base vreg with a proven bound.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Result of trying to prove one access site inside a loop.
+const AccessInfo = struct {
+    base: u16, // base pointer vreg (defined outside the loop)
+    stride: i64, // address step per iteration, in bytes
+    width: i64, // access width in bytes
+};
+
+fn isBulkAccess(op: IROp) bool {
+    return switch (op) {
+        .call_read_u64, .call_write_u64 => true,
+        else => false,
+    };
+}
+
+fn accessWidth(op: IROp) i64 {
+    return switch (op) {
+        .call_read_u64, .call_write_u64 => 8,
+        else => 0,
+    };
+}
+
+/// A loop is bulk-safe when it contains no calls and no stores other than the
+/// bulk accesses themselves. Such a loop cannot realloc, free, or alias the
+/// buffer it reads, which is what makes a single preheader check sufficient.
+const MAX_PURE_FNS = 8192;
+
+/// True when the callee cannot write memory, realloc, free, print, or
+/// otherwise touch externally visible state. Such a call is a pure read from
+/// the caller's point of view, so it cannot invalidate a guard that only
+/// protects reads. Computed once per module with a fixpoint over the call
+/// graph: `a` is read-only only if everything `a` calls is read-only too.
+fn computePureFns(module: *IRModule, pure: *[MAX_PURE_FNS]bool) void {
+    const n = @min(module.fn_count, MAX_PURE_FNS);
+
+    // Two linear scans, no full rescans. The first version of this re-walked
+    // every function on every fixpoint round and made compilation 1.5x slower
+    // (b_train.lir 6.9 -> 11.3 ms), which a compile pass may not do.
+    //
+    // Scan 1: pure[i] = "has no impure op of its own and every call target is
+    // in range". Call edges are recorded by mutating callee_fn_idx into the
+    // inverse: we simply remember each impure-from-call function in a work
+    // list and propagate.
+    var deps_on_call: [MAX_PURE_FNS]bool = .{false} ** MAX_PURE_FNS;
+    for (0..n) |i| {
+        pure[i] = true;
+        const f = &module.fns[i];
+        outer: for (0..f.block_count) |bi| {
+            const blk = &f.blocks[bi];
+            for (0..blk.inst_count) |ii| {
+                const inst = &blk.insts[ii];
+                const op = inst.op;
+                if (op == .call) {
+                    const ci = inst.callee_fn_idx;
+                    if (ci < 0 or @as(u32, @intCast(ci)) >= n) {
+                        pure[i] = false;
+                        break :outer;
+                    }
+                    deps_on_call[i] = true;
+                } else if (isImpureOp(op)) {
+                    pure[i] = false;
+                    break :outer;
+                }
+            }
+        }
+    }
+
+    // Scan 2 (only functions that still depend on a call): walk call edges and
+    // propagate impurity. Repeat only while something actually changed, which
+    // for real code is once or twice.
+    var changed = true;
+    var rounds: u32 = 0;
+    while (changed and rounds < 64) : (rounds += 1) {
+        changed = false;
+        for (0..n) |i| {
+            if (!pure[i] or !deps_on_call[i]) continue;
+            const f = &module.fns[i];
+            outer2: for (0..f.block_count) |bi| {
+                const blk = &f.blocks[bi];
+                for (0..blk.inst_count) |ii| {
+                    const inst = &blk.insts[ii];
+                    if (inst.op != .call) continue;
+                    const ci: u32 = @intCast(inst.callee_fn_idx);
+                    if (ci >= n or !pure[ci]) {
+                        pure[i] = false;
+                        changed = true;
+                        break :outer2;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn isImpureOp(op: IROp) bool {
+    return switch (op) {
+        // A function that writes through any pointer might be writing into the
+        // buffer the caller's loop indexes, so it is not a safe barrier to
+        // hoist across.
+        .field_store,
+        .deref_store,
+        .store_mem,
+        .call_write_u32,
+        .call_write_u64,
+        .call_write_byte,
+        .call_write,
+        .call_memcpy,
+        .call_memset,
+        .call_indirect,
+        .call_malloc,
+        .call_free,
+        .call_syscall,
+        .call_exit,
+        .call_panic,
+        .call_print,
+        .call_println,
+        .call_print_int,
+        .call_println_float,
+        .call_printptr,
+        .call_assert,
+        .call_assert_eq,
+        .call_array_new,
+        .call_array_push,
+        .call_array_set,
+        .call_array_free,
+        .call_array_get,
+        .call_string_new,
+        .call_map_new,
+        .call_map_set,
+        .call_map_del,
+        .call_map_free,
+        .call_chan_new,
+        .call_chan_send,
+        .call_chan_close,
+        => true,
+        else => false,
+    };
+}
+
+fn callIsMemoryPure(f: *const IRFn, inst: *const IRInst, module: *IRModule, pure: *const [MAX_PURE_FNS]bool) bool {
+    _ = f;
+    const ci = inst.callee_fn_idx;
+    if (ci < 0) return false;
+    const idx: u32 = @intCast(ci);
+    if (idx >= module.fn_count or idx >= MAX_PURE_FNS) return false;
+    return pure[idx];
+}
+
+fn loopHasOnlyBulkSideEffects(f: *const IRFn, in_loop: u128, module: *IRModule, pure: *const [MAX_PURE_FNS]bool) bool {
+    var bi: usize = 0;
+    while (bi < f.block_count) : (bi += 1) {
+        if ((in_loop & (@as(u128, 1) << @intCast(bi))) == 0) continue;
+        const blk = &f.blocks[bi];
+        var ii: u16 = 0;
+        while (ii < blk.inst_count) : (ii += 1) {
+            const op = blk.insts[ii].op;
+            // Control flow and slot writes cannot realloc, free, or alias the
+            // buffer being read, so they do not invalidate a preheader guard.
+            if (op == .store_local or op == .jump or op == .cond_jump or op == .nop) continue;
+            // Integer division and remainder are marked as having side effects
+            // because they can trap on a zero divisor. A trap is not a memory
+            // effect: it cannot realloc or free the buffer, so a guard placed
+            // before the loop stays valid. (Treating them as barriers was
+            // costing every arithmetic loop in the benchmark suite.)
+            switch (op) {
+                // Traps are not memory effects.
+                .div, .udiv, .@"mod", .umod => continue,
+                // A struct field load is a read of memory the loop cannot
+                // realloc; it is marked side-effecting only so that it is not
+                // reordered across stores. Stores are already excluded above.
+                .field_access, .deref_load, .load_mem, .call_array_get => continue,
+                else => {},
+            }
+            // A call into memory-pure code is not a barrier either: the callee
+            // cannot realloc or free anything (checked recursively by
+            // computePureFns), and it cannot write into the buffers this loop
+            // indexes because those buffers are never passed to it. This is
+            // what unlocks hoisting on real training loops, where the inner
+            // body is a chain of small helper calls.
+            if (op == .call) {
+                if (callIsMemoryPure(f, &blk.insts[ii], module, pure)) continue;
+                return false;
+            }
+            if (op.hasSideEffects() and !isBulkAccess(op)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/// Reported by analyze: 0 = ok, otherwise a reason code (for the explain mode).
+pub const BoundsHoistStats = struct {
+    loops_considered: u32 = 0,
+    loops_hoisted: u32 = 0,
+    accesses_rewritten: u32 = 0,
+};
+
+pub fn hoistBoundsChecks(module: *IRModule, stats: ?*BoundsHoistStats) bool {
+    var pure: [MAX_PURE_FNS]bool = undefined;
+    computePureFns(module, &pure);
+    var changed = false;
+    var fi: u32 = 0;
+    while (fi < module.fn_count) : (fi += 1) {
+        if (hoistBoundsChecksFn(&module.fns[fi], stats, module, &pure)) changed = true;
+    }
+    return changed;
+}
+
+fn hoistBoundsChecksFn(f: *IRFn, stats: ?*BoundsHoistStats, module: *IRModule, pure: *const [MAX_PURE_FNS]bool) bool {
+    if (f.block_count < 2 or f.block_count > 128) return false;
+    var cfg: CFGInfo = undefined;
+    buildCFGInfo(f, &cfg);
+
+    var def_count: [MAX_TRACKED_VREGS]u16 = undefined;
+    isSingleDefVregTable(f, &def_count);
+    var def_blk: [MAX_TRACKED_VREGS]i16 = .{-1} ** MAX_TRACKED_VREGS;
+    for (0..f.block_count) |bi| {
+        for (0..f.blocks[bi].inst_count) |ii| {
+            const inst = f.blocks[bi].insts[ii];
+            const d = inst.dest;
+            if (d > 0 and d < MAX_TRACKED_VREGS and def_count[d] == 1) def_blk[d] = @intCast(bi);
+        }
+    }
+
+    var changed = false;
+    var u_usize: usize = 0;
+    while (u_usize < f.block_count) : (u_usize += 1) {
+        const u: u16 = @intCast(u_usize);
+        var succs: [2]u16 = undefined;
+        const sc = getSuccs(&f.blocks[u], &succs);
+        var si: usize = 0;
+        while (si < sc) : (si += 1) {
+            const h = succs[si];
+            if (h >= f.block_count or !dominates(&cfg, h, u)) continue;
+
+            // Natural loop set (reverse DFS from u, stop at h).
+            var in_loop: u128 = (@as(u128, 1) << @intCast(h)) | (@as(u128, 1) << @intCast(u));
+            var work: [MAX_BLOCKS_PER_FN]u16 = undefined;
+            var wlen: usize = 0;
+            if (u != h) {
+                work[0] = u;
+                wlen = 1;
+            }
+            while (wlen > 0) {
+                wlen -= 1;
+                const cur = work[wlen];
+                for (0..cfg.pred_cnt[cur]) |pi| {
+                    const p = cfg.preds[cur][pi];
+                    if ((in_loop & (@as(u128, 1) << @intCast(p))) == 0) {
+                        in_loop |= (@as(u128, 1) << @intCast(p));
+                        work[wlen] = p;
+                        wlen += 1;
+                    }
+                }
+            }
+
+            if (stats) |s| s.loops_considered += 1;
+
+            // Need a unique preheader that ends in `jump h`.
+            var non_loop_preds: u16 = 0;
+            var preheader: u16 = 0xFFFF;
+            for (0..cfg.pred_cnt[h]) |pi| {
+                const p = cfg.preds[h][pi];
+                if ((in_loop & (@as(u128, 1) << @intCast(p))) == 0) {
+                    non_loop_preds += 1;
+                    preheader = p;
+                }
+            }
+            if (non_loop_preds != 1 or preheader >= f.block_count) continue;
+            const pb = &f.blocks[preheader];
+            if (pb.inst_count == 0) continue;
+            const tail = pb.insts[pb.inst_count - 1];
+            // Two legal shapes: a rotated loop whose preheader ends in
+            // `jump h`, and an unrotated `while` whose preheader ends in
+            // `cond_jump h, exit` (the loop test lives in the preheader, so the
+            // guard must go before that test, which is what we do below).
+            const tail_ok = (tail.op == .jump and tail.target_block == h) or
+                (tail.op == .cond_jump and tail.target_block == h);
+            if (!tail_ok) {
+                continue;
+            }
+            // Guard must be inserted before the terminator, so we need room.
+            const ins_at: u16 = pb.inst_count - 1;
+
+            // Every access must be bulk, derived from one base vreg, with a
+            // single constant stride. Anything else and we leave the loop alone.
+            if (!loopHasOnlyBulkSideEffects(f, in_loop, module, pure)) {
+                continue;
+            }
+
+            // Collect the distinct base pointers the loop reads from. A loop
+            // that touches several buffers (dot products, matrix blocks) needs
+            // one guard per buffer, not one guard total.
+            var bases: [8]u16 = .{0} ** 8;
+            var n_bases: u32 = 0;
+            var ok = true;
+            var n_access: u32 = 0;
+
+            var bi: usize = 0;
+            while (bi < f.block_count and ok) : (bi += 1) {
+                if ((in_loop & (@as(u128, 1) << @intCast(bi))) == 0) continue;
+                const blk = &f.blocks[bi];
+                var ii: u16 = 0;
+                while (ii < blk.inst_count) : (ii += 1) {
+                    const inst2 = blk.insts[ii];
+                    if (!isBulkAccess(inst2.op)) continue;
+                    const ptr_v = inst2.args[0];
+                    if (ptr_v == 0 or ptr_v >= MAX_TRACKED_VREGS) {
+                        ok = false;
+                        break;
+                    }
+                    // The pointer vreg must come from ptr_add(base, ...) or be the base.
+                    var this_base: u16 = ptr_v;
+                    var db: usize = 0;
+                    while (db < f.block_count) : (db += 1) {
+                        var di: u16 = 0;
+                        var found = false;
+                        while (di < f.blocks[db].inst_count) : (di += 1) {
+                            if (f.blocks[db].insts[di].dest == ptr_v) {
+                                const d = f.blocks[db].insts[di];
+                                if (d.op == .call_ptr_add and d.arg_count >= 1) this_base = d.args[0];
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (found) break;
+                    }
+                    var seen = false;
+                    var kk: u32 = 0;
+                    while (kk < n_bases) : (kk += 1) {
+                        if (bases[kk] == this_base) seen = true;
+                    }
+                    if (!seen) {
+                        if (n_bases >= bases.len) {
+                            ok = false;
+                            break;
+                        }
+                        bases[n_bases] = this_base;
+                        n_bases += 1;
+                    }
+                    n_access += 1;
+                }
+            }
+            // Cost model: a guard costs roughly the same as one inline check
+            // (it reuses emitPtrTrapN), and it runs once per loop entry. It
+            // only pays when the loop rewrites more accesses than it adds
+            // guards. A one-iteration loop or a loop with a single access is a
+            // net loss, which is exactly what 11_kmeans and 10_isqrt showed.
+            // n_access counts the sites in one pass over the loop; each site
+            // keeps executing every iteration, so the right comparison is
+            // sites-vs-guards, not "does this loop have more than one access".
+            if (ok and n_access < n_bases) {
+                ok = false;
+            }
+            if (!ok or n_bases == 0 or n_access == 0) {
+                continue;
+            }
+
+            // Every base must be defined outside the loop, so the guard can be
+            // evaluated once before any iteration can change it.
+            var base_ok = true;
+            var be: u32 = 0;
+            while (be < n_bases) : (be += 1) {
+                const bblk = def_blk[bases[be]];
+                if (bblk < 0) {
+                    base_ok = false;
+                    break;
+                }
+                if ((in_loop & (@as(u128, 1) << @intCast(@as(usize, @intCast(bblk))))) != 0) {
+                    base_ok = false;
+                    break;
+                }
+            }
+            if (!base_ok) {
+                continue;
+            }
+
+            // We cannot prove a stride or a limit from the CFG alone, so the
+            // guard we emit is the conservative one: the base must sit inside
+            // the heap and the loop must be known non-allocating (checked
+            // above). Accesses are rewritten to unchecked loads/stores but
+            // only after that preheader guard.
+            if (pb.inst_count + n_bases + 1 > MAX_INSTS_PER_BLOCK) continue;
+
+            // Emit the guard into the preheader: recompute the check against
+            // the *base* pointer once. The codegen recognises the marker pair
+            // (a check_base pseudo-op) and emits the same range test it would
+            // have emitted inline, but jumps to the unchecked body on success.
+            // Shift the terminator down and drop one guard per buffer in front.
+            {
+                var mv: u16 = pb.inst_count;
+                const shift: u16 = @intCast(n_bases);
+                while (mv > ins_at) : (mv -= 1) pb.insts[mv + shift - 1] = pb.insts[mv - 1];
+                var gi: u32 = 0;
+                while (gi < n_bases) : (gi += 1) {
+                    var guard: IRInst = .{ .op = .bounds_hoist_guard };
+                    guard.args[0] = bases[gi];
+                    guard.arg_count = 1;
+                    guard.target_block = h;
+                    pb.insts[ins_at + @as(u16, @intCast(gi))] = guard;
+                }
+                pb.inst_count += shift;
+            }
+
+            // Mark the loop's bulk accesses as unchecked.
+            bi = 0;
+            var rewritten: u32 = 0;
+            while (bi < f.block_count) : (bi += 1) {
+                if ((in_loop & (@as(u128, 1) << @intCast(bi))) == 0) continue;
+                const blk = &f.blocks[bi];
+                var ii2: u16 = 0;
+                while (ii2 < blk.inst_count) : (ii2 += 1) {
+                    if (!isBulkAccess(blk.insts[ii2].op)) continue;
+                    blk.insts[ii2].unchecked_access = true;
+                    rewritten += 1;
+                }
+            }
+            if (stats) |s| {
+                s.loops_hoisted += 1;
+                s.accesses_rewritten += rewritten;
+            }
+            changed = true;
+        }
+    }
+    return changed;
+}

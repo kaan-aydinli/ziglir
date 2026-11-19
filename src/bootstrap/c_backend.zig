@@ -22,6 +22,7 @@ pub const CBackendError = error{
     InvalidFunction,
     OutOfMemory,
     CCompilerNotFound,
+    CrossCompilerNotFound,
     CCompileFailed,
 };
 
@@ -1361,8 +1362,15 @@ pub fn emitC(alloc: std.mem.Allocator, module: *const IRModule, source: []const 
                     .call_write_byte => try w.print("    lir_chk_ptr_n(v{d}, 1u); *(uint8_t *)(uintptr_t)v{d} = (uint8_t)v{d};\n", .{ inst.args[0], inst.args[0], inst.args[1] }),
                     .call_read_u32 => try w.print("    do {{ lir_chk_ptr_n(v{d}, 4u); uint32_t _t; memcpy(&_t, (const void *)(uintptr_t)v{d}, 4); v{d} = _t; }} while (0);\n", .{ inst.args[0], inst.args[0], inst.dest }),
                     .call_write_u32 => try w.print("    do {{ lir_chk_ptr_n(v{d}, 4u); uint32_t _t = (uint32_t)v{d}; memcpy((void *)(uintptr_t)v{d}, &_t, 4); }} while (0);\n", .{ inst.args[0], inst.args[1], inst.args[0] }),
-                    .call_read_u64 => try w.print("    lir_chk_ptr_n(v{d}, 8u); memcpy(&v{d}, (const void *)(uintptr_t)v{d}, 8);\n", .{ inst.args[0], inst.dest, inst.args[0] }),
-                    .call_write_u64 => try w.print("    lir_chk_ptr_n(v{d}, 8u); memcpy((void *)(uintptr_t)v{d}, &v{d}, 8);\n", .{ inst.args[0], inst.args[0], inst.args[1] }),
+                    .bounds_hoist_guard => try w.print("    lir_chk_ptr_n(v{d}, 1u); /* bounds-hoist guard */\n", .{inst.args[0]}),
+                    .call_read_u64 => if (inst.unchecked_access)
+                        try w.print("    memcpy(&v{d}, (const void *)(uintptr_t)v{d}, 8);\n", .{ inst.dest, inst.args[0] })
+                    else
+                        try w.print("    lir_chk_ptr_n(v{d}, 8u); memcpy(&v{d}, (const void *)(uintptr_t)v{d}, 8);\n", .{ inst.args[0], inst.dest, inst.args[0] }),
+                    .call_write_u64 => if (inst.unchecked_access)
+                        try w.print("    memcpy((void *)(uintptr_t)v{d}, &v{d}, 8);\n", .{ inst.args[0], inst.args[1] })
+                    else
+                        try w.print("    lir_chk_ptr_n(v{d}, 8u); memcpy((void *)(uintptr_t)v{d}, &v{d}, 8);\n", .{ inst.args[0], inst.args[0], inst.args[1] }),
                     .call_memcpy => try w.print("    if ((int64_t)v{d} < 0) lir_trap(); if (v{d} > 0) {{ lir_chk_ptr_n(v{d}, (size_t)v{d}); lir_chk_ptr_n(v{d}, (size_t)v{d}); memmove((void *)(uintptr_t)v{d}, (const void *)(uintptr_t)v{d}, (size_t)v{d}); }} v{d} = v{d};\n", .{ inst.args[2], inst.args[2], inst.args[0], inst.args[2], inst.args[1], inst.args[2], inst.args[0], inst.args[1], inst.args[2], inst.dest, inst.args[0] }),
                     .call_memset => try w.print("    if ((int64_t)v{d} < 0) lir_trap(); if (v{d} > 0) {{ lir_chk_ptr_n(v{d}, (size_t)v{d}); memset((void *)(uintptr_t)v{d}, (int)v{d}, (size_t)v{d}); }} v{d} = v{d};\n", .{ inst.args[2], inst.args[2], inst.args[0], inst.args[2], inst.args[0], inst.args[1], inst.args[2], inst.dest, inst.args[0] }),
                     .call_secure_zero => try w.print("    if ((int64_t)v{d} < 0) lir_trap(); if (v{d} > 0) {{ lir_chk_ptr_n(v{d}, (size_t)v{d}); lir_secure_zero_mem((void *)(uintptr_t)v{d}, (size_t)v{d}); }}\n", .{ inst.args[1], inst.args[1], inst.args[0], inst.args[1], inst.args[0], inst.args[1] }),
@@ -1568,6 +1576,10 @@ pub fn compileCWithToolchain(
         try argv.append(alloc, "cc");
         try argv.append(alloc, "-target");
         try argv.append(alloc, target.zigTriple());
+    } else if (!target.isHost()) {
+        // A host `cc` can only produce host binaries; silently emitting a host
+        // binary for a cross target would be a miscompile.
+        return error.CrossCompilerNotFound;
     } else if (host_cc) |hc| {
         try argv.append(alloc, hc);
     } else {

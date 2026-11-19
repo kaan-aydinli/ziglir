@@ -1,341 +1,335 @@
-# LIR Language Specification v2.0
+# LIR Language Specification
 
-## Overview
+**Version:** 2.3 (bootstrap reference) · compiler `lir 2.3.0`
+**Status of this document:** describes what the **checked-in bootstrap compiler
+actually accepts, checks and executes**. Anything not implemented is explicitly
+labelled *planned* (see [ROADMAP.md](ROADMAP.md)).
 
-LIR is a systems programming language designed for:
-- **Zero-cost abstractions** — no runtime overhead
-- **Memory safety without garbage collection** — ownership + borrowing
-- **Fearless concurrency** — compile-time data race prevention
-- **Native speed** — compiles to native machine code
-- **Self-contained** — no external dependencies needed
-- **Cross-platform** — intended to target Linux, macOS, Windows, WASM, and embedded systems
+> **Ground truth.** The authoritative, always-current list of syntax is generated
+> from the compiler itself:
+>
+> ```sh
+> lir lang                 # human-readable catalogue with examples
+> lir lang --json          # machine-readable (schema lir.lang.v1)
+> lir lang --keywords      # reserved words (schema lir.keywords.v1 with --json)
+> lir lang --markdown      # regenerate docs/LANGUAGE_REFERENCE.md
+> lir builtins --json      # every builtin + signature
+> lir check file.lir --json # validate; lir.diagnostics.v1 on stderr
+> ```
+>
+> [`LANGUAGE_REFERENCE.md`](LANGUAGE_REFERENCE.md) is generated from that table
+> and every `supported` example is compiled and executed by `zig build test`, so
+> it cannot silently drift from the implementation.
 
-These are language design goals, not a claim that every feature is implemented in the current compiler. The checked-in bootstrap compiler currently emits Linux x86-64 ELF executables. Cross-platform backends, complete static type checking, and enforced ownership/borrow checking must be treated as incomplete until implemented and covered by tests. See the roadmap for implementation status.
+---
 
-## Design Principles
+## 1. Overview
 
-1. **Easy to learn** — a small core language, consistent rules, and beginner-friendly diagnostics.
-2. **Easy to write** — infer obvious local types; require explicit annotations when they improve clarity or resolve ambiguity.
-3. **Readable by default** — prefer familiar control flow and avoid syntax that has multiple meanings.
-4. **Predictable performance** — make allocation, layout, ownership, and expensive operations understandable to the programmer.
-5. **Optimization with evidence** — every performance claim must be backed by correctness tests, reproducible benchmarks, and generated-code inspection.
-6. **Safety without surprise** — enforce ownership and borrowing only when the compiler actually implements and tests those checks.
-7. **Portable semantics** — keep language rules independent of target-specific machine code.
+LIR is a small, performance-first systems language. Its reference
+implementation, **Ziglir**, is a Zig bootstrap compiler that emits:
 
-### Syntax ergonomics acceptance criteria
+| Backend | Target | External toolchain |
+|---|---|---|
+| `native` (ELF64) | `x86_64-linux` | none |
+| `wasm` | `wasm32-wasi` | none (Wasmtime/Node to run) |
+| `c` / `--emit-c` | `aarch64`/`riscv64`/macOS/Windows/FreeBSD/Linux | `cc` or `zig cc` |
+| `vm` | any host | none |
 
-- A first program should require only a function, a print call, and a clear exit value.
-- Common code should not require annotations when the type is unambiguous from the initializer.
-- Error messages should identify the source location, explain the problem in plain language, and suggest a valid next step when possible.
-- There should be one canonical spelling for each core operation; avoid aliases and punctuation-heavy alternatives.
-- New syntax must be covered by parser, diagnostics, formatting, and compatibility tests before it is declared supported.
-- Ergonomics changes must preserve explicit control over allocation and predictable native code generation.
+Design goals (not guarantees): a small and consistent core syntax, predictable
+layout and allocation, checks that are on by default, and evidence-backed
+performance claims.
 
-## Type System
-
-### Primitive Types
-```
-i8, i16, i32, i64, i128    — signed integers
-u8, u16, u32, u64, u128    — unsigned integers
-f16, f32, f64, f128         — floating point
-bool                        — true/false
-char                        — Unicode code point
-string                      — immutable UTF-8 string
-void                        — no value
-never                       — never returns (panic, infinite loop)
-```
-
-### Compound Types
-```
-[Type; N]           — fixed-size array
-[]Type              — slice (pointer + length)
-*Type               — raw pointer
-*const Type         — immutable raw pointer
-*mut Type           — mutable raw pointer
-?type               — optional (null if not present)
-!Type               — result (error or value)
-(Type, Type, ...)   — tuple
-fn(Args) -> Ret     — function pointer
-```
-
-### User-Defined Types
-```
-struct Name { fields... }       — product type
-enum Name { variants... }       — sum type
-trait Name { methods... }       — interface
-type Alias = Type               — type alias
-```
-
-## Ownership System
-
-LIR uses affine type system with ownership tracking:
+### 1.1 One-page example
 
 ```lir
-fn main() {
-    let s = "hello"          // s owns the string
-    let t = s                // t takes ownership (s is moved)
-    // print(s)              // ERROR: s was moved
-    print(t)                 // OK: t is valid
-}
-```
+import core
 
-### Borrowing
-```lir
-fn process(data: *const []i32) {   // immutable borrow
-    print(data.len)
+enum Shape {
+    Square(i64),
+    Empty,
 }
 
-fn modify(data: *mut []i32) {      // mutable borrow
-    data[0] = 42
-}
-
-// Rules:
-// - Multiple immutable borrows allowed
-// - Only one mutable borrow allowed
-// - Cannot mix mutable and immutable borrows
-// - Borrows cannot outlive the owner
-```
-
-### Lifetimes
-```lir
-fn longest<'a>(x: *const str, y: *const str) -> *const str {
-    if x.len > y.len { x } else { y }
-}
-```
-
-## Concurrency Model
-
-### Threads
-```lir
-let handle = spawn {
-    // runs on new thread
-    compute()
-}
-let result = handle.join()
-```
-
-### Channels
-```lir
-let (tx, rx) = channel()
-spawn { tx.send(compute()) }
-let value = rx.recv()
-```
-
-### Async/Await
-```lir
-async fn fetch(url: string) -> Response {
-    let response = await http.get(url)
-    response
-}
-
-// Run async code
-let result = runtime.block_on(fetch("https://example.com"))
-```
-
-### Data Race Prevention
-```lir
-// Compile-time error if data races detected
-let data = Arc::new(Mutex::new(Vec::new()))
-let data2 = data.clone()
-
-spawn {
-    let guard = data2.lock()
-    guard.push(1)
-}  // lock released here
-```
-
-## Error Handling
-
-### Result Type
-```lir
-fn divide(a: f64, b: f64) -> !f64 {
-    if b == 0.0 { return Err("division by zero") }
-    Ok(a / b)
-}
-
-// Propagate errors
-let result = try divide(10.0, 2.0)?
-```
-
-### Option Type
-```lir
-fn find(arr: []i32, value: i32) -> ?usize {
-    for i, item in arr {
-        if item == value { return Some(i) }
+fn area(shape: Shape) -> i64 {
+    return match shape {
+        Shape::Square(side) => side * side,
+        Shape::Empty => 0,
     }
-    None
 }
-
-// Pattern matching
-match find(arr, 42) {
-    Some(idx) => print("Found at index: {idx}"),
-    None => print("Not found"),
-}
-```
-
-## Pattern Matching
-
-```lir
-match value {
-    0 => print("zero"),
-    1..=9 => print("single digit"),
-    10 | 20 | 30 => print("special number"),
-    n if n > 100 => print("big number"),
-    _ => print("other"),
-}
-```
-
-## Generics
-
-```lir
-struct Vec(T) {
-    items: []T
-    len: u64
-    capacity: u64
-}
-
-impl Vec(T) {
-    fn push(self: *mut Self, value: T) { ... }
-    fn get(self: *const Self, index: u64) -> ?T { ... }
-}
-
-// Usage
-let mut numbers = Vec(i32).init(alloc)
-numbers.push(42)
-```
-
-## Compile-Time Execution
-
-```lir
-comptime fn fibonacci(n: u64) -> u64 {
-    if n <= 1 { return n }
-    fibonacci(n - 1) + fibonacci(n - 2)
-}
-
-// Computed at compile time
-const TABLE_SIZE = fibonacci(10)  // = 55
-let table = [TABLE_SIZE]u8
-```
-
-## Modules
-
-```lir
-// math.lir
-pub fn add(a: i32, b: i32) -> i32 { a + b }
-pub fn mul(a: i32, b: i32) -> i32 { a * b }
-
-// main.lir
-import math
 
 fn main() -> i64 {
-    print(math.add(2, 3))
-    0
+    let mut total = 0
+    for i in 1..=3 {
+        total += area(Shape::Square(i))
+    }
+    println("total = {total}")
+    return 0
 }
 ```
 
-## Attributes
+---
+
+## 2. Lexical structure
+
+* **Encoding:** UTF-8 source; identifiers are ASCII `[A-Za-z_][A-Za-z0-9_]*`.
+* **Statement separation:** newlines. `;` is accepted and ignored, but is never
+  required and must **not** be placed between `if`/`else` blocks.
+* **Comments:** `#` to end of line, `//` to end of line, `///` documentation
+  comment, and nested `/* ... */`. `#[` introduces an attribute and `#{` a map
+  literal, so they are not comments.
+* **Literals:**
+  * integers — decimal, `0xFF`, `0b1010`, `0o17`, with `_` separators; must fit
+    in `i64` (diagnostic `LIR-E1004` otherwise)
+  * floats — `1.5`, `2.5e3` (binary64 value; `f32` rounding only on cast)
+  * strings — `"..."` with `\n \t \r \\ \" \0`; interpolation `"{expr}"`
+  * chars — `'A'` is an **`i64` code point**, not a distinct type
+  * booleans — `true`, `false`; `null` exists only for pointer contexts
+
+---
+
+## 3. Types
+
+### 3.1 Primitive
+
+```
+i8 i16 i32 i64 u8 u16 u32 u64 isize usize    integers (8-byte slot)
+   f32 f64                                  IEEE-754
+   bool                                     distinct from integers
+   string                                   immutable, length-prefixed UTF-8
+   void  never                              no value / does not return
+```
+
+Not available: `i128`, `u128`, `char`, `f16`, `f128`.
+
+### 3.2 Compound
+
+```
+(T, U, ...)        tuple, up to 8 fields, accessed as t.0 … t.7
+[T; N]  [v; N]     fixed-size array / repeated element
+[]T                slice spelling (parses and type-checks; no slicing syntax)
+*T  *mut T         pointer to a value; &x / &mut x borrow a local
+fn(A) -> R         function value
+Option<T>  ?T      optional value
+Result<T, E>       success or error (8-byte payloads)
+Name / Name::V     struct/enum/union type and variant constructor
+dyn Trait          dynamic dispatch
+map  chan          builtin handles (@map_*, @chan_*)
+```
+
+### 3.3 Conversions
+
+There are **no implicit numeric conversions**. Use `as`:
 
 ```lir
-#[test]
-fn test_add() {
-    assertEq(add(2, 3), 5)
+let wide: i64 = 300
+let byte = wide as u8      // 44 — low 8 bits are kept
+let back = byte as i64     // 44
+let n = 2.9 as i64         // 2 — truncation toward zero
+```
+
+* float → integer traps on `NaN` and out-of-range values;
+* integer → float preserves signedness (unsigned values stay non-negative);
+* `f32` casts round to binary32 precision before widening;
+* a bare integer literal is not a float: `let f: f64 = 1` is rejected.
+
+---
+
+## 4. Declarations
+
+```lir
+fn add(a: i64, b: i64) -> i64 { return a + b }
+const LIMIT: i64 = 3 ** 4
+struct Point { x: i64 y: i64 }              // newline-separated fields
+enum Shape { Square(i64), Empty }           // comma-separated variants
+union Bits { i: i64 f: f64 }
+trait Area { fn area(self) -> i64 }
+impl Area for Square { fn area(self) -> i64 { return self.side * self.side } }
+impl Point { fn norm1(self) -> i64 { return self.x + self.y } }
+type Count = i64
+type Percent = i64 range 0..100
+import math
+import "../lib/util.lir"
+```
+
+Rules:
+
+* functions are **top-level only**; there are no nested function declarations
+  (use a closure `|x| ...` for local behaviour);
+* at most **8 parameters** per function; defaults must follow the parameter and
+  may reference global constants;
+* struct fields are newline separated and **cannot name another struct type** —
+  store `*B` instead. Struct literals use commas: `Point { x: 1, y: 2 }`;
+* `proc` is a legacy alias of `fn`; `pub` is accepted and ignored (there is no
+  visibility system);
+* `mod`, `extern`, and `extern "C"` are rejected (`LIR-E2003`).
+
+---
+
+## 5. Statements
+
+```lir
+let x = 1                 // immutable
+let x: i64 = 1            // annotated
+let mut n = 0             // mutable (legacy: var n = 0)
+const K = 2 ** 5          // local compile-time constant
+n += 1                    // += -= *= /= %= **= &= |= ^= <<= >>=
+if c { } elif c2 { } else { }
+unless c { } else { }     // negated if; value-producing
+while c { }               // pre-test loop, requires progress
+until c { }               // loop until the condition holds
+loop { break }            // unconditional loop
+for i in 0..n { }         // exclusive range
+for i in 0..=n { }        // inclusive range
+for v in array { }        // element iteration (arrays and strings)
+break  continue           // loops only, not inside defer
+return value
+defer cleanup()           // LIFO, runs on every scope exit
+guard cond else { return }
+unreachable
+match value { … }         // expression, see §6
+```
+
+There are no labelled loops, no `break value`, no `do/while`, no `for(;;)`, and
+no index/value pair form (`for i, v in arr` is rejected).
+
+---
+
+## 6. Expressions
+
+| Form | Example |
+|---|---|
+| arithmetic | `a + b - c * d / e % f`, `2 ** 3 ** 2` (right-assoc) |
+| bitwise | `a & b \| c ^ d << e >> f` |
+| logic | `a and b`, `a or b`, `!a` (`&&`/`\|\|` are synonyms; `not` does not exist) |
+| comparison | `== != < <= > >=` (strings are equality-comparable only) |
+| conditional | `cond ? a : b`, `if c { 1 } else { 2 }` |
+| call | `f(a, b)`, `recv.method(x)`, `f(name: v)` (named args, direct calls) |
+| member | `p.field`, `t.0`, `s.len` |
+| index | `a[i]` — fixed arrays and dynamic arrays, bounds-checked |
+| cast | `value as u8` |
+| closure | `\|x: i64\| x + 1`, `\|\| 7` |
+| string | `"a" + "b"`, `"{a + b}"`, `s == "x"` |
+| collection | `[1, 2, 3]`, `[0; 8]`, `(1, true)`, `#{ "k": 1 }`, `[i * i for i in 0..4]` |
+| option/result | `Some(v)`, `None`, `Ok(v)`, `Err(e)`, `fallible()?`, `maybe ?? 7` |
+| concurrency | `spawn f()`, `spawn { … }` |
+| comptime | `comptime(2 + 3)`, `comptime fn f() { … }` |
+
+Precedence (high → low): `**` → unary `+ - ! ~ & *` → `* / %` → `+ -` →
+`<< >>` → `&` → `^` → `|` → comparisons → `and` → `or` → `?:` → `??` →
+assignment.
+
+`match` is an expression; arms are comma separated and **must be exhaustive**
+(integers need `_` or `else`, enums need every variant or a fallback, guarded
+arms never establish coverage).
+
+---
+
+## 7. Memory, ownership and safety
+
+* Local variables live on the stack; `@malloc`/`@array_new`/`@map_new` allocate
+  heap memory and must be released (`@free`, `@array_free`, `@map_free`).
+* Borrowing: `&x` and `&mut x`. While a mutable borrow is live, reading or
+  writing the owner is a compile error; returning a pointer to a local is
+  rejected.
+* Compile-time analyses that run by default: use-after-free, double-free,
+  double-close, leaks inside loops, constant index out of bounds, constant
+  invalid shift counts, division by a constant zero, dangling references,
+  stack-frame budget (32 KiB), spin loops that cannot terminate.
+* Runtime traps: bounds violations, division/modulo by zero, dynamic shift
+  overflow, `NaN`/out-of-range float→int conversions, heap canary corruption.
+  A trap terminates the process with status **132**.
+* Raw memory is reached only through `@ptr_add`, `@read_u8`, `@write_u64`, …;
+  there is no `unsafe { }` block and no inline assembly.
+
+A full Rust-style borrow checker and lifetime inference are **not** implemented;
+[ROADMAP.md](ROADMAP.md) tracks that work.
+
+---
+
+## 8. Errors
+
+```lir
+fn find(ok: bool) -> Option<i64> {
+    if ok { return Some(5) }
+    return None
 }
 
-#[target(x86_64)]
-fn fast_path() { ... }
+fn twice(ok: bool) -> Option<i64> {
+    let v = find(ok)?        // propagate None to the caller
+    return Some(v * 2)
+}
 
-#[inline(always)]
-fn hot_function() { ... }
-
-#[cold]
-fn error_handler() { ... }
+fn main() -> i64 {
+    let a: ?i64 = None
+    let fallback = a ?? 7    // 7
+    return match twice(true) { Some(v) => v, None => 0 }
+}
 ```
 
-## String Interpolation
+`Some`/`None`/`Ok`/`Err` are context typed — `let x = None` without an
+annotation or return context is rejected with a hint to add a type.
+
+`main` returns `i64`; the low 8 bits become the process exit status.
+
+---
+
+## 9. Attributes
 
 ```lir
-let name = "World"
-println("Hello, {name}!")           // Hello, World!
-println("2 + 3 = {2 + 3}")         // 2 + 3 = 5
-println("Hex: {42:#x}")            // Hex: 0x2a
-println("Bin: {42:#b}")            // Bin: 0b101010
+#[test]                     // collected by `lir test`
+#[inline]  #[cold]          // optimization hints
+#[pure]                     // side-effect-free; printing/allocating is rejected
+#[pre(b != 0)]              // precondition, verified when arguments are constant
+#[post(result >= 0)]        // postcondition
 ```
 
-## Defer
+Contract syntax is **attribute-based**. The keywords `requires`/`ensures` and
+`pure fn` do not parse.
 
-```lir
-fn process() {
-    let file = File.open("data.txt")?
-    defer file.close()           // always runs when scope exits
-    
-    let data = file.readAll()?
-    // process data...
-}   // file.close() called here
+---
+
+## 10. Tooling contract
+
+```sh
+lir build file.lir -o app [-O0|-O1|-O2] [--target=…] [--backend=…] [--emit-c]
+lir run   file.lir [--backend=vm|native|wasm|c] [-- args…]
+lir check file.lir [--json]
+lir test  [file.lir]
+lir ir    file.lir [-O2]         # dump SSA IR
+lir ast   file.lir               # pretty-print the syntax tree
+lir lang  [feature] [--json|--markdown]   # language catalogue
+lir builtins [name] [--json]              # builtin catalogue
+lir explain <topic|LIR-Exxxx>             # knowledge base
+lir init  name [--ai]                     # new project (+ agent scaffolding)
+lir targets | repl | install | version | help
 ```
 
-## Memory Management
-
-```lir
-// Stack allocation (default)
-let x = 42
-
-// Heap allocation
-let ptr = box 42              // Box(i32)
-let shared = rc 42            // Rc(i32)
-let atomic = arc 42           // Arc(i32)
-
-// Manual allocation
-let buf = allocator.alloc(u8, 1024)
-defer allocator.free(buf)
-```
-
-## Syntax Summary
+Diagnostics carry a stable code, a span, and usually a `help` line plus an
+`expect{kind, value}` field for automated repair:
 
 ```
-Keywords:    fn, let, mut, const, struct, enum, trait, impl,
-             match, if, else, while, for, in, return, break,
-             continue, defer, spawn, async, await, try, pub,
-             mod, use, as, type, where, comptime, extern, unsafe
-
-Operators:   + - * / % ** ++ 
-             == != < > <= >=
-             = += -= *= /= %=
-             && || !
-             & | ^ ~ << >>
-             -> => |> <|
-             .. ..=
-             ? : :: . ,
-
-Delimiters:  ( ) { } [ ] ; ,
-
-Comments:    // line comment
-             /* block comment */
-             # hash comment
-             /// doc comment
+file.lir:2:5: error[LIR-E3004]: annotation on 'x' is 'i64' but the initializer has type 'string'
+    2 |     let x: i64 = "text"
+      |     ^
+      = help: make the initializer a 'i64', or annotate the variable as 'string', or add 'as i64'
 ```
 
-## Performance Features
+`--json` turns every command into a machine contract; see [AI.md](AI.md).
 
-1. **Zero-cost abstractions** — generics, iterators, closures compile to optimized code
-2. **Compile-time evaluation** — constants, table generation, partial evaluation
-3. **Inline assembly** — direct access to hardware
-4. **SIMD intrinsics** — vectorized operations
-5. **Cache-friendly data structures** — arrays of structs, not structs of arrays
-6. **Branch prediction hints** — likely/unlikely annotations
-7. **Tail call optimization** — guaranteed for self-recursive calls
-8. **Escape analysis** — stack allocation when possible
-9. **Lazy initialization** — static variables initialized on first use
-10. **LTO-friendly** — whole-program optimization support
+---
 
-## Comparison with Other Languages
+## 11. Implementation status summary
 
-| Feature | LIR | Rust | Zig | Go | C++ |
-|---------|-----|------|-----|-----|-----|
-| Zero-cost abstractions | ✓ | ✓ | ✓ | ✗ | ✓ |
-| Memory safety | ✓ | ✓ | Partial | ✓ | Partial |
-| No GC | ✓ | ✓ | ✓ | ✗ | ✓ |
-| Compile-time execution | ✓ | ✓ | ✓ | ✗ | ✗ |
-| Built-in concurrency | ✓ | ✓ | ✗ | ✓ | ✗ |
-| Self-contained build | ✓ | ✗ | ✓ | ✓ | ✗ |
-| Cross-compilation | ✓ | ✓ | ✓ | ✓ | ✗ |
-| Learning curve | Easy | Hard | Medium | Easy | Hard |
+| Area | Status |
+|---|---|
+| Frontend (lexer, parser, sema, IR, verifier) | implemented in Zig |
+| Native x86-64 ELF, Wasm32-WASI, C11, IR VM backends | implemented |
+| Generics, ADTs, `match` with guards, traits/`dyn`, closures, tuples, maps, comprehensions | implemented |
+| Compile-time evaluation, contracts, purity, bounded ranges, borrow/UAF analysis | implemented (documented limits) |
+| Concurrency: threads, channels, mutexes, atomics | implemented on host targets; threads/channels rejected for `wasm32-wasi` (`LIR-E7004`) |
+| Async/await, FFI, `mod` system, macros, package manager, LSP, SIMD | **not implemented** |
+| Full borrow checker / lifetime inference | **not implemented** |
+
+Language surface counts, generated: 65 supported, 2 partial, 3 legacy,
+6 explicitly-unsupported entries (`lir lang --short`); 71 reserved words
+(`lir lang --keywords`). Per-area detail and the known-gap list live in
+[STATUS.md](STATUS.md).

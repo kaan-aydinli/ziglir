@@ -1,0 +1,41 @@
+// SEL test 04 — ters indeks ve sıralama.
+//
+// 5 belge, 3 terim. "kus" araması: belge 4 (tf=2) belge 3'ten (tf=1)
+// daha ilgili olmalı. Bu test hem indeksin hem sıralamanın doğruluğunu
+// sabitler.
+//
+// Beklenen çıktı: 4 3   (en iyi iki belge, sırayla)
+import "../src/search.lir"
+
+fn main() -> i64 {
+    let ix = index_new(5, 3, 7)
+    // terim 0 "kedi": belge 0 (tf=3), belge 2 (tf=1)
+    idx_set_term(ix, 0, 0, 2)
+    idx_set_post(ix, 0, 0, 3)
+    idx_set_post(ix, 1, 2, 1)
+    // terim 1 "kopek": belge 1 (tf=2), belge 2 (tf=1), belge 4 (tf=1)
+    idx_set_term(ix, 1, 2, 3)
+    idx_set_post(ix, 2, 1, 2)
+    idx_set_post(ix, 3, 2, 1)
+    idx_set_post(ix, 4, 4, 1)
+    // terim 2 "kus": belge 3 (tf=1), belge 4 (tf=2)
+    idx_set_term(ix, 2, 5, 2)
+    idx_set_post(ix, 5, 3, 1)
+    idx_set_post(ix, 6, 4, 2)
+
+    let scores = @malloc(5 * 8)
+    scores_clear(scores, 5)
+    add_term_score(ix, scores, 2, ONE)
+    let out = @malloc(3 * 8)
+    let found = top_k(scores, 5, out, 3)
+
+    // Önce sonuçları yerel değişkenlere al (top_k sonrası başka çağrı
+    // yapmak `out`'u etkilemesin).
+    let first = @read_u64(@ptr_add(out, 0)) as i64
+    let second = @read_u64(@ptr_add(out, 8)) as i64
+    printInt(found)
+    printInt(first)
+    printInt(second)
+    println("")
+    return 0
+}

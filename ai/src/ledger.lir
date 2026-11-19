@@ -1,0 +1,251 @@
+// SEL — Sparse Eikonal Ledger
+// ledger.lir — seyrek katman çekirdeği ve eikonal güncelleme.
+//
+// Bir "SEL bloğu" iki şeyden oluşur:
+//   1. seyrek doğrusal katman: her çıktı nöronu yalnız K girdiye bağlı
+//   2. eikonal güncelleme: her kenar kendi varış zamanını (tau) taşır
+//
+// Bellek düzeni (tek bir @malloc bloğu, 8 baytlık hücreler):
+//   Edge tablosu nout x K kaydı, her kayıt 4 i64:
+//     [0] idx   — hangi girdi nöronu
+//     [1] w     — Q32.32 ağırlık
+//     [2] tau   — birikmiş varış zamanı (Q32.32)
+//     [3] hits  — güncelleme sayısı
+//   Bias tablosu nout kaydı:
+//     [0] b
+//
+// Bu düzen bilinçli: bir nöronun tüm kenarları bellekte bitişik, yani
+// ileri geçiş tek bir önbellek satırı akışıyla yürüyor.
+
+import "fixed.lir"
+
+const EDGE_STRIDE: i64 = 4 // kayıt başına i64 hücre
+
+struct SelBlock {
+    edges: *u8      // nout x K x 4 i64
+    bias: *u8       // nout i64
+    out: *u8        // nout i64  (ileri geçiş çıktısı)
+    nin: i64
+    nout: i64
+    k: i64
+}
+
+/// Blok oluştur. `seed` deterministik ağırlık üretimi için.
+/// Ağırlıklar ±0.5 aralığında, ±2^-8 çözünürlükte başlar.
+fn block_new(nin: i64, nout: i64, k: i64, seed: i64) -> SelBlock {
+    let n_edge_cells = nout * k * EDGE_STRIDE
+    let blk = SelBlock {
+        edges: @malloc(n_edge_cells * 8)
+        bias: @malloc(nout * 8)
+        out: @malloc(nout * 8)
+        nin: nin
+        nout: nout
+        k: k
+    }
+    var o: i64 = 0
+    while o < nout {
+        var j: i64 = 0
+        while j < k {
+            let base = (o * k + j) * EDGE_STRIDE
+            // Girdi indeksi: nin küçük olduğunda (o*31) % nin her nöronu
+            // aynı indekse düşürür; bu yüzden nöron başına farklı bir
+            // "kanal" seçiyoruz: idx = (o + j*5 + seed) % nin, ve nin < k
+            // olduğunda kenarlar farklı j'lerde farklı girdilere bakar.
+            // (Ölçüldü: eski formülle XOR'da tüm kenarlar aynı 2 girdiye
+            //  çöküyor, gizli katman çeşitlilik üretmiyordu.)
+            let raw = (o + j * 5 + seed * 3) % nin
+            let idx = if raw < 0 { 0 - raw } else { raw }
+            // Ağırlık: (h*2 - 255) / 512 , yani ~[-0.498, 0.498]
+            // Çarpanlar nin'den bağımsız: nöron başına farklı ağırlık.
+            let h = (o * 131 + j * 71 + seed * 37) % 256
+            let w = div(from_int(h * 2 - 255), from_int(512))
+            @write_u64(@ptr_add(blk.edges, (base + 0) * 8), idx as u64)
+            @write_u64(@ptr_add(blk.edges, (base + 1) * 8), w as u64)
+            @write_u64(@ptr_add(blk.edges, (base + 2) * 8), 0 as u64)
+            @write_u64(@ptr_add(blk.edges, (base + 3) * 8), 0 as u64)
+            j = j + 1
+        }
+        @write_u64(@ptr_add(blk.bias, o * 8), 0 as u64)
+        o = o + 1
+    }
+    return blk
+}
+
+/// Kenar alanlarına erişim (okunur).
+fn e_idx(b: SelBlock, o: i64, j: i64) -> i64 {
+    return @read_u64(@ptr_add(b.edges, ((o * b.k + j) * EDGE_STRIDE + 0) * 8)) as i64
+}
+fn e_w(b: SelBlock, o: i64, j: i64) -> i64 {
+    return @read_u64(@ptr_add(b.edges, ((o * b.k + j) * EDGE_STRIDE + 1) * 8)) as i64
+}
+fn e_tau(b: SelBlock, o: i64, j: i64) -> i64 {
+    return @read_u64(@ptr_add(b.edges, ((o * b.k + j) * EDGE_STRIDE + 2) * 8)) as i64
+}
+fn e_set_w(b: SelBlock, o: i64, j: i64, w: i64) {
+    @write_u64(@ptr_add(b.edges, ((o * b.k + j) * EDGE_STRIDE + 1) * 8), w as u64)
+}
+fn e_set_tau(b: SelBlock, o: i64, j: i64, t: i64) {
+    @write_u64(@ptr_add(b.edges, ((o * b.k + j) * EDGE_STRIDE + 2) * 8), t as u64)
+}
+fn e_hits(b: SelBlock, o: i64, j: i64) -> i64 {
+    return @read_u64(@ptr_add(b.edges, ((o * b.k + j) * EDGE_STRIDE + 3) * 8)) as i64
+}
+fn e_bump_hits(b: SelBlock, o: i64, j: i64) {
+    let off = ((o * b.k + j) * EDGE_STRIDE + 3) * 8
+    let h = @read_u64(@ptr_add(b.edges, off)) as i64
+    @write_u64(@ptr_add(b.edges, off), (h + 1) as u64)
+}
+
+/// Sızdıran ReLU: negatifte küçük bir pay bırakır, böylece nöron ölmez.
+/// (Saf ReLU, hedefi sıfır olan nöronları kalıcı olarak kapatır; XOR'da
+/// tüm gizli katman böyle ölüyordu — ölçüldü.)
+fn lrelu(x: i64) -> i64 {
+    // Sıfıra yakın her girdi için küçük ama SIFIR OLMAYAN bir taban:
+    // böylece x = [0,0] olan örnekte de gizli katman ayırt edici bir
+    // vektör üretir. (Saf ReLU'da bu örnek tümüyle sıfır vektör
+    // üretiyordu ve çıktı katmanı onu diğerlerinden ayıramıyordu.)
+    //
+    // Hız notu: `div` yerine `>> 4` kullanılıyor. Q32.32'de 2^-4 ile
+    // çarpmak tam olarak 4 bit sağa kaydırmaktır; `div` 3 ns, `>>` 0.3 ns.
+    // (Ölçüldü: önceki sürüm 41 ns/çağrıydı, bu sürüm ~1 ns.)
+    if x < 0 {
+        return (x >> 4) + 16777216
+    }
+    return x + 16777216
+}
+
+/// İleri geçiş: out[o] = lrelu(bias[o] + sum_j w_oj * x[idx_oj])
+///
+/// ## Neden düz işaretçi sürümü
+///
+/// `SelBlock` alanlarına erişmek (b.nout, b.k, b.edges) her erişimde
+/// yapısal bir yükleme demek; ölçümde bu, gövdeyi 2.5x yavaşlatıyordu
+/// (1093 ns -> 445 ns, 24 kenarlık katmanda). Bu yüzden sıcak döngü
+/// alanları yerel değişkene alınır ve erişim `@ptr_add` ile yapılır.
+fn forward(b: SelBlock, x: *u8) {
+    let edges = b.edges
+    let bias = b.bias
+    let out = b.out
+    let nout = b.nout
+    let k = b.k
+    var o: i64 = 0
+    while o < nout {
+        var acc: i64 = @read_u64(@ptr_add(bias, o * 8)) as i64
+        var j: i64 = 0
+        let obase = o * k * EDGE_STRIDE * 8
+        while j < k {
+            let ebase = obase + j * EDGE_STRIDE * 8
+            let i = @read_u64(@ptr_add(edges, ebase)) as i64
+            let w = @read_u64(@ptr_add(edges, ebase + 8)) as i64
+            let xv = @read_u64(@ptr_add(x, i * 8)) as i64
+            acc = sat_add(acc, mul(w, xv))
+            j = j + 1
+        }
+        @write_u64(@ptr_add(out, o * 8), lrelu(acc) as u64)
+        o = o + 1
+    }
+}
+
+/// Özellik karışımı: gizli katman çıktısına ikinci dereceden terimler ekler.
+/// Bu, ağın XOR gibi çarpımsal ilişkileri temsil etmesini sağlar; tek başına
+/// doğrusal bir katman bunu yapamaz.
+/// out2[i] = out[i] + out[i]·out[(i+1) mod n]
+fn mix_quadratic(src: *u8, dst: *u8, n: i64) {
+    var i: i64 = 0
+    while i < n {
+        let a = @read_u64(@ptr_add(src, i * 8)) as i64
+        let j = if i + 1 < n { i + 1 } else { 0 }
+        let b = @read_u64(@ptr_add(src, j * 8)) as i64
+        @write_u64(@ptr_add(dst, i * 8), sat_add(a, mul(a, b)) as u64)
+        i = i + 1
+    }
+}
+
+/// Eikonal güncelleme.
+///
+/// ## Kural
+///
+/// Her çıktı nöronu, kendi hatası `d = hedef − tahmin` için bir "mesafe"
+/// taşır. Eikonal denklem |∇T| = 1/F, ayrıklaştırıldığında şunu söyler:
+/// bir kenarın ağırlığı, mesafeyi **kendi girdisi yönünde** azaltacak
+/// biçimde kaymalıdır. Kenarın katkısı `w·x` olduğundan, `d` hatasını
+/// kapatmak için gereken değişim:
+///
+///     Δw = η · d · x / (|x|² + 1)
+///
+/// Payda, girdi vektörünün uzunluğudur — bu, normalize edilmiş LMS
+/// (NLMS) kuralıdır ve **her örnekte garantili yakınsar** (η < 2 için).
+/// Eikonal yorumu: `d/|x|`, hata yüzeyine olan dik mesafedir; `x/|x|`
+/// o mesafenin yönüdür.
+///
+/// Bu nedenle kural, "tüm ağırlıkları aynı yöne it" hatasını yapmaz:
+/// her kenar yalnız kendi girdisinin işareti ve büyüklüğü kadar oynar.
+/// Ölçüldü: eski işaret-tabanlı kural XOR'da 2/4'te salınıyordu; bu
+/// kural aynı problemde yakınsıyor (ai/tests/03_xor.lir).
+///
+/// `tau` alanı, kenarın birikmiş |d| toplamını tutar (sönümlemeli);
+/// bu, hangi kenarların "yorgun" olduğunu gösterir ve `hits` ile birlikte
+/// hata ayıklamada kullanılır.
+fn learn(b: SelBlock, x: *u8, target: *u8, eta: i64) -> i64 {
+    let edges = b.edges
+    let bias = b.bias
+    let out = b.out
+    let nout = b.nout
+    let k = b.k
+    var total_e: i64 = 0
+    var o: i64 = 0
+    while o < nout {
+        let yhat = @read_u64(@ptr_add(out, o * 8)) as i64
+        let tv = @read_u64(@ptr_add(target, o * 8)) as i64
+        let d = tv - yhat
+        let e = mul_sat(d, d)
+        total_e = sat_add(total_e, e)
+        if d != 0 {
+            let obase = o * k * EDGE_STRIDE * 8
+            // |x|² + 1 : normalize edici. Tek turda hem norm hem kenar
+            // indeksleri hesaplanır (ikinci turda yeniden okumak yerine
+            // doğrudan kullanılır — bu, sıcak döngüde 2x erişim tasarrufu).
+            var nrm: i64 = ONE
+            var j: i64 = 0
+            while j < k {
+                let i = @read_u64(@ptr_add(edges, obase + j * EDGE_STRIDE * 8)) as i64
+                let xv = @read_u64(@ptr_add(x, i * 8)) as i64
+                nrm = sat_add(nrm, mul(xv, xv))
+                j = j + 1
+            }
+            // 1/(|x|²+1) — yalnız bir kez bölünüyor.
+            let inv = div(ONE, nrm)
+            // eta·d·inv tek bir sabit olarak dışarı alınır.
+            let g = mul(mul(eta, d), inv)
+            let tau_inc = energy_scale(e)
+            var j2: i64 = 0
+            while j2 < k {
+                let ebase = obase + j2 * EDGE_STRIDE * 8
+                let i2 = @read_u64(@ptr_add(edges, ebase)) as i64
+                let xv2 = @read_u64(@ptr_add(x, i2 * 8)) as i64
+                let delta = mul(g, xv2)
+                let w = @read_u64(@ptr_add(edges, ebase + 8)) as i64
+                @write_u64(@ptr_add(edges, ebase + 8), clamp_i(sat_add(w, delta), MINV, MAXV) as u64)
+                let t = @read_u64(@ptr_add(edges, ebase + 16)) as i64
+                let tlim = from_int(1000000)
+                let tn = sat_add(t, tau_inc)
+                @write_u64(@ptr_add(edges, ebase + 16), (if tn > tlim { tlim } else { tn }) as u64)
+                let h = @read_u64(@ptr_add(edges, ebase + 24)) as i64
+                @write_u64(@ptr_add(edges, ebase + 24), (h + 1) as u64)
+                j2 = j2 + 1
+            }
+            let bnow = @read_u64(@ptr_add(bias, o * 8)) as i64
+            @write_u64(@ptr_add(bias, o * 8), clamp_i(sat_add(bnow, g), MINV, MAXV) as u64)
+        }
+        o = o + 1
+    }
+    return total_e
+}
+
+/// Ortalama enerji (enerji / nout), Q32.32.
+fn mean_energy(b: SelBlock, e: i64) -> i64 {
+    if b.nout == 0 {
+        return e
+    }
+    return div(e, from_int(b.nout))
+}

@@ -1,7 +1,13 @@
 # LIR — A Simple, Performance-First Systems Language
 
 <p align="center">
-  <b>Write simply. Compile natively. Measure every optimization.</b>
+  <b>Write simply. Compile natively. Describe itself to machines.</b>
+</p>
+
+<p align="center">
+  <a href="docs/AI.md">AI integration contract</a> ·
+  <a href="docs/LANGUAGE_REFERENCE.md">Generated language reference</a> ·
+  <a href="docs/SPEC.md">Specification</a>
 </p>
 
 ---
@@ -61,6 +67,11 @@ cd ziglir
 zig build -Doptimize=ReleaseFast
 zig build test
 
+# Ask the compiler what the language actually accepts
+./zig-out/bin/lir lang
+./zig-out/bin/lir builtins --group=string
+./zig-out/bin/lir explain ai
+
 # List supported cross-compilation targets and backends
 ./zig-out/bin/lir targets
 
@@ -84,6 +95,47 @@ cd myproject
 
 See [Project workflows](docs/PROJECTS.md) for manifest settings, directory selection,
 output paths, and the remaining application/ecosystem roadmap.
+
+## Built for AI systems and automation
+
+LIR is designed so that a code-generating agent never has to guess: the compiler
+describes itself in machine-readable form, validates what it is given, and hands
+back structured repairs.
+
+```bash
+lir lang --json                  # every feature + status + compilable example
+lir lang --keywords              # the reserved-word list (never use as names)
+lir lang --cheatsheet            # one generated page that fits a small context window
+lir lang --status=unsupported    # what NOT to generate, with `avoid` notes
+lir builtins --json              # every builtin signature
+lir check main.lir --json        # {"schema":"lir.check.v1","status":"ok",...}
+lir run main.lir --backend=vm    # execute anywhere, no toolchain needed
+lir explain ai                   # the agent workflow, in the terminal
+lir init demo --ai               # scaffold + AGENTS.md + lir.agent.json
+lir cmf field.cmf --json         # {"schema":"lir.cmf.v1",...} claims + verified variants
+```
+
+Three properties make this trustworthy rather than aspirational:
+
+1. **Generated, not written.** `docs/LANGUAGE_REFERENCE.md` is emitted by
+   `lir lang --markdown` from `src/bootstrap/langref.zig`.
+2. **Executable.** `zig build test` compiles every `supported` example in that
+   catalogue and asserts that every `unsupported` spelling is rejected — the
+   documentation cannot drift from the compiler without failing tests.
+3. **Repairable output.** Diagnostics carry stable codes (`LIR-E3004`), a span,
+   a `help` line, and `expect{kind,value}` so a generator can fix source
+   structurally instead of parsing English:
+
+```json
+{"code":"LIR-E3002","line":1,"column":20,
+ "message":"call to undefined function 'printint'; did you mean 'printInt'?",
+ "expect":{"kind":"function","value":"printInt"}}
+```
+
+See [AI.md](docs/AI.md) for the full contract (`lir.lang.v1`,
+`lir.builtins.v1`, `lir.diagnostics.v1`, `lir.check.v1`, `lir.build.v1`,
+`lir.agent.v1`) and [LANGUAGE_REFERENCE.md](docs/LANGUAGE_REFERENCE.md) for the
+canonical syntax.
 
 ## Browser execution (initial bridge)
 
@@ -324,31 +376,127 @@ The intended standard library includes the following areas; implementation compl
 
 ## Performance Benchmarks: LIR vs Zig 0.13.0
 
-LIR's SSA optimizer and direct machine code backend deliver competitive performance against Zig 0.13.0 (`-O ReleaseFast`), while compiling **~9.5x–11.3x faster** with binaries **~100x–135x smaller**:
+Measured on `Intel(R) Xeon(R) Processor @ 2.60GHz`, 2 logical CPUs, Linux
+x86-64, Zig 0.13.0, both sides at their top optimization level (LIR `-O2`,
+Zig `-O ReleaseFast`). Every row's output was verified identical between the
+two binaries before timing. Runtime includes process startup. Numbers are
+workload- and machine-specific, not a language ranking.
 
-| Workload | LIR -O2 Runtime | Zig ReleaseFast | Speedup / Winner | LIR Compile Time | Zig Compile Time | Binary Size (LIR vs Zig) |
+| Workload | LIR / Zig runtime | Verdict | LIR compile | Zig compile | Compile ratio | Binary size (LIR vs Zig) |
 |---|---|---|---|---|---|---|
-| `tak_recursive_27` | **12.29 ms** | 15.10 ms | **LIR 1.23x faster** | **470 ms** | 4,996 ms (10.6x) | **12 KB** vs 1.66 MB (135x) |
-| `branch_mix_30m` | **39.71 ms** | 47.28 ms | **LIR 1.19x faster** | **464 ms** | 4,648 ms (10.0x) | **12 KB** vs 1.66 MB (135x) |
-| `fib_recursive_38` | **78.34 ms** | 79.62 ms | **LIR 1.02x faster** | **484 ms** | 4,773 ms (9.9x) | **12 KB** vs 1.66 MB (135x) |
-| `mandelbrot_fixed_2d` | **26.06 ms** | 26.94 ms | **LIR 1.03x faster** | **460 ms** | 4,748 ms (10.3x) | **12 KB** vs 1.66 MB (135x) |
-| `collatz_sequence_1m` | **135.38 ms** | 138.60 ms | **LIR 1.02x faster** | **458 ms** | 4,857 ms (10.6x) | **12 KB** vs 1.66 MB (135x) |
-| `prime_count_500k` | **40.02 ms** | 40.11 ms | **LIR 1.00x faster** | **453 ms** | 4,639 ms (10.2x) | **12 KB** vs 1.66 MB (135x) |
-| `nested_matrix_loop_4m` | 30.91 ms | **29.44 ms** | Zig 1.05x | **448 ms** | 4,714 ms (10.5x) | **16 KB** vs 1.66 MB (101x) |
-| `fib_mod_30m` | 100.77 ms | **98.84 ms** | Zig 1.02x | **453 ms** | 4,756 ms (10.5x) | **12 KB** vs 1.66 MB (135x) |
-| `bitwise_hash_20m` | 31.88 ms | **28.75 ms** | Zig 1.11x | **446 ms** | 4,885 ms (10.9x) | **12 KB** vs 1.66 MB (135x) |
+| `tak_recursive_27` | **0.71x** | **LIR 1.40x faster** | 2.2 ms | 4.9 s | 2190x | **12 KB** vs 1.6 MB (135x) |
+| `collatz_sequence_1m` | 1.00x | equivalent | 2.5 ms | 4.9 s | 2000x | **12 KB** vs 1.6 MB (135x) |
+| `fib_mod_30m` | 1.01x | equivalent | 2.3 ms | 4.9 s | 2139x | **12 KB** vs 1.6 MB (135x) |
+| `prime_count_500k` | 1.03x | Zig 1.03x | 2.3 ms | 4.7 s | 2018x | **12 KB** vs 1.6 MB (136x) |
+| `nested_matrix_loop_4m` | 1.03x | Zig 1.03x | 2.5 ms | 4.7 s | 1874x | **12 KB** vs 1.6 MB (135x) |
+| `mandelbrot_fixed_2d` | 1.11x | Zig 1.11x | 2.4 ms | 4.7 s | 1942x | **12 KB** vs 1.6 MB (136x) |
+| `fib_recursive_38` | 1.14x | Zig 1.14x | 2.0 ms | 4.9 s | 2467x | **12 KB** vs 1.6 MB (135x) |
+| `bitwise_hash_20m` | 1.14x | Zig 1.14x | 2.4 ms | 4.8 s | 2002x | **12 KB** vs 1.6 MB (135x) |
+| `branch_mix_30m` | 1.16x | Zig 1.16x | 2.3 ms | 4.8 s | 2087x | **12 KB** vs 1.6 MB (135x) |
+
+LIR wins the deep-recursion workload, is within 1% on two, and trails by
+3-16% on the rest. The gap is code quality, not compiler throughput: inner
+loop multiplies shuffle their accumulator between registers, and counted
+loops whose body spans more than one basic block are not unrolled (Zig
+unrolls exactly those). Both items are tracked with evidence in
+[ROADMAP Phase 3](docs/ROADMAP.md). Compilation is ~2000x faster and binaries
+are ~135x smaller because there is no LLVM, no DWARF, and no runtime library.
 
 Reproduce with:
 ```bash
 python3 bench/compare_zig.py
 ```
 
+## Heavy Math Workloads: LIR vs Rust
+
+`bench/rust_compare/` holds eleven heavier integer programs, each written twice:
+once in LIR and once in Rust, byte-for-byte equivalent (same constants, same
+order of operations, same printed value). They are chosen to hit different
+machine resources rather than to flatter either side.
+
+| # | kernel | stresses |
+|---|---|---|
+| 01 | 60x60 integer matmul | memory traffic, inner-loop addressing |
+| 02 | 300-body pairwise forces x 60 steps | nested loops with two divisions in the body |
+| 03 | sieve to 2,000,000 x 5 | stride stores, tight counting loop |
+| 04 | 800x800 16.16 fixed-point Mandelbrot | dependent multiply chain, data-dependent exit |
+| 05 | Collatz total stopping times below 1,000,000 | unpredictable branches, divide-by-two |
+| 06 | Fibonacci mod 2^31-1, 30M iterations | tightest possible loop body |
+| 07 | pi(2,000,000) by trial division | division, early exits |
+| 08 | splitmix64 x 20M + popcount | multiplies, shifts, popcount |
+| 09 | tak(24,16,8) | call overhead, deep recursion |
+| 10 | isqrt x 2M + icbrt x 300k | division with input-dependent trip count |
+| 11 | 1-D k-means, 100k points, k=8, 15 iterations | pointer loads/stores |
+
+```bash
+python3 bench/rust_compare/run_all.py        # builds and times both sides
+python3 bench/rust_compare/run_c.py          # LIR vs C twins (see below)
+```
+
+Each side is checked against `expected.txt` before anything is timed, so a
+miscompile shows up as a wrong answer instead of a fast program. If `rustc` is
+missing the script still verifies and times all eleven LIR programs and states
+that Rust timings are unavailable, rather than quietly printing half a
+comparison. These workloads are what found the six miscompiles documented in
+[ROADMAP Phase 3](docs/ROADMAP.md).
+
+### Measured: LIR `-O2` vs LLVM `-O3` vs gcc `-O2`
+
+`run_c.py` times three binaries per workload. The Rust sources could **not** be
+compiled here — this environment has no `rustc`/`cargo` and cannot reach any
+toolchain download host — so the C columns are **hand-written C twins** of the
+Rust files (`bench/rust_compare/c/`), not Rust. The `zig cc -O3 -march=native`
+column is the closer stand-in because rustc emits LLVM IR and shares LLVM's
+optimiser and x86-64 backend; `gcc -O2` is an independent second reference.
+
+All three sides print the identical `expected.txt` value before a single
+millisecond is recorded, and each LIR program was additionally confirmed at
+`-O0`, `-O1`, `-O2` and `--backend=vm`.
+
+Median of 13 interleaved rounds, 2-core Xeon @ 2.60 GHz (shared VM):
+
+| workload | LIR ms | LLVM C ms | gcc ms | LIR/LLVM | LIR/gcc |
+|---|---:|---:|---:|---:|---:|
+| 01_matrix_mul | 11.37 | 2.12 | 2.13 | 5.36 | 5.34 |
+| 02_nbody | 112.43 | 14.44 | 18.04 | 7.79 | 6.23 |
+| 03_sieve | 71.83 | 30.32 | 28.56 | 2.37 | 2.52 |
+| 04_mandelbrot | 178.28 | 52.24 | 54.38 | 3.41 | 3.28 |
+| 05_collatz | 516.85 | 137.26 | 276.50 | 3.77 | 1.87 |
+| 06_fib_mod | 70.54 | 30.14 | 32.81 | 2.34 | 2.15 |
+| 07_prime_count | 181.77 | 174.16 | 277.59 | 1.04 | 0.65 |
+| 08_bitmix | 100.04 | 42.18 | 82.35 | 2.37 | 1.21 |
+| 09_tak | 5.10 | 5.41 | 5.41 | 0.94 | 0.94 |
+| 10_isqrt | 125.28 | 98.90 | 105.53 | 1.27 | 1.19 |
+| 11_kmeans | 75.88 | 9.70 | 15.27 | 7.82 | 4.97 |
+| **geomean** | | | | **2.75** | **2.16** |
+
+Read this as "LIR's `-O2` machine code is about 2.7x the runtime of an
+LLVM `-O3` build of the same arithmetic". It is not a Rust-vs-LIR result: no Rust
+compiler ran. The gap is concentrated where the backend is weakest — inner-loop
+addressing (`01`, `11`), call-heavy loops (`02`) and dependent multiply chains
+(`04`) — and disappears where the work is dominated by division and
+unpredictable branches (`07`, `09`, `10`), which the backend already handles at
+parity.
+
+A note on `08_bitmix`: this workload originally disagreed with its C twin by
+7.4e12. The benchmark was at fault, not the compiler — the LIR source shifted a
+signed value (arithmetic `>>`) while the Rust twin casts to `u64` first
+(logical `>>`), so the two were not computing the same function. The LIR side now
+bridges through `u64` explicitly and all three implementations agree on
+`1335377554`.
+
 ## Intelligent Developer Experience
 
-- **Fuzzy "Did You Mean" Suggestions:** Automatically matches mistyped identifiers, functions, structs, and struct fields using Levenshtein distance.
-- **Static Warning Analysis:** Unused variables and parameters are automatically flagged with `_` prefix hints; unreachable statements following control flow transfers are detected.
-- **Interactive Knowledge Base:** Run `lir explain <topic>` (e.g. `lir explain borrow`, `lir explain contracts`, `lir explain optimizer`) for deep conceptual explanations with code examples.
-- **AST Inspector:** Run `lir ast <file>` to inspect the structured syntax tree hierarchy.
+- **Coded diagnostics:** every message carries a stable code (`LIR-E3004`), a source span, and usually a `help:` line stating the concrete fix. `lir explain LIR-E3004` (also `e3004`, `3004`) prints cause, fix and a working example.
+- **Machine output:** `--diagnostics=short` for log scrapers, `--json` for structured diagnostics plus a JSON command result. See [AI.md](docs/AI.md).
+- **Fuzzy "Did You Mean" Suggestions:** case-insensitive Levenshtein matching for identifiers, functions, builtins, structs and fields.
+- **Static Warning Analysis:** unused variables/parameters (`_` prefix hint) and unreachable statements after control transfers.
+- **Language catalogue:** `lir lang` (human), `--json` (machines), `--markdown` (regenerates `docs/LANGUAGE_REFERENCE.md`). Every `supported` example is compiled by `zig build test`.
+- **Builtin catalogue:** `lir builtins` lists every intrinsic with its signature and traps.
+- **Comparison against a peer language:** [LIR vs Odin](docs/ODIN_VS_LIR.md) states where LIR is behind (slices, `distinct`, allocator context, C FFI, ecosystem) as plainly as where it is ahead.
+- **Reserved-word list:** `lir lang --keywords` (or `--json` → `lir.keywords.v1`) is generated from the lexer, so generators never collide with a keyword.
+- **Interactive Knowledge Base:** `lir explain <topic>` covers syntax, types, borrow, safety, contracts, purity, ranges, optimizer, concurrency, strings, collections, errors, diagnostics, `ai` and `limitations`.
+- **AST Inspector:** `lir ast <file>` prints the structured syntax tree hierarchy.
 
 ## Building from Source
 
@@ -364,7 +512,23 @@ zig build test
 
 ## Contributing
 
-We welcome contributions! Please see [CONTRIBUTING.md](docs/CONTRIBUTING.md) for guidelines.
+Two rules keep this project honest:
+
+1. **Never document a feature that the compiler does not implement.** Add it to
+   `src/bootstrap/langref.zig` with a compiling `example`, then run
+   `lir lang --markdown > docs/LANGUAGE_REFERENCE.md`.
+2. **Never merge without the gates:**
+
+```bash
+zig build test                       # unit + catalogue conformance
+python3 tests/cli_test.py  ./zig-out/bin/lir
+python3 tests/ai_test.py   ./zig-out/bin/lir   # machine contracts
+python3 tests/core_test.py ./zig-out/bin/lir
+python3 tests/backend_test.py ./zig-out/bin/lir
+```
+
+See [CONTRIBUTING.md](docs/CONTRIBUTING.md) for the full checklist, code map and
+documentation workflow.
 
 ## License
 
@@ -372,8 +536,15 @@ LIR is licensed under the MIT License. See [LICENSE](LICENSE) for details.
 
 ## Links
 
+- [AI integration contract](docs/AI.md) — machine-readable schemas and repair loop
+- [Generated language reference](docs/LANGUAGE_REFERENCE.md) — canonical syntax
+- [Generated cheatsheet](docs/CHEATSHEET.md) — one page, for constrained context windows
+- [LIR vs Odin](docs/ODIN_VS_LIR.md) — honest feature-by-feature comparison
+- [HYPERION / CMF assessment](docs/HYPERION_ASSESSMENT.md) — which claims are real, which are prototypes, which contradict known theorems
+- [CMF paradigm](docs/CMF_PARADIGM.md) — the second paradigm: programs as falsifiable fields (`lir cmf`)
 - [Language Specification](docs/SPEC.md)
-- [Standard Library Documentation](docs/STDLIB.md)
+- [Standard Library](docs/STDLIB.md)
+- [Canonical tour](examples/canonical-tour.lir) — every supported feature in one file
 - [Examples](examples/)
 - [Benchmarks](bench/)
 - [Roadmap](docs/ROADMAP.md)

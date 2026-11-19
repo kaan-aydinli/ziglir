@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Dependency-free CLI regression tests; all outputs stay in a temp directory."""
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -28,6 +29,49 @@ class CliTests(unittest.TestCase):
 
     def test_metadata(self):
         self.assertIn("lir ", self.run_cli("version").stdout)
+
+    def test_target_triples_printed_by_targets_are_accepted(self):
+        listing = self.run_cli("targets").stdout
+        triples = re.findall(r"^  ([a-z0-9_]+-[a-z0-9]+)\s", listing, re.M)
+        self.assertGreaterEqual(len(triples), 10)
+        with tempfile.TemporaryDirectory(prefix="lir-targets-") as temp:
+            src = pathlib.Path(temp) / "main.lir"
+            src.write_text("fn main() -> i64 { return 3 }\n")
+            out = pathlib.Path(temp) / "out.c"
+            for triple in triples:
+                with self.subTest(triple=triple):
+                    result = self.run_cli("build", str(src), "--emit-c",
+                                          "-o", str(out), f"--target={triple}")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+            # Well-known GNU spellings resolve to the same targets.
+            for alias in ("x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
+                          "wasm32-unknown-wasi", "x86_64-pc-windows-gnu"):
+                with self.subTest(alias=alias):
+                    result = self.run_cli("build", str(src), "--emit-c",
+                                          "-o", str(out), f"--target={alias}")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+            for bogus in ("bogus", "x86_64-plan9", "aarch64-"):
+                with self.subTest(bogus=bogus):
+                    result = self.run_cli("build", str(src), "--emit-c",
+                                          "-o", str(out), f"--target={bogus}", ok=False)
+                    self.assertIn("unsupported target", result.stderr)
+
+    def test_help_flags_and_unknown_options(self):
+        for command in ("lang", "builtins"):
+            with self.subTest(command=command):
+                self.assertIn("Usage: lir " + command,
+                              self.run_cli(command, "--help").stdout)
+        self.assertIn("LIR knowledge base", self.run_cli("explain", "--help").stdout)
+        for args in (("lang", "--nope"), ("builtins", "--nope"),
+                     ("lang", "--status=bogus"), ("lang", "--category=bogus")):
+            with self.subTest(args=args):
+                self.run_cli(*args, ok=False)
+
+    def test_version_matches_package_manifest(self):
+        manifest = pathlib.Path(__file__).resolve().parents[1] / "build.zig.zon"
+        declared = re.search(r'\.version = "([^"]+)"', manifest.read_text()).group(1)
+        self.assertIn(declared, self.run_cli("version").stdout)
+        self.assertIn(declared, self.run_cli("help").stdout)
         self.assertIn("Usage:", self.run_cli("help").stdout)
         self.assertIn("wasm32-wasi", self.run_cli("targets").stdout)
 

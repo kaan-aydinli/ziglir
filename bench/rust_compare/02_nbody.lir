@@ -1,0 +1,69 @@
+// N-body style pairwise force accumulation over 300 bodies, 60 steps.
+//
+// Positions live in a malloc'd flat block of doubles-as-integers, so the
+// arithmetic stays in the integer pipeline: this measures loop overhead and
+// multiply throughput, not the FPU.
+import "common.lir"
+
+fn main() -> i64 {
+    const n: i64 = 300
+    const steps: i64 = 60
+    let px = @malloc(n * 8)
+    let py = @malloc(n * 8)
+    let vx = @malloc(n * 8)
+    let vy = @malloc(n * 8)
+
+    var i: i64 = 0
+    while i < n {
+        let a = ((i * 2654435761) % 20000) - 10000
+        let b = ((i * 40503) % 20000) - 10000
+        @write_u64(@ptr_add(px, i * 8), a)
+        @write_u64(@ptr_add(py, i * 8), b)
+        @write_u64(@ptr_add(vx, i * 8), 0)
+        @write_u64(@ptr_add(vy, i * 8), 0)
+        i = i + 1
+    }
+
+    var s: i64 = 0
+    while s < steps {
+        var a: i64 = 0
+        while a < n {
+            let axi = @read_u64(@ptr_add(px, a * 8)) as i64
+            let ayi = @read_u64(@ptr_add(py, a * 8)) as i64
+            var fx: i64 = 0
+            var fy: i64 = 0
+            var b: i64 = 0
+            while b < n {
+                if a != b {
+                    let dx = (@read_u64(@ptr_add(px, b * 8)) as i64) - axi
+                    let dy = (@read_u64(@ptr_add(py, b * 8)) as i64) - ayi
+                    let d2 = (dx * dx + dy * dy) / 1000000 + 1
+                    let inv = 100000000 / d2
+                    fx = fx + dx * inv
+                    fy = fy + dy * inv
+                }
+                b = b + 1
+            }
+            let nvx = (@read_u64(@ptr_add(vx, a * 8)) as i64) + fx / 1000
+            let nvy = (@read_u64(@ptr_add(vy, a * 8)) as i64) + fy / 1000
+            @write_u64(@ptr_add(vx, a * 8), nvx % 100000)
+            @write_u64(@ptr_add(vy, a * 8), nvy % 100000)
+            a = a + 1
+        }
+        s = s + 1
+    }
+
+    var acc: i64 = 0
+    var q: i64 = 0
+    while q < n {
+        acc = acc + (@read_u64(@ptr_add(vx, q * 8)) as i64) + (@read_u64(@ptr_add(vy, q * 8)) as i64)
+        q = q + 1
+    }
+    printInt(acc % 1000000007)
+    println("")
+    @free(px)
+    @free(py)
+    @free(vx)
+    @free(vy)
+    return 0
+}

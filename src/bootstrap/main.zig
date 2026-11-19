@@ -55,6 +55,14 @@ pub const Compiler = driver_mod.Compiler;
 pub const CBackend = c_backend_mod;
 pub const WasmBackend = wasm_backend_mod;
 pub const IRVM = ir_vm_mod;
+/// The second paradigm: programs as falsifiable fields rather than objects.
+pub const CMF = cmf_mod;
+
+/// Exposed for the language-catalogue conformance test: the builtin table is
+/// the authority for which call names may resolve.
+pub fn sema_lookupBuiltin(name: []const u8) ?sema_mod.BuiltinSpec {
+    return sema_mod.lookupBuiltin(name);
+}
 
 const eql = util.eql;
 const printStr = util.printStr;
@@ -64,10 +72,18 @@ const project = @import("project.zig");
 const manifest = @import("manifest.zig");
 const sysExit = util.sysExit;
 const repl_mod = @import("repl.zig");
+const langcmd_mod = @import("langcmd.zig");
+const explain_mod = @import("explain.zig");
+const langref_mod = @import("langref.zig");
+const cmf_mod = @import("cmf.zig");
 
 // ════════════════════════════════════════════════════════════════════════════
 // CLI
 // ════════════════════════════════════════════════════════════════════════════
+
+/// Single source of truth for the compiler version string. `build.zig.zon`
+/// carries the release version; this constant must match it (guarded by a test).
+pub const version = "2.3.0";
 
 pub fn main() !void {
     const alloc = std.heap.page_allocator;
@@ -90,9 +106,15 @@ pub fn main() !void {
     if (eql(command, "help") or eql(command, "--help") or eql(command, "-h")) {
         printUsage();
     } else if (eql(command, "version") or eql(command, "--version") or eql(command, "-V")) {
-        printStr("lir 2.2.0 (ZigLIR compiler; implemented in Zig)\n");
+        printStr("lir " ++ version ++ " (ZigLIR compiler; implemented in Zig)\n");
     } else if (eql(command, "targets")) {
         printTargets();
+    } else if (eql(command, "lang")) {
+        langcmd_mod.cmdLang(args[2..]);
+    } else if (eql(command, "cmf")) {
+        cmf_mod.cmdCmf(args[2..]);
+    } else if (eql(command, "builtins") or eql(command, "builtin")) {
+        langcmd_mod.cmdBuiltins(args[2..]);
     } else if (eql(command, "build")) {
         cmdBuild(args[2..]);
     } else if (eql(command, "run")) {
@@ -108,16 +130,31 @@ pub fn main() !void {
     } else if (eql(command, "test")) {
         cmdTest(args[2..]);
     } else if (eql(command, "init")) {
-        if (args.len > 3) unexpectedArgument(args[3]);
-        const name = if (args.len >= 3) args[2] else "myproject";
-        cmdInit(name);
+        var positional: ?[]const u8 = null;
+        var for_agents = false;
+        for (args[2..]) |arg| {
+            if (eql(arg, "--ai") or eql(arg, "--agent") or eql(arg, "--agents")) {
+                for_agents = true;
+            } else if (eql(arg, "--help") or eql(arg, "-h")) {
+                printStr("Usage: lir init [name] [--ai]\n\nCreates <name>/project.manifest, src/main.lir, src/lib.lir,\nsrc/tests.lir and .gitignore. --ai also writes AGENTS.md and lir.agent.json\n(orientation guide and machine-readable capability manifest). Never\noverwrites an existing directory.\n");
+                return;
+            } else if (arg.len > 0 and arg[0] == '-') {
+                unexpectedArgument(arg);
+            } else if (positional == null) {
+                positional = arg;
+            } else {
+                unexpectedArgument(arg);
+            }
+        }
+        const name = positional orelse "myproject";
+        cmdInit(name, for_agents);
     } else if (eql(command, "repl")) {
         repl_mod.cmdRepl();
     } else if (eql(command, "install")) {
         cmdInstall();
     } else {
         const known_commands = [_][]const u8{
-            "build", "run", "check", "ir", "ast", "explain", "test", "targets", "init", "repl", "install", "help", "version",
+            "build", "run", "check", "ir", "ast", "explain", "test", "targets", "lang", "builtins", "init", "repl", "install", "help", "version",
         };
         printErr("Unknown command: '");
         printErr(command);
@@ -132,9 +169,60 @@ pub fn main() !void {
     }
 }
 
+fn printJsonEscaped(text: []const u8) void {
+    printStr("\"");
+    for (text) |ch| {
+        switch (ch) {
+            '"' => printStr("\\\""),
+            '\\' => printStr("\\\\"),
+            '\n' => printStr("\\n"),
+            '\r' => printStr("\\r"),
+            '\t' => printStr("\\t"),
+            else => {
+                if (ch < 0x20) {
+                    var buf: [8]u8 = undefined;
+                    const esc = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{ch}) catch "";
+                    printStr(esc);
+                } else {
+                    var one = [_]u8{ch};
+                    printStr(one[0..]);
+                }
+            },
+        }
+    }
+    printStr("\"");
+}
+
+/// Actionable hint for failures that are about the environment rather than the
+/// program. Printed after the error name so a user (or an agent) knows what to
+/// change instead of seeing a bare enum value.
+fn printErrorHint(err: anyerror) void {
+    switch (err) {
+        error.CrossCompilerNotFound => printErr(
+            "  hint: cross-compiling to a non-host target through the C11 backend needs 'zig' on PATH (or CC set to a cross-compiler);\n" ++
+                "        run 'lir build <file> --emit-c' to emit portable C11 and compile it wherever you like,\n" ++
+                "        or 'lir run <file> --backend=vm' to execute the program here.\n",
+        ),
+        error.CCompilerNotFound => printErr(
+            "  hint: the C11 backend needs a C compiler; install one (cc/clang/gcc) or put 'zig' on PATH.\n" ++
+                "        The native ELF backend (default for x86_64-linux) and --backend=vm need no external toolchain.\n",
+        ),
+        error.CCompileFailed => printErr(
+            "  hint: the host C compiler rejected the generated C11. Re-run with 'lir build <file> --emit-c -o out.c' to inspect it.\n",
+        ),
+        error.UnsupportedTarget, error.UnsupportedTargetForNativeElf, error.UnsupportedTargetForNativeWasm => printErr(
+            "  hint: run 'lir targets' for the supported triples and the backend that serves each one.\n",
+        ),
+        error.Unsupported => printErr(
+            "  hint: the program uses something the selected target cannot provide; try --backend=vm to run it here.\n",
+        ),
+        else => {},
+    }
+}
+
 fn printUsage() void {
     printStr(
-        \\LIR Compiler v2.2.0
+        \\LIR Compiler v2.3.0
         \\
         \\Usage: lir <command> [options]
         \\
@@ -146,28 +234,39 @@ fn printUsage() void {
         \\    --backend <kind>    Backend: auto | native | wasm | c | vm
         \\    --emit-ir           Print lowered & optimized IR to stdout
         \\    --emit-c            Emit standalone portable C11 source instead of linking
-        \\  run [file|dir]      Compile and execute in one step (supports --backend=vm/wasm/c/native)
-        \\  check [file|dir]    Type-check and verify IR without emitting binary
+        \\  run [file|dir]      Compile and execute (supports --backend=vm/wasm/c/native)
+        \\  check [file|dir]    Type-check, verify IR, and report diagnostics only
         \\  ir [file|dir]       Dump lowered & optimized IR
-        \\  ast [file|dir]      Pretty-print Abstract Syntax Tree
-        \\  explain [topic]     Interactive developer reference & error explanation
-        \\  test [file|dir]     Run #[test] suite
-        \\  repl                Start interactive Read-Eval-Print Loop
+        \\  ast [file|dir]      Pretty-print the Abstract Syntax Tree
+        \\  test [file|dir]     Run the #[test] suite
+        \\  lang [feature]      Language catalogue: what LIR accepts (--json/--markdown)
+        \\  builtins [name]     Builtin catalogue with signatures (--json)
+        \\  cmf <file.cmf>      Check a Causal Morphogenetic Field header (claims, not classes)
+        \\  explain [topic]     Knowledge base; also accepts diagnostics codes (LIR-E3004)
         \\  targets             List supported cross-compilation targets and host defaults
-        \\  init [name]         Create a new project
+        \\  init [name]         Create a new project (--ai adds AGENTS.md + agent manifest)
+        \\  repl                Start interactive Read-Eval-Print Loop
         \\  install             Install lir binary to system PATH
         \\  help                Show this help
         \\  version             Show version
+        \\
+        \\Diagnostics options (any command):
+        \\  --diagnostics=human Error snippets with caret and help (default)
+        \\  --diagnostics=short One machine-friendly line per diagnostic
+        \\  --json              JSON result on stdout, JSON diagnostics on stderr
         \\
         \\With no file/dir, commands load ./project.manifest.
         \\
         \\Examples:
         \\  lir build main.lir -O2 -o main
+        \\  lir run main.lir --backend=vm -- arg1 arg2
+        \\  lir check main.lir --json
+        \\  lir lang --json > lang.json
+        \\  lir builtins --group=string
+        \\  lir explain ai
         \\  lir build main.lir --target=wasm32-wasi -o main.wasm
         \\  lir build main.lir --target=aarch64-macos -o main_mac
         \\  lir build main.lir --emit-c -o main.c
-        \\  lir run main.lir --backend=vm -- arg1 arg2
-        \\  lir check main.lir
         \\
     );
 }
@@ -203,6 +302,32 @@ fn unexpectedArgument(arg: []const u8) noreturn {
     printErr(arg);
     printErr("'\n");
     sysExit(1);
+}
+
+/// Machine-readable output mode. `--json` is shorthand for the whole CLI
+/// switching to JSON envelopes; `--diagnostics=<fmt>` only changes how
+/// diagnostics are rendered. Both are accepted by every command.
+var cli_json: bool = false;
+
+fn parseDiagFormatFlag(args: []const []const u8, idx: *usize) bool {
+    const arg = args[idx.*];
+    if (eql(arg, "--json")) {
+        cli_json = true;
+        diag_mod.default_format = .json;
+        return true;
+    }
+    if (parseFlagValue(args, idx, "--diagnostics=", "--diagnostics")) |spec| {
+        const fmt = diag_mod.Format.parse(spec) orelse {
+            printErr("Error: unknown diagnostics format '");
+            printErr(spec);
+            printErr("' (expected human, short, or json)\n");
+            sysExit(1);
+        };
+        diag_mod.default_format = fmt;
+        if (fmt == .json) cli_json = true;
+        return true;
+    }
+    return false;
 }
 
 fn parseOptFlag(arg: []const u8) ?OptLevel {
@@ -290,6 +415,8 @@ fn cmdBuild(args: []const []const u8) void {
             emit_ir = true;
         } else if (eql(arg, "--emit-c")) {
             emit_c = true;
+        } else if (parseDiagFormatFlag(args, &idx)) {
+            // handled
         } else if (arg.len > 0 and arg[0] == '-') {
             printErr("Error: unknown option '");
             printErr(arg);
@@ -321,10 +448,20 @@ fn cmdBuild(args: []const []const u8) void {
     var compiler = Compiler.initForTarget(source_buf, in_path, opt_level, target, backend_kind);
     compiler.emit_ir = emit_ir;
     compiler.emit_c = emit_c;
+    compiler.diag_format = diag_mod.default_format;
     const result = compiler.compile() catch |err| {
+        if (cli_json) {
+            printStr("{\"schema\":\"lir.build.v1\",\"status\":\"error\",\"input\":");
+            printJsonEscaped(in_path);
+            printStr(",\"error\":\"");
+            printStr(@errorName(err));
+            printStr("\"}\n");
+            sysExit(1);
+        }
         printErr("Compilation failed: ");
         printErr(@errorName(err));
         printErr("\n");
+        printErrorHint(err);
         sysExit(1);
     };
     defer alloc.free(result);
@@ -345,6 +482,25 @@ fn cmdBuild(args: []const []const u8) void {
         sysExit(1);
     }
 
+    if (cli_json) {
+        // Machine contract: a single JSON object on stdout describing the build.
+        var tbuf: [64]u8 = undefined;
+        printStr("{\"schema\":\"lir.build.v1\",\"status\":\"ok\",\"input\":");
+        printJsonEscaped(in_path);
+        printStr(",\"output\":");
+        printJsonEscaped(resolved_out);
+        printStr(",\"bytes\":");
+        printUsize(result.len);
+        printStr(",\"backend\":\"");
+        printStr(target.resolveBackend(backend_kind).name());
+        printStr("\",\"target\":\"");
+        printStr(target.triple(&tbuf));
+        printStr("\",\"optimization\":\"");
+        printStr(@tagName(opt_level));
+        printStr("\"}\n");
+        return;
+    }
+
     printStr(if (emit_c) "Emitted C11 " else "Compiled ");
     printStr(in_path);
     printStr(" -> ");
@@ -362,6 +518,8 @@ fn cmdCheck(args: []const []const u8) void {
         const arg = args[idx];
         if (parseFlagValue(args, &idx, "--target=", "--target")) |spec| {
             target = parseTargetOrDie(spec);
+        } else if (parseDiagFormatFlag(args, &idx)) {
+            // handled
         } else if (arg.len > 0 and arg[0] == '-') {
             printErr("Error: unknown option '");
             printErr(arg);
@@ -386,12 +544,32 @@ fn cmdCheck(args: []const []const u8) void {
     defer alloc.free(source_buf);
 
     var compiler = Compiler.initForTarget(source_buf, file, .O2, target, .auto);
+    compiler.diag_format = diag_mod.default_format;
+    var tbuf: [64]u8 = undefined;
     compiler.check() catch |err| {
+        if (cli_json) {
+            printStr("{\"schema\":\"lir.check.v1\",\"status\":\"error\",\"file\":");
+            printJsonEscaped(file);
+            printStr(",\"target\":\"");
+            printStr(target.triple(&tbuf));
+            printStr("\",\"error\":\"");
+            printStr(@errorName(err));
+            printStr("\"}\n");
+            sysExit(1);
+        }
         printErr("Check failed: ");
         printErr(@errorName(err));
         printErr("\n");
         sysExit(1);
     };
+    if (cli_json) {
+        printStr("{\"schema\":\"lir.check.v1\",\"status\":\"ok\",\"file\":");
+        printJsonEscaped(file);
+        printStr(",\"target\":\"");
+        printStr(target.triple(&tbuf));
+        printStr("\"}\n");
+        return;
+    }
     printStr("OK: ");
     printStr(file);
     printStr("\n");
@@ -598,203 +776,7 @@ fn cmdAst(args: []const []const u8) void {
 }
 
 pub fn cmdExplain(args: []const []const u8) void {
-    if (args.len == 0) {
-        printStr(
-            \\LIR Architecture & Language Explanations
-            \\
-            \\Usage: lir explain <topic|error>
-            \\
-            \\Available Topics:
-            \\  borrow          Affine type system, shared (&) and mutable (&mut) borrows
-            \\  contracts       Formal verification with pre/post-conditions (requires, ensures)
-            \\  purity          Side-effect-free functions with strict immutability
-            \\  ranges          Ada/SPARK-style bounded scalar types (type T is i64 range min..max)
-            \\  optimizer       SSA construction, GVN, LICM, loop unrolling, magic division
-            \\  diagnostics     Intelligent fuzzy typo detection and static analysis warnings
-            \\  all             Comprehensive summary of all LIR concepts
-            \\
-            \\Error Explanations:
-            \\  UndefinedVariable, UndefinedFunctionCall, UnknownField, UndefinedStruct, TypeMismatch
-            \\
-            \\Example:
-            \\  lir explain contracts
-            \\  lir explain borrow
-            \\
-        );
-        return;
-    }
-    const topic = args[0];
-    if (eql(topic, "borrow") or eql(topic, "lifetimes") or eql(topic, "ownership")) {
-        printStr(
-            \\=== LIR Borrow Checker & Affine Type System ===
-            \\
-            \\LIR enforces compile-time memory safety without a garbage collector using an
-            \\affine borrow checking system inspired by Rust:
-            \\
-            \\1. Shared Borrows (&T):
-            \\   Multiple read-only references may coexist simultaneously:
-            \\     let p: &Point = &origin;
-            \\     let q: &Point = &origin; // Valid: multiple shared references
-            \\
-            \\2. Exclusive Mutable Borrows (&mut T):
-            \\   Only ONE active mutable reference can exist at any given time.
-            \\   When an object is mutably borrowed, the owner cannot be read or modified:
-            \\     var count = 0;
-            \\     let r = &mut count;
-            \\     // Reading 'count' here is a compile-time error:
-            \\     // cannot borrow/read 'count' while mutably borrowed!
-            \\
-            \\3. Dangling Reference Prevention:
-            \\   LIR prevents returning or escaping pointers to local stack frames:
-            \\     fn bad() -> &i64 {
-            \\         let x = 42;
-            \\         return &x; // COMPILE ERROR: dangling reference to stack variable
-            \\     }
-            \\
-        );
-    } else if (eql(topic, "contracts") or eql(topic, "spark") or eql(topic, "formal-verification")) {
-        printStr(
-            \\=== Formal Verification & Contracts (SPARK / Hoare Logic) ===
-            \\
-            \\LIR includes first-class Hoare-style preconditions and postconditions:
-            \\
-            \\1. Preconditions (requires):
-            \\   Invariants that callers must satisfy before invoking the function:
-            \\     fn divide(a: i64, b: i64) -> i64
-            \\       requires b != 0
-            \\     {
-            \\         return a / b;
-            \\     }
-            \\
-            \\2. Postconditions (ensures):
-            \\   Guarantees that the function promises upon successful return:
-            \\     fn abs_val(x: i64) -> i64
-            \\       ensures result >= 0
-            \\     {
-            \\         if x < 0 { return -x; }
-            \\         return x;
-            \\     }
-            \\
-            \\Contracts are statically checked at compile time for constant arguments and
-            \\inlined as zero-cost assertions in debug/verification modes.
-            \\
-        );
-    } else if (eql(topic, "purity") or eql(topic, "pure")) {
-        printStr(
-            \\=== Pure Functions in LIR ===
-            \\
-            \\Functions declared with 'pure' are mathematically pure:
-            \\  pure fn square(x: i64) -> i64 {
-            \\      return x * x;
-            \\  }
-            \\
-            \\Purity Rules Enforced at Compile Time:
-            \\  1. Cannot mutate global state or heap objects.
-            \\  2. Cannot perform I/O operations (e.g. print, disk, network).
-            \\  3. May only call other 'pure' functions.
-            \\  4. The optimizer aggressively memoizes and eliminates identical pure calls (GVN).
-            \\
-        );
-    } else if (eql(topic, "ranges") or eql(topic, "bounded-scalar")) {
-        printStr(
-            \\=== Ada/SPARK-Style Bounded Scalar Types ===
-            \\
-            \\LIR allows declaring strongly-typed numeric domains with bounds:
-            \\  type Percentage is i64 range 0..100;
-            \\  type DayOfMonth is i64 range 1..31;
-            \\
-            \\Features:
-            \\  1. Compile-Time Checking: Out-of-bounds constant assignments trigger compile errors:
-            \\       let p: Percentage = 105; // COMPILE ERROR: 105 exceeds range [0..100]
-            \\  2. Overflow Immunity: Array indexing with bounded types proves memory safety
-            \\     without emitting redundant bounds-check instructions in assembly!
-            \\
-        );
-    } else if (eql(topic, "optimizer") or eql(topic, "ir-opt")) {
-        printStr(
-            \\=== LIR Optimization Pipeline (-O2) ===
-            \\
-            \\The LIR optimizer applies production-grade optimization passes on SSA IR:
-            \\
-            \\1. SSA Construction (mem2reg):
-            \\   Promotes stack allocations to SSA virtual registers.
-            \\2. Global Value Numbering (GVN):
-            \\   Eliminates redundant expressions and unifies equivalent computations.
-            \\3. Loop Invariant Code Motion (LICM):
-            \\   Hoists invariant computations outside loop bodies.
-            \\4. Counted Loop Unrolling:
-            \\   Unrolls hot loops up to 8x to maximize instruction-level parallelism.
-            \\5. Magic Divisor Lowering & Multiplier Hoisting:
-            \\   Lowers integer divisions to fixed-point reciprocal multiplications (imul rcx),
-            \\   hoisting invariant magic multipliers into dedicated hardware registers.
-            \\6. Algebraic Reassociation & Simplification:
-            \\   Reassociates constant chains: (x + c1) + c2 -> x + (c1 + c2),
-            \\   collapses double negations: -(-x) -> x, ~(~x) -> x,
-            \\   and eliminates identity operations (x * 1, x + 0, x ^ x).
-            \\7. Post-SSA Copy Coalescing:
-            \\   Eliminates register bouncing moves across loop iterations.
-            \\
-        );
-    } else if (eql(topic, "diagnostics") or eql(topic, "typo")) {
-        printStr(
-            \\=== Intelligent Compiler Diagnostics ===
-            \\
-            \\The LIR compiler includes intelligent developer assistance:
-            \\
-            \\1. Fuzzy Typo Suggestions:
-            \\   When an undeclared identifier, function, struct, or field is encountered,
-            \\   the compiler calculates Levenshtein distances against known candidates in scope
-            \\   and suggests: "did you mean '...'?".
-            \\
-            \\2. Unused Variable Warnings:
-            \\   Detects variables or parameters declared but never read, suggesting prefixing
-            \\   with '_' to silence (e.g. '_my_var').
-            \\
-            \\3. Unreachable Code Detection:
-            \\   Warns about dead statements following 'return', 'break', or 'continue'.
-            \\
-        );
-    } else if (eql(topic, "UndefinedVariable")) {
-        printStr(
-            \\=== UndefinedVariable ===
-            \\
-            \\Cause:
-            \\  An identifier was referenced that has not been declared in the current or
-            \\  enclosing lexical scopes, nor in global constants or functions.
-            \\
-            \\Solution:
-            \\  1. Check for typos. The compiler suggests the closest matching name in scope.
-            \\  2. Ensure the variable was declared before use with 'let' or 'var'.
-            \\  3. If importing from another module, ensure the import statement is present.
-            \\
-        );
-    } else if (eql(topic, "TypeMismatch")) {
-        printStr(
-            \\=== TypeMismatch ===
-            \\
-            \\Cause:
-            \\  An expression's type does not match the expected type of its context
-            \\  (e.g. passing a string to an integer parameter, or mismatched return type).
-            \\
-            \\Solution:
-            \\  1. Inspect the type expected by the function or assignment.
-            \\  2. Use explicit casting with 'as' (e.g. 'val as i32').
-            \\
-        );
-    } else {
-        const known_topics = [_][]const u8{
-            "borrow", "contracts", "purity", "ranges", "optimizer", "diagnostics", "UndefinedVariable", "TypeMismatch",
-        };
-        printErr("Unknown topic '");
-        printErr(topic);
-        printErr("'.");
-        if (util.findSimilarName(topic, &known_topics, 2)) |sugg| {
-            printErr(" Did you mean 'lir explain ");
-            printErr(sugg);
-            printErr("'?");
-        }
-        printErr("\nRun 'lir explain' without arguments to see available topics.\n");
-    }
+    explain_mod.run(args);
 }
 
 fn findExeInPath(alloc: std.mem.Allocator, name: []const u8) ?[]u8 {
@@ -836,6 +818,7 @@ fn executeCompiledArtifact(
         printErr("Compilation failed: ");
         printErr(@errorName(err));
         printErr("\n");
+        printErrorHint(err);
         sysExit(1);
     };
     defer alloc.free(result);
@@ -977,7 +960,7 @@ fn cmdRun(args: []const []const u8) void {
     executeCompiledArtifact(alloc, &compiler, prog_args);
 }
 
-fn cmdInit(name: []const u8) void {
+fn cmdInit(name: []const u8, for_agents: bool) void {
     project.create(std.fs.cwd(), name) catch |err| {
         printErr("Error: cannot initialize project '");
         printErr(name);
@@ -986,9 +969,19 @@ fn cmdInit(name: []const u8) void {
         printErr(" (use a new directory name; existing work is never overwritten)\n");
         sysExit(1);
     };
+    if (for_agents) {
+        project.addAgentScaffold(std.fs.cwd(), name) catch |err| {
+            printErr("Error: cannot write AI scaffolding: ");
+            printErr(@errorName(err));
+            printErr("\n");
+            sysExit(1);
+        };
+    }
     printStr("Created ");
     printStr(name);
-    printStr("/project.manifest, src/main.lir, src/lib.lir, src/tests.lir and .gitignore\n\nNext: cd ");
+    printStr("/project.manifest, src/main.lir, src/lib.lir, src/tests.lir and .gitignore");
+    if (for_agents) printStr(", AGENTS.md, lir.agent.json");
+    printStr("\n\nNext: cd ");
     printStr(name);
     printStr(" && lir run\n");
 }

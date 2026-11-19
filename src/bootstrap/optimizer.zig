@@ -84,10 +84,19 @@ pub const Optimizer = struct {
             .let_stmt => {
                 if (node.child0 != 0) {
                     self.optimizeExpr(node.child0, changed);
+                    // `flags & 4` marks a destructuring `let`; `flags & 1` marks
+                    // `let mut`. Only an immutable scalar `let` is a constant.
+                    // Propagating a mutable binding turns `a = 7` into a dead
+                    // store that later passes delete, which silently drops the
+                    // assignment (the value read afterwards stays the old one).
                     if ((node.flags & 4) == 0) {
-                        // Track constant bindings for propagation (after optimizing initializer)
                         const val = self.getConstantValue(node.child0);
-                        if (val) |v| {
+                        if ((node.flags & 1) != 0) {
+                            // Mutable binding: never constant-fold, and shadow
+                            // any same-named outer constant.
+                            if (node.text_len > 0)
+                                self.invalidateConst(self.textOfSrc(node.text_start, node.text_len, node.source_id), node.source_id);
+                        } else if (val) |v| {
                             self.trackConst(idx, v);
                         } else if (node.text_len > 0) {
                             // Shadow any outer constant with same name

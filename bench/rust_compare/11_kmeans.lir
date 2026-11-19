@@ -1,0 +1,86 @@
+// 1-D k-means with k = 8 over 100,000 points, 15 Lloyd iterations.
+//
+// Points are generated deterministically into a malloc'd buffer, then each
+// iteration assigns every point to its nearest centroid (a loop with an early
+// best-distance check) and recomputes centroids. This is the memory-traffic
+// workload of the suite: the arithmetic per point is small, so it measures how
+// well loads/stores through pointers are scheduled.
+import "common.lir"
+
+fn main() -> i64 {
+    const n: i64 = 100000
+    const k: i64 = 8
+    const iters: i64 = 15
+
+    let pts = @malloc(n * 8)
+    let cen = @malloc(k * 8)
+    let sum = @malloc(k * 8)
+    let cnt = @malloc(k * 8)
+
+    var i: i64 = 0
+    while i < n {
+        // spread values over 0..1000000 with a cheap LCG
+        let v = @wrapping_mul(i + 1, 2654435761) % 1000000
+        @write_u64(@ptr_add(pts, i * 8), v)
+        i = i + 1
+    }
+    var c: i64 = 0
+    while c < k {
+        @write_u64(@ptr_add(cen, c * 8), c * 125000)
+        c = c + 1
+    }
+
+    var it: i64 = 0
+    while it < iters {
+        var z: i64 = 0
+        while z < k {
+            @write_u64(@ptr_add(sum, z * 8), 0)
+            @write_u64(@ptr_add(cnt, z * 8), 0)
+            z = z + 1
+        }
+        var p: i64 = 0
+        while p < n {
+            let v = @read_u64(@ptr_add(pts, p * 8)) as i64
+            var best: i64 = 0
+            var best_d: i64 = 9223372036854775807
+            var ci: i64 = 0
+            while ci < k {
+                let cc = @read_u64(@ptr_add(cen, ci * 8)) as i64
+                let d = v - cc
+                let ad = @max(d, 0 - d)
+                if ad < best_d {
+                    best_d = ad
+                    best = ci
+                }
+                ci = ci + 1
+            }
+            @write_u64(@ptr_add(sum, best * 8), (@read_u64(@ptr_add(sum, best * 8)) as i64) + v)
+            @write_u64(@ptr_add(cnt, best * 8), (@read_u64(@ptr_add(cnt, best * 8)) as i64) + 1)
+            p = p + 1
+        }
+        var q: i64 = 0
+        while q < k {
+            let s = @read_u64(@ptr_add(sum, q * 8)) as i64
+            let m = @read_u64(@ptr_add(cnt, q * 8)) as i64
+            if m > 0 {
+                @write_u64(@ptr_add(cen, q * 8), s / m)
+            }
+            q = q + 1
+        }
+        it = it + 1
+    }
+
+    var acc: i64 = 0
+    var w: i64 = 0
+    while w < k {
+        acc = acc + (@read_u64(@ptr_add(cen, w * 8)) as i64) * (w + 1)
+        w = w + 1
+    }
+    printInt(acc % 1000000007)
+    println("")
+    @free(pts)
+    @free(cen)
+    @free(sum)
+    @free(cnt)
+    return 0
+}

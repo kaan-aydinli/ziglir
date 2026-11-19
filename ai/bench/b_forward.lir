@@ -1,0 +1,11 @@
+import "../src/ledger.lir"
+fn main() -> i64 {
+    let o = block_new(24, 1, 24, 5)
+    let hv = @malloc(192)
+    @write_u64(@ptr_add(hv, 0), ONE as u64)
+    var i: i64 = 0
+    while i < 100000 { forward(o, hv)  i = i + 1 }
+    printInt(to_int(@read_u64(@ptr_add(o.out, 0)) as i64))
+    println("")
+    return 0
+}

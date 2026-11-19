@@ -1,0 +1,29 @@
+# ════════════════════════════════════════════════════════════════════════════
+# A Causal Morphogenetic Field: one body, five constructed variants, zero
+# classes, zero dispatch tables.
+#
+# `lir cmf examples/cmf/widening.cmf` substitutes each witness into the bloom
+# body and runs the ordinary LIR front end (lex, parse, type check, IR verify)
+# on the result. A witness whose expansion does not verify is *refused*, and a
+# refused variant is never emitted, so it cannot be selected at runtime either.
+# ════════════════════════════════════════════════════════════════════════════
+
+# Shapes: the instances are the witnesses, not subclasses.
+morph Cell =<< u8 u16 u32 u64 i64 >>=
+
+# Substrate: a region with a checkable surface. ?exclusive means "one writer at
+# a time is a claim we can check"; ?shared would withdraw that claim.
+field ledger: u64[1024] ?exclusive
+
+# Commitments: each claim says exactly how it is judged, or it is rejected.
+claim exclusive_writer over ledger check uniqueness
+claim linear_use over ledger for 4tick runtime adjudicate
+claim no_partial_reads over ledger check absence
+
+# Expression: one body, instantiated per witness. @witness is the placeholder.
+bloom narrow: morph Cell {
+fn main() -> i64 {
+    let cell: @witness = 200
+    return cell as i64
+}
+}

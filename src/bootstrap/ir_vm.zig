@@ -38,6 +38,9 @@ pub const VMError = error{
 
 pub const VMResult = struct {
     exit_code: i64 = 0,
+    /// Instructions actually executed. The only cost number this compiler
+    /// reports, because it is the only one it can measure.
+    steps: u64 = 0,
     stdout: []u8 = &[_]u8{},
     stderr: []u8 = &[_]u8{},
     trapped: bool = false,
@@ -122,6 +125,9 @@ pub const VMState = struct {
 
     // Virtual file descriptors (0,1,2 reserved for stdio)
     files: std.ArrayListUnmanaged(?std.fs.File) = .{},
+
+    // Instructions executed so far (deterministic: no wall-clock involved)
+    steps: u64 = 0,
 
     // Program arguments
     prog_args: []const []const u8 = &[_][]const u8{},
@@ -509,6 +515,7 @@ pub const VMState = struct {
 
             while (ii < blk.inst_count) : (ii += 1) {
                 const inst = blk.insts[ii];
+                self.steps += 1;
                 switch (inst.op) {
                     .nop, .struct_decl, .module_import, .phi => {},
                     .const_int => vregs[inst.dest] = @bitCast(inst.imm),
@@ -774,6 +781,13 @@ pub const VMState = struct {
             .call_write_byte => try self.writeU8(vregs[inst.args[0]], @truncate(vregs[inst.args[1]])),
             .call_read_u32 => vregs[inst.dest] = try self.readU32(vregs[inst.args[0]]),
             .call_write_u32 => try self.writeU32(vregs[inst.args[0]], @truncate(vregs[inst.args[1]])),
+            // bounds_hoist_guard: the native backend emits one range test here
+            // and then runs the loop body unchecked. The VM keeps its normal
+            // per-access checks, so the guard is a no-op — but it must still
+            // validate the base pointer, because a native run would trap here.
+            .bounds_hoist_guard => {
+                _ = try self.resolveSlice(vregs[inst.args[0]], 1, false);
+            },
             .call_read_u64 => vregs[inst.dest] = try self.readU64(vregs[inst.args[0]]),
             .call_write_u64 => try self.writeU64(vregs[inst.args[0]], vregs[inst.args[1]]),
             .call_memcpy => {
@@ -1527,6 +1541,7 @@ pub fn execute(
             else => 1,
         };
     }
+    result.steps = vm.steps;
     if (capture_io) {
         result.stdout = try vm.out_buf.toOwnedSlice(alloc);
         result.stderr = try vm.err_buf.toOwnedSlice(alloc);

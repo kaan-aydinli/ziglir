@@ -1,0 +1,29 @@
+// Fibonacci mod 2^31-1, 30,000,000 iterations.
+//
+// Two-register recurrence (a, b) = (b, a+b mod m). The modulus is a Mersenne
+// prime so the comparison-and-subtract reduction is cheap, and m < 2^31 keeps
+// a + b inside i64 with room to spare. This measures the tightest possible
+// loop body: one add, one compare, one conditional subtract.
+import "common.lir"
+
+fn main() -> i64 {
+    const iters: i64 = 30000000
+    const m: i64 = 2147483647
+    var a: i64 = 0
+    var b: i64 = 1
+    var i: i64 = 0
+    while i < iters {
+        let t = a + b
+        if t >= m {
+            a = b
+            b = t - m
+        } else {
+            a = b
+            b = t
+        }
+        i = i + 1
+    }
+    printInt(a)
+    println("")
+    return 0
+}

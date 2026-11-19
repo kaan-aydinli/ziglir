@@ -1,0 +1,33 @@
+// Prime counting function pi(x) for x = 2,000,000, by trial division up to the
+// square root of each candidate.
+//
+// Every composite exits the divisor loop early, so the branch predictor sees a
+// mix: most candidates take one iteration, primes take ~sqrt(n)/2. The inner
+// comparison `d * d <= n` keeps the loop bound derived from the counter rather
+// than a separate limit variable.
+import "common.lir"
+
+fn is_prime(n: i64) -> i64 {
+    if n < 2 { return 0 }
+    if n < 4 { return 1 }
+    if n % 2 == 0 { return 0 }
+    var d: i64 = 3
+    while d * d <= n {
+        if n % d == 0 { return 0 }
+        d = d + 2
+    }
+    return 1
+}
+
+fn main() -> i64 {
+    const limit: i64 = 2000000
+    var count: i64 = 0
+    var n: i64 = 2
+    while n < limit {
+        count = count + is_prime(n)
+        n = n + 1
+    }
+    printInt(count)
+    println("")
+    return 0
+}
