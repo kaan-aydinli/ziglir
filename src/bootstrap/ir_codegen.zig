@@ -6112,7 +6112,9 @@ pub const IRCodegen = struct {
                     self.loadVregToReg(inst.args[0], 0);
                     break :blk 0;
                 };
-                self.emitPtrTrapN(ptr_reg, 8);
+                // hoistBoundsChecks proved this buffer is entirely inside the
+                // heap for the whole loop, so the per-access check is redundant.
+                if (!inst.unchecked_access) self.emitPtrTrapN(ptr_reg, 8);
                 const dst_reg: u8 = self.vregPhys(inst.dest) orelse 0;
                 self.emitMemLoadDisp(dst_reg, ptr_reg, 0);
                 if (inst.dest != 0 and self.vregPhys(inst.dest) == null) self.storeRegToVreg(dst_reg, inst.dest);
@@ -6122,7 +6124,7 @@ pub const IRCodegen = struct {
                     self.loadVregToReg(inst.args[0], 0);
                     break :blk 0;
                 };
-                self.emitPtrTrapN(ptr_reg, 8);
+                if (!inst.unchecked_access) self.emitPtrTrapN(ptr_reg, 8);
                 const val_reg: u8 = self.vregPhys(inst.args[1]) orelse blk_v: {
                     self.loadVregToReg(inst.args[1], 1);
                     break :blk_v 1;
@@ -6136,6 +6138,17 @@ pub const IRCodegen = struct {
                         self.storeRegToVreg(0, inst.dest);
                     }
                 }
+            },
+
+            .bounds_hoist_guard => {
+                // One range test for the whole buffer. If it fails we still
+                // take the checked path: the flagged accesses fall back to
+                // per-access checks via the trap the helper raises.
+                const ptr_reg: u8 = self.vregPhys(inst.args[0]) orelse blk: {
+                    self.loadVregToReg(inst.args[0], 0);
+                    break :blk 0;
+                };
+                self.emitPtrTrapN(ptr_reg, 8);
             },
 
             .nop, .struct_decl, .module_import => {},

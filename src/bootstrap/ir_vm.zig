@@ -781,6 +781,13 @@ pub const VMState = struct {
             .call_write_byte => try self.writeU8(vregs[inst.args[0]], @truncate(vregs[inst.args[1]])),
             .call_read_u32 => vregs[inst.dest] = try self.readU32(vregs[inst.args[0]]),
             .call_write_u32 => try self.writeU32(vregs[inst.args[0]], @truncate(vregs[inst.args[1]])),
+            // bounds_hoist_guard: the native backend emits one range test here
+            // and then runs the loop body unchecked. The VM keeps its normal
+            // per-access checks, so the guard is a no-op — but it must still
+            // validate the base pointer, because a native run would trap here.
+            .bounds_hoist_guard => {
+                _ = try self.resolveSlice(vregs[inst.args[0]], 1, false);
+            },
             .call_read_u64 => vregs[inst.dest] = try self.readU64(vregs[inst.args[0]]),
             .call_write_u64 => try self.writeU64(vregs[inst.args[0]], vregs[inst.args[1]]),
             .call_memcpy => {
