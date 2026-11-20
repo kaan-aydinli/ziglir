@@ -1,0 +1,25 @@
+// Havuz benchmark'ının seri referansı — b_pool.lir ile aynı iş yükü,
+// aynı veri, yalnızca havuz yok.
+import "../src/ledger.lir"
+
+fn main() -> i64 {
+    let nout = 512
+    let steps = 6000
+    let b = block_new(128, nout, 8, 1)
+    let x = @malloc(128 * 8)
+    var i: i64 = 0
+    while i < 128 { @write_u64(@ptr_add(x, i*8), (i % 11) as u64)  i = i + 1 }
+    // Sonucu OKU ve yazdir: aksi halde derleyici donguyu olu kod olarak
+    // atiyor (olculdu: 4.6 ms). Ayrica cagri basina birikim yapiliyor ki
+    // dongu govdesi kaldirilamasin.
+    var c: i64 = 0
+    var acc: i64 = 0
+    while c < steps {
+        forward(b, x)
+        acc = acc + (@read_u64(@ptr_add(b.out, 0)) as i64)
+        c = c + 1
+    }
+    printInt(to_int(acc) & 1048575)
+    print(" ");
+    return 0
+}

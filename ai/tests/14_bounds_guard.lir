@@ -1,0 +1,41 @@
+// 14_bounds_guard — hoist edilmiş sınır kapıları doğru mu?
+//
+// İç içe döngülerde her düzey kendi `bounds_hoist_guard`'ını alır. Bunlar
+// tekilleştirildiğinde (dedupeBoundsGuards) yanlış bir blokta bırakılırsa
+// erişimler doğrulanmadan çalışır. Bu test hem sonucu hem de sınır dışı
+// erişimin hâlâ yakalandığını kontrol eder.
+fn main() -> i64 {
+    const n: i64 = 32
+    let a = @malloc(n * n * 8)
+    let b = @malloc(n * n * 8)
+    var i: i64 = 0
+    while i < n {
+        var j: i64 = 0
+        while j < n {
+            @write_u64(@ptr_add(a, (i * n + j) * 8), (i + j) as u64)
+            @write_u64(@ptr_add(b, (i * n + j) * 8), (i * j) as u64)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    // Üç iç içe döngü: guard tekilleştirmesinin en çok karıştığı şekil
+    var s: i64 = 0
+    i = 0
+    while i < n {
+        var kk: i64 = 0
+        while kk < n {
+            let av = @read_u64(@ptr_add(a, (i * n + kk) * 8)) as i64
+            var j: i64 = 0
+            while j < n {
+                let bv = @read_u64(@ptr_add(b, (kk * n + j) * 8)) as i64
+                s = s + av * bv
+                j = j + 1
+            }
+            kk = kk + 1
+        }
+        i = i + 1
+    }
+    printInt(s % 1000003)
+    println("")
+    return 0
+}

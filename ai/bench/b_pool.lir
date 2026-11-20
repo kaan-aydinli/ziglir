@@ -1,0 +1,57 @@
+// b_pool.lir — kalıcı işçi havuzu benchmark'ı.
+//
+// Ölçülen: seri `forward` vs havuz, aynı iş yükü, aynı çıktı.
+// Çıktı doğrulanır: iki yolun sonucu aynı olmalı (aksi halde benchmark
+// anlamsız).
+//
+// Kullanım:  ./zig-out/bin/lir build ai/bench/b_pool.lir -O2 -o /tmp/bp
+//            python3 ai/bench/bench_pool.py
+import "../src/pool.lir"
+import "../src/ledger.lir"
+
+fn main() -> i64 {
+    let nout = 512
+    let steps = 6000
+    let b = block_new(128, nout, 8, 1)
+    let x = @malloc(128 * 8)
+    var i: i64 = 0
+    while i < 128 { @write_u64(@ptr_add(x, i*8), (i % 11) as u64)  i = i + 1 }
+
+    // --- SERI referans ---
+    // Sonucu biriktir: aksi halde derleyici donguyu olu kod olarak atiyor
+    // (olculdu: 6000 adim 4.6 ms'ye dusuyordu).
+    var c: i64 = 0
+    var sacc: i64 = 0
+    while c < steps {
+        forward(b, x)
+        sacc = sacc + (@read_u64(@ptr_add(b.out, 0)) as i64)
+        c = c + 1
+    }
+    let ref = @read_u64(@ptr_add(b.out, 0))
+
+    // --- HAVUZ ---
+    let p = pool_new(2)
+    let h = @malloc(16 * 8)
+    pool_start(p, 2, h)
+    pset(p, P_EDGES, b.edges as i64)
+    pset(p, P_BIAS, b.bias as i64)
+    pset(p, P_OUT, b.out as i64)
+    pset(p, P_K, b.k)
+    pset(p, P_X, x as i64)
+    c = 0
+    var pacc: i64 = 0
+    while c < steps {
+        pool_run_fwd(p, 0, nout, 64)
+        pacc = pacc + (@read_u64(@ptr_add(b.out, 0)) as i64)
+        c = c + 1
+    }
+    let got = @read_u64(@ptr_add(b.out, 0))
+    pool_shutdown(p, h)
+
+    printInt(if ref == got { 1 } else { 0 })
+    printInt(to_int(sacc) & 1048575)
+    print(" ")
+    printInt(to_int(pacc) & 1048575)
+    println(" esitlik toplam")
+    return 0
+}

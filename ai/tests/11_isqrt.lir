@@ -1,0 +1,51 @@
+// SEL test 11 — karekök doğruluğu ve eski Newton sürümüyle eşitliği.
+//
+// `sqrt` Q32.32'de tanımlı: sonuç = floor(sqrt(x >> 16)) << 24.
+// Bu test hem bilinen değerleri hem de geniş bir aralıkta "Newton referansı
+// ile birebir aynı" olma özelliğini doğrular.
+// Beklenen: bilinen değerler, 0 fark.
+import "../src/fixed.lir"
+
+/// Eski sürüm: Newton iterasyonu. Referans olarak burada tutuluyor ki
+/// bit-shift sürümünün birebir aynı sonucu verdiği kanıtlanabilsin.
+fn sqrt_newton(x: i64) -> i64 {
+    if x <= 0 {
+        return 0
+    }
+    let y = x >> 16
+    if y <= 0 {
+        return 0
+    }
+    var g = y
+    var next = (g + 1) / 2
+    var rounds: i64 = 0
+    while next < g and rounds < 64 {
+        g = next
+        if g == 0 { g = 1 }
+        next = (g + y / g) / 2
+        rounds = rounds + 1
+    }
+    if g < 1 { g = 1 }
+    return g << 24
+}
+
+fn main() -> i64 {
+    // 1) Bilinen değerler (Q32.32 tam sayı kökleri)
+    printInt(sqrt(from_int(4)) >> 16)    // 2
+    printInt(sqrt(from_int(9)) >> 16)    // 3
+    printInt(sqrt(from_int(1)) >> 16)    // 1
+    printInt(sqrt(from_int(0)) >> 16)    // 0
+    printInt(sqrt(0 - from_int(1)) >> 16) // negatif -> 0
+
+    // 2) 5999 farklı büyüklükte Newton ile birebir karşılaştırma
+    var bad: i64 = 0
+    var i: i64 = 1
+    while i < 6000 {
+        if sqrt(i * 16777216) != sqrt_newton(i * 16777216) {
+            bad = bad + 1
+        }
+        i = i + 1
+    }
+    printInt(bad)
+    return 0
+}

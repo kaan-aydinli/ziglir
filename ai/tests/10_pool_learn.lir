@@ -1,0 +1,56 @@
+// backends: native
+// SEL test 10 — paralel öğrenme geçişi, seri `learn` ile eşitlik.
+//
+// `learn` nöron başına bağımsız (her nöron yalnızca kendi kenarlarını ve
+// bias'ını yazar), bu yüzden aralıklara bölmek güvenli. Beklenen çıktı:
+// enerji eşit, 0 farklı kenar, 0 farklı bias.
+import "../src/pool.lir"
+import "../src/ledger.lir"
+
+fn main() -> i64 {
+    let nout = 128
+    let eta = from_int(2000)
+    // A) seri learn
+    let b1 = block_new(64, nout, 8, 9)
+    let x = @malloc(64 * 8)
+    let t = @malloc(nout * 8)
+    var i: i64 = 0
+    while i < 64 { @write_u64(@ptr_add(x, i*8), ((i * 7) % 13) as u64) i = i + 1 }
+    i = 0
+    while i < nout { @write_u64(@ptr_add(t, i*8), ONE as u64) i = i + 1 }
+    forward(b1, x)
+    let e1 = learn(b1, x, t, eta)
+    // B) havuzla learn (aynı tohumlu, ayrı blok)
+    let b2 = block_new(64, nout, 8, 9)
+    forward(b2, x)
+    let p = pool_new(2)
+    let h = @malloc(16 * 8)
+    pool_start(p, 2, h)
+    pset(p, P_EDGES, b2.edges as i64)
+    pset(p, P_BIAS, b2.bias as i64)
+    pset(p, P_OUT, b2.out as i64)
+    pset(p, P_K, b2.k)
+    pset(p, P_X, x as i64)
+    let e2 = pool_run_learn(p, 0, nout, t, eta, 32)
+    pool_shutdown(p, h)
+    // enerji ve tum kenar agirliklari karsilastir
+    var wdiff: i64 = 0
+    let nedge = nout * 8 * 4
+    i = 0
+    while i < nedge {
+        if (@read_u64(@ptr_add(b1.edges, i*8)) as i64) != (@read_u64(@ptr_add(b2.edges, i*8)) as i64) { wdiff = wdiff + 1 }
+        i = i + 1
+    }
+    var bdiff: i64 = 0
+    i = 0
+    while i < nout {
+        if (@read_u64(@ptr_add(b1.bias, i*8)) as i64) != (@read_u64(@ptr_add(b2.bias, i*8)) as i64) { bdiff = bdiff + 1 }
+        i = i + 1
+    }
+    println(if e1 == e2 { "enerji ESIT" } else { "enerji FARKLI" })
+    printInt(wdiff)
+    println(" farkli kenar (0 olmali)")
+    printInt(bdiff)
+    println(" farkli bias (0 olmali)")
+    return 0
+}
