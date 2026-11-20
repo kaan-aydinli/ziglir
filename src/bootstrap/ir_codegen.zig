@@ -6141,14 +6141,35 @@ pub const IRCodegen = struct {
             },
 
             .bounds_hoist_guard => {
-                // One range test for the whole buffer. If it fails we still
-                // take the checked path: the flagged accesses fall back to
-                // per-access checks via the trap the helper raises.
+                // Döngü tabanı için TEK aralık testi. Tam `emitPtrTrapN`
+                // gövdesi (~40 bayt, 4 global yükleme, 3 dallanma) burada
+                // gereksiz: hoist edilen guard döngü girişinde bir kez
+                // koşar ve zaten serbestçe kullanılan erişimleri korur.
+                //
+                // Hafif biçim: 2 global yükleme + 1 dallanma.
+                //
+                //   if (base < heap_min || base > heap_max) -> trap
+                //
+                // Bu, `-O2`'de kalan en büyük maliyetin kaynağıydı:
+                // hoisting üç iç içe döngünün her birine guard koyuyor ve
+                // her guard tam gövdeyi üretiyordu.
                 const ptr_reg: u8 = self.vregPhys(inst.args[0]) orelse blk: {
                     self.loadVregToReg(inst.args[0], 0);
                     break :blk 0;
                 };
-                self.emitPtrTrapN(ptr_reg, 8);
+                self.emitCmpRegAbs(ptr_reg, @intCast(DATA_VADDR + 0x88)); // heap_min
+                const jb_trap = self.code_len + 1;
+                self.emit8(0x72); // jb .trap
+                self.emit8(0);
+                self.emitCmpRegAbs(ptr_reg, @intCast(DATA_VADDR + 0x90)); // heap_max
+                const jbe_ok = self.code_len + 1;
+                self.emit8(0x76); // jbe .ok
+                const trap_pos = self.code_len;
+                self.code[jb_trap] = @intCast(trap_pos - (jb_trap + 1));
+                self.emit8(0x0F);
+                self.emit8(0x0B); // ud2
+                const ok_pos = self.code_len;
+                self.code[jbe_ok] = @intCast(ok_pos - (jbe_ok + 1));
             },
 
             .nop, .struct_decl, .module_import => {},

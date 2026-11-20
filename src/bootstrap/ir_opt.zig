@@ -4817,5 +4817,107 @@ fn hoistBoundsChecksFn(f: *IRFn, stats: ?*BoundsHoistStats, module: *IRModule, p
             changed = true;
         }
     }
+    if (changed) _ = dedupeBoundsGuards(f, stats);
     return changed;
+}
+
+/// Aynı taban işaretçi için birden çok `bounds_hoist_guard` varsa ve
+/// hepsi tek bir baskın bloktan geçiyorsa, yalnızca o blokta bırak.
+///
+/// Neden gerekli: iç içe döngülerde her döngü düzeyi kendi guard'ını
+/// preheader'a koyuyor. Ölçüldü (60x60 matris çarpımı): B4/B5/B6/B7
+/// bloklarında 3+3+3+2 = 11 guard; en sık koşan B7'deki guard her (i,k)
+/// çifti için, yani 3600 kez çalışıyordu. Taban işaretçi döngü boyunca
+/// sabit olduğundan bu kontrollerin hepsi aynı sonucu verir.
+///
+/// Baskınlık koşulu: herhangi bir guard bloğundan fonksiyon çıkışına veya
+/// başka bir guard bloğuna giden her yol, o baskın guard bloğundan geçmeli.
+/// Bunu, aday bloğun diğer tüm guard bloklarını domine etmesiyle sınıyoruz.
+fn dedupeBoundsGuards(f: *IRFn, _: ?*BoundsHoistStats) bool {
+    if (f.block_count < 2) return false;
+
+    // Guard içeren bloklar ve her birindeki guard'ların taban vreg'leri.
+    var guard_blocks: [MAX_BLOCKS_PER_FN]u16 = undefined;
+    var n_guard_blocks: usize = 0;
+    for (0..f.block_count) |bi| {
+        for (0..f.blocks[bi].inst_count) |ii| {
+            if (f.blocks[bi].insts[ii].op == .bounds_hoist_guard) {
+                guard_blocks[n_guard_blocks] = @intCast(bi);
+                n_guard_blocks += 1;
+                break;
+            }
+        }
+    }
+    if (n_guard_blocks < 2) return false;
+
+    var cfg: CFGInfo = undefined;
+    buildCFGInfo(f, &cfg);
+
+    // Her taban için, onu koruyan tüm blokları domine eden bir blok var mı?
+    // Adaylar: guard bloklarının kendisi.
+    // `keep[blk][base]` = bu blok/base kombinasyonu kalsın mı.
+    var keep: [MAX_BLOCKS_PER_FN][8]u16 = undefined;
+    var keep_n: [MAX_BLOCKS_PER_FN]u8 = .{0} ** MAX_BLOCKS_PER_FN;
+    for (0..f.block_count) |bi| keep[bi] = .{0} ** 8;
+
+    var saw_any = false;
+    var b1: usize = 0;
+    while (b1 < n_guard_blocks) : (b1 += 1) {
+        const gb = guard_blocks[b1];
+        var ii: u16 = 0;
+        while (ii < f.blocks[gb].inst_count) : (ii += 1) {
+            const g = f.blocks[gb].insts[ii];
+            if (g.op != .bounds_hoist_guard or g.args[0] == 0) continue;
+            const base = g.args[0];
+            // Bu taban için, gb'yi domine eden tüm guard bloklarını topla.
+            var dominators_of_gb: [MAX_BLOCKS_PER_FN]u16 = undefined;
+            var n_dom: usize = 0;
+            var b2: usize = 0;
+            while (b2 < n_guard_blocks) : (b2 += 1) {
+                const other = guard_blocks[b2];
+                if (other == gb) continue;
+                var has_base = false;
+                for (0..f.blocks[other].inst_count) |oi| {
+                    const og = f.blocks[other].insts[oi];
+                    if (og.op == .bounds_hoist_guard and og.args[0] == base) has_base = true;
+                }
+                if (has_base and dominates(&cfg, other, gb)) {
+                    dominators_of_gb[n_dom] = other;
+                    n_dom += 1;
+                }
+            }
+            if (n_dom > 0) {
+                // gb'deki bu guard gereksiz: onu domine eden başka bir guard var.
+                saw_any = true;
+                continue;
+            }
+            // Bu guard, aynı tabanın tüm diğer guard'larını domine eden tek
+            // blok ise kalsın; aksi hâlde (ne domine eden ne edilen) koru.
+            if (keep_n[gb] < 8) {
+                keep[gb][keep_n[gb]] = base;
+                keep_n[gb] += 1;
+            }
+        }
+    }
+    if (!saw_any) return false;
+
+    // Fazla guard'ları kaldır.
+    for (0..f.block_count) |bi| {
+        var out_i: u16 = 0;
+        var ii: u16 = 0;
+        while (ii < f.blocks[bi].inst_count) : (ii += 1) {
+            const inst = f.blocks[bi].insts[ii];
+            if (inst.op == .bounds_hoist_guard) {
+                var kept = false;
+                for (0..keep_n[bi]) |k| {
+                    if (keep[bi][k] == inst.args[0]) kept = true;
+                }
+                if (!kept) continue;
+            }
+            f.blocks[bi].insts[out_i] = inst;
+            out_i += 1;
+        }
+        f.blocks[bi].inst_count = out_i;
+    }
+    return true;
 }
