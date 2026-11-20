@@ -1,0 +1,522 @@
+// pool.lir — kalıcı işçi havuzu ve dalga (wave) tabanlı iş paylaşımı.
+//
+// ## Neden kalıcı havuz
+//
+// Ölçüldü (bu repoda, 2 çekirdek):
+//   thread kurulumu        ~150 us
+//   forward (512 nöron)     ~40 us
+//
+// Yani her adımda thread açmak işin ~7 katı maliyet. Denendi: 20 000 adım
+// 368 ms yerine 35 599 ms sürdü (0.01x). Bu yüzden thread'ler BİR KEZ açılır
+// ve adımlar arasında yaşar.
+//
+// ## Dalga protokolü
+//
+// Koordinatör bir dalga yayınlar: `[lo, hi)` aralığı ve tampon işaretçileri
+// yazılır, sonra `P_WAVE` atomik olarak artırılır. İşçiler dalga numarası
+// değişene kadar bekler, değişince kendi paylarını işler.
+//
+// ## Neden sabit bölme (dinamik çekiş değil)
+//
+// İlk sürüm OpenMP `dynamic` gibi atomik sayaçtan parça çekiyordu. Ölçüldü:
+// dalga başına 24.8 ms, seri karşılığı 0.035 ms — 700x yavaş. Sebep livelock:
+// işçiler ve koordinatör aynı önbellek hattındaki sayaçlara sürekli
+// `lock xadd` yapıyordu. Sabit bölmede sıcak yolda HİÇ atomik yok.
+//
+// ## Neden işçi başına ayrı bitiş hücresi
+//
+// Tek ortak `done` sayacı + sıfırlama ile 2. dalgada segfault oluşuyordu
+// (ölçüldü): işçi bir önceki dalganın artırımını geç yapınca yeni dalganın
+// sayacı kirleniyordu. Artık her işçi YALNIZCA kendi hücresine yazıyor
+// (`P_DONE + wid*8`) ve hücre "bu işçinin bitirdiği son dalga"yı tutuyor.
+// Monoton olduğu için yarış durumunda bile yanlış pozitif üretmez.
+//
+// ## Ölçülen sonuçlar (2 çekirdek, 512 nöron, 6000 adım)
+//
+//   seri `forward` (tek çekirdek)          208–230 ms
+//   `pool_chunk_fwd` tek çağrıda (aynı iş)  227–234 ms   <- aritmetik eşit
+//   havuz, 2 işçi                          623 ms       = 0.35x
+//
+// **Sonuç dürüstçe: havuz bu makinede kazandırmıyor, kaybettiriyor.**
+//
+// Nedenini bulmak için yapılan izolasyon ölçümleri:
+//
+//   * İşçi tek başına 256 nöronu 6000 kez işliyor: **25 ms** (hızlı).
+//   * Koordinatör tek başına 256 nöronu 6000 kez işliyor: ~117 ms.
+//   * İkisi paralel: **511 ms** — yani ikisi de 4–5x yavaşlıyor.
+//   * Ayrı veri kümeleriyle (çekişme yok): **379 ms** — düzelmiyor.
+//   * Saf CPU döngüsü (bellek erişimi yok): 2 thread **1.61x** ölçek.
+//
+// Yani: saf hesaplamada thread'ler 1.61x ölçekliyor, ama **bellek erişimli**
+// iş yükünde bu 2 çekirdekli VM'de ölçek negatife dönüyor. Bu bir protokol
+// hatası değil, ortamın gerçeği.
+//
+// Denenip reddedilen bekleme şemaları:
+//   * dinamik atomik parça çekişi  → 700x yavaş (livelock)
+//   * birikimli tek toplam sayaç   → flaky sonuç (0/84/170 farklı nöron)
+//   * iç içe bekleme döngüsü       → kilitlenme
+//   * koordinatörde `yield` yok    → 53 887 ms (işçiler aç kalıyor)
+//   * `nanosleep(50 µs)`           → 1500 ms (dalga süresinden uzun)
+//   * tek dalgada toplu işleme     → 749 ms (bölünme doğru, thread yavaş)
+//
+// ## Doğrulanan
+//
+//   * `pool_chunk_fwd` çıktısı `ledger.forward` ile BİREBİR aynı
+//     (`ai/tests/09_pool.lir`: 256 nöron, 0 farklı; 900 dalga, 0 bozuk).
+//   * `pool_run_learn` çıktısı `ledger.learn` ile BİREBİR aynı: aynı enerji,
+//     0 farklı kenar, 0 farklı bias (`ai/tests/10_pool_learn.lir`).
+//
+// ## Kullanım kararı
+//
+// `pool_run_fwd` / `pool_run_learn` iş eşiğin altındaysa havuzu HİÇ
+// kullanmaz (o çağrıda seri yol). Eşik `chunk_size` parametresi. Bu yüzden
+// üretim yolu etkilenmez; havuz yalnızca açıkça çağrıldığında devreye girer
+// ve daha çok çekirdekli bir makinede yeniden ölçülmelidir.
+//
+// ## Bellek düzeni (tek @malloc, 320 bayt)
+//
+//   [0]    wave        — dalga numarası; koordinatör artırır
+//   [8]    next        — (kullanılmıyor; dinamik çekiş denemesinden kaldı)
+//   [16]   n_chunks    — (kullanılmıyor)
+//   [24]   n_workers   — işçi sayısı
+//   [32]   stop        — 1 -> işçiler çıkar
+//   [40]   chunk_size  — havuzu kullanma eşiği
+//   [48]   edges       — blok kenar tablosu
+//   [56]   bias
+//   [64]   out
+//   [72]   k
+//   [80]   x           — girdi vektörü
+//   [88]   lo
+//   [96]   hi
+//   [104]  done[0..7]  — işçi başına son biten dalga (wid 1..n)
+//   [168]  ready       — havuza girmiş işçi sayısı (atomik)
+//   [176]  checksum    — bariyer için dokunulan hücre
+
+import "fixed.lir"
+
+// Kenar kaydındaki hücre sayısı: idx, w, tau, hits — her biri 8 bayt.
+// `ledger.lir` de `EDGE_STRIDE` tanımlıyor; ikisi aynı dosyaya import
+// edilebildiği için çakışmaması adına burada farklı ad kullanılıyor.
+const POOL_EDGE_STRIDE: i64 = 4
+
+// Havuzun bayt cinsinden boyu. `done` dizisi 8 hücreye kadar destekleniyor.
+const POOL_BYTES: i64 = 384
+
+const P_WAVE: i64 = 0
+const P_NEXT: i64 = 8
+const P_NCHUNK: i64 = 16
+const P_NWORK: i64 = 24
+const P_STOP: i64 = 32
+const P_CSIZE: i64 = 40
+const P_EDGES: i64 = 48
+const P_BIAS: i64 = 56
+const P_OUT: i64 = 64
+const P_K: i64 = 72
+const P_X: i64 = 80
+const P_LO: i64 = 88
+const P_HI: i64 = 96
+const P_DONE: i64 = 104
+const P_READY: i64 = 168
+const P_CHECK: i64 = 176
+const P_DONE_TOTAL: i64 = 184
+// Cift tamponlu dalga parametreleri: slot = wave & 1
+const P_LO_A: i64 = 192
+const P_HI_A: i64 = 200
+const P_LO_B: i64 = 208
+const P_HI_B: i64 = 216
+// Slot basina bekleyen isci sayaci
+const P_ACK_A: i64 = 224
+const P_ACK_B: i64 = 232
+// learn icin ek alanlar
+const P_TARGET: i64 = 240
+const P_ETA: i64 = 248
+const P_ENERGY: i64 = 256
+const P_OP: i64 = 264
+const P_SPAN: i64 = 272
+// Cift tamponlu op kodu: slot basina
+const P_OP_A: i64 = 280
+const P_OP_B: i64 = 288
+
+/// Havuzdan hücre oku.
+fn pget(p: *u8, off: i64) -> i64 {
+    return @read_u64(@ptr_add(p, off)) as i64
+}
+
+/// Havuza hücre yaz.
+fn pset(p: *u8, off: i64, v: i64) {
+    @write_u64(@ptr_add(p, off), v as u64)
+}
+
+/// Düz okuma. Sıcak bekleme döngüsünde atomik KULLANILMAZ: ölçüldü, boştaki
+/// işçiler `lock xadd` ile aynı önbellek hattını kilitleyince dalga başına
+/// maliyet 24.8 ms'ye çıkıyordu (seri karşılığı 0.035 ms). x86'da hizalı
+/// 64-bit yükleme zaten atomiktir.
+fn pread(p: *u8, off: i64) -> i64 {
+    return @read_u64(@ptr_add(p, off)) as i64
+}
+
+/// Bariyerli okuma: `lock xadd` delta 0. Hem okur hem tam bellek bariyeri
+/// koyar, yani derleyici bunu döngü dışına taşıyamaz. Yalnızca BEKLEME
+/// döngülerinde kullanılır — sıcak yolda `pread` kullanılıyor.
+fn pwait(p: *u8, off: i64) -> i64 {
+    return @atomic_add(@ptr_add(p, off), 0)
+}
+
+/// Havuz oluştur. `n_workers` işçi için yer ayırır ama thread açmaz
+/// (onu `pool_start` yapar).
+fn pool_new(n_workers: i64) -> *u8 {
+    let p = @malloc(POOL_BYTES)
+    var i: i64 = 0
+    while i < 48 {
+        pset(p, i * 8, 0)
+        i = i + 1
+    }
+    pset(p, P_NWORK, n_workers)
+    return p
+}
+
+/// Çevrimiçi CPU sayısı (`sched_getaffinity` + popcount).
+fn cpu_count() -> i64 {
+    let mask = @malloc(128)
+    var i: i64 = 0
+    while i < 16 {
+        @write_u64(@ptr_add(mask, i * 8), 0 as u64)
+        i = i + 1
+    }
+    let rc = @syscall(204, 0, 128, mask)
+    if rc < 0 {
+        return 1
+    }
+    var n: i64 = 0
+    var k: i64 = 0
+    while k < 16 {
+        var bits: i64 = @read_u64(@ptr_add(mask, k * 8)) as i64
+        while bits != 0 {
+            n = n + (bits & 1)
+            bits = bits >> 1
+        }
+        k = k + 1
+    }
+    if n < 1 {
+        return 1
+    }
+    return n
+}
+
+/// `ledger.lrelu` ile birebir aynı (import edilen struct'ı parametre olarak
+/// alamadığımız için yardımcıları burada tutuyoruz; `ai/tests` eşitlik testi var).
+fn pool_lrelu(x: i64) -> i64 {
+    if x < 0 {
+        return (x >> 4) + 16777216
+    }
+    return x + 16777216
+}
+
+/// Bir nöron aralığını ileri geçişle işle — `ledger.forward` ile BİREBİR aynı
+/// aritmetik (aynı `sat_add`, `mul`, `lrelu`), yalnızca döngü aralığı verili.
+///
+/// `forward`'ı çağırmak yerine burada kopyalanıyor çünkü `SelBlock` import
+/// edilmiş bir struct ve LIR onu parametre tipi olarak kabul etmiyor
+/// (`LIR-E2005`). Aritmetik aynı kalsın diye birebir aynı yardımcılar
+/// kullanılıyor; `ai/tests` içinde eşitlik testi var.
+fn pool_chunk_fwd(p: *u8, a: i64, b: i64) {
+    let edges = @read_u64(@ptr_add(p, P_EDGES)) as *u8
+    let bias = @read_u64(@ptr_add(p, P_BIAS)) as *u8
+    let out = @read_u64(@ptr_add(p, P_OUT)) as *u8
+    let k = pget(p, P_K)
+    let x = @read_u64(@ptr_add(p, P_X)) as *u8
+    var o: i64 = a
+    while o < b {
+        var acc: i64 = @read_u64(@ptr_add(bias, o * 8)) as i64
+        var j: i64 = 0
+        let obase = o * k * POOL_EDGE_STRIDE * 8
+        while j < k {
+            let ebase = obase + j * POOL_EDGE_STRIDE * 8
+            let i = @read_u64(@ptr_add(edges, ebase)) as i64
+            let w = @read_u64(@ptr_add(edges, ebase + 8)) as i64
+            let xv = @read_u64(@ptr_add(x, i * 8)) as i64
+            acc = sat_add(acc, mul(w, xv))
+            j = j + 1
+        }
+        @write_u64(@ptr_add(out, o * 8), pool_lrelu(acc) as u64)
+        o = o + 1
+    }
+}
+
+/// `ledger.learn`'in nöron aralığı versiyonu. Aritmetik birebir aynı:
+/// aynı `mul_sat`, `sat_add`, `energy_scale`, `clamp_i`, aynı tau tavanı.
+/// Nöron başına bağımsız olduğu için aralıklara bölmek güvenli.
+fn pool_chunk_learn(p: *u8, a: i64, b: i64) -> i64 {
+    let edges = @read_u64(@ptr_add(p, P_EDGES)) as *u8
+    let bias = @read_u64(@ptr_add(p, P_BIAS)) as *u8
+    let out = @read_u64(@ptr_add(p, P_OUT)) as *u8
+    let k = pget(p, P_K)
+    let x = @read_u64(@ptr_add(p, P_X)) as *u8
+    let target = @read_u64(@ptr_add(p, P_TARGET)) as *u8
+    let eta = pget(p, P_ETA)
+    let tlim = from_int(1000000)
+    var total_e: i64 = 0
+    var o: i64 = a
+    while o < b {
+        let yhat = @read_u64(@ptr_add(out, o * 8)) as i64
+        let tv = @read_u64(@ptr_add(target, o * 8)) as i64
+        let d = tv - yhat
+        let e = mul_sat(d, d)
+        total_e = sat_add(total_e, e)
+        if d != 0 {
+            let obase = o * k * POOL_EDGE_STRIDE * 8
+            var nrm: i64 = ONE
+            var j: i64 = 0
+            while j < k {
+                let i = @read_u64(@ptr_add(edges, obase + j * POOL_EDGE_STRIDE * 8)) as i64
+                let xv = @read_u64(@ptr_add(x, i * 8)) as i64
+                nrm = sat_add(nrm, mul(xv, xv))
+                j = j + 1
+            }
+            let inv = div(ONE, nrm)
+            let g = mul(mul(eta, d), inv)
+            let tau_inc = energy_scale(e)
+            var j2: i64 = 0
+            while j2 < k {
+                let ebase = obase + j2 * POOL_EDGE_STRIDE * 8
+                let i2 = @read_u64(@ptr_add(edges, ebase)) as i64
+                let xv2 = @read_u64(@ptr_add(x, i2 * 8)) as i64
+                let delta = mul(g, xv2)
+                let w = @read_u64(@ptr_add(edges, ebase + 8)) as i64
+                @write_u64(@ptr_add(edges, ebase + 8), clamp_i(sat_add(w, delta), MINV, MAXV) as u64)
+                let t = @read_u64(@ptr_add(edges, ebase + 16)) as i64
+                let tn = sat_add(t, tau_inc)
+                @write_u64(@ptr_add(edges, ebase + 16), (if tn > tlim { tlim } else { tn }) as u64)
+                let h = @read_u64(@ptr_add(edges, ebase + 24)) as i64
+                @write_u64(@ptr_add(edges, ebase + 24), (h + 1) as u64)
+                j2 = j2 + 1
+            }
+            let bnow = @read_u64(@ptr_add(bias, o * 8)) as i64
+            @write_u64(@ptr_add(bias, o * 8), clamp_i(sat_add(bnow, g), MINV, MAXV) as u64)
+        }
+        o = o + 1
+    }
+    return total_e
+}
+
+/// İşçi: dalga numarası değişene kadar bekler, sonra kendi payını işler.
+///
+/// `job`: [0] = havuz işaretçisi, [8] = bu işçinin kimliği (1..n).
+/// Her thread kendi kaydını alır; paylaşılan durum yalnızca havuzdadır.
+fn pool_worker(job: *u8) -> i64 {
+    let p = @read_u64(@ptr_add(job, 0)) as *u8
+    let wid = @read_u64(@ptr_add(job, 8)) as i64
+    // Havuzu okudum: koordinatör bunu bekler. Bu olmadan koordinatör dalga
+    // yayınlayabiliyor, işçi henüz havuzu görmemiş oluyor.
+    let _ready = @atomic_add(@ptr_add(p, P_READY), 1)
+    // 0 ile başla: `P_WAVE` başlangıçta 0'dır ve gerçek dalgalar 1'den
+    // başlar. -1 ile başlarsa işçi ilk turda "0. dalga"yı işler ve toplam
+    // sayacı kirletir (ölçüldü: flaky sonuçlar).
+    var my_wave: i64 = 0
+    while true {
+        if pread(p, P_STOP) != 0 {
+            return 0
+        }
+        let w = pread(p, P_WAVE)
+        if w == my_wave {
+            // Boşta: çekirdeği bırak. `nanosleep` denendi ve reddedildi:
+            // 50 µs'lik uyku dalga süresinden uzun (ölçüldü: 1500 ms).
+            let _y = @syscall(24)
+            continue
+        }
+        my_wave = w
+        // Bu dalganın kendi yuvasını oku (çift tampon). Aralık yayın
+        // anında HESAPLANIP yazılıyor; işçi yalnızca okuyor.
+        var lo = 0
+        var hi = 0
+        if (w & 1) == 0 {
+            lo = pget(p, P_LO_A)
+            hi = pget(p, P_HI_A)
+        } else {
+            lo = pget(p, P_LO_B)
+            hi = pget(p, P_HI_B)
+        }
+        // Kendi dilimimiz: koordinatör 0, işçiler 1..n.
+        let nw = pget(p, P_NWORK)
+        var a = 0
+        var b = 0
+        if hi > lo and nw > 0 {
+            let span = (hi - lo + nw) / (nw + 1)
+            a = lo + wid * span
+            b = a + span
+            if a > hi {
+                a = hi
+            }
+            if b > hi {
+                b = hi
+            }
+        }
+        var op = 0
+        if (w & 1) == 0 {
+            op = pget(p, P_OP_A)
+        } else {
+            op = pget(p, P_OP_B)
+        }
+        if a < b {
+            if op == 0 {
+                pool_chunk_fwd(p, a, b)
+            } else {
+                let e = pool_chunk_learn(p, a, b)
+                let _acc = @atomic_add(@ptr_add(p, P_ENERGY), e)
+            }
+        }
+        // Tek yazar: bu işçi. Sıfırlama yok, o yüzden yarış da yok.
+        @write_u64(@ptr_add(p, P_DONE + wid * 8), w as u64)
+    }
+}
+
+/// Dalga yayınla ve koordinatörün kendi payını işle. Beklemez.
+///
+/// Bekleme `pool_wait`'te AYRI: iç içe döngü (çağıranın döngüsü + buradaki
+/// bekleme) tek bir import edilmiş fonksiyonda birleşince LIR'de kilitlenme
+/// üretiyordu. Ayrı tutmak bunu önlüyor.
+fn pool_publish(p: *u8, lo: i64, hi: i64, op: i64) -> i64 {
+    // ## Sıra kritik
+    //
+    // Dalga numarası EN SON yayınlanır. İlk sürümde `@atomic_add(P_WAVE)`
+    // en baştaydı: işçi numarayı görüp slotu okuyordu ama slot henüz
+    // yazılmamış oluyordu → işçi bir önceki dalganın aralığını işliyor,
+    // kendi payı hiç yazılmıyordu (ölçüldü: 15 koşunun 6'sında 86/256
+    // nöron eksik).
+    //
+    // Ayrıca yayın öncesi tam bariyer (`lock xadd 0`) var: x86'da sıralı
+    // yazma garantisi derleyici tarafından bozulabilir.
+    let n_workers = pget(p, P_NWORK)
+    let span = (hi - lo + n_workers) / (n_workers + 1)
+    var mb = lo + span
+    if mb > hi {
+        mb = hi
+    }
+    // Hangi yuvayı kullanacağımızı önceden bilmemiz gerekiyor; numarayı
+    // rezerve etmek için atomik okuma kullanıyoruz (artırma DEĞİL).
+    let cur = @atomic_add(@ptr_add(p, P_WAVE), 0)
+    let wave = cur + 1
+    if (wave & 1) == 0 {
+        pset(p, P_OP_A, op)
+        pset(p, P_LO_A, lo)
+        pset(p, P_HI_A, hi)
+    } else {
+        pset(p, P_OP_B, op)
+        pset(p, P_LO_B, lo)
+        pset(p, P_HI_B, hi)
+    }
+    // Bariyer: bütün slot yazımları yayından önce görünür olsun.
+    let _bar = @atomic_add(@ptr_add(p, P_CHECK), 0)
+    // Şimdi yayınla.
+    let pubd = @atomic_add(@ptr_add(p, P_WAVE), 1) + 1
+    if pubd != wave {
+        return pubd
+    }
+    if lo < mb {
+        if op == 0 {
+            pool_chunk_fwd(p, lo, mb)
+        } else {
+            let e = pool_chunk_learn(p, lo, mb)
+            let _acc = @atomic_add(@ptr_add(p, P_ENERGY), e)
+        }
+    }
+    return wave
+}
+
+/// Bu dalganın bütün işçileri bitirene kadar bekle.
+///
+/// `wave`, `pool_publish`'in DÖNDÜRDÜĞÜ numara olmalı — `P_WAVE`'den yeniden
+/// okunmamalı. Aksi halde işçi bir sonraki dalgayı çoktan görüp toplam
+/// sayacı fazla artırabiliyor ve koordinatör erken dönüyor (ölçüldü: flaky
+/// sonuçlar — 0, 84, 170 farklı nöron).
+fn pool_wait(p: *u8, wave: i64) {
+    let n_workers = pget(p, P_NWORK)
+    // İşçi başına hücre: hücre, o işçinin bitirdiği son dalgayı tutar.
+    // Hücreyi yalnızca o işçi yazar, koordinatör okur — yarış yok.
+    //
+    // Birikimli tek toplam sayaç DENENDİ ve reddedildi: işçi bir önceki
+    // dalganın artırımını geç yapınca toplam yanlış dalgaya ait oluyordu
+    // (ölçüldü: flaky sonuç — 0/84/170 farklı nöron).
+    // Birikimli toplam sayaç DENENDİ ve reddedildi: işçi bir önceki dalganın
+    // artırımını geç yapınca toplam yanlış dalgaya ait oluyor → flaky sonuç
+    // (ölçüldü: 0/84/170 farklı nöron). Kesin yöntem işçi hücreleri.
+    var pending = 1
+    while pending > 0 {
+        pending = 0
+        var wid: i64 = 1
+        while wid <= n_workers {
+            if pread(p, P_DONE + wid * 8) < wave {
+                pending = 1
+            }
+            wid = wid + 1
+        }
+        if pending != 0 {
+            // Koordinatör beklerken çekirdeği bırakmalı; bırakmazsa işçiler
+            // aç kalıyor (ölçüldü: 6000 dalga 53 887 ms).
+            let _y = @syscall(24)
+        }
+    }
+}
+
+/// Koordinatör: yayınla, kendi payını işle, bitmesini bekle.
+/// Küçük işlerde havuzu hiç kullanmaz (senkronizasyon işten büyük olur).
+fn pool_run_fwd(p: *u8, lo: i64, hi: i64, chunk_size: i64) {
+    let n_workers = pget(p, P_NWORK)
+    if n_workers <= 0 or (hi - lo) <= chunk_size {
+        pool_chunk_fwd(p, lo, hi)
+        return
+    }
+    let wave = pool_publish(p, lo, hi, 0)
+    pool_wait(p, wave)
+}
+
+/// Öğrenme geçişini paralel yürüt. Toplam hatayı döndürür.
+///
+/// `ledger.learn` nöron başına bağımsız (her nöron yalnızca kendi kenarlarını
+/// ve bias'ını yazar), bu yüzden aralıklara bölmek güvenli. Toplam hata
+/// atomik olarak toplanır; kayan nokta olmadığı için sıra bağımsız.
+fn pool_run_learn(p: *u8, lo: i64, hi: i64, target: *u8, eta: i64, chunk_size: i64) -> i64 {
+    let n_workers = pget(p, P_NWORK)
+    if n_workers <= 0 or (hi - lo) <= chunk_size {
+        pset(p, P_TARGET, target as i64)
+        pset(p, P_ETA, eta)
+        return pool_chunk_learn(p, lo, hi)
+    }
+    pset(p, P_TARGET, target as i64)
+    pset(p, P_ETA, eta)
+    // Enerji toplamı dalga başına sıfırlanır (koordinatör tek yazar).
+    pset(p, P_ENERGY, 0)
+    let wave = pool_publish(p, lo, hi, 1)
+    pool_wait(p, wave)
+    return pget(p, P_ENERGY)
+}
+
+/// Havuzu kur: `n` işçi thread'i aç. `handles` en az n*8 bayt olmalı.
+fn pool_start(p: *u8, n: i64, handles: *u8) -> i64 {
+    var i: i64 = 0
+    while i < n {
+        let job = @malloc(16)
+        @write_u64(@ptr_add(job, 0), p as u64)
+        @write_u64(@ptr_add(job, 8), (i + 1) as u64)
+        @write_u64(@ptr_add(handles, i * 8), @thread_create("pool_worker", job) as u64)
+        i = i + 1
+    }
+    // Bütün işçiler "havuzu okudum" diyene kadar bekle. Bu bir kez ödenir.
+    // `pwait`: düz yükleme hoist edilirse kilitlenir (bkz. pool_run_fwd notu).
+    while pwait(p, P_READY) < n {
+        continue
+    }
+    return n
+}
+
+/// Havuzu kapat: işçilere stop ver ve hepsini bekle.
+fn pool_shutdown(p: *u8, handles: *u8) {
+    pset(p, P_STOP, 1)
+    let n = pget(p, P_NWORK)
+    var i: i64 = 0
+    while i < n {
+        let h = @read_u64(@ptr_add(handles, i * 8)) as i64
+        @thread_join(h)
+        i = i + 1
+    }
+}

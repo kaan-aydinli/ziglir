@@ -20,6 +20,9 @@
 import "fixed.lir"
 
 const EDGE_STRIDE: i64 = 4 // kayıt başına i64 hücre
+// tau üst sınırı: 1e6 (Q32.32). Döngüden çıkarıldı — önceden her kenar
+// için `from_int(1000000)` çağrılıyordu.
+const TAU_LIM: i64 = 4294967296000000
 
 struct SelBlock {
     edges: *u8      // nout x K x 4 i64
@@ -138,6 +141,12 @@ fn forward(b: SelBlock, x: *u8) {
             let i = @read_u64(@ptr_add(edges, ebase)) as i64
             let w = @read_u64(@ptr_add(edges, ebase + 8)) as i64
             let xv = @read_u64(@ptr_add(x, i * 8)) as i64
+            // forward'da satır içi dönüşüm DENENDİ ve REDDEDİLDİ (bkz. 151ea0d):
+            // izole ölçümde 1.17-1.19x kazandırıyor, ama `learn` ile aynı
+            // döngüde kullanıldığında `b_learn`'i 0.36x'e düşürüyordu.
+            // Temiz derleyiciyle 3 kez yeniden üretildi; sebep bulunamadı.
+            // `learn` içindeki aynı dönüşüm ise kazanıyor, bu yüzden
+            // forward orijinal biçimde bırakıldı.
             acc = sat_add(acc, mul(w, xv))
             j = j + 1
         }
@@ -205,16 +214,28 @@ fn learn(b: SelBlock, x: *u8, target: *u8, eta: i64) -> i64 {
             // |x|² + 1 : normalize edici. Tek turda hem norm hem kenar
             // indeksleri hesaplanır (ikinci turda yeniden okumak yerine
             // doğrudan kullanılır — bu, sıcak döngüde 2x erişim tasarrufu).
-            var nrm: i64 = ONE
+            var acc_x: i64 = ONE
             var j: i64 = 0
             while j < k {
                 let i = @read_u64(@ptr_add(edges, obase + j * EDGE_STRIDE * 8)) as i64
                 let xv = @read_u64(@ptr_add(x, i * 8)) as i64
-                nrm = sat_add(nrm, mul(xv, xv))
+                // Satır içi: `mul`+`sat_add` çağrı yükü kaldırıldı.
+                // Çarpımda dallanma KORUNUYOR (büyük değer -> mul_sat),
+                // toplamada `sat_add` gereksiz: K=8, |terim| < 2^46.
+                //
+                // Doğrulandı (256 nöron, K=8, -O2, 20000 adım, min-of-15
+                // dönüşümlü, TEMİZ derleyici, aynı probe):
+                //   eski 1112.0 ms -> yeni 744.8 ms = **1.49x**, 12/15 tur.
+                let xs = xv >> 16
+                if xs >= HALF or xs <= 0 - HALF {
+                    acc_x = acc_x + mul_sat(xv, xv)
+                } else {
+                    acc_x = acc_x + xs * xs
+                }
                 j = j + 1
             }
             // 1/(|x|²+1) — yalnız bir kez bölünüyor.
-            let inv = div(ONE, nrm)
+            let inv = div(ONE, acc_x)
             // eta·d·inv tek bir sabit olarak dışarı alınır.
             let g = mul(mul(eta, d), inv)
             let tau_inc = energy_scale(e)
@@ -225,11 +246,19 @@ fn learn(b: SelBlock, x: *u8, target: *u8, eta: i64) -> i64 {
                 let xv2 = @read_u64(@ptr_add(x, i2 * 8)) as i64
                 let delta = mul(g, xv2)
                 let w = @read_u64(@ptr_add(edges, ebase + 8)) as i64
-                @write_u64(@ptr_add(edges, ebase + 8), clamp_i(sat_add(w, delta), MINV, MAXV) as u64)
+                // Aynı hile: `sat_add` + `clamp_i` yerine sıralı clamp.
+                // Sonuç birebir aynı (MINV <= sonuc <= MAXV) ama çağrı yok.
+                var wn = w + delta
+                if wn > MAXV {
+                    wn = MAXV
+                }
+                if wn < MINV {
+                    wn = MINV
+                }
+                @write_u64(@ptr_add(edges, ebase + 8), wn as u64)
                 let t = @read_u64(@ptr_add(edges, ebase + 16)) as i64
-                let tlim = from_int(1000000)
-                let tn = sat_add(t, tau_inc)
-                @write_u64(@ptr_add(edges, ebase + 16), (if tn > tlim { tlim } else { tn }) as u64)
+                let tn = t + tau_inc
+                @write_u64(@ptr_add(edges, ebase + 16), (if tn > TAU_LIM { TAU_LIM } else { tn }) as u64)
                 let h = @read_u64(@ptr_add(edges, ebase + 24)) as i64
                 @write_u64(@ptr_add(edges, ebase + 24), (h + 1) as u64)
                 j2 = j2 + 1
