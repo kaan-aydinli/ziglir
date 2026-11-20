@@ -3793,8 +3793,13 @@ fn isPureHeaderOp(op: IROp) bool {
         .shl,
         .shr,
         .ushr,
-        .@"mod",
-        .umod,
+        // `mod`/`umod` BURADA DEĞİL. Bunlar `isPureHeaderOp`'un amaçladığı
+        // "koşul bloğunun ucuz önsözü" değil, gerçek iş yapan bölmelerdir.
+        // Listeye girdiklerinde loop rotasyonu onları koşul bloğuna taşıyor
+        // ve aynı vreg'i yeniden tanımlatarak gövdedeki okumayı bozuyordu:
+        //   let t = x % y; x = y; y = t
+        // -O2'de `mod` gövde-öncesine taşınıp `gcd(24,18)` 6 yerine 18
+        // dönüyordu. Ölçüldü; -O1 doğruydu.
         .select,
         .cmp_eq,
         .cmp_ne,
