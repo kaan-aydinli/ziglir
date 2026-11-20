@@ -151,9 +151,8 @@ const DeferredDiv64 = struct {
 // back are real relocs - `relaxAndPatch` shortens jumps, so hand-written disp8
 // bytes would go stale.
 const DeferredPtrCold = struct {
-    j_cold1: u32, // jae cold1 (pointer >= cached chunk end)
-    j_cold2: u32, // jb  cold2 (pointer < cached chunk start), 0 if unused
-    jmp_cold: u32, // jump into the deferred body
+    j_cold1: u32, // jb cold (pointer < cached chunk start)
+    j_cold2: u32, // ja cold (pointer > cached chunk end - 8)
     reg: u8, // register still holding the pointer at the access site
     access_bytes: u8,
     resume_pos: u32, // code offset the cold body jumps back to
@@ -6463,33 +6462,27 @@ pub const IRCodegen = struct {
             return;
         }
 
+        // Two compares and two forward branches that point *directly* at the
+        // deferred cold body, so the access itself falls through with no third
+        // branch and no inline trampoline at all. (A trampoline would sit
+        // exactly in the fall-through path, which measured 0.2x: every access
+        // ended up taking the cold path.)
+        //
+        // The cache holds [chunk_start, chunk_end - 8], so `reg > hi` is the
+        // size-aware upper bound for every access size up to 8 - the byte and
+        // the multi-byte cases share this single form.
+        self.emitCmpRegAbs(reg, @intCast(DATA_VADDR + 0xC0));
+        const j_cold1 = self.emitJccReloc(0x2, .code_offset, 0, self.cur_fn_idx); // jb
         self.emitCmpRegAbs(reg, @intCast(DATA_VADDR + 0xC8));
-        const j_cold1 = self.emitJccReloc(0x3, .code_offset, 0, self.cur_fn_idx); // jae
-        var j_cold2: u32 = 0;
-        var j_ok: u32 = 0;
-        if (access_bytes <= 1) {
-            self.emitCmpRegAbs(reg, @intCast(DATA_VADDR + 0xC0));
-            j_ok = self.emitJccReloc(0x3, .code_offset, 0, self.cur_fn_idx); // jae
-        } else {
-            self.emitCmpRegAbs(reg, @intCast(DATA_VADDR + 0xC0));
-            j_cold2 = self.emitJccReloc(0x2, .code_offset, 0, self.cur_fn_idx); // jb
-            self.emitCmpRegAbs(reg, @intCast(DATA_VADDR + 0xC8));
-            j_ok = self.emitJccReloc(0x6, .code_offset, 0, self.cur_fn_idx); // jbe
-        }
+        const j_cold2 = self.emitJccReloc(0x7, .code_offset, 0, self.cur_fn_idx); // ja
 
-        // Cold stub: nothing is clobbered on purpose. r11 may be a cached
-        // constant, and the access's own register still holds the pointer.
-        const cold_stub = self.code_len;
-        self.relocs[j_cold1].target_id = cold_stub;
-        if (j_cold2 != 0) self.relocs[j_cold2].target_id = cold_stub;
-        const jmp_cold = self.emitJmpReloc(.code_offset, 0, self.cur_fn_idx);
+        // Nothing is clobbered here: r11 may be a cached constant and the
+        // access's own register still holds the pointer.
         const ok_pos = self.code_len;
-        self.relocs[j_ok].target_id = ok_pos;
 
         self.deferred_ptr_cold[self.deferred_ptr_cold_count] = .{
             .j_cold1 = j_cold1,
             .j_cold2 = j_cold2,
-            .jmp_cold = jmp_cold,
             .reg = reg,
             .access_bytes = access_bytes,
             .resume_pos = ok_pos,
@@ -6502,7 +6495,9 @@ pub const IRCodegen = struct {
     /// that could otherwise fall through into them.
     fn emitDeferredPtrCold(self: *IRCodegen) void {
         for (self.deferred_ptr_cold[0..self.deferred_ptr_cold_count]) |dc| {
-            self.relocs[dc.jmp_cold].target_id = self.code_len;
+            const body = self.code_len;
+            self.relocs[dc.j_cold1].target_id = body;
+            self.relocs[dc.j_cold2].target_id = body;
             self.emitPtrColdBody(dc.reg, dc.access_bytes, dc.resume_pos);
         }
         self.deferred_ptr_cold_count = 0;
