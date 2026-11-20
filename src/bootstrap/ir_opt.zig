@@ -4704,21 +4704,38 @@ fn hoistBoundsChecksFn(f: *IRFn, stats: ?*BoundsHoistStats, module: *IRModule, p
                         ok = false;
                         break;
                     }
-                    // The pointer vreg must come from ptr_add(base, ...) or be the base.
+                    // The pointer vreg must resolve, through any chain of
+                    // ptr_add's, to a vreg defined outside the loop. Chained
+                    // ones are the normal shape for `@write_u64(@ptr_add(buf,
+                    // k), v)`; following only one level up made the guard give
+                    // up on those loops and left every access inline-checked.
                     var this_base: u16 = ptr_v;
-                    var db: usize = 0;
-                    while (db < f.block_count) : (db += 1) {
-                        var di: u16 = 0;
-                        var found = false;
-                        while (di < f.blocks[db].inst_count) : (di += 1) {
-                            if (f.blocks[db].insts[di].dest == ptr_v) {
-                                const d = f.blocks[db].insts[di];
-                                if (d.op == .call_ptr_add and d.arg_count >= 1) this_base = d.args[0];
-                                found = true;
-                                break;
+                    var depth: u8 = 0;
+                    while (depth < 8) : (depth += 1) {
+                        var def_inst: ?IRInst = null;
+                        var db: usize = 0;
+                        while (db < f.block_count and def_inst == null) : (db += 1) {
+                            var di: u16 = 0;
+                            while (di < f.blocks[db].inst_count) : (di += 1) {
+                                if (f.blocks[db].insts[di].dest == this_base) {
+                                    def_inst = f.blocks[db].insts[di];
+                                    break;
+                                }
                             }
                         }
-                        if (found) break;
+                        const d = def_inst orelse break;
+                        // Single-def chains only, so the resolved base is the one
+                        // that actually reaches this access.
+                        if (def_count[this_base] != 1) break;
+                        if (this_base >= MAX_TRACKED_VREGS) break;
+                        if (d.op != .call_ptr_add or d.arg_count < 1) break;
+                        if (d.args[0] == 0 or d.args[0] >= MAX_TRACKED_VREGS) break;
+                        if (def_count[d.args[0]] != 1) break;
+                        this_base = d.args[0];
+                        // Stop as soon as the base is defined outside the loop:
+                        // that is the vreg the guard has to test.
+                        const bblk = def_blk[this_base];
+                        if (bblk >= 0 and (in_loop & (@as(u128, 1) << @intCast(@as(usize, @intCast(bblk))))) == 0) break;
                     }
                     var seen = false;
                     var kk: u32 = 0;
