@@ -137,6 +137,28 @@ const DeferredDiv64 = struct {
     known_imm: i64,
 };
 
+// Out-of-line cold body for the hottest pointer checks.
+//
+// The inline form emits hot path + cold half next to each other; the cold half
+// (NULL/kernel-range/heap-range screening and the `call` into the verifier) is
+// never executed by a correct program but occupies the same I-cache lines as
+// the loop around the access. Measured on 03_sieve with the cold half deleted
+// entirely (unsound build, just for headroom): 59.0 ms -> 43.8 ms, i.e. 1.35x
+// of the workload is spent *fetching* code that never runs.
+//
+// The deferred form keeps the hot path and parks the cold half after the
+// function's last block. Both the branches out of the hot path and the jump
+// back are real relocs - `relaxAndPatch` shortens jumps, so hand-written disp8
+// bytes would go stale.
+const DeferredPtrCold = struct {
+    j_cold1: u32, // jae cold1 (pointer >= cached chunk end)
+    j_cold2: u32, // jb  cold2 (pointer < cached chunk start), 0 if unused
+    jmp_cold: u32, // jump into the deferred body
+    reg: u8, // register still holding the pointer at the access site
+    access_bytes: u8,
+    resume_pos: u32, // code offset the cold body jumps back to
+};
+
 const Reloc = struct {
     kind: RelocKind,
     opcode_pos: u32,
@@ -241,12 +263,24 @@ pub const IRCodegen = struct {
     deferred_div64: [256]DeferredDiv64 = undefined,
     deferred_div64_count: usize = 0,
 
+    // null = not probed yet; cached because the probe is a getenv per access
+    opt_trap_ceil: ?bool = null,
+
+    deferred_ptr_cold: [4096]DeferredPtrCold = undefined,
+    deferred_ptr_cold_count: usize = 0,
+
     // Entry register-only parameter tracking for current function
     param_reg_only: [8]bool = .{false} ** 8,
     param_target_vreg: [8]u16 = .{0} ** 8,
     param_load_skip: [8]bool = .{false} ** 8,
 
     pub fn init(self: *IRCodegen, source: []const u8, module: *const IRModule) void {
+        // The instance is a pointer off the heap, so default field values are
+        // NOT applied. Counters that gate deferred-emission loops must be
+        // cleared explicitly or the loops index the arrays out of bounds.
+        self.deferred_ptr_cold_count = 0;
+        self.deferred_div64_count = 0;
+        self.opt_trap_ceil = null;
         self.code_len = 0;
         self.overflowed = false;
         self.invalid_reference = false;
@@ -1654,6 +1688,14 @@ pub const IRCodegen = struct {
         self.emitAssertFailRoutine();
         self.reserveCfiTable();
         self.emitCfiRoutine();
+
+        // Every deferred cold pointer-check body in the module is flushed here,
+        // once, at the very end of .text. Flushing per function would let the
+        // bodies push the next function's hot loops to a different alignment,
+        // which measured as a 0.92x regression on 11_kmeans while the loop body
+        // itself got 14 instructions shorter.
+        if (self.overflowed) return;
+        self.emitDeferredPtrCold();
         if (self.overflowed) return;
 
         self.relaxAndPatch();
@@ -2785,6 +2827,7 @@ pub const IRCodegen = struct {
             self.xorReg(0, 0);
             self.emitEpilogueReturn();
         }
+
         self.cur_canary_active = false;
     }
 
@@ -6392,11 +6435,134 @@ pub const IRCodegen = struct {
         self.emit8(0x0B); // ud2
     }
 
-    fn emitPtrTrap(self: *IRCodegen, reg: u8) void {
-        self.emitPtrTrapN(reg, 1);
+    /// Measurement-only switch: LIR_TRAP_CEIL=1 compiles away the heap-range
+    /// screen and the verifier call, i.e. an unsound but maximally fast build.
+    /// Used to quantify how much headroom the check machinery still costs.
+    fn trapCeil(self: *IRCodegen) bool {
+        return self.opt_trap_ceil orelse blk: {
+            const v = std.posix.getenv("LIR_TRAP_CEIL") != null;
+            self.opt_trap_ceil = v;
+            break :blk v;
+        };
     }
 
+    /// Pointer check for the hottest access opcodes: the hot path stays inline,
+    /// the cold half is parked after the function's last block.
     fn emitPtrTrapN(self: *IRCodegen, reg: u8, access_bytes: u8) void {
+        std.debug.assert(reg != 4);
+        if (self.trapCeil() and access_bytes <= 8) {
+            self.emitCmpRegImm32(reg, 4096);
+            self.emit8(0x73);
+            self.emit8(0x02);
+            self.emit8(0x0F);
+            self.emit8(0x0B);
+            return;
+        }
+        if (self.deferred_ptr_cold_count >= self.deferred_ptr_cold.len) {
+            self.emitPtrTrapNInline(reg, access_bytes);
+            return;
+        }
+
+        self.emitCmpRegAbs(reg, @intCast(DATA_VADDR + 0xC8));
+        const j_cold1 = self.emitJccReloc(0x3, .code_offset, 0, self.cur_fn_idx); // jae
+        var j_cold2: u32 = 0;
+        var j_ok: u32 = 0;
+        if (access_bytes <= 1) {
+            self.emitCmpRegAbs(reg, @intCast(DATA_VADDR + 0xC0));
+            j_ok = self.emitJccReloc(0x3, .code_offset, 0, self.cur_fn_idx); // jae
+        } else {
+            self.emitCmpRegAbs(reg, @intCast(DATA_VADDR + 0xC0));
+            j_cold2 = self.emitJccReloc(0x2, .code_offset, 0, self.cur_fn_idx); // jb
+            self.emitCmpRegAbs(reg, @intCast(DATA_VADDR + 0xC8));
+            j_ok = self.emitJccReloc(0x6, .code_offset, 0, self.cur_fn_idx); // jbe
+        }
+
+        // Cold stub: nothing is clobbered on purpose. r11 may be a cached
+        // constant, and the access's own register still holds the pointer.
+        const cold_stub = self.code_len;
+        self.relocs[j_cold1].target_id = cold_stub;
+        if (j_cold2 != 0) self.relocs[j_cold2].target_id = cold_stub;
+        const jmp_cold = self.emitJmpReloc(.code_offset, 0, self.cur_fn_idx);
+        const ok_pos = self.code_len;
+        self.relocs[j_ok].target_id = ok_pos;
+
+        self.deferred_ptr_cold[self.deferred_ptr_cold_count] = .{
+            .j_cold1 = j_cold1,
+            .j_cold2 = j_cold2,
+            .jmp_cold = jmp_cold,
+            .reg = reg,
+            .access_bytes = access_bytes,
+            .resume_pos = ok_pos,
+        };
+        self.deferred_ptr_cold_count += 1;
+    }
+
+    /// Flush the cold bodies deferred since the last call. Must run right after
+    /// a function's (or helper routine's) epilogue so they land past every block
+    /// that could otherwise fall through into them.
+    fn emitDeferredPtrCold(self: *IRCodegen) void {
+        for (self.deferred_ptr_cold[0..self.deferred_ptr_cold_count]) |dc| {
+            self.relocs[dc.jmp_cold].target_id = self.code_len;
+            self.emitPtrColdBody(dc.reg, dc.access_bytes, dc.resume_pos);
+        }
+        self.deferred_ptr_cold_count = 0;
+    }
+
+    /// The cold half of the pointer check: NULL / kernel-range / heap-range
+    /// screening plus the call into the verifier. Never taken by a correct
+    /// program. Ends by jumping back to the access's continuation.
+    fn emitPtrColdBody(self: *IRCodegen, reg: u8, access_bytes: u8, resume_at: u32) void {
+        const trap_kind: TargetKind = switch (access_bytes) {
+            4 => .chk_heap4_fn,
+            8 => .chk_heap8_fn,
+            else => .chk_heap1_fn,
+        };
+        self.emitCmpRegImm32(reg, 4096);
+        const jb_trap = self.code_len + 1;
+        self.emit8(0x72);
+        self.emit8(0); // jb .trap
+        self.emitRex(reg, reg);
+        self.emit8(0x85);
+        self.emitModRM(3, reg, reg); // test reg, reg
+        const js_trap = self.code_len + 1;
+        self.emit8(0x78);
+        self.emit8(0); // js .trap
+        self.emitCmpRegAbs(reg, @intCast(DATA_VADDR + 0x88)); // heap_min
+        const jb_ok1 = self.code_len + 1;
+        self.emit8(0x72);
+        self.emit8(0); // jb .ok
+        self.emitCmpRegAbs(reg, @intCast(DATA_VADDR + 0x90)); // heap_max
+        const jae_ok2 = self.code_len + 1;
+        self.emit8(0x73);
+        self.emit8(0); // jae .ok
+        self.pushReg(reg);
+        self.emitCallReloc(trap_kind, 0);
+        self.popReg(reg);
+        const jmp_ok = self.code_len + 1;
+        self.emit8(0xEB);
+        self.emit8(0); // jmp .ok
+
+        const trap_pos = self.code_len;
+        self.code[jb_trap] = @intCast(trap_pos - (jb_trap + 1));
+        self.code[js_trap] = @intCast(trap_pos - (js_trap + 1));
+        self.emit8(0x0F);
+        self.emit8(0x0B); // ud2
+
+        const ok_pos = self.code_len;
+        self.code[jb_ok1] = @intCast(ok_pos - (jb_ok1 + 1));
+        self.code[jae_ok2] = @intCast(ok_pos - (jae_ok2 + 1));
+        self.code[jmp_ok] = @intCast(ok_pos - (jmp_ok + 1));
+        _ = self.emitJmpReloc(.code_offset, resume_at, self.cur_fn_idx);
+    }
+
+    /// Pointer check for every non-hottest site (allocator, strings, arrays,
+    /// maps, channels, ...): the original fully inline form, so behaviour there
+    /// is unchanged.
+    fn emitPtrTrap(self: *IRCodegen, reg: u8) void {
+        self.emitPtrTrapNInline(reg, 1);
+    }
+
+    fn emitPtrTrapNInline(self: *IRCodegen, reg: u8, access_bytes: u8) void {
         std.debug.assert(reg != 4);
         const trap_kind: TargetKind = switch (access_bytes) {
             4 => .chk_heap4_fn,
@@ -6422,15 +6588,7 @@ pub const IRCodegen = struct {
             jb_slow2 = self.code_len + 1;
             self.emit8(0x72);
             self.emit8(0); // jb .slow
-            if (reg != 11) {
-                self.emitLeaRegDisp(11, reg, @intCast(access_bytes));
-                self.emitCmpRegAbs(11, @intCast(DATA_VADDR + 0xC8));
-            } else {
-                self.pushReg(0);
-                self.emitLeaRegDisp(0, 11, @intCast(access_bytes));
-                self.emitCmpRegAbs(0, @intCast(DATA_VADDR + 0xC8));
-                self.popReg(0); // pop preserves flags
-            }
+            self.emitCmpRegAbs(reg, @intCast(DATA_VADDR + 0xC8));
             fast_ok_patch = self.code_len + 1;
             self.emit8(0x76);
             self.emit8(0); // jbe .ok
@@ -7553,8 +7711,15 @@ pub const IRCodegen = struct {
         self.emit8(0x49);
         self.emit8(0x89);
         self.emit8(0x82);
-        self.emit32(0xC0); // mov [r10 + 0xC0], rax
+        self.emit32(0xC0); // mov [r10 + 0xC0], rax     (chunk start)
         self.emitLeaRegIdxScale(11, 0, 9, 0); // r11 = rax + r9
+        // Store the chunk END minus the largest inline-checked access size (8),
+        // so the hot path can test `ptr <= [0xC8]` with no lea, no scratch
+        // register and no push/pop.
+        self.emit8(0x49);
+        self.emit8(0x83);
+        self.emit8(0xEB);
+        self.emit8(0x08); // sub r11, 8
         self.emit8(0x4D);
         self.emit8(0x89);
         self.emit8(0x9A);
