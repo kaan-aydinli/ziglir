@@ -1,0 +1,32 @@
+// NOEMA Stage 12: explicit supported/refuted/unknown/conflict query statuses.
+import "../src/noema_reasoning.lir"
+fn main() -> i64 {
+    var checks: i64 = 0
+    var passed: i64 = 0
+    let facts = @malloc(4 * 8)
+    @write_u64(facts, 11 as u64)
+    @write_u64(@ptr_add(facts, 8), 20 as u64)
+    checks = checks + 1
+    if reasoning_query_status(2, facts, 11, 12) == QUERY_SUPPORTED { passed = passed + 1 }
+    checks = checks + 1
+    if reasoning_query_status(2, facts, 12, 20) == QUERY_REFUTED { passed = passed + 1 }
+    checks = checks + 1
+    if reasoning_query_status(2, facts, 30, 31) == QUERY_UNKNOWN { passed = passed + 1 }
+    @write_u64(@ptr_add(facts, 16), 12 as u64)
+    checks = checks + 1
+    if reasoning_query_status(3, facts, 11, 12) == QUERY_CONFLICT { passed = passed + 1 }
+    checks = checks + 1
+    if reasoning_query_status(3, facts, 11, 11) == QUERY_INVALID { passed = passed + 1 }
+    checks = checks + 1
+    if reasoning_query_status(3, facts, 0, 12) == QUERY_INVALID { passed = passed + 1 }
+    @write_u64(@ptr_add(facts, 24), 0 as u64)
+    checks = checks + 1
+    if reasoning_query_status(4, facts, 11, 12) == QUERY_INVALID { passed = passed + 1 }
+    checks = checks + 1
+    if reasoning_query_status(-1, facts, 11, 12) == QUERY_INVALID { passed = passed + 1 }
+    printInt(passed)
+    print("/")
+    printInt(checks)
+    println("")
+    return 0
+}
