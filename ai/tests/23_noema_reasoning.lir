@@ -1,0 +1,45 @@
+// NOEMA Stage 9 exact-rule forward chaining.
+import "../src/noema_reasoning.lir"
+fn main() -> i64 {
+    var checks: i64 = 0
+    var passed: i64 = 0
+    let facts = @malloc(4 * 8)
+    let ants = @malloc(4 * 8)
+    let cons = @malloc(4 * 8)
+    let out = @malloc(8 * 8)
+    @write_u64(facts, 1 as u64)
+    @write_u64(@ptr_add(facts, 8), 4 as u64)
+    @write_u64(ants, 1 as u64)
+    @write_u64(cons, 2 as u64)
+    @write_u64(@ptr_add(ants, 8), 2 as u64)
+    @write_u64(@ptr_add(cons, 8), 3 as u64)
+    @write_u64(@ptr_add(ants, 16), 4 as u64)
+    @write_u64(@ptr_add(cons, 16), 5 as u64)
+    @write_u64(@ptr_add(ants, 24), 3 as u64)
+    @write_u64(@ptr_add(cons, 24), 1 as u64)
+    let n = reasoning_closure(2, facts, 4, ants, cons, 8, out)
+    checks = checks + 1
+    if n == 5 { passed = passed + 1 }
+    checks = checks + 1
+    if reasoning_fact_present(n, out, 3) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if reasoning_fact_present(n, out, 5) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if reasoning_fact_present(n, out, 9) == 0 { passed = passed + 1 }
+    checks = checks + 1
+    if reasoning_closure(2, facts, 4, ants, cons, 4, out) == REASON_INVALID { passed = passed + 1 }
+    checks = checks + 1
+    if reasoning_closure(2, facts, 4, ants, cons, 8, out) == n { passed = passed + 1 }
+    checks = checks + 1
+    @write_u64(facts, 0 as u64)
+    if reasoning_closure(2, facts, 4, ants, cons, 8, out) == REASON_INVALID { passed = passed + 1 }
+    @write_u64(facts, 1 as u64)
+    checks = checks + 1
+    @write_u64(@ptr_add(ants, 16), 0 as u64)
+    if reasoning_closure(2, facts, 4, ants, cons, 8, out) == REASON_INVALID { passed = passed + 1 }
+    printInt(passed)
+    print("/")
+    printInt(checks)
+    println("")
+    return 0
+}
