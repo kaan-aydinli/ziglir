@@ -1,17 +1,65 @@
-// NOEMA Stage 9: bounded deterministic exact-rule inference kernel.
-// Facts and rule terms are positive integer IDs. Each rule has one antecedent
-// and one consequent. This is a small forward-chaining core, not natural-language
-// reasoning, a proof assistant, or a complete NOEMA inference runtime.
+// NOEMA Stage 9: bounded deterministic exact-rule inference kernels.
+// Facts and rule terms are positive integer IDs. `reasoning_closure` supports
+// unary rules; `reasoning_closure2` supports conjunctions of up to two premises
+// (right premise zero means unary). These are small forward-chaining kernels,
+// not natural-language reasoning, a proof assistant, or a complete runtime.
 const REASON_INVALID: i64 = -1
 const REASON_MAX_FACTS: i64 = 256
 const REASON_MAX_RULES: i64 = 1024
 
-/// Compute monotone closure using ordered single-premise rules. Returns the
-/// number of unique facts, or REASON_INVALID for malformed input/capacity.
-/// Input/output buffers are caller-owned u64 arrays sized to the declared caps.
+/// Compute monotone closure using ordered single-premise rules.
 fn reasoning_closure(initial_count: i64, initial_facts: *u8, rule_count: i64, antecedents: *u8, consequents: *u8, capacity: i64, output_facts: *u8) -> i64 {
-    if initial_count < 0 or initial_count > REASON_MAX_FACTS { return REASON_INVALID }
-    if rule_count < 0 or rule_count > REASON_MAX_RULES { return REASON_INVALID }
+    if initial_count < 0 or initial_count > REASON_MAX_FACTS or rule_count < 0 or rule_count > REASON_MAX_RULES { return REASON_INVALID }
+    if capacity < initial_count or capacity > REASON_MAX_FACTS { return REASON_INVALID }
+    var count: i64 = 0
+    var i: i64 = 0
+    while i < initial_count {
+        let fact = @read_u64(@ptr_add(initial_facts, i * 8)) as i64
+        if fact <= 0 { return REASON_INVALID }
+        var j: i64 = 0
+        while j < count { if (@read_u64(@ptr_add(output_facts, j * 8)) as i64) == fact { return REASON_INVALID } j = j + 1 }
+        @write_u64(@ptr_add(output_facts, count * 8), fact as u64)
+        count = count + 1
+        i = i + 1
+    }
+    i = 0
+    while i < rule_count {
+        if (@read_u64(@ptr_add(antecedents, i * 8)) as i64) <= 0 or (@read_u64(@ptr_add(consequents, i * 8)) as i64) <= 0 { return REASON_INVALID }
+        i = i + 1
+    }
+    var changed = 1
+    while changed == 1 {
+        changed = 0
+        var r: i64 = 0
+        while r < rule_count {
+            let antecedent = @read_u64(@ptr_add(antecedents, r * 8)) as i64
+            let consequent = @read_u64(@ptr_add(consequents, r * 8)) as i64
+            var has_a = 0
+            var has_c = 0
+            var f: i64 = 0
+            while f < count {
+                let value = @read_u64(@ptr_add(output_facts, f * 8)) as i64
+                if value == antecedent { has_a = 1 }
+                if value == consequent { has_c = 1 }
+                f = f + 1
+            }
+            if has_a == 1 and has_c == 0 {
+                if count >= capacity { return REASON_INVALID }
+                @write_u64(@ptr_add(output_facts, count * 8), consequent as u64)
+                count = count + 1
+                changed = 1
+            }
+            r = r + 1
+        }
+    }
+    return count
+}
+
+/// Compute closure for rules (left AND right) -> conclusion. A zero right
+/// premise denotes a unary rule; zero left/conclusion is invalid. Rule order is
+/// stable. The caller must provide output storage for `capacity` u64 cells.
+fn reasoning_closure2(initial_count: i64, initial_facts: *u8, rule_count: i64, left_terms: *u8, right_terms: *u8, conclusions: *u8, capacity: i64, output_facts: *u8) -> i64 {
+    if initial_count < 0 or initial_count > REASON_MAX_FACTS or rule_count < 0 or rule_count > REASON_MAX_RULES { return REASON_INVALID }
     if capacity < initial_count or capacity > REASON_MAX_FACTS { return REASON_INVALID }
     var count: i64 = 0
     var i: i64 = 0
@@ -29,8 +77,8 @@ fn reasoning_closure(initial_count: i64, initial_facts: *u8, rule_count: i64, an
     }
     i = 0
     while i < rule_count {
-        if (@read_u64(@ptr_add(antecedents, i * 8)) as i64) <= 0 { return REASON_INVALID }
-        if (@read_u64(@ptr_add(consequents, i * 8)) as i64) <= 0 { return REASON_INVALID }
+        if (@read_u64(@ptr_add(left_terms, i * 8)) as i64) <= 0 or (@read_u64(@ptr_add(conclusions, i * 8)) as i64) <= 0 { return REASON_INVALID }
+        if (@read_u64(@ptr_add(right_terms, i * 8)) as i64) < 0 { return REASON_INVALID }
         i = i + 1
     }
     var changed = 1
@@ -38,20 +86,23 @@ fn reasoning_closure(initial_count: i64, initial_facts: *u8, rule_count: i64, an
         changed = 0
         var r: i64 = 0
         while r < rule_count {
-            let antecedent = @read_u64(@ptr_add(antecedents, r * 8)) as i64
-            let consequent = @read_u64(@ptr_add(consequents, r * 8)) as i64
-            var has_antecedent = 0
-            var has_consequent = 0
+            let left = @read_u64(@ptr_add(left_terms, r * 8)) as i64
+            let right = @read_u64(@ptr_add(right_terms, r * 8)) as i64
+            let conclusion = @read_u64(@ptr_add(conclusions, r * 8)) as i64
+            var has_left = 0
+            var has_right = if right == 0 { 1 } else { 0 }
+            var has_conclusion = 0
             var f: i64 = 0
             while f < count {
                 let value = @read_u64(@ptr_add(output_facts, f * 8)) as i64
-                if value == antecedent { has_antecedent = 1 }
-                if value == consequent { has_consequent = 1 }
+                if value == left { has_left = 1 }
+                if value == right { has_right = 1 }
+                if value == conclusion { has_conclusion = 1 }
                 f = f + 1
             }
-            if has_antecedent == 1 and has_consequent == 0 {
+            if has_left == 1 and has_right == 1 and has_conclusion == 0 {
                 if count >= capacity { return REASON_INVALID }
-                @write_u64(@ptr_add(output_facts, count * 8), consequent as u64)
+                @write_u64(@ptr_add(output_facts, count * 8), conclusion as u64)
                 count = count + 1
                 changed = 1
             }
@@ -61,7 +112,7 @@ fn reasoning_closure(initial_count: i64, initial_facts: *u8, rule_count: i64, an
     return count
 }
 
-/// Exact membership query over the resulting closure.
+/// Exact membership query over a closure.
 fn reasoning_fact_present(fact_count: i64, facts: *u8, query: i64) -> i64 {
     if fact_count < 0 or fact_count > REASON_MAX_FACTS or query <= 0 { return 0 }
     var i: i64 = 0

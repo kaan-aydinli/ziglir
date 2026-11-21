@@ -1,0 +1,48 @@
+// NOEMA Stage 10: conjunction rules in the bounded inference kernel.
+import "../src/noema_reasoning.lir"
+fn main() -> i64 {
+    var checks: i64 = 0
+    var passed: i64 = 0
+    let facts = @malloc(3 * 8)
+    let left = @malloc(3 * 8)
+    let right = @malloc(3 * 8)
+    let conclusions = @malloc(3 * 8)
+    let out = @malloc(8 * 8)
+    @write_u64(facts, 1 as u64)
+    @write_u64(@ptr_add(facts, 8), 2 as u64)
+    @write_u64(@ptr_add(left, 0), 1 as u64)
+    @write_u64(@ptr_add(right, 0), 2 as u64)
+    @write_u64(@ptr_add(conclusions, 0), 3 as u64)
+    @write_u64(@ptr_add(left, 8), 3 as u64)
+    @write_u64(@ptr_add(right, 8), 4 as u64)
+    @write_u64(@ptr_add(conclusions, 8), 5 as u64)
+    @write_u64(@ptr_add(left, 16), 2 as u64)
+    @write_u64(@ptr_add(right, 16), 0 as u64)
+    @write_u64(@ptr_add(conclusions, 16), 6 as u64)
+    let n = reasoning_closure2(2, facts, 3, left, right, conclusions, 8, out)
+    checks = checks + 1
+    if n == 4 { passed = passed + 1 }
+    checks = checks + 1
+    if reasoning_fact_present(n, out, 3) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if reasoning_fact_present(n, out, 5) == 0 { passed = passed + 1 }
+    checks = checks + 1
+    if reasoning_fact_present(n, out, 6) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    @write_u64(@ptr_add(facts, 16), 4 as u64)
+    let n2 = reasoning_closure2(3, facts, 3, left, right, conclusions, 8, out)
+    if n2 == 6 { passed = passed + 1 }
+    checks = checks + 1
+    if reasoning_fact_present(n2, out, 5) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if reasoning_closure2(2, facts, 3, left, right, conclusions, 3, out) == REASON_INVALID { passed = passed + 1 }
+    checks = checks + 1
+    @write_u64(@ptr_add(right, 8), 0 as u64)
+    @write_u64(@ptr_add(left, 8), 0 as u64)
+    if reasoning_closure2(2, facts, 3, left, right, conclusions, 8, out) == REASON_INVALID { passed = passed + 1 }
+    printInt(passed)
+    print("/")
+    printInt(checks)
+    println("")
+    return 0
+}
