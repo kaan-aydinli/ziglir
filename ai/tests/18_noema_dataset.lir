@@ -1,0 +1,66 @@
+// NOEMA Stage 4: data eligibility, group split and release-gate tests.
+import "../src/noema_dataset.lir"
+
+fn main() -> i64 {
+    var checks: i64 = 0
+    var passed: i64 = 0
+
+    checks = checks + 1
+    if dataset_record_eligibility(1, 1, 1, 1, 1, 1, 1, 1) == DATA_ELIGIBLE { passed = passed + 1 }
+    checks = checks + 1
+    if dataset_record_eligibility(1, 0, 1, 1, 1, 1, 1, 1) == DATA_QUARANTINE { passed = passed + 1 }
+    checks = checks + 1
+    if dataset_record_eligibility(1, 2, 1, 1, 1, 1, 1, 1) == DATA_REJECT { passed = passed + 1 }
+    checks = checks + 1
+    if dataset_record_eligibility(2, 1, 1, 1, 1, 1, 1, 1) == DATA_REJECT { passed = passed + 1 }
+    checks = checks + 1
+    if dataset_record_eligibility(1, 1, 1, 2, 1, 1, 1, 1) == DATA_REJECT { passed = passed + 1 }
+    checks = checks + 1
+    if dataset_record_eligibility(1, 1, 1, 1, 1, 2, 1, 1) == DATA_REJECT { passed = passed + 1 }
+    checks = checks + 1
+    if dataset_record_eligibility(1, 1, 1, 1, 2, 1, 1, 1) == DATA_REJECT { passed = passed + 1 }
+    checks = checks + 1
+    if dataset_record_eligibility(1, 1, 1, 1, 1, 1, 2, 1) == DATA_QUARANTINE { passed = passed + 1 }
+    checks = checks + 1
+    if dataset_record_eligibility(1, 1, 1, 1, 1, 1, 1, 0) == DATA_QUARANTINE { passed = passed + 1 }
+    checks = checks + 1
+    if dataset_record_eligibility(3, 1, 1, 1, 1, 1, 1, 1) == DATA_REJECT { passed = passed + 1 }
+
+    checks = checks + 1
+    if dataset_split_for_bucket(0, 8000, 9000) == DATA_SPLIT_TRAIN { passed = passed + 1 }
+    checks = checks + 1
+    if dataset_split_for_bucket(7999, 8000, 9000) == DATA_SPLIT_TRAIN { passed = passed + 1 }
+    checks = checks + 1
+    if dataset_split_for_bucket(8000, 8000, 9000) == DATA_SPLIT_DEV { passed = passed + 1 }
+    checks = checks + 1
+    if dataset_split_for_bucket(8999, 8000, 9000) == DATA_SPLIT_DEV { passed = passed + 1 }
+    checks = checks + 1
+    if dataset_split_for_bucket(9000, 8000, 9000) == DATA_SPLIT_TEST { passed = passed + 1 }
+    checks = checks + 1
+    if dataset_split_for_bucket(-1, 8000, 9000) == DATA_SPLIT_INVALID { passed = passed + 1 }
+    checks = checks + 1
+    if dataset_split_for_bucket(10, 9000, 8000) == DATA_SPLIT_INVALID { passed = passed + 1 }
+    checks = checks + 1
+    if dataset_split_for_bucket(10, 0, 8000) == DATA_SPLIT_INVALID { passed = passed + 1 }
+    checks = checks + 1
+    if dataset_split_for_bucket(10, 8000, 10000) == DATA_SPLIT_INVALID { passed = passed + 1 }
+
+    checks = checks + 1
+    if dataset_report_promotable(10, 0, 0, 1, 1) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if dataset_report_promotable(10, 1, 0, 1, 1) == 0 { passed = passed + 1 }
+    checks = checks + 1
+    if dataset_report_promotable(10, 0, 1, 1, 1) == 0 { passed = passed + 1 }
+    checks = checks + 1
+    if dataset_report_promotable(10, 0, 0, 0, 1) == 0 { passed = passed + 1 }
+    checks = checks + 1
+    if dataset_report_promotable(10, 0, 0, 1, 0) == 0 { passed = passed + 1 }
+    checks = checks + 1
+    if dataset_report_promotable(0, 0, 0, 1, 1) == 0 { passed = passed + 1 }
+
+    printInt(passed)
+    print("/")
+    printInt(checks)
+    println("")
+    return 0
+}

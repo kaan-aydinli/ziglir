@@ -1,6 +1,6 @@
 # NOEMA — Analog-Doğal, Doğrulama-Kapılı Muhakeme Mimarisi
 
-**Durum:** v2.3 — tasarım + LIR ile uygulanmış ilk üç çekirdek dilim (TTA, evidence refs, task DAG). NOEMA'nın geri kalan runtime/training/retrieval katmanları uygulanmadı.
+**Durum:** v2.4 — tasarım + LIR ile uygulanmış ilk dört çekirdek dilim (TTA, evidence, scheduler, dataset gates). NOEMA'nın geri kalan runtime/training/retrieval katmanları uygulanmadı.
 **Amaç:** `ai/` çatısının dışına ve SEL'in üstüne sıfırdan kurulan, **muhakeme-öncelikli** yeni mimarinin eksiksiz tanımı.
 **Bu deponun kuralı (iddia = ölçüm) bu belge için de geçerlidir:** aşağıda geçen her "hedef", "kestirim" ya da "beklenti" açıkça **ölçülmemiştir**. Ölçülmüş tek sayılar, mevcut SEL çekirdeğine aittir ve öyle etiketlenmiştir. Bu belge bir *vaad* değil, bir *ölçülecek hipotezler listesi*dir.
 
@@ -1998,7 +1998,7 @@ Current successful checks validate only code-level invariants: 18 unit tests, ex
 
 *Belge sürümü: v2.1 — 2026-11-16. Mevcut çalışma alanındaki darboğazlar önceliklendirildi; dataset audit memory-index darboğazı disk spill ile azaltıldı ve bir sentetik ölçek ölçümü eklendi; NOEMA runtime darboğazları açık/çözülmemiştir.*
 
-## 38. v2.2 — LIR ile uygulama sırası ve yürütülebilir ilk dilim
+## 38. v2.4 — LIR ile sıralı uygulama ve yürütülebilir dilimler
 
 Mimari tek PR'da “tamamlandı” işaretlenmeyecek. Uygulama sırası bağımlılıkları ve release kapıları izler. LIR, deterministik tipli core sözleşmeler/validator logic için birincil uygulama dilidir; dosya sistemi, JSONL, dış kaynak ve işletim sistemi entegrasyonu mevcut permissioned host/adapter sınırında kalabilir. Bu I/O köprüsünü LIR core içine saklamak veya LIR'de olmayan JSON/network özellikleri varmış gibi yazmak yasaktır.
 
@@ -2010,7 +2010,7 @@ Mimari tek PR'da “tamamlandı” işaretlenmeyecek. Uygulama sırası bağıml
 | 1 | `ai/src/noema_contracts.lir`: TTA obligation lifecycle ve independent evidence/scope gate | `ai/tests/15_noema_contracts.lir` | legal/illegal transition + close precondition testleri native/VM/C | **Uygulandı; 12/12 fixture assertion geçti, test runner'da 3 backend** |
 | 2 | LIR `EvidenceRecord`/scope helpers: positive ID, producer≠verifier, evidence pass, exact scope ve artifact→obligation/evidence refs | JSONL parse/stream host adapter; LIR'e numeric identity ve relation arrays | dangling/duplicate ref, wrong scope/self-check red tests | **Uygulandı; 9/9 fixture assertion, native/VM/C** |
 | 3 | LIR deterministic task DAG: dependency-ready seçimi, cycle/invalid-input detection, 64-task cap | Host runner yalnız I/O, checkpoint ve immutable event persistence | deterministic order, cycle/budget/cancel fault fixtures | **İlk DAG çekirdeği uygulandı; 10/10 fixture assertion, native/VM/C. Event replay/budget/cancel henüz yok** |
-| 4 | Dataset eligibility/split primitives: policy decisions, grouped split plan, quality-gate result aggregation | mevcut Python JSONL/disk auditor I/O'su; signed source/dataset manifest | leakage/unknown policy fail closed, large corpus bounded RSS; audit report ref run manifest'e bağlanır | Bekliyor |
+| 4 | Dataset eligibility/split primitives: policy decisions, grouped split plan, quality-gate result aggregation | mevcut Python JSONL/disk auditor I/O'su; manifest reference/hash binding (signature not implemented) | leakage/unknown policy fail closed, audit report run manifest'e hash/ref ile bağlanır | **LIR eligibility/split/gate primitives + manifest-bound Python audit uygulandı; 25 assertion native/VM/C. LIR↔host release-promoter bridge henüz yok** |
 | 5 | Capability graph routing: `CapabilityNode` scope/prerequisite/evidence gates, explicit unsupported state | current-version registry ve per-skill eval adapters | unsupported node auto-route yok; unseen composition aparteval | Bekliyor |
 | 6 | Memory/CAG typed keys, permission/freshness/dependency invalidation decisions | storage/index/connector adapters, tenant isolation | cache on/off correctness invariant, deletion/ACL fault suite | Bekliyor |
 | 7 | Isolated candidate/release state machine, learning/evaluation/promote/rollback | immutable dataset+run manifests, sealed eval CI | hard gate bypass=0, atomic rollback/replay integration | Bekliyor |
@@ -2018,7 +2018,7 @@ Mimari tek PR'da “tamamlandı” işaretlenmeyecek. Uygulama sırası bağıml
 
 Each stage must add LIR unit/regression fixture and expected output, run **native + VM + C** where semantics are supported, and preserve previous AI/core/compiler tests. Other targets are added only when their backend coverage is declared and available. Keep LIR core pure/deterministic where possible; never claim formal proof from ordinary test output. Bridge code is independently checked for permission, bounds, error propagation, cancellation and payload identity.
 
-### 38.2 Stages 1–3 implemented: TTA, evidence gate and deterministic scheduler
+### 38.2 Stages 1–4 implemented: TTA, evidence, scheduler and data gates
 
 `ai/src/noema_contracts.lir` now defines stable numeric state constants and a pure guard:
 
@@ -2037,12 +2037,16 @@ Test `ai/tests/15_noema_contracts.lir` exercises 12 positive/negative assertions
 
 Stage 3 adds `ai/src/noema_scheduler.lir`. The pure DAG scheduler interprets a bounded (max 64 nodes) adjacency matrix, checks binary/done/self-edge validity, picks the lowest-ID currently-ready node deterministically, and reports complete, cycle/deadlock or invalid input. `ai/tests/17_noema_scheduler.lir` covers 10 assertions. It does not persist cursor/events, enforce compute/time budgets, cancel jobs or execute tasks; caller owns valid buffers and durable event state.
 
-Validation in this session: `python3 ai/run_tests.py` reports **46 passed, 0 failed** over all AI LIR fixtures/backends; `zig build test` passes with Zig 0.13.0; all 18 Python data/validator tests pass. These establish fixture/compiler correctness for implemented code, not NOEMA capability or model quality. Zig 0.13.0 was installed into temporary sandbox tooling from the PyPI `ziglang` package; it was not added as a repository/runtime dependency.
+Stage 4 adds `ai/src/noema_dataset.lir`: tri-state source/consent/license/schema/provenance/privacy/label/evidence eligibility; explicit deny rejects, unknown/disputed data quarantines, only all-pass records become training-eligible. Stable host-computed buckets map each entire group deterministically to train/dev/test boundaries; invalid/empty ranges fail. `dataset_report_promotable` is a pure final aggregation guard requiring nonempty records, zero errors/leaks, a passed unknown policy and manifest linkage. `ai/tests/18_noema_dataset.lir` covers 25 positive/negative assertions. The LIR functions consume typed scalar statuses and do not read JSON or verify legal documents.
+
+The existing Python `dataset_audit.py` now accepts `--manifest`, checks the v2 run manifest's `dataset_quality` contract, fails unknown finding codes under `block_promotion`, requires human review for configured warnings and binds manifest/report refs plus canonical hashes in its report. The command is deliberately **not** a release promoter: `promotion_allowed` remains false until the host calls the LIR aggregate gate and authenticated event/review integration exists. Stable group digest/bucket generation and source consent verification remain host-side responsibilities.
+
+Validation in this session: `python3 ai/run_tests.py` reports **49 passed, 0 failed** over all AI LIR fixtures/backends; `zig build test` passes with Zig 0.13.0; all 21 Python data/validator tests pass. These establish fixture/compiler correctness for implemented code, not NOEMA capability or model quality. Zig 0.13.0 was installed into temporary sandbox tooling from the PyPI `ziglang` package; it was not added as a repository/runtime dependency.
 
 ### 38.3 Stage completion rules
 
 No stage starts while its predecessor's contract, tests and versioned data fixture are incomplete. A LIR return code is not a proof kernel certificate unless the checker soundness boundary is established. Any failing gate blocks the next stage, and explicit event/report contains failed IDs. Approximate retrieval, model self-score, or passing its own generated tests cannot promote a capability alone. A capability is implemented only when code, tests, caller integration, resource/security limits, observability and rollback are all present.
 
-**Current limit:** Stages 1–3 implement pure guards only. No durable event store, real evidence payload/hash validation, task execution, retry/checkpoint/budget/cancellation, dataset ingestion integration, retrieval, memory, training or serving pipeline runs end-to-end. Stage 4 is next: dataset eligibility/split primitives and a manifest-bound quality-audit result; the Python host remains responsible for JSONL/disk I/O while pure decisions are implemented/tested in LIR.
+**Current limit:** Stages 1–4 implement pure guards and objective audit only. No authenticated event store, real evidence payload/hash verification, task execution, retry/checkpoint/budget/cancellation, component-graph/fuzzy leakage detection, legal/consent verification, LIR↔host promotion bridge, retrieval, memory, training or serving pipeline runs end-to-end. Stage 5 is next: capability graph routing with scoped prerequisites/evidence and explicit unsupported state.
 
-*Belge sürümü: v2.3 — 2026-11-16. LIR ile TTA, evidence reference checks ve bounded deterministic DAG scheduler uygulandı; native/VM/C testleri geçti.*
+*Belge sürümü: v2.4 — 2026-11-16. LIR eligibility/split/release-audit guards and manifest-bound objective audit were added; native/VM/C and Python fixture tests pass, full runtime is not implemented.*

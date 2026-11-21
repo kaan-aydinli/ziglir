@@ -73,6 +73,44 @@ class DatasetAuditTests(unittest.TestCase):
         self.assertTrue(report["findings_truncated"])
         self.assertEqual(report["release_gate"], "fail")
 
+    def test_clean_audit_binds_quality_result_but_not_release_promotion(self):
+        root = Path(__file__).parent
+        manifest = root / "run_manifest.example.json"
+        report = dataset_audit.audit(root / "capability_eval.example.jsonl", manifest)
+        self.assertEqual(report["manifest_policy_result"], "pass")
+        self.assertTrue(report["quality_policy_passed"])
+        self.assertFalse(report["promotion_allowed"])
+        self.assertEqual(report["manifest_binding"]["dataset_manifest"], "demo-dataset-manifest")
+        self.assertEqual(len(report["manifest_binding"]["objective_report_hash"]), 64)
+
+    def test_known_warning_requires_review_not_promotion(self):
+        source = Path(__file__).parent / "run_manifest.example.json"
+        manifest = json.loads(source.read_text(encoding="utf-8"))
+        row = self.row("a", "train", "g1", "A sufficiently long prompt for warning review test.")
+        row["provenance"] = "unstructured"
+        data = self.make_dataset([row])
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = Path(tmp) / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            report = dataset_audit.audit(data, manifest_path)
+        self.assertEqual(report["manifest_policy_result"], "review_required")
+        self.assertFalse(report["promotion_allowed"])
+
+    def test_unknown_finding_code_blocks_promotion(self):
+        source = Path(__file__).parent / "run_manifest.example.json"
+        manifest = json.loads(source.read_text(encoding="utf-8"))
+        manifest["dataset_quality"]["warn_on"].remove("provenance_not_structured")
+        row = self.row("a", "train", "g1", "A sufficiently long prompt for unknown policy test.")
+        row["provenance"] = "unstructured"
+        data = self.make_dataset([row])
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = Path(tmp) / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            report = dataset_audit.audit(data, manifest_path)
+        self.assertEqual(report["manifest_policy_result"], "unknown_blocked")
+        self.assertEqual(report["manifest_binding"]["unknown_codes"], ["provenance_not_structured"])
+        self.assertFalse(report["promotion_allowed"])
+
     def test_report_is_deterministic(self):
         report = dataset_audit.audit(Path(__file__).parent / "capability_eval.example.jsonl")
         encoded1 = json.dumps(report, ensure_ascii=False, sort_keys=True)

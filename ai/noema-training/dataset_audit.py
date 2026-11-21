@@ -103,7 +103,71 @@ def _count_value(db: sqlite3.Connection, kind: str, value: str) -> None:
     )
 
 
-def audit(path: Path) -> dict[str, Any]:
+def _bind_quality_plan(report: dict[str, Any], manifest_path: Path | None) -> dict[str, Any]:
+    if manifest_path is None:
+        report["manifest_policy_result"] = "not_evaluated"
+        report["promotion_allowed"] = False
+        return report
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise AuditError(f"{manifest_path}: cannot load run manifest: {exc}") from exc
+    if not isinstance(manifest, dict) or manifest.get("schema") != "noema.training_run.v2":
+        raise AuditError(f"{manifest_path}: expected noema.training_run.v2")
+    plan = manifest.get("dataset_quality")
+    if not isinstance(plan, dict) or plan.get("audit_schema") != report["audit_schema"]:
+        raise AuditError(f"{manifest_path}: dataset_quality audit schema mismatch")
+    fail_on, warn_on = plan.get("fail_on"), plan.get("warn_on")
+    if not isinstance(fail_on, list) or not all(isinstance(code, str) and code for code in fail_on):
+        raise AuditError(f"{manifest_path}: invalid dataset_quality.fail_on")
+    if not isinstance(warn_on, list) or not all(isinstance(code, str) and code for code in warn_on):
+        raise AuditError(f"{manifest_path}: invalid dataset_quality.warn_on")
+    if set(fail_on) & set(warn_on):
+        raise AuditError(f"{manifest_path}: fail_on and warn_on must be disjoint")
+    if plan.get("unknown_policy") != "block_promotion":
+        raise AuditError(f"{manifest_path}: unknown dataset quality outcomes must block promotion")
+    for field in ("report_ref", "dataset_manifest"):
+        if not isinstance(plan.get(field), str) or not plan[field].strip():
+            raise AuditError(f"{manifest_path}: missing dataset_quality.{field}")
+
+    observed = {item["code"] for item in report["finding_counts"]}
+    unknown_codes = sorted(observed - set(fail_on) - set(warn_on))
+    hard_errors = sum(item["count"] for item in report["finding_counts"] if item["severity"] == "error")
+    hard_policy = sorted(observed & set(fail_on))
+    warnings = sorted(observed & set(warn_on))
+    if hard_errors or hard_policy:
+        policy_result = "fail"
+    elif unknown_codes:
+        policy_result = "unknown_blocked"
+    elif warnings:
+        policy_result = "review_required"
+    else:
+        policy_result = "pass"
+    canonical = json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    manifest_hash = hashlib.sha256(json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    report["manifest_binding"] = {
+        "run_id": manifest.get("run_id"),
+        "dataset_manifest": plan["dataset_manifest"],
+        "report_ref": plan["report_ref"],
+        "manifest_hash": manifest_hash,
+        "objective_report_hash": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        "unknown_codes": unknown_codes,
+        "warning_codes": warnings,
+    }
+    report["manifest_policy_result"] = policy_result
+    report["quality_policy_passed"] = policy_result == "pass"
+    # This CLI emits an audit result only. Release promotion also requires the
+    # LIR gate, authenticated report/event persistence and review policy.
+    report["promotion_allowed"] = False
+    report["promotion_blocker"] = "audit_cli_is_not_a_release_promoter"
+    if policy_result in {"fail", "unknown_blocked"}:
+        report["release_gate"] = "fail"
+    elif policy_result == "review_required":
+        report["release_gate"] = "review"
+    return report
+
+
+def audit(path: Path, manifest_path: Path | None = None) -> dict[str, Any]:
     details: list[dict[str, str]] = []
     records = 0
     with tempfile.TemporaryDirectory(prefix="noema-dataset-audit-") as temp_dir:
@@ -200,7 +264,7 @@ def audit(path: Path) -> dict[str, Any]:
             error_count = sum(item["count"] for item in finding_counts if item["severity"] == "error")
             total_findings = sum(item["count"] for item in finding_counts)
             details.sort(key=lambda item: (item["severity"], item["code"], item["record"], item.get("first", "")))
-            return {
+            report = {
                 "audit_schema": "noema.dataset_audit.v1",
                 "dataset": path.name,
                 "records": records,
@@ -217,6 +281,7 @@ def audit(path: Path) -> dict[str, Any]:
                 "python_heap_detail_cap": MAX_FINDINGS,
                 "limitations": ["No fuzzy or semantic duplicate detection.", "No payload, license, consent authenticity, label truth, privacy, or model-quality verification.", "Warnings require human review; a clean audit is not a quality certification."],
             }
+            return _bind_quality_plan(report, manifest_path)
         finally:
             db.close()
 
@@ -225,20 +290,23 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("dataset", type=Path, help="JSONL dataset")
     parser.add_argument("--report", type=Path, help="write deterministic JSON report")
+    parser.add_argument("--manifest", type=Path, help="bind the audit result to a noema.training_run.v2 dataset_quality plan")
     args = parser.parse_args(argv)
     try:
-        report = audit(args.dataset)
+        report = audit(args.dataset, args.manifest)
     except (AuditError, sqlite3.Error) as exc:
         print(f"INVALID: {exc}", file=sys.stderr)
         return 2
     rendered = json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
     if args.report:
         args.report.write_text(rendered, encoding="utf-8")
-    print(f"{report['dataset']}: {report['records']} records; gate={report['release_gate']}; findings={report['total_findings']}")
+    print(f"{report['dataset']}: {report['records']} records; gate={report['release_gate']}; policy={report['manifest_policy_result']}; findings={report['total_findings']}")
     for finding in report["findings"]:
         print(f"{finding['severity'].upper()} {finding['code']} {finding['record']}")
     if report["findings_truncated"]:
         print(f"NOTE findings truncated to first {MAX_FINDINGS}; full counts are in the report")
+    if report["manifest_policy_result"] not in {"not_evaluated", "pass"}:
+        return 1
     return 1 if report["release_gate"] == "fail" else 0
 
 
