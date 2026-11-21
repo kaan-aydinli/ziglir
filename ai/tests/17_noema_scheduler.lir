@@ -1,0 +1,62 @@
+// NOEMA Stage 3: deterministic task DAG scheduling regression tests.
+import "../src/noema_scheduler.lir"
+
+fn main() -> i64 {
+    var checks: i64 = 0
+    var passed: i64 = 0
+    let edges = @malloc(16 * 8)
+    let done = @malloc(4 * 8)
+    var i: i64 = 0
+    while i < 16 { @write_u64(@ptr_add(edges, i * 8), 0 as u64) i = i + 1 }
+    i = 0
+    while i < 4 { @write_u64(@ptr_add(done, i * 8), 0 as u64) i = i + 1 }
+    // 0 -> 2, 1 -> 2, 2 -> 3. Independent roots are chosen by lowest ID.
+    @write_u64(@ptr_add(edges, 2 * 8), 1 as u64)
+    @write_u64(@ptr_add(edges, 1 * 4 * 8 + 2 * 8), 1 as u64)
+    @write_u64(@ptr_add(edges, 2 * 4 * 8 + 3 * 8), 1 as u64)
+
+    checks = checks + 1
+    if dag_next_ready(4, edges, done) == 0 { passed = passed + 1 }
+    @write_u64(done, 1 as u64)
+    checks = checks + 1
+    if dag_next_ready(4, edges, done) == 1 { passed = passed + 1 }
+    @write_u64(@ptr_add(done, 8), 1 as u64)
+    checks = checks + 1
+    if dag_next_ready(4, edges, done) == 2 { passed = passed + 1 }
+    @write_u64(@ptr_add(done, 16), 1 as u64)
+    checks = checks + 1
+    if dag_next_ready(4, edges, done) == 3 { passed = passed + 1 }
+    @write_u64(@ptr_add(done, 24), 1 as u64)
+    checks = checks + 1
+    if dag_next_ready(4, edges, done) == DAG_COMPLETE { passed = passed + 1 }
+
+    let cycle_edges = @malloc(4 * 8)
+    let cycle_done = @malloc(2 * 8)
+    @write_u64(cycle_edges, 0 as u64)
+    @write_u64(@ptr_add(cycle_edges, 8), 1 as u64)
+    @write_u64(@ptr_add(cycle_edges, 16), 1 as u64)
+    @write_u64(@ptr_add(cycle_edges, 24), 0 as u64)
+    @write_u64(cycle_done, 0 as u64)
+    @write_u64(@ptr_add(cycle_done, 8), 0 as u64)
+    checks = checks + 1
+    if dag_next_ready(2, cycle_edges, cycle_done) == DAG_CYCLE { passed = passed + 1 }
+
+    let self_edges = @malloc(8)
+    @write_u64(self_edges, 1 as u64)
+    checks = checks + 1
+    if dag_next_ready(1, self_edges, cycle_done) == DAG_INVALID { passed = passed + 1 }
+
+    @write_u64(cycle_done, 2 as u64)
+    checks = checks + 1
+    if dag_next_ready(2, cycle_edges, cycle_done) == DAG_INVALID { passed = passed + 1 }
+    checks = checks + 1
+    if dag_next_ready(65, edges, done) == DAG_INVALID { passed = passed + 1 }
+    checks = checks + 1
+    if dag_next_ready(0, edges, done) == DAG_COMPLETE { passed = passed + 1 }
+
+    printInt(passed)
+    print("/")
+    printInt(checks)
+    println("")
+    return 0
+}

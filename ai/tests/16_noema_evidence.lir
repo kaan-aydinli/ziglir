@@ -1,0 +1,50 @@
+// NOEMA Stage 2: evidence identity/scope and artifact reference checks.
+import "../src/noema_evidence.lir"
+
+fn main() -> i64 {
+    var checks: i64 = 0
+    var passed: i64 = 0
+
+    checks = checks + 1
+    if evidence_record_valid(1, 2, 10, 11, 7, 7, 1) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if evidence_record_valid(1, 2, 10, 10, 7, 7, 1) == 0 { passed = passed + 1 }
+    checks = checks + 1
+    if evidence_record_valid(1, 2, 10, 11, 7, 8, 1) == 0 { passed = passed + 1 }
+    checks = checks + 1
+    if evidence_record_valid(0, 2, 10, 11, 7, 7, 1) == 0 { passed = passed + 1 }
+    checks = checks + 1
+    if evidence_record_valid(1, 2, 10, 11, 7, 7, 0) == 0 { passed = passed + 1 }
+
+    let ref_o = @malloc(16)
+    let ref_e = @malloc(16)
+    let rec_o = @malloc(16)
+    let rec_e = @malloc(16)
+    @write_u64(ref_o, 2 as u64)
+    @write_u64(@ptr_add(ref_o, 8), 3 as u64)
+    @write_u64(ref_e, 20 as u64)
+    @write_u64(@ptr_add(ref_e, 8), 30 as u64)
+    @write_u64(rec_o, 2 as u64)
+    @write_u64(@ptr_add(rec_o, 8), 3 as u64)
+    @write_u64(rec_e, 20 as u64)
+    @write_u64(@ptr_add(rec_e, 8), 30 as u64)
+
+    checks = checks + 1
+    if artifact_evidence_refs_valid(2, ref_o, ref_e, 2, rec_o, rec_e) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    @write_u64(@ptr_add(ref_e, 8), 99 as u64)
+    if artifact_evidence_refs_valid(2, ref_o, ref_e, 2, rec_o, rec_e) == 0 { passed = passed + 1 }
+    @write_u64(@ptr_add(ref_e, 8), 20 as u64)
+    @write_u64(@ptr_add(ref_o, 8), 2 as u64)
+    @write_u64(@ptr_add(ref_e, 8), 20 as u64)
+    checks = checks + 1
+    if artifact_evidence_refs_valid(2, ref_o, ref_e, 2, rec_o, rec_e) == 0 { passed = passed + 1 }
+    checks = checks + 1
+    if artifact_evidence_refs_valid(0, ref_o, ref_e, 2, rec_o, rec_e) == 1 { passed = passed + 1 }
+
+    printInt(passed)
+    print("/")
+    printInt(checks)
+    println("")
+    return 0
+}

@@ -1,6 +1,6 @@
 # NOEMA — Analog-Doğal, Doğrulama-Kapılı Muhakeme Mimarisi
 
-**Durum:** v2.2 — tasarım + ilk yürütülebilir LIR sözleşme dilimi. NOEMA'nın geri kalan runtime/training/retrieval katmanları uygulanmadı.
+**Durum:** v2.3 — tasarım + LIR ile uygulanmış ilk üç çekirdek dilim (TTA, evidence refs, task DAG). NOEMA'nın geri kalan runtime/training/retrieval katmanları uygulanmadı.
 **Amaç:** `ai/` çatısının dışına ve SEL'in üstüne sıfırdan kurulan, **muhakeme-öncelikli** yeni mimarinin eksiksiz tanımı.
 **Bu deponun kuralı (iddia = ölçüm) bu belge için de geçerlidir:** aşağıda geçen her "hedef", "kestirim" ya da "beklenti" açıkça **ölçülmemiştir**. Ölçülmüş tek sayılar, mevcut SEL çekirdeğine aittir ve öyle etiketlenmiştir. Bu belge bir *vaad* değil, bir *ölçülecek hipotezler listesi*dir.
 
@@ -2008,8 +2008,8 @@ Mimari tek PR'da “tamamlandı” işaretlenmeyecek. Uygulama sırası bağıml
 |---|---|---|---|---|
 | 0 | Compiler/toolchain pin + test harness | `zig build`, `ai/run_tests.py` | pinned compiler; backend regression baseline | Bu ortamda Zig 0.13.0 ile doğrulandı |
 | 1 | `ai/src/noema_contracts.lir`: TTA obligation lifecycle ve independent evidence/scope gate | `ai/tests/15_noema_contracts.lir` | legal/illegal transition + close precondition testleri native/VM/C | **Uygulandı; 12/12 fixture assertion geçti, test runner'da 3 backend** |
-| 2 | LIR `EvidenceRecord`/scope helpers: evidence-level enum validation, non-empty source/verifier identity, producer≠verifier, evidence→obligation bağlantı sözleşmeleri | JSONL parse/stream host adapter; exact artifact refs LIR core'a typed args | dangling ref 0; wrong scope/producer self-check red tests | Sıradaki |
-| 3 | LIR deterministic task DAG: dependency-ready seçimi, cycle detection, step/compute budget, partial/abstain terminal states | Python/host runner yalnız I/O, checkpoint ve immutable event persistence | replay hash aynı; cycle/budget/cancel fault fixtures | Bekliyor |
+| 2 | LIR `EvidenceRecord`/scope helpers: positive ID, producer≠verifier, evidence pass, exact scope ve artifact→obligation/evidence refs | JSONL parse/stream host adapter; LIR'e numeric identity ve relation arrays | dangling/duplicate ref, wrong scope/self-check red tests | **Uygulandı; 9/9 fixture assertion, native/VM/C** |
+| 3 | LIR deterministic task DAG: dependency-ready seçimi, cycle/invalid-input detection, 64-task cap | Host runner yalnız I/O, checkpoint ve immutable event persistence | deterministic order, cycle/budget/cancel fault fixtures | **İlk DAG çekirdeği uygulandı; 10/10 fixture assertion, native/VM/C. Event replay/budget/cancel henüz yok** |
 | 4 | Dataset eligibility/split primitives: policy decisions, grouped split plan, quality-gate result aggregation | mevcut Python JSONL/disk auditor I/O'su; signed source/dataset manifest | leakage/unknown policy fail closed, large corpus bounded RSS; audit report ref run manifest'e bağlanır | Bekliyor |
 | 5 | Capability graph routing: `CapabilityNode` scope/prerequisite/evidence gates, explicit unsupported state | current-version registry ve per-skill eval adapters | unsupported node auto-route yok; unseen composition aparteval | Bekliyor |
 | 6 | Memory/CAG typed keys, permission/freshness/dependency invalidation decisions | storage/index/connector adapters, tenant isolation | cache on/off correctness invariant, deletion/ACL fault suite | Bekliyor |
@@ -2018,7 +2018,7 @@ Mimari tek PR'da “tamamlandı” işaretlenmeyecek. Uygulama sırası bağıml
 
 Each stage must add LIR unit/regression fixture and expected output, run **native + VM + C** where semantics are supported, and preserve previous AI/core/compiler tests. Other targets are added only when their backend coverage is declared and available. Keep LIR core pure/deterministic where possible; never claim formal proof from ordinary test output. Bridge code is independently checked for permission, bounds, error propagation, cancellation and payload identity.
 
-### 38.2 Stage 1 implemented: pure transition guard
+### 38.2 Stages 1–3 implemented: TTA, evidence gate and deterministic scheduler
 
 `ai/src/noema_contracts.lir` now defines stable numeric state constants and a pure guard:
 
@@ -2033,12 +2033,16 @@ REJECTED → terminal
 
 `CANDIDATE → CLOSED` additionally requires evidence present, verifier passed, producer/verifier independence and exact scope match. `CANDIDATE → REJECTED` requires failed verifier. Function returns only allow/deny; it does not mutate a database or append events. Caller must persist accepted transition as an immutable, authenticated event; authorization, ID uniqueness and evidence content verification are not yet implemented by this stage.
 
-Test `ai/tests/15_noema_contracts.lir` exercises 12 positive/negative assertions. Validation in this session: `python3 ai/run_tests.py` reports **40 passed, 0 failed** over all AI LIR fixtures/backends; `zig build test` also passes with Zig 0.13.0. These establish fixture/compiler correctness for this implemented code, not NOEMA capability or model quality. Zig 0.13.0 was installed into temporary sandbox tooling from the PyPI `ziglang` package; it was not added as a repository/runtime dependency.
+Test `ai/tests/15_noema_contracts.lir` exercises 12 positive/negative assertions. Stage 2 adds `ai/src/noema_evidence.lir`: `evidence_record_valid` checks positive IDs, verifier pass, producer/verifier separation and exact scope; `artifact_evidence_refs_valid` checks exact obligation/evidence pairs, rejects duplicates/dangling references and bounds each list to 256 entries. `ai/tests/16_noema_evidence.lir` covers 9 positive/negative cases. This is numeric reference validation only—not cryptographic ID authentication, payload hash verification, permissions or persistence.
+
+Stage 3 adds `ai/src/noema_scheduler.lir`. The pure DAG scheduler interprets a bounded (max 64 nodes) adjacency matrix, checks binary/done/self-edge validity, picks the lowest-ID currently-ready node deterministically, and reports complete, cycle/deadlock or invalid input. `ai/tests/17_noema_scheduler.lir` covers 10 assertions. It does not persist cursor/events, enforce compute/time budgets, cancel jobs or execute tasks; caller owns valid buffers and durable event state.
+
+Validation in this session: `python3 ai/run_tests.py` reports **46 passed, 0 failed** over all AI LIR fixtures/backends; `zig build test` passes with Zig 0.13.0; all 18 Python data/validator tests pass. These establish fixture/compiler correctness for implemented code, not NOEMA capability or model quality. Zig 0.13.0 was installed into temporary sandbox tooling from the PyPI `ziglang` package; it was not added as a repository/runtime dependency.
 
 ### 38.3 Stage completion rules
 
 No stage starts while its predecessor's contract, tests and versioned data fixture are incomplete. A LIR return code is not a proof kernel certificate unless the checker soundness boundary is established. Any failing gate blocks the next stage, and explicit event/report contains failed IDs. Approximate retrieval, model self-score, or passing its own generated tests cannot promote a capability alone. A capability is implemented only when code, tests, caller integration, resource/security limits, observability and rollback are all present.
 
-**Current limit:** Stage 1 is a deliberately small slice. NOEMA event storage, dataset ingestion in LIR, evidence payload validation, task graph, retrieval, memory, training and serving still do not run as one system. This section records actual sequence and status so that the architecture is built, not merely described, one verifiable boundary at a time.
+**Current limit:** Stages 1–3 implement pure guards only. No durable event store, real evidence payload/hash validation, task execution, retry/checkpoint/budget/cancellation, dataset ingestion integration, retrieval, memory, training or serving pipeline runs end-to-end. Stage 4 is next: dataset eligibility/split primitives and a manifest-bound quality-audit result; the Python host remains responsible for JSONL/disk I/O while pure decisions are implemented/tested in LIR.
 
-*Belge sürümü: v2.2 — 2026-11-16. LIR uygulama sırası sabitlendi; TTA transition guard ilk yürütülebilir dilim olarak eklendi ve üç AI backend'inde test edildi.*
+*Belge sürümü: v2.3 — 2026-11-16. LIR ile TTA, evidence reference checks ve bounded deterministic DAG scheduler uygulandı; native/VM/C testleri geçti.*
