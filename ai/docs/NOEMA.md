@@ -1,6 +1,6 @@
 # NOEMA — Analog-Doğal, Doğrulama-Kapılı Muhakeme Mimarisi
 
-**Durum:** v0.3 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
+**Durum:** v0.4 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
 **Amaç:** `ai/` çatısının dışına ve SEL'in üstüne sıfırdan kurulan, **muhakeme-öncelikli** yeni mimarinin eksiksiz tanımı.
 **Bu deponun kuralı (iddia = ölçüm) bu belge için de geçerlidir:** aşağıda geçen her "hedef", "kestirim" ya da "beklenti" açıkça **ölçülmemiştir**. Ölçülmüş tek sayılar, mevcut SEL çekirdeğine aittir ve öyle etiketlenmiştir. Bu belge bir *vaad* değil, bir *ölçülecek hipotezler listesi*dir.
 
@@ -593,3 +593,103 @@ K22: veri verimliliği — aynı kalite eşiğinde çözülen yeni kural ailesi 
 `example.jsonl` için ilk alıştırma: `arithmetic` ve `planning` örneklerinin train altkümesinde tam çalışan deterministic validator yaz; `abstain` örneğinde eksik birim yüzünden uydurma hesap yapılmadığını doğrula; `causal` satırında korelasyonun müdahale sonucu diye sunulmadığını test et. Sonra aynı kuralları kullanan ama farklı sabit seed/kural bileşimiyle üretilmiş holdout oluştur. Örnek dosyanın kendi satırlarını hem train hem test kullanmak geçersizdir.
 
 *Belge sürümü: v0.3 — 2026-11-20. Mimari ve eğitim planı tasarımdır; implementasyon, maliyet ve yetenek sonucu henüz yoktur.*
+
+## 20. v0.4 — Uçtan uca framework ve kayıpsız sürekli ön-eğitim
+
+**Durum: tasarım; uygulanmış eğitim altyapısı değildir.** Bu bölüm tüm AI framework yaşam döngüsünü ve "lossless continuous pretraining" talebini operasyonel olarak tanımlar. "Kayıpsız" tek anlamlı bir vaat değildir; burada üç farklı garanti ayrılır.
+
+### 20.1 Kayıpsızlığın kesin anlamı ve imkânsız vaatler
+
+| Katman | Tasarım garantisi | Garanti edilmeyen şey |
+|---|---|---|
+| Ham kaynak kaydı | İzinli ve saklanması hukuken uygun her kayıt, özgün baytlarıyla, checksum ve provenansla değişmez nesne deposuna yazılır; normalizasyon ayrı türetilmiş nesnedir. | Fiziksel arızaya karşı mutlak ölümsüzlük; yedek ve restore testleri riski azaltır. |
+| Öğrenme olayı | Her kabul, ret, düzeltme ve sürüm append-only event log'a yazılır; aynı snapshot + event dizisi deterministik dijital backend'de tekrar oynatılabilir. | Analog backend'de bit-bit tekrar üretim. |
+| Bilgi/beceri | Önceki bilgi arşivde tutulur; aday model geçmiş prob testlerini geçmeden terfi etmez; eski sürüme rollback mümkündür. | Sınırlı parametrede keyfi büyüyen tüm bilginin kayıpsız sıkıştırılması veya her görevin aynı kalması. |
+| Silme/mahremiyet | Onaylı silme isteği ham nesne ve türevlerini policy'ye göre erişilemez kılar; içeriksiz tombstone audit izi bırakır. | İçeriği silip aynı anda geri getirilebilir kopya saklamak. |
+
+Burada **lossless**, "izinli stream kaydı sessizce atılmaz veya aslı yok edilerek dönüştürülmez" demektir; model ağırlıklarının her örneği unutmasız özümsemesi değildir. Model sınırlı/değişebilir, arşiv gerçeğin kaynağıdır. Depolama kotası dolarsa sistem sessizce veri düşürmez: ingest'i durdurur/geri basınç uygular veya açık politikayla tiered storage'a taşır.
+
+### 20.2 Tam framework bileşenleri
+
+NOEMA tek model dosyası değil, sürümlenmiş modüllerdir. Başlangıçta tek süreç olabilir; arayüzler değişmeden worker'lara ayrılabilir.
+
+```
+İstemci/API → A Girdi kapısı → B Güvenlik/izin/PII
+  → C Çok-kipli alıcılar (metin/ses/görüntü/tablo/sensör/kod)
+  → D Anlam ve olay grafı (alternatif yorum, birim, provenans)
+  → E Görev yönlendirici → F Uzman motorları
+       ├─ VGPS proof/kural arama       ├─ exact math/kod sentezi
+       ├─ STF dünya/nedensel model     ├─ planlama/kısıt çözümü
+       ├─ algı/ölçüm adaptörleri       └─ E/M/P retrieval
+  → G Bağımsız doğrulayıcı + çürütücü + güven kalibratörü
+       ├─ geçer → H yanıt/araç onayı
+       └─ kalmaz → yeniden ara / soru sor / çekimser kal
+  → I Epizot yazıcısı → J İzole sürekli öğrenme hattı
+       ├─ tüm kapılar geçer → imzalı sürüm deposu
+       └─ hata → karantina / ret / rollback
+```
+
+Ortak protokoller: `TaskContract` görev, izin ve bütçeyi; `EvidenceRecord` iddia-kaynak-validator bağını; `MemoryEvent` bellek/öğrenme değişikliğini; `ToolCall` izin, yan etki ve timeout'u taşır. Her nesnede `schema_version`, `run_id`, `timestamp`, `producer_version`, `provenance_id` vardır. Şema dönüşümü eski kaydı overwrite etmez; yeni sürümlü görünüm üretir.
+
+### 20.3 Sürekli ön-eğitim hattı
+
+Ön-eğitim burada next-token corpus optimizasyonu değil, yeni örnek/olaylardan algı adaptörü, kural deposu ve küçük yönlendirici parametrelerini kontrollü güncelleyen sürekli yetenek öğrenimidir.
+
+1. **Alım:** izinli örnek özgün baytları, kaynak/lisans/onam, zaman, hash ve kip bilgisiyle `raw_object` deposuna yazılır. Saklama izni yoksa içerik tutulmaz.
+2. **Tekrar bulma:** hash/fuzzy-match tekrarları bulur; yeni gözlem event'i yine kaydedilir. Dedup ham kaydı silmez, aynı nesneye referans verir.
+3. **Ön işleme:** Unicode/OCR/ASR/feature dönüşümleri türetilmiş artifact'tir; kaynak değişmez, dönüşüm sürümü ve kayıplı alan listesi saklanır.
+4. **Güvenlik/kalite:** PII, lisans, poisoning, enjeksiyon ve bozuk etiket taranır. Karantina verisi canlı bellek/eğitime giremez.
+5. **Örnek tipi:** `supervised`, `self_supervised`, `verified_trace`, `preference`, `correction`, `unlabeled`; her sınıf için izinli hedef ve provenans ayrı tutulur. Modelin kendi çıktısı gerçek etiket sayılmaz.
+6. **Hedef:** verified trace → kural adayı; correction → önceki hata ile düzeltme bağlantısı; unlabeled → yalnız kendinden denetimli sinyal, kesin dünya bilgisi değil.
+7. **Aday öğrenim:** küçük yerel adaptör/kural adayları izole snapshot'ta üretilir; başlangıç sürümü ve algoritma kaydedilir. Canlı model çevrimiçi ağırlık güncellemez.
+8. **Replay:** yeni örneğe ek olarak izinli eski prob/retention örnekleri, sentetik counterexample ve adversarial set kullanılır. Seçim deterministik ve seed'li. Silinmiş içerik replay'e giremez.
+9. **Bağımsız doğrulama:** exact/property/holdout/kalibrasyon/safety testleri eğitim hedefinden ayrı kod yoluyla çalışır; üretici kendi başarısını onaylayamaz.
+10. **Terfi:** tüm kapılar, provenans ve policy geçerse imzalı sürüm registry'ye girer; hassas davranış değişiminde insan onayı gerekir. Aksi halde karantina, canlı sürüm sabit.
+11. **Dağıtım:** offline replay → shadow (yanıt vermeden karşılaştır) → düşük riskli canary. SLO/regresyon bozulursa rollback.
+12. **Düzeltme/silme:** düzeltme yeni event; geçmiş overwrite edilmez. Silme raw, kopya, cache, index, feature, replay planı ve kural bağımlılıklarını takip eder; yedek expiry'si policy'de belirlenir.
+
+### 20.4 Eski yeteneklerin korunması
+
+Her görev ailesi için kilitli prob setinde update öncesi `old_score`, sonrası `new_score` ölçülür. Ortalama skor tek kritik kaybı saklayamaz; her alan ve altgrup ayrı kapı.
+
+- Proof kernel, güvenlik politikası ve exact aritmetik: test kapsamındaki kritik invariant'larda sıfır regresyon.
+- Dil/algı/kestirim: önceden tanımlı tolerans, grup ve dağılım kırılımlarıyla kalibrasyon.
+- Kural terfisi: destekleyici örnek + çürütücüler birlikte saklanır. Çürütülünce kural `retracted/superseded` yapılır; audit izi kalır.
+- Parametre değişimi eşdeğer çıktı garantisi vermezse bu **kayıpsız update değildir**; aday sürüm, risk ve rollback bilgisiyle raporlanır.
+- Snapshot + config + izinli data manifest + seed tarihsel tekrar sağlar; tüm tarihsel bilgiyi tek küçük modele sıkıştırmaz.
+
+Bu, ölçülen testlerde forgetting'i azaltmayı hedefler; test edilmemiş her görevde unutmayı matematiksel olarak önlemez. Sonlu model durumu, keyfi büyüyen akışın tüm bilgisini kayıpsız temsil edemez. Gerçek kayıpsızlık büyüyebilen arşiv ister; bunun bedeli depolama ve aramadır.
+
+### 20.5 Sürekli öğrenme event şeması
+
+Örnekler [`ai/noema-training/continual_events.jsonl`](../noema-training/continual_events.jsonl) içinde. Event türleri: `observation` (raw content-addressed ref), `correction`, `candidate_update`, `evaluation`, `promotion`/`rejection`/`rollback`, `deletion`. Dosyadaki değerler demo/yer tutucudur; hash, imza veya skorlar gerçek ölçüm değildir.
+
+Log append-only'dir ama kişisel veri içermez. Hash/pseudonymous id bile bazı bağlamlarda kişisel veri sayılabilir; erişim ve retention policy gerekir. Hashing şifreleme/anonimleştirme değildir.
+
+### 20.6 Eğitim ve servis işletimi
+
+**Offline factory:** manifest'i dondur → adayı üret → regression/benchmark/red-team → model+kurallar+schema+lineage manifestini paketle → imzala.
+
+**Online serving:** inference sürümü pinlidir; kullanıcı verisi varsayılan olarak ağırlık güncellemez. Feedback consent/policy sonrası kuyruğa girer. Tenant verisi açık izin ve izolasyon olmadan global eğitime geçmez.
+
+**Gözlemlenebilirlik:** p50/p95 latency, timeout, abstention, verifier fail, tool error, memory hit, drift, enerji ve maliyet; içerik loglamak yerine hassasiyetsiz sayaçlar. Yanıt model/rule/validator sürümüne bağlanır; rollback imzalı eski snapshot'a döner.
+
+**Güvenlik:** araçlar least privilege; kod sandbox ve kaynak limiti; model çıktısı doğrudan shell veya fiziksel eylem yetkisi değildir. Destructive/high-impact eylemde kapsamlı izin, insan onayı ve son durum doğrulaması gerekir. Poisoning şüphesinde kaynak karantinaya alınır, dependency grafı taranır.
+
+### 20.7 Yeni ölçüm kapıları
+
+| Kapı | Ölçüm | Başarı yorumu |
+|---|---|---|
+| K24 — ingest integrity | raw event hash eşleşmesi + restore testleri | test edilen saklama koşullarında kayıp 0; mutlak ölümsüzlük değil |
+| K25 — replay determinism | aynı snapshot/manifest/seed dijital tekrarları | event/snapshot eşitliği; analog backend kapsam dışı |
+| K26 — forgetting | her update sonrası eski görev ailesi ve invariant | önkayıtlı eşik; yalnız test paneli kapsamında |
+| K27 — düzeltme yayılımı | yanlış türetilmiş index/kural bulunup retraction | dependency kapsamı ve kaçak riski raporlanır |
+| K28 — silme uyumu | sentetik veri yaşam döngüsü: raw/copy/cache/index/replay/artifact | policy kapsamındaki erişim kesilir; model unlearning ayrıca ölçülür |
+| K29 — continual maliyeti | saat/enerji/etiket/byte/update gecikmesi | aynı kalite ve donanımda baseline |
+| K30 — staged rollout | shadow/canary tespit ve rollback süresi | SLO önceden belirlenir |
+
+### 20.8 Tasarımı uygulamaya bağlayan kararlar
+
+Framework arayüzleri ve yaşam döngüsü burada tanımlıdır; uygulama başlamadan ADR ile sabitlenecekler: (1) LIR ABI ve worker sınırları; (2) disk object-store/index; (3) izin, retention ve silme policy'si; (4) ilk görev ailesi (öneri: LIR kod sentezi + matematik); (5) bütçe/latency profili; (6) manifest/validator imza biçimi. Kullanıcı verisi politikası netleşmeden canlı sürekli öğrenme açılmamalıdır.
+
+*Belge sürümü: v0.4 — 2026-11-20. Uçtan uca tasarım ve kayıpsız ingest/denetimli öğrenme protokolü eklendi; uygulama veya forgetting maliyet ölçümü yoktur.*
