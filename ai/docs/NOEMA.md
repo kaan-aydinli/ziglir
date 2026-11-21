@@ -1,6 +1,6 @@
 # NOEMA — Analog-Doğal, Doğrulama-Kapılı Muhakeme Mimarisi
 
-**Durum:** v1.2 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
+**Durum:** v1.3 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
 **Amaç:** `ai/` çatısının dışına ve SEL'in üstüne sıfırdan kurulan, **muhakeme-öncelikli** yeni mimarinin eksiksiz tanımı.
 **Bu deponun kuralı (iddia = ölçüm) bu belge için de geçerlidir:** aşağıda geçen her "hedef", "kestirim" ya da "beklenti" açıkça **ölçülmemiştir**. Ölçülmüş tek sayılar, mevcut SEL çekirdeğine aittir ve öyle etiketlenmiştir. Bu belge bir *vaad* değil, bir *ölçülecek hipotezler listesi*dir.
 
@@ -556,7 +556,7 @@ TaskContract {
 - **E1 — Öğretmenli görev tanımı:** eğitim örnekleri doğal dil hedefi, kanonik anlam grafı, çözüm/eylem, kanıt standardı ve validator içerir. Aynı örnekten yüzey paraphrase'leri otomatik türetilir; paraphrase'ler ayrı yeni bilgi sayılmaz.
 - **E2 — Sentetik üretim:** küçük DSL'de rastgele dünya/denklem/program üret; referans çözücünün sonucu ve adım izini kaydet. Parametreleri ve random seed'i sakla. Üretici ile doğrulayıcı aynı kod yoluna bağımlı olmamalı; küçük bir bağımsız örnek kümesi elle kontrol edilir.
 - **E3 — Karşı-örnek ve kontrast:** doğru örneklerin yanına tek bir koşulu değiştiren, çelişkili veya yetersiz bilgi taşıyan örnek koy. Doğru davranış bazen çözmek, bazen soru sormak, bazen çekimser kalmaktır.
-- **E4 — Yerel kalibrasyon:** SEL/eikonal yalnız görev yönlendirici, eşik ve algı adaptörünün küçük parametrelerini günceller. Bu güncelleme bir deney dalında tutulur; önce/sonra regresyon paneli çalışmadan ana sürüme alınmaz.
+- **E4 — Yerel kalibrasyon:** v0.9 core için SEL/eikonal zorunlu değildir. İstenirse yalnız karşılaştırma/uyumluluk modülü olarak route/algı adaptörünün küçük parametrelerini izole candidate branch'te günceller; K43 ablation ve retention paneli geçmeden ana sürüme alınmaz.
 - **E5 — Kural keşfi:** tekrar eden doğru alt-izlerden anti-unification ile kural adayı çıkar. Kural, eğitim örneği dışındaki holdout ve üretilmiş çürütücüleri geçmeden kullanılabilir belleğe girmez.
 - **E6 — Müfredat:** tek değişkenli basit görev → birden çok kuralın bileşimi → belirsizlik/çelişki → dağılım dışı kombinasyon → araç ve uzun plan. Her basamakta öğrenme maliyeti, çözüm ve aşırı uyum kaydı tutulur.
 - **E7 — İnsan emeğini düşük tutma:** rutin sentetik örnekler otomatik kanıtla etiketlenir; yalnız validator uyuşmazlığı, semantik belirsizlik ve riskli örnekler insan incelemesine gider. İnsan emeği ayrıca raporlanır, sıfır varsayılmaz.
@@ -922,7 +922,7 @@ Tüm katalogu birden uygulamak yerine, framework'ün tam yaşam döngüsünü do
 1. `reasoning` ve `code` text-only; girdi `noema.example.v2`, küçük LIR programı ve arithmetic/array-bounds kuralları.
 2. Exact validator: parser/checker/compiler + unit/property tests; dış tool ve canlı kullanıcı verisi yok.
 3. Immutable fixture store + manifest hash + training run event log; deletion path sentetik data ile test edilir.
-4. Candidate rule induction + SEL yerel yönlendiricisi ayrı sürümlenir; online update yok.
+4. Candidate rule induction (v0.9 TTA sözleşme türetimi) ve optional SEL compatibility probe ayrı sürümlenir; SEL çekirdeğe zorunlu değildir, online update yok.
 5. Sabit 3 split: train, rule-family holdout, adversarial/retention. Aynı üretim seed'leri testte görülmez.
 6. Run başına gate: schema/provenance → baseline → candidate → proof/tests → retention → deterministic replay → cost report → review.
 7. Başarılı package shadow'da çalışır; gerçek serving/promote sonraki ADR ve güvenlik review'ına bağlıdır.
@@ -1030,7 +1030,7 @@ Bu sürüm, "başka sistemlerde kullanılan hiçbir özellik olmasın" talebini 
 - §3 H/VSA ve faz vektörü **artık çekirdek semantik değildir**; deneysel, kapatılabilir retrieval/cache backend'i olarak arşivlenir. Eğitim, doğruluk veya görev yönlendirme buna bağımlı olamaz.
 - §5 SDM/holografik M, §6 eikonal/SEL, LSH ve §4 enerji inişi **çekirdekten çıkarılır**. SEL geriye uyumluluk/karşılaştırma modülüdür, NOEMA'nın zorunlu öğrenme motoru değildir.
 - §4'teki VGPS adı, yalnızca aşağıdaki yeni işletim modeli için kullanılır; klasik program araması/kural rewrite ile eşanlamlı değildir. Kod sentezi araç/özel görev adaptörü olarak kalabilir.
-- Önceki §2 katman diyagramı tarihsel tasarım sürümüdür; aşağıdaki §25.2 çekirdek için üstün (normative) tanımdır. Eski adı taşıyan bir backend ancak etkinleştirme manifesti ve benchmark'ıyla açılır.
+- Önceki §2 katman diyagramı ve §11 faz tablosu tarihsel tasarım sürümüdür; aşağıdaki §25.2 ve §25.7 core tanımıdır. Eski adı taşıyan bir backend ancak etkinleştirme manifesti ve benchmark'ıyla açılır.
 - Basit tam sayı işlemleri, disk, graph, hash/checksum, queue, parser ve test yine gerekir. Bunların başka sistemlerde de kullanılması kaçınılmaz genel altyapıdır; özgünlük iddiası sayılmaz.
 
 ### 25.2 Yeni merkezî primitive: Taahhüt–Tanık Akışı (TTA)
@@ -1328,3 +1328,92 @@ Geniş iddia için önceden kaydedilmiş benchmark suite'inde bütün capability
 | K58 — human preference separation | preference improvement ile correctness/factuality regression ayrı; correctness düşerse tercih gain promotion sağlamaz |
 
 *Belge sürümü: v1.2 — 2026-11-16. NLU/NLG/düşünme/kod/problem çözme motorları, tokenizer'sız dil sınırı, eğitim müfredatı ve kalite kıyas protokolü eklendi; model performansı ölçülmedi.*
+
+## 29. v1.3 — Kanonik sözleşmeler ve uçtan uca kimlik uyumu
+
+Bu bölüm diğer tüm bölümler arasında normatif uyumluluk katmanıdır. Çelişki halinde: (1) §29 kimlik/şema bağlantıları, (2) §25 core ve evidence semantics, (3) ilgili güncel capability bölümü, (4) v0.x tarihsel çizim/ölçüm hedefi sırası geçerlidir. Bölüm başlığı eski sürüm taşıyorsa içindeki fikir uygulanmadan önce bu sıra ile değerlendirilir.
+
+### 29.1 Tek kimlik grafı
+
+| Nesne | ID | Üst/bağlantı | Yetkili yaşam döngüsü |
+|---|---|---|---|
+| İstek | `request_id` | client/session/tenant + idempotency key | API kabulünden terminal output/cancel |
+| Görev | `task_id` | `request_id`, task-family/capability | scheduler'ın bounded task planı |
+| Taahhüt | `obligation_id` | `task_id`, parent obligations, source refs | open → candidate → closed-at-level / unresolved / invalidated |
+| Tanık/kanıt | `evidence_id` | `obligation_id`, producer/verifier, artifact/source | proposed → checked → valid/invalid/limited |
+| Araç çağrısı | `tool_call_id` | `task_id` + obligation, permission scope | requested → authorized/denied → executed/failed/unknown-side-effect |
+| Artifact | `artifact_id` | `request_id`, obligation refs, evidence refs | partial → final / failed / cancelled / expired |
+| Örnek | `example_id` | dataset/split/group key, schema/provenance | staged → audited → eligible/quarantined/retracted |
+| Eğitim turu | `run_id` | immutable manifest, data manifest, parent release | state machine §22.2 |
+| Release | `release_id` | run + signed manifest + parent release | candidate → shadow → canary → promoted/rolled-back |
+
+ID'ler sürüm kapsamındaki immutable identifier'dır; içerik hash'i integrity adresidir, tek başına auth/privacy/semantics değildir. Hangi object store'da bulunduğu `payload_ref` ile gösterilir; storage URI, nesnenin anlamı yerine geçmez.
+
+### 29.2 EvidenceLevel tek enumerasyonu
+
+Tüm `Obligation`, `Witness`, `OutputArtifact`, evaluation ve JSONL alanları aynı enum kullanır:
+
+- `formal_proof`: küçük trusted kernel'in açık kapsamı içinde doğruladığı matematiksel/biçimsel sonuç.
+- `executed_test`: belirli build/input/fixture üzerinde çalıştırılıp testi geçen artifact; genel correctness theorem değildir.
+- `empirical_support`: belirtilen veri/yöntem/ölçüm ve uncertainty ile desteklenen iddia; causal/general guarantee değildir.
+- `interpretation`: kaynak spanlarından çıkarılan fakat ambiguity kalan anlam adayı.
+- `hypothesis`: henüz independent check geçmemiş öneri.
+- `unsupported`: kapsam/kanıt/adapter yok; kesin iddia veya artifact üretilmez.
+
+Terminal obligation status tek başına evidence level değildir. `closed` yalnız bağlı evidence record'u ve valid checker sonucu varsa kullanılabilir. Kaynak veya scope değişince closure invalidation event ile yeniden açılır. Cevap seviyesini en zayıf iddia belirler; yüksek güvenli bir matematik satırı yanındaki hipotezi `formal_proof` yapmaz.
+
+### 29.3 Girdi→çıktı kanıt zinciri
+
+Kanonik zincir:
+
+```
+TaskContract(request_id, permissions, budget, input_refs)
+  → MeaningRecord(task_id, alternatives, source_spans, unknowns)
+  → Obligation(task_id, statement, assumptions, scope)
+  → Witness(evidence_id, obligation_id, producer_id, artifact/source refs)
+  → VerifierResult(evidence_id, verifier_id, result, limits)
+  → OutputArtifact(request_id, source_obligation_ids, source_evidence_ids)
+  → terminal API response(status, capability, evidence summary, budget used)
+```
+
+Zorunlu invariant'lar:
+
+1. Her obligation request/task içinde var olmalı; task dışı orphan obligation release edilmez.
+2. Her evidence bir var olan obligation'a bağlanır; evidence `valid` olmadan obligation closed olamaz.
+3. Her factual OutputArtifact en az bir obligation ve aynı obligation'ların valid evidence ref'lerini taşır; ref'i olmayan claim render edilirse post-render scanner yeni obligation açmalı veya claim'i çıkarmalıdır.
+4. Her tool result `untrusted_observation` olarak evidence adayıdır; izin ve verifier olmadan final fact değildir.
+5. `unsupported` kararında ilgili modality artifact listesi boş olmalıdır; text açıklaması desteklenmeyen medya üretimi diye sunulamaz.
+6. Cancel/error/budget-exhausted terminal cevapta partial artifact `final` olarak işaretlenemez; tamamlanmış coverage listesi verilmeden bütün görevin çözüldüğü söylenemez.
+7. Split/tenant sınırındaki source ref başka split/tenant içeriğini çözemez; permission denetimi retrieval ve renderer'ın ikisinde de yapılır.
+
+### 29.4 Şema sürümleri ve dönüşüm
+
+Her kayıt tam bir `schema` string'i ve major version taşır. Major version değişikliği yeni parser/validator + migration test + archived old fixture gerektirir; unknown major fail-closed. Minor additive field yalnız optional ise uyumlu sayılır; bilinmeyen required value enum'u sessizce default olmaz. Migration pure function ve `source_hash → derived_hash` ile kayıtlı; raw artifact overwrite edilmez.
+
+JSONL eğitim kayıtları (`noema.example.v2`), capability eval (`noema.capability_eval.v1`), run manifest (`noema.training_run.v1`), event log ve output artifact (`noema.output_example.v1`) farklı aggregate'lerdir, birbirine kopyalanıp karıştırılmaz. `example_id`, `request_id` ve `run_id` aynı string olsa bile ID namespace'i farklıdır; referans alanının türü önemlidir.
+
+### 29.5 Eğitim–servis ayrımı ve online tutarlılık
+
+Serving istekleri sadece immutable promoted release + izinli tenant memory okur; eğitim adayını asla canlı istek yarısında okuyamaz. Feedback, response/request/evidence refs taşıyan ayrı observation event olur; ancak §22 state machine'inden geçince training-eligible olur. Release promotion atomik manifest switch'tir: bir request aynı anda iki release'ın yarım rule table/adapter state'ini karıştıramaz. Rollback parent release'a döner; sonradan gelen correction/deletion event'leri rollback ile silinmez.
+
+### 29.6 Dependency-aware invalidation
+
+`source → derived parse → meaning record → obligation → evidence → rule/artifact` yönlü dependency graph tutulur. Kaynak correction/deletion olduğunda affected descendants bulunur ve `valid → stale/invalidated` event'i çıkar; hangi descendant setinin incelendiği coverage report'a yazılır. Bulunamayan edge ihtimali yüzünden dependent result'lar kaynak değişiminden sonra yeni sorguda cache'ten final diye sunulmaz. Cache index silmek knowledge/event archive silmek anlamına gelmez.
+
+### 29.7 Cross-contract tests ve kabul kapıları
+
+`validate_examples.py` şu an yalnız structural/certain referential checks yapar. Uygulama geliştikçe contract testleri katmanlanır:
+
+- **schema tests:** required field, type, enum, unknown version.
+- **referential tests:** output obligation/evidence refs; event/run/release parent links; no orphan IDs.
+- **state machine tests:** yasadışı transition, retry/idempotency, cancellation ve rollback.
+- **permission tests:** cross-tenant/split ref erişimi reddedilir; deny event iz bırakır.
+- **fault-injection tests:** bozuk hash, eksik event, truncated stream, disk full, clock rollback, verifier crash.
+- **differential tests:** dijital core deterministik oracle ile aynı input semantics; analog output yalnız tolerance band içinde ve final proof checker'dan geçer.
+
+K59 — canonical ID/reference integrity: dangling obligation/evidence/artifact/event/release ref = 0 (fixture kapsamı).
+K60 — legal state transitions: state machine dışı promotion/close/cross-tenant read = 0 kabul.
+K61 — correction/deletion propagation: dependency graph üzerinden affected outputların invalidation coverage'ı ölçülür; unknown coverage varsa fail-closed.
+K62 — version migration: eski örnekler yalnız explicit migration ile kabul; raw source hash değişmez.
+
+*Belge sürümü: v1.3 — 2026-11-16. Request→task→obligation→evidence→artifact ve train→release kimlik/yaşam döngüleri tek normatif sözleşmede hizalandı; runtime cross-contract testlerinin çoğu henüz uygulanmadı.*

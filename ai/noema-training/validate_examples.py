@@ -24,7 +24,7 @@ SPLITS = {"train", "dev", "test", "retention", "redteam"}
 EVENT_TYPES = {"observation", "correction", "candidate_update", "evaluation", "promotion", "rejection", "rollback", "deletion"}
 EXAMPLE_REQUIRED = {"id", "split", "seed", "task", "input", "context", "target_graph", "target", "evidence", "decision", "validator", "provenance"}
 UNIVERSAL_REQUIRED = {"schema", "id", "split", "group_key", "seed", "task", "conversation", "context", "target", "grounding", "evidence", "tools", "safety", "quality", "provenance"}
-OUTPUT_REQUIRED = {"schema", "id", "task", "split", "request_ref", "decision", "artifacts", "validation", "provenance"}
+OUTPUT_REQUIRED = {"schema", "id", "task", "split", "request_ref", "decision", "obligations", "artifacts", "validation", "provenance"}
 EVAL_REQUIRED = {"schema", "id", "split", "group_key", "task", "language", "input", "context", "reference", "criterion", "checker", "risk", "provenance"}
 MANIFEST_REQUIRED = {"schema", "run_id", "parent_release", "data_manifests", "split_manifest", "generator_versions", "task_families", "modules_to_update", "update_methods", "seed", "compute_budget", "policy_version", "schema_versions", "gate_set", "replay_plan", "artifact_retention", "review_policy"}
 EVENT_REQUIRED = {
@@ -138,12 +138,35 @@ def validate_output_rows(rows: list[dict[str, Any]], where: str = "outputs") -> 
         ids.add(row["id"])
         _enum(row["split"], SPLITS, f"{loc}.split")
         _enum(row["decision"], DECISIONS, f"{loc}.decision")
+        _require(isinstance(row["obligations"], list), f"{loc}.obligations: expected list")
+        obligation_ids: set[str] = set()
+        evidence_ids: set[str] = set()
+        evidence_by_obligation: dict[str, str] = {}
+        for j, obligation in enumerate(row["obligations"]):
+            _require(isinstance(obligation, dict), f"{loc}.obligations[{j}]: expected object")
+            _nonempty_string(obligation.get("obligation_id"), f"{loc}.obligations[{j}].obligation_id")
+            _require(obligation["obligation_id"] not in obligation_ids, f"{loc}: duplicate obligation id {obligation['obligation_id']!r}")
+            obligation_ids.add(obligation["obligation_id"])
+            _nonempty_string(obligation.get("evidence_id"), f"{loc}.obligations[{j}].evidence_id")
+            _require(obligation["evidence_id"] not in evidence_ids, f"{loc}: duplicate evidence id {obligation['evidence_id']!r}")
+            evidence_ids.add(obligation["evidence_id"])
+            evidence_by_obligation[obligation["obligation_id"]] = obligation["evidence_id"]
         _require(isinstance(row["artifacts"], list), f"{loc}.artifacts: expected list")
         if row["decision"] == "unsupported":
             _require(not row["artifacts"], f"{loc}: unsupported output must not claim artifacts")
         for j, artifact in enumerate(row["artifacts"]):
-            _required(_object(artifact, f"{loc}.artifacts[{j}]"), {"artifact_id", "kind", "media_type", "payload_ref", "payload_hash", "source_obligations", "evidence_level", "generator_version", "safety_labels", "user_rights"}, f"{loc}.artifacts[{j}]")
+            _required(_object(artifact, f"{loc}.artifacts[{j}]"), {"artifact_id", "kind", "media_type", "payload_ref", "payload_hash", "source_obligations", "source_evidence", "evidence_level", "generator_version", "safety_labels", "user_rights"}, f"{loc}.artifacts[{j}]")
             _require(isinstance(artifact["source_obligations"], list), f"{loc}.artifacts[{j}].source_obligations: expected list")
+            for ref_index, ref in enumerate(artifact["source_obligations"]):
+                _nonempty_string(ref, f"{loc}.artifacts[{j}].source_obligations[{ref_index}]")
+            dangling = set(artifact["source_obligations"]) - obligation_ids
+            _require(not dangling, f"{loc}.artifacts[{j}]: unknown obligation refs: {sorted(dangling)}")
+            _require(isinstance(artifact["source_evidence"], list), f"{loc}.artifacts[{j}].source_evidence: expected list")
+            for ref_index, ref in enumerate(artifact["source_evidence"]):
+                _nonempty_string(ref, f"{loc}.artifacts[{j}].source_evidence[{ref_index}]")
+            expected_evidence = {evidence_by_obligation[ref] for ref in artifact["source_obligations"] if ref in evidence_by_obligation}
+            actual_evidence = set(artifact["source_evidence"])
+            _require(actual_evidence == expected_evidence, f"{loc}.artifacts[{j}]: evidence refs do not match obligation refs")
         _require(isinstance(row["validation"], dict), f"{loc}.validation: expected object")
 
 
