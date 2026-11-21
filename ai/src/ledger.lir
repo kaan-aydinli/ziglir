@@ -271,6 +271,78 @@ fn learn(b: SelBlock, x: *u8, target: *u8, eta: i64) -> i64 {
     return total_e
 }
 
+// NOEMA Stage 17: deterministic typed-array fit/evaluation loop.
+const FIT_INVALID: i64 = -1
+const FIT_MAX_ROWS: i64 = 4096
+const FIT_MAX_EPOCHS: i64 = 10000
+const FIT_TRAIN: i64 = 0
+const FIT_DEV: i64 = 1
+const FIT_TEST: i64 = 2
+
+/// Train one epoch over contiguous Q32.32 rows; non-train rows are never updated.
+fn noema_train_epoch(b: SelBlock, row_count: i64, features: *u8, targets: *u8, splits: *u8, eta: i64, mean_energy_out: *u8) -> i64 {
+    if row_count < 0 or row_count > FIT_MAX_ROWS or b.nin <= 0 or b.nout <= 0 or b.k <= 0 or eta <= 0 { return FIT_INVALID }
+    var trained: i64 = 0
+    var total: i64 = 0
+    var row: i64 = 0
+    while row < row_count {
+        let split = @read_u64(@ptr_add(splits, row * 8)) as i64
+        if split < FIT_TRAIN or split > FIT_TEST { return FIT_INVALID }
+        if split == FIT_TRAIN {
+            let x = @ptr_add(features, row * b.nin * 8)
+            let target = @ptr_add(targets, row * b.nout * 8)
+            forward(b, x)
+            total = sat_add(total, learn(b, x, target, eta))
+            trained = trained + 1
+        }
+        row = row + 1
+    }
+    if trained == 0 { return FIT_INVALID }
+    @write_u64(mean_energy_out, div(total, from_int(trained)) as u64)
+    return trained
+}
+
+/// Evaluate a selected split without weight updates; empty evaluation is invalid.
+fn noema_evaluate_split(b: SelBlock, row_count: i64, features: *u8, targets: *u8, splits: *u8, wanted_split: i64, mean_energy_out: *u8) -> i64 {
+    if row_count < 0 or row_count > FIT_MAX_ROWS or b.nin <= 0 or b.nout <= 0 { return FIT_INVALID }
+    if wanted_split < FIT_TRAIN or wanted_split > FIT_TEST { return FIT_INVALID }
+    var evaluated: i64 = 0
+    var total: i64 = 0
+    var row: i64 = 0
+    while row < row_count {
+        let split = @read_u64(@ptr_add(splits, row * 8)) as i64
+        if split < FIT_TRAIN or split > FIT_TEST { return FIT_INVALID }
+        if split == wanted_split {
+            let x = @ptr_add(features, row * b.nin * 8)
+            let target = @ptr_add(targets, row * b.nout * 8)
+            forward(b, x)
+            var o: i64 = 0
+            while o < b.nout {
+                let error = (@read_u64(@ptr_add(b.out, o * 8)) as i64) - (@read_u64(@ptr_add(target, o * 8)) as i64)
+                total = sat_add(total, mul_sat(error, error))
+                o = o + 1
+            }
+            evaluated = evaluated + 1
+        }
+        row = row + 1
+    }
+    if evaluated == 0 { return FIT_INVALID }
+    @write_u64(mean_energy_out, div(total, from_int(evaluated * b.nout)) as u64)
+    return evaluated
+}
+
+/// Fixed-epoch deterministic fit; history stores mean training energy per epoch.
+fn noema_fit(b: SelBlock, row_count: i64, features: *u8, targets: *u8, splits: *u8, eta: i64, epochs: i64, history: *u8) -> i64 {
+    if epochs <= 0 or epochs > FIT_MAX_EPOCHS { return FIT_INVALID }
+    var epoch: i64 = 0
+    while epoch < epochs {
+        let trained = noema_train_epoch(b, row_count, features, targets, splits, eta, @ptr_add(history, epoch * 8))
+        if trained == FIT_INVALID { return FIT_INVALID }
+        epoch = epoch + 1
+    }
+    return epochs
+}
+
 /// Ortalama enerji (enerji / nout), Q32.32.
 fn mean_energy(b: SelBlock, e: i64) -> i64 {
     if b.nout == 0 {

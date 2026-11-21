@@ -1,6 +1,6 @@
 # NOEMA — LIR ile uygulanan karar-kapıları
 
-**Durum:** v3.4. LIR’de uygulanıp test edilenler: contract/evidence/scheduler/data/capability/memory-scope/release-lifecycle/task-execution guard’ları, sınırlı unary/conjunctive exact-rule forward-chaining, yerel türetim ve sınırlı acyclic proof-certificate doğrulaması, açık query-status sınıflaması, scoped volatile record store ve eğitim verisi için deficit-guided curriculum seçimi + group split leakage kontrolü. Bu, tasarlanan NOEMA AI framework’ünün tamamı değildir.
+**Durum:** v3.5. LIR’de uygulanıp test edilenler: contract/evidence/scheduler/data/capability/memory-scope/release-lifecycle/task-execution guard’ları, bounded exact-rule inference/proof checks, scoped volatile record store, deficit-guided curriculum/split checks ve SEL tabanlı typed-array regression fit/evaluation loop’u. Bu, genel amaçlı veya üretime hazır AI framework’ünün tamamı değildir.
 
 ## Uygulanmış dilimler
 
@@ -17,12 +17,13 @@
 | Exact-rule inference, derivation/proof-certificate validation, explicit query status | `ai/src/noema_reasoning.lir` | `ai/tests/23_noema_reasoning.lir`–`ai/tests/27_noema_proof_certificate.lir` |
 | Bounded volatile scoped record store (append/find/tombstone/compact with expiry and vacated-cell clearing) | `ai/src/noema_store.lir` | `ai/tests/28_noema_store.lir`, `ai/tests/29_noema_store_compaction.lir` |
 | Deficit-guided curriculum frontier selection and group split leakage check | `ai/src/noema_training.lir` | `ai/tests/30_noema_training_data.lir` |
+| Typed-array SEL regression fit, split-isolated evaluation and epoch loss history | `ai/src/noema_fit.lir`, `ai/src/ledger.lir` | `ai/tests/31_noema_fit.lir` |
 
-The latest LIR suite passes all 85 fixture/backend executions (including 9 Stage 16 training-data checks); backend coverage varies for legacy fixtures. Zig build tests, 21 Python standard-library validator/audit tests, and example validation also pass. These results verify bounded decision logic only; they do not establish that corresponding services exist.
+The latest LIR suite passes all 88 fixture/backend executions (including 9 Stage 17 fit/evaluation checks); backend coverage varies for legacy fixtures. Zig build tests, 21 Python standard-library validator/audit tests, and example validation also pass. These results verify bounded decision logic only; they do not establish that corresponding services exist.
 
 ## Not implemented
 
-No complete inference/reasoning engine, model training loop, tokenizer/parser, persistent episodic/semantic/procedural store, retrieval/CAG backend, task executor, connector/tool runtime, authenticated artifact pipeline, release/deployment service, or production observability/operations layer is provided by these guard modules. Stage 16 adds curriculum selection and leakage checks over already-decoded typed arrays; it does not parse JSONL, tokenize examples, construct training targets, update a model, or constitute a runnable training pipeline. They do not train or serve an AI model. Integration and end-to-end tests remain outstanding.
+A bounded numeric regression fit loop now updates an existing SEL block from contiguous typed Q32.32 arrays; evaluation is split-selective and non-updating. This is a runnable LIR training primitive, not a turnkey training project: no JSONL/parser ingestion, text-to-feature/target construction, checkpoint save/restore, optimizer selection, experiment manifest IO, artifact provenance binding, general model architecture, GPU/accelerator execution, or production deployment exists. Stage 16 curriculum selectors consume host-prepared typed arrays and are not yet wired into the fit loop. Persistent episodic/semantic/procedural storage, retrieval/CAG backend, task executor, connector/tool runtime, authenticated artifact pipeline, release/deployment service, and production observability remain unimplemented. Therefore the project is not yet fully training-ready for its example JSONL datasets or for end-to-end AI training. They do not train or serve an AI model. Integration and end-to-end tests remain outstanding.
 
 The new framework decision logic in this increment is LIR. Existing Python dataset validator/auditor remains host-side tooling and was not expanded into runtime functionality. No external dependency was added. LIR guard return values are not proof of authorization, persistence, deletion, release safety, or model quality; those require real backends and end-to-end verification.
 
