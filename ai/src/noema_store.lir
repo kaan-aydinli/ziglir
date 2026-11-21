@@ -1,17 +1,13 @@
-// NOEMA Stage 14: caller-owned bounded record store for scoped memory entries.
-// This is volatile memory over a supplied buffer, not durable persistence,
-// encryption, ACL enforcement, replica management, or a deletion backend.
+// NOEMA Stage 14–15: bounded caller-owned scoped record store.
+// Volatile memory only: no durability, encryption, ACL backend or replica handling.
 const STORE_INVALID: i64 = -1
 const STORE_ACTIVE: i64 = 0
 const STORE_DELETED: i64 = 1
 const STORE_ROW_BYTES: i64 = 56
 const STORE_MAX_ROWS: i64 = 4096
 
-/// Append a seven-cell record [id, tenant, consent_epoch, expiry_tick,
-/// content_ref, provenance_ref, state]. Returns updated count or -1.
 fn memory_store_append(count: i64, capacity: i64, records: *u8, input_row: *u8) -> i64 {
-    if count < 0 or count > capacity or capacity > STORE_MAX_ROWS { return STORE_INVALID }
-    if count >= capacity { return STORE_INVALID }
+    if count < 0 or count > capacity or capacity > STORE_MAX_ROWS or count >= capacity { return STORE_INVALID }
     let id = @read_u64(input_row) as i64
     let tenant = @read_u64(@ptr_add(input_row, 8)) as i64
     let epoch = @read_u64(@ptr_add(input_row, 16)) as i64
@@ -33,18 +29,14 @@ fn memory_store_append(count: i64, capacity: i64, records: *u8, input_row: *u8) 
     return count + 1
 }
 
-/// Find exact ID only in the requesting tenant/consent epoch, before expiry,
-/// while active. Returns row index or STORE_INVALID.
 fn memory_store_find(count: i64, records: *u8, id: i64, tenant: i64, epoch: i64, now_tick: i64) -> i64 {
     if count < 0 or count > STORE_MAX_ROWS or id <= 0 or tenant <= 0 or epoch <= 0 or now_tick < 0 { return STORE_INVALID }
     var i: i64 = 0
     while i < count {
         let base = i * STORE_ROW_BYTES
         if (@read_u64(@ptr_add(records, base)) as i64) == id {
-            if (@read_u64(@ptr_add(records, base + 8)) as i64) != tenant { return STORE_INVALID }
-            if (@read_u64(@ptr_add(records, base + 16)) as i64) != epoch { return STORE_INVALID }
-            if (@read_u64(@ptr_add(records, base + 24)) as i64) <= now_tick { return STORE_INVALID }
-            if (@read_u64(@ptr_add(records, base + 48)) as i64) != STORE_ACTIVE { return STORE_INVALID }
+            if (@read_u64(@ptr_add(records, base + 8)) as i64) != tenant or (@read_u64(@ptr_add(records, base + 16)) as i64) != epoch { return STORE_INVALID }
+            if (@read_u64(@ptr_add(records, base + 24)) as i64) <= now_tick or (@read_u64(@ptr_add(records, base + 48)) as i64) != STORE_ACTIVE { return STORE_INVALID }
             return i
         }
         i = i + 1
@@ -52,7 +44,6 @@ fn memory_store_find(count: i64, records: *u8, id: i64, tenant: i64, epoch: i64,
     return STORE_INVALID
 }
 
-/// Scoped tombstone. Caller must separately persist and propagate this action.
 fn memory_store_tombstone(count: i64, records: *u8, id: i64, tenant: i64, epoch: i64) -> i64 {
     if count < 0 or count > STORE_MAX_ROWS or id <= 0 or tenant <= 0 or epoch <= 0 { return STORE_INVALID }
     var i: i64 = 0
@@ -67,4 +58,39 @@ fn memory_store_tombstone(count: i64, records: *u8, id: i64, tenant: i64, epoch:
         i = i + 1
     }
     return STORE_INVALID
+}
+
+/// Remove tombstoned and expired rows in-place, preserve the order of survivors,
+/// and zero vacated cells. Returns compacted row count or STORE_INVALID.
+fn memory_store_compact(count: i64, records: *u8, now_tick: i64) -> i64 {
+    if count < 0 or count > STORE_MAX_ROWS or now_tick < 0 { return STORE_INVALID }
+    var kept: i64 = 0
+    var scan: i64 = 0
+    while scan < count {
+        let source = scan * STORE_ROW_BYTES
+        let state = @read_u64(@ptr_add(records, source + 48)) as i64
+        let expiry = @read_u64(@ptr_add(records, source + 24)) as i64
+        if state != STORE_ACTIVE and state != STORE_DELETED { return STORE_INVALID }
+        if state == STORE_ACTIVE and expiry > now_tick {
+            if kept != scan {
+                var cell: i64 = 0
+                while cell < 7 {
+                    @write_u64(@ptr_add(records, kept * STORE_ROW_BYTES + cell * 8), @read_u64(@ptr_add(records, source + cell * 8)))
+                    cell = cell + 1
+                }
+            }
+            kept = kept + 1
+        }
+        scan = scan + 1
+    }
+    var row: i64 = kept
+    while row < count {
+        var cell: i64 = 0
+        while cell < 7 {
+            @write_u64(@ptr_add(records, row * STORE_ROW_BYTES + cell * 8), 0 as u64)
+            cell = cell + 1
+        }
+        row = row + 1
+    }
+    return kept
 }

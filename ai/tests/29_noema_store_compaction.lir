@@ -1,0 +1,44 @@
+// NOEMA Stage 15 ordered compaction, expiry sweep and vacated-cell clearing.
+import "../src/noema_store.lir"
+fn main() -> i64 {
+    var checks: i64 = 0
+    var passed: i64 = 0
+    let rows = @malloc(3 * 7 * 8)
+    let row = @malloc(7 * 8)
+    @write_u64(@ptr_add(row, 8), 4 as u64)
+    @write_u64(@ptr_add(row, 16), 2 as u64)
+    @write_u64(@ptr_add(row, 24), 50 as u64)
+    @write_u64(@ptr_add(row, 32), 1000 as u64)
+    @write_u64(@ptr_add(row, 40), 2000 as u64)
+    @write_u64(@ptr_add(row, 48), STORE_ACTIVE as u64)
+    @write_u64(row, 10 as u64)
+    let c1 = memory_store_append(0, 3, rows, row)
+    @write_u64(row, 11 as u64)
+    @write_u64(@ptr_add(row, 24), 5 as u64)
+    let c2 = memory_store_append(c1, 3, rows, row)
+    @write_u64(row, 12 as u64)
+    @write_u64(@ptr_add(row, 24), 60 as u64)
+    let c3 = memory_store_append(c2, 3, rows, row)
+    checks = checks + 1
+    if c3 == 3 { passed = passed + 1 }
+    checks = checks + 1
+    if memory_store_tombstone(c3, rows, 10, 4, 2) == 1 { passed = passed + 1 }
+    let compacted = memory_store_compact(c3, rows, 10)
+    checks = checks + 1
+    if compacted == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if (@read_u64(rows) as i64) == 12 { passed = passed + 1 }
+    checks = checks + 1
+    if (@read_u64(@ptr_add(rows, 56)) as i64) == 0 { passed = passed + 1 }
+    checks = checks + 1
+    if memory_store_find(compacted, rows, 12, 4, 2, 10) == 0 { passed = passed + 1 }
+    checks = checks + 1
+    if memory_store_find(compacted, rows, 10, 4, 2, 10) == STORE_INVALID { passed = passed + 1 }
+    checks = checks + 1
+    if memory_store_compact(3, rows, -1) == STORE_INVALID { passed = passed + 1 }
+    printInt(passed)
+    print("/")
+    printInt(checks)
+    println("")
+    return 0
+}
