@@ -1,6 +1,6 @@
 # NOEMA — Analog-Doğal, Doğrulama-Kapılı Muhakeme Mimarisi
 
-**Durum:** v1.8 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
+**Durum:** v1.9 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
 **Amaç:** `ai/` çatısının dışına ve SEL'in üstüne sıfırdan kurulan, **muhakeme-öncelikli** yeni mimarinin eksiksiz tanımı.
 **Bu deponun kuralı (iddia = ölçüm) bu belge için de geçerlidir:** aşağıda geçen her "hedef", "kestirim" ya da "beklenti" açıkça **ölçülmemiştir**. Ölçülmüş tek sayılar, mevcut SEL çekirdeğine aittir ve öyle etiketlenmiştir. Bu belge bir *vaad* değil, bir *ölçülecek hipotezler listesi*dir.
 
@@ -1793,3 +1793,90 @@ CAG/memory and multilingual packs are integrated with §33 retrieval, dialogue a
 **Residual limits:** memory capacity, source availability, user consent, language data/review, latency, cost, adversarial inputs and cultural interpretation remain finite. Typed graph/cache structure may improve traceability and reuse but can also add engineering complexity and latency. No context cache can make unknown facts known; no memory design guarantees perfect recall or forgetting; no architecture can be fluent in every human language without adequate grounded language resources and tests. The measurable goal is broader validated capability and faster repeated work at fixed quality gates—not universal fluency or zero weakness.
 
 *Belge sürümü: v1.8 — 2026-11-16. CAG, çok katmanlı memory fabric ve locale-pack tabanlı multilingual reasoning tanımlandı; uygulama ve ölçüm yok.*
+
+## 35. v1.9 — Eğitim ve veri seti kalite işletim sistemi
+
+Amaç “en kaliteli” sıfatını peşinen vermek değil; her veri kaynağının **kabul edilebilirliğini, temsil ettiği kapsamı, bilinen kusurlarını ve terfi kararını tekrar üretilebilir** kılmaktır. Veri kalitesi tek bir skor değildir: lisans/consent, provenance, şema, etik doğruluk, coverage, split bağımsızlığı, güvenlik, gizlilik ve görev başarısı ayrı hard gate/metric'tir. Yüksek ortalama, bir kritik ihlali maskeleyemez.
+
+### 35.1 Data Supply Chain ve kayıt zinciri
+
+Her source için `SourceManifest`: owner, origin, collection method/time, license/terms version, consent basis/scope, allowed purposes, territories/expiry, PII/sensitivity class, retention/deletion contact, transforms, quality limits, language/domain/demographic coverage, reviewer. Bu alanlar bilinmiyorsa source `quarantine`; eğitime alınmaz. “Publicly reachable” tek başına lisans/consent değildir. İçerik ve manifest hash'leri ayrı tutulur; hash doğruluğu kaynağın hukuki/semantik doğruluğunu kanıtlamaz.
+
+Pipeline states:
+
+```
+REGISTERED → POLICY_REVIEW → INGESTED_RAW → STRUCTURAL_AUDIT →
+DEDUPED_VIEW → LABEL/PROVENANCE_REVIEW → SPLIT_LOCKED →
+QUALITY_AUDIT → TRAIN_ELIGIBLE | QUARANTINED | REJECTED
+```
+
+Her geçiş event ve actor/version/time taşımalı. Dönüşüm raw kaydı overwrite etmez; türev `parent_hash + transform_id + params + loss declaration` ile bağlanır. Silme/correction; dataset manifest, split, caches, derived labels ve candidate descendants'ını invalid eder. Release tam olarak hangi source/rule snapshot'ından çıktığını yeniden kurabilir.
+
+### 35.2 Sekiz bağımsız kalite ekseni
+
+| Eksen | Kabul denetimi | Fail/uyarı davranışı |
+|---|---|---|
+| Hukuk/consent | source-specific license/consent, permitted purpose, expiry, provenance | fail-closed quarantine; policy belirsizse ingest yok |
+| Schema/integrity | strict JSONL/schema version, IDs, payload hash/schema, encoding, required refs | hard fail; satır/field konumu raporla |
+| Etiket doğruluğu | task-specific deterministic checker; risk bazlı çift bağımsız annotator; adjudication | disagreement silinmez; disputed/quarantine |
+| Grounding | her cevap/claim span→source/evidence; proof/test id ve kapsam | unsupported claim oranı gate üstündeyse reject |
+| Coverage/representativeness | language/dialect/script, task/risk, domain, time, demographic ve modality dağılımı; eksik hücre raporu | ağırlıklı toplam tek başına kabul değil; kritik hücre için ayrı gate |
+| Split integrity | group/entity/source/document/template/near-duplicate/time graph holdout | leakage hard fail; group key tanımlanmamışsa split kilitlenmez |
+| Safety/privacy | PII/secrets, toxic/harmful, prompt injection, consent revocation, sensitive groups | restricted set ayrı access; safety coverage boşluğu release blocker |
+| Benchmark integrity | hidden test access control, contamination audit, frozen baseline, independent scoring | test sızıntısı şüpheliyse set emekliye ayrılır ve yeni holdout üretilir |
+
+Risk-based review sampling: low-risk deterministic synthetic output'ta oracle doğrulaması ve stratified random human audit; ambiguous/high-impact/legal/social labels'ta double annotation ve adjudicator; reviewer agreement raw counts + class-specific kappa/CI ile raporlanır. Agreement truth değildir; disagreement sebepleri label taxonomy'ye döner. Annotator'lar prompt injection ve source instruction/content ayrımına göre eğitilir.
+
+### 35.3 Duplicate, contamination ve split protokolü
+
+Split bir satır hash'i üzerinden rastgele yapılmaz. Önce leakage component graph kurulur: same user/document/source, source revision, generator seed/template, paraphrase cluster, entity/episode, conversation thread, code repository/version, derived transformation. Connected component tek split'e atanır. Zamanla değişen bilgi için temporal holdout ayrıca kurulur; test split'e erişim evaluator identity ile sınırlandırılır.
+
+Dedup katmanları: exact bytes/hash → Unicode NFKC/casefold/whitespace canonical exact text → modality-specific perceptual/fuzzy candidate → semantic-near-duplicate human/algorithm review. Fuzzy hit otomatik silme değil; candidate pair ve reason üretir. Aynı factual entity/rule ailesinin train ve test'te bulunması istenmiyorsa `group_key` bu aileyi temsil etmelidir; rastgele benzersiz ID kullanmak leakage kontrolü değildir. Template-only paraphrase'ler bağımsız örnek sayılmaz.
+
+İşletimde yeni eklenen `dataset_audit.py` streaming JSONL audit ile duplicate ID, `group_key` cross-split ve normalize edilmiş exact-text cross-split leakage'ı raporlar; provenance/license eksiklerini hard fail, yapılandırılmamış provenance ve label disagreement'i review warning yapar. Komut:
+
+```sh
+python3 ai/noema-training/dataset_audit.py ai/noema-training/universal_examples.jsonl --report /tmp/universal-audit.json
+python3 ai/noema-training/dataset_audit.py ai/noema-training/capability_eval.example.jsonl
+```
+
+Audit raporu hassas metni yazmaz; split/family/language sayımları ve hash/ID tabanlı finding verir. Exact-text kontrolleri ≥24 karakter normalize prompt'larda uygulanır. Şimdilik fuzzy/semantic leakage, payload content/hash correspondence, license/consent authenticity, label truth, PII classifier recall veya model quality ölçmez. `gate=pass` yalnız uygulanan objective kontrollerin geçtiğidir, dataset sertifikası değildir. Production pipeline'da modality-aware fuzzy candidate review ve cross-file lineage graph ayrıca uygulanmalıdır.
+
+### 35.4 Örnek üretme ve label kalibrasyonu
+
+- Her synthetic generator, bağımsız oracle/verifier ile differential test edilir; üretici ile oracle ortak kod/seed-derived shortcut paylaşmamalı. Metamorphic/property tests generator range ve boundary'lerini kapsar.
+- Üretici, dağılım ve kabul edilen seed/range tanımlıdır; model/solver çıktısını target diye kaydetmek circular supervision olarak etiketlenir ve bağımsız doğrulanmadan training'e girmez.
+- Her hedef etiketi `label_source`, `label_version`, `reviewer/annotator scheme`, `confidence/uncertainty`, `disagreement`, `adjudication`, `evidence_ref` taşır. `unknown`, `not_applicable`, `insufficient_evidence` ayrı sınıflardır; `null` ile birleştirilmez.
+- Preference verisi truth label değildir; style/preference objective'ine gider. Safety refusal example doğruluğu ayrı safety rubric ile kontrol edilir.
+- Dil verisi locale/dialect/script + span offset taşır. Makine çevirisi native gold sayılmaz; translation provenance, revision ve semantic loss mark'ları korunur. Her locale için native reviewer/coverage yoksa o locale train/eval coverage claim'i yapılmaz.
+- Human audit örneklemi severity × source × locale × task-family strata'larında seçilir; yalnız en sık sınıf incelenmez. Review'dan sonra değişiklik etkisi hangi records/version'ı kapsadığıyla loglanır.
+
+### 35.5 Eğitim örnekleme ve dataset release
+
+Sampler objective/task-family başına açık quota ve uncertainty/rarity ağırlığı taşır; ağırlık manifesttedir ve deterministik seed ile replay edilir. Bir örneğin eğitimde tekrar sayısı ve toplam token/byte/compute maliyeti sayılır. Dengesiz kaynak, aşırı temsil ve annotator/source shortcut'ları ayrı eval edilir. “Rare” hücreye sentetik oversampling coverage'ı artırabilir ama yeni gerçek-world evidence üretmez.
+
+Dataset release değişmez ve içerik adreslidir: `dataset_manifest` records (source/data hashes, parent/split graph, filters, dedup decisions, transform/generator versions, labels, consent/license scope, excluded/quarantined counts, language/domain coverage, redaction/deletion state, audit report hashes, random seed, owner). Aday training manifest exact dataset manifest ref'i taşır. `run_manifest.example.json` içinde `dataset_quality` audit schema/report/dataset manifest refs, hard-fail/warning codes ve `unknown_policy=block_promotion` ile execution gate'e bağlanmıştır; report ref'i demo placeholder'dır, imzalı production report değildir. Deletion/correction gelince eski historical release overwrite edilmez; policy gereği serving/train eligibility revoke edilir ve yeni release hazırlanır.
+
+### 35.6 Kapılar ve scorecard
+
+K98 — consent/license/provenance completeness: training-eligible records içinde required source fields eksik = 0.
+K99 — split leakage: group/document/source/entity exact duplicates cross split = 0; fuzzy candidates adjudicated, unresolved = 0 before test lock.
+K100 — label quality: risk stratum başına independent review agreement/error/uncertainty report; high-risk unresolved disagreement = 0 eligible.
+K101 — grounding: answerable target claim'leri için support coverage; unsupported target claim hard ceiling = policy'de önceden kayıtlı.
+K102 — coverage: task/language/dialect/script/domain/risk hücreleri ve missing coverage yayımlanır; unsupported cells, supported as diye sayılmaz.
+K103 — safety/privacy: licensed/sensitive/PII/redteam subset'leri erişim kontrollü ve deletion testli; critical leak = 0 test scope.
+K104 — contamination: hidden eval canary/near-duplicate audit ve test-access log; şüpheli setin quarantine/emeklilik süresi ölçülür.
+K105 — dataset lineage reproducibility: manifest+seed ile split/transform/audit summary tekrarlanır; farklılık varsa release bloklanır.
+K106 — training outcome: held-out quality/coverage/calibration/retention/safety ile total run+human cost birlikte; kalite eşitliği sağlanmadan hız/kazanç iddiası yok.
+
+Scorecard her eksen için `pass/fail/unknown`, coverage denominator, confidence interval, artifact hash, caveat ve owner içerir. Unknown “pass” değildir. Release hard gates'den biri fail ise reject; warning varsa kayıtlı owner ve remediation deadline olmadan promote edilmez. Her dataset sürümünde model kalitesi ayrıca eval edilir; dataset audit'i modelin iyi öğrenmesini garanti etmez.
+
+### 35.7 Kapsam ve next implementation gates
+
+Şu an çalışan `validate_examples.py`, `dataset_audit.py` ve testleri küçük demo JSONL kayıtlarında structural/referential, group split, normalized exact-text ve license-field checks yapar; gerçek büyük corpora üzerinde throughput/recall, fuzzy detection, policy enforcement ya da adjudication workflow ölçülmedi. Elde edilen demo dosyaları yüksek kaliteli veya pazar lideri veri kümesi değildir.
+
+Sıra: (1) production dataset manifest schema + signed source registry; (2) lineage/component-graph splitter + hidden-test ACL; (3) payload-aware duplicate/PII/license workflow; (4) reviewer console/adjudication and locale strata; (5) model-in-loop contamination, memorization/privacy and quality eval; (6) external comparable benchmark with same rights/compute/quality target. Her adım dependency-free core ve mevcut standart kütüphane validator'ı korur; harici dependency ancak açık onay ve güvenlik/licensing incelemesiyle.
+
+“Piyasadaki en kaliteli” sonuç değil, karşılaştırmalı iddiadır. K98–K106 ve temsilî, lisanslı, aynı koşullu dış karşılaştırmalar tamamlanmadan NOEMA'nın eğitim veya dataset sistemine pazar lideri denmez. Hiçbir quality pipeline bütün yanlış etiketleri, unknown distribution shift'i veya gelecekteki misuse'u sıfırlayamaz; hedef ölçülebilir risk azaltımı, hızlı geri çekme ve şeffaf kapsamdır.
+
+*Belge sürümü: v1.9 — 2026-11-16. Veri tedarik zinciri, objective dataset audit CLI, split/label/coverage gates ve training release scorecard bağlandı; piyasa kıyası veya büyük corpus sonucu yok.*

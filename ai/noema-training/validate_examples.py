@@ -226,6 +226,13 @@ def validate_manifest(path: Path) -> None:
     review = _object(manifest["review_policy"], f"{path}.review_policy")
     _require(review.get("online_weight_update") is False, f"{path}: example policy must keep online weight update disabled")
     if manifest["schema"] == "noema.training_run.v2":
+        data_quality = _object(manifest.get("dataset_quality"), f"{path}.dataset_quality")
+        _require(data_quality.get("audit_schema") == "noema.dataset_audit.v1", f"{path}.dataset_quality.audit_schema: unsupported audit schema")
+        _nonempty_string(data_quality.get("report_ref"), f"{path}.dataset_quality.report_ref")
+        _nonempty_string(data_quality.get("dataset_manifest"), f"{path}.dataset_quality.dataset_manifest")
+        for key in ("fail_on", "warn_on"):
+            _require(isinstance(data_quality.get(key), list) and all(isinstance(code, str) and code for code in data_quality[key]), f"{path}.dataset_quality.{key}: expected string list")
+        _enum(data_quality.get("unknown_policy"), {"block_promotion"}, f"{path}.dataset_quality.unknown_policy")
         plan = _object(manifest.get("execution_plan"), f"{path}.execution_plan")
         for key in ("max_workers", "batch_size"):
             _require(isinstance(plan.get(key), int) and not isinstance(plan.get(key), bool) and plan[key] > 0, f"{path}.execution_plan.{key}: expected positive integer")

@@ -25,6 +25,14 @@
     "risk_ceiling": "low",
     "online_weight_update": false
   },
+  "dataset_quality": {
+    "audit_schema": "noema.dataset_audit.v1",
+    "report_ref": "demo-dataset-quality-report",
+    "dataset_manifest": "demo-dataset-manifest",
+    "fail_on": ["duplicate_id", "group_split_leakage", "exact_text_split_leakage", "missing_source_or_license"],
+    "warn_on": ["provenance_not_structured", "unresolved_label_disagreement"],
+    "unknown_policy": "block_promotion"
+  },
   "execution_plan": {
     "max_workers": 2,
     "batch_size": 32,

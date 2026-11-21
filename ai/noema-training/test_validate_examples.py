@@ -97,6 +97,16 @@ class ValidatorTests(unittest.TestCase):
         with self.assertRaisesRegex(validator.ValidationError, "must not include deleted content"):
             validator.validate_event_rows([row])
 
+    def test_manifest_requires_dataset_quality_gate(self):
+        source = Path(__file__).parent / "run_manifest.example.json"
+        manifest = json.loads(source.read_text(encoding="utf-8"))
+        manifest["dataset_quality"]["unknown_policy"] = "allow"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "manifest.json"
+            path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(validator.ValidationError, "unsupported value"):
+                validator.validate_manifest(path)
+
     def test_manifest_requires_deterministic_execution_merge(self):
         source = Path(__file__).parent / "run_manifest.example.json"
         manifest = json.loads(source.read_text(encoding="utf-8"))
