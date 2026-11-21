@@ -1,6 +1,6 @@
 # NOEMA — Analog-Doğal, Doğrulama-Kapılı Muhakeme Mimarisi
 
-**Durum:** v2.1 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
+**Durum:** v2.2 — tasarım + ilk yürütülebilir LIR sözleşme dilimi. NOEMA'nın geri kalan runtime/training/retrieval katmanları uygulanmadı.
 **Amaç:** `ai/` çatısının dışına ve SEL'in üstüne sıfırdan kurulan, **muhakeme-öncelikli** yeni mimarinin eksiksiz tanımı.
 **Bu deponun kuralı (iddia = ölçüm) bu belge için de geçerlidir:** aşağıda geçen her "hedef", "kestirim" ya da "beklenti" açıkça **ölçülmemiştir**. Ölçülmüş tek sayılar, mevcut SEL çekirdeğine aittir ve öyle etiketlenmiştir. Bu belge bir *vaad* değil, bir *ölçülecek hipotezler listesi*dir.
 
@@ -1997,3 +1997,48 @@ P2 — only after baseline, run matched frontier benchmark and scale/fault-injec
 Current successful checks validate only code-level invariants: 18 unit tests, example JSONL schema, exact split leakage audit for two tiny fixtures, plus the one synthetic 250k throughput/RSS point above. No model was trained, no true dataset was certified, no market/frontier comparison was run. This honest inventory is itself a quality gate: future session cannot accidentally convert design intent into claimed runtime capability.
 
 *Belge sürümü: v2.1 — 2026-11-16. Mevcut çalışma alanındaki darboğazlar önceliklendirildi; dataset audit memory-index darboğazı disk spill ile azaltıldı ve bir sentetik ölçek ölçümü eklendi; NOEMA runtime darboğazları açık/çözülmemiştir.*
+
+## 38. v2.2 — LIR ile uygulama sırası ve yürütülebilir ilk dilim
+
+Mimari tek PR'da “tamamlandı” işaretlenmeyecek. Uygulama sırası bağımlılıkları ve release kapıları izler. LIR, deterministik tipli core sözleşmeler/validator logic için birincil uygulama dilidir; dosya sistemi, JSONL, dış kaynak ve işletim sistemi entegrasyonu mevcut permissioned host/adapter sınırında kalabilir. Bu I/O köprüsünü LIR core içine saklamak veya LIR'de olmayan JSON/network özellikleri varmış gibi yazmak yasaktır.
+
+### 38.1 Aşamalar
+
+| Sıra | LIR teslimatı | Entegrasyon | Kapanış ölçütü | Durum |
+|---|---|---|---|---|
+| 0 | Compiler/toolchain pin + test harness | `zig build`, `ai/run_tests.py` | pinned compiler; backend regression baseline | Bu ortamda Zig 0.13.0 ile doğrulandı |
+| 1 | `ai/src/noema_contracts.lir`: TTA obligation lifecycle ve independent evidence/scope gate | `ai/tests/15_noema_contracts.lir` | legal/illegal transition + close precondition testleri native/VM/C | **Uygulandı; 12/12 fixture assertion geçti, test runner'da 3 backend** |
+| 2 | LIR `EvidenceRecord`/scope helpers: evidence-level enum validation, non-empty source/verifier identity, producer≠verifier, evidence→obligation bağlantı sözleşmeleri | JSONL parse/stream host adapter; exact artifact refs LIR core'a typed args | dangling ref 0; wrong scope/producer self-check red tests | Sıradaki |
+| 3 | LIR deterministic task DAG: dependency-ready seçimi, cycle detection, step/compute budget, partial/abstain terminal states | Python/host runner yalnız I/O, checkpoint ve immutable event persistence | replay hash aynı; cycle/budget/cancel fault fixtures | Bekliyor |
+| 4 | Dataset eligibility/split primitives: policy decisions, grouped split plan, quality-gate result aggregation | mevcut Python JSONL/disk auditor I/O'su; signed source/dataset manifest | leakage/unknown policy fail closed, large corpus bounded RSS; audit report ref run manifest'e bağlanır | Bekliyor |
+| 5 | Capability graph routing: `CapabilityNode` scope/prerequisite/evidence gates, explicit unsupported state | current-version registry ve per-skill eval adapters | unsupported node auto-route yok; unseen composition aparteval | Bekliyor |
+| 6 | Memory/CAG typed keys, permission/freshness/dependency invalidation decisions | storage/index/connector adapters, tenant isolation | cache on/off correctness invariant, deletion/ACL fault suite | Bekliyor |
+| 7 | Isolated candidate/release state machine, learning/evaluation/promote/rollback | immutable dataset+run manifests, sealed eval CI | hard gate bypass=0, atomic rollback/replay integration | Bekliyor |
+| 8 | Multilingual/dialogue/retrieval adapters per locale/domain | permitted source connectors, native review, SLO ops | locale-wise grounded eval, source coverage, failure-injection and matched frontier comparison | Bekliyor |
+
+Each stage must add LIR unit/regression fixture and expected output, run **native + VM + C** where semantics are supported, and preserve previous AI/core/compiler tests. Other targets are added only when their backend coverage is declared and available. Keep LIR core pure/deterministic where possible; never claim formal proof from ordinary test output. Bridge code is independently checked for permission, bounds, error propagation, cancellation and payload identity.
+
+### 38.2 Stage 1 implemented: pure transition guard
+
+`ai/src/noema_contracts.lir` now defines stable numeric state constants and a pure guard:
+
+```
+OPEN → CANDIDATE | UNRESOLVED
+CANDIDATE → CLOSED | REJECTED | OPEN | UNRESOLVED
+UNRESOLVED → OPEN | CANDIDATE
+CLOSED → INVALIDATED
+INVALIDATED → OPEN
+REJECTED → terminal
+```
+
+`CANDIDATE → CLOSED` additionally requires evidence present, verifier passed, producer/verifier independence and exact scope match. `CANDIDATE → REJECTED` requires failed verifier. Function returns only allow/deny; it does not mutate a database or append events. Caller must persist accepted transition as an immutable, authenticated event; authorization, ID uniqueness and evidence content verification are not yet implemented by this stage.
+
+Test `ai/tests/15_noema_contracts.lir` exercises 12 positive/negative assertions. Validation in this session: `python3 ai/run_tests.py` reports **40 passed, 0 failed** over all AI LIR fixtures/backends; `zig build test` also passes with Zig 0.13.0. These establish fixture/compiler correctness for this implemented code, not NOEMA capability or model quality. Zig 0.13.0 was installed into temporary sandbox tooling from the PyPI `ziglang` package; it was not added as a repository/runtime dependency.
+
+### 38.3 Stage completion rules
+
+No stage starts while its predecessor's contract, tests and versioned data fixture are incomplete. A LIR return code is not a proof kernel certificate unless the checker soundness boundary is established. Any failing gate blocks the next stage, and explicit event/report contains failed IDs. Approximate retrieval, model self-score, or passing its own generated tests cannot promote a capability alone. A capability is implemented only when code, tests, caller integration, resource/security limits, observability and rollback are all present.
+
+**Current limit:** Stage 1 is a deliberately small slice. NOEMA event storage, dataset ingestion in LIR, evidence payload validation, task graph, retrieval, memory, training and serving still do not run as one system. This section records actual sequence and status so that the architecture is built, not merely described, one verifiable boundary at a time.
+
+*Belge sürümü: v2.2 — 2026-11-16. LIR uygulama sırası sabitlendi; TTA transition guard ilk yürütülebilir dilim olarak eklendi ve üç AI backend'inde test edildi.*
