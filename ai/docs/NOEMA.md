@@ -1,6 +1,6 @@
 # NOEMA — Analog-Doğal, Doğrulama-Kapılı Muhakeme Mimarisi
 
-**Durum:** v1.6 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
+**Durum:** v1.7 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
 **Amaç:** `ai/` çatısının dışına ve SEL'in üstüne sıfırdan kurulan, **muhakeme-öncelikli** yeni mimarinin eksiksiz tanımı.
 **Bu deponun kuralı (iddia = ölçüm) bu belge için de geçerlidir:** aşağıda geçen her "hedef", "kestirim" ya da "beklenti" açıkça **ölçülmemiştir**. Ölçülmüş tek sayılar, mevcut SEL çekirdeğine aittir ve öyle etiketlenmiştir. Bu belge bir *vaad* değil, bir *ölçülecek hipotezler listesi*dir.
 
@@ -32,7 +32,7 @@ Bunu bir tasarım belgesi **veremez**; yalnız bir *deney düzeneği* verebilir.
 2. **Kapasiteyi parametre sayısı yerine sayılabilir bilgi birikimine bağlamak** — kural deposu (procedural memory) her doğrulanmış türetmede **büyür**. LLM'de "bilmek" 12B weight'te gizlidir, ölçülemez; NOEMA'da "bilmek" = depodaki kural + bölüm sayısı, sayılabilir ve denetlenebilir.
 3. **Bilişsel yeteneği sert kapılarla ölçmek** (§10): doğrulanabilir matematik, kod sentezi, planlama zincirleri, bileşimsel genelleme, unutmasız sürekli öğrenme. Her kapının bir sayı hedefi ve bir **"dur-ölç" koşulu** vardır. Kapı geçilemiyorsa mimari değişir, iddia kabartılmaz.
 
-Dürüst karşı-taraf (NOEMA'nın kaybedeceği yerler): web-ölçeğinde hazır bilgi, açık-alan sohbet akıcılığı, 7/24 kesintisiz üretim. NOEMA, "her şeyi bilen sohbet modeli" değildir; **hesaplayan, doğrulayan, ispat üreten** bir çekirdektir. Bu dar ama gerçek bir iddiadır.
+Başlangıçtaki üç açık risk — web-ölçeğinde hazır bilgi, açık-alan sohbet akıcılığı, kesintisiz servis — bu belgenin son sürümünde mimari alt-sistemlerle ele alınır (§33): kanıt bağlantılı federatif retrieval, diyalog durumu + açık dil yüzeyleyici, hata toleranslı servis işletimi. Bunlar tasarım hedefidir, çözülmüş kapasite değildir. Retrieval web'in tamamını kapsamaz; dil akıcılığı öğrenilmiş/öğretilmiş kapsamı aşamaz; dağıtık yedeklilik donanım, ağ ve operasyon hatalarını sıfırlamaz. NOEMA bu nedenle "her şeyi bilen/kusursuz/daima erişilebilir" diye tanımlanmaz; **kanıtla sınırlandırılmış, kapsamını ve servis durumunu doğru bildiren** sistem olarak tasarlanır.
 
 ---
 
@@ -368,7 +368,7 @@ SEL'in "bütün sistem = tek ağ" iddiası geri çekilir; yerine "SEL = NOEMA'n�
 3. **Analog gürültü** — faz kuantizasyonu 8 bitin altında K4'ü öldürebilir; K9 bunu ölçmeden "analog" iddiası yapılmaz.
 4. **Kural uzayının patlaması** — VGPS'in R'si yüz binlerce kurala ulaşırsa öneri LSH'u ve enerji sıralaması isabet kaybeder; çözüm: kural başına kullanım istatistiği + çürütücü (contradiction) prunesi.
 5. **Doğrulanamayan alanlar** — ortak-akıl, etik, sosyal tahmin: NOEMA burada bilinçli olarak **çekimserdir**; bu bir eksiklik değil tasarım tercihidir, ama "AGI" diline izin vermez.
-6. **Bilgi soğuk-başlangıcı** — web-ölçeğinde önceden yüklenmiş bilgi yoktur; NOEMA'nın "bilir" demek için önce doğrulanmış bir türetme ya da epizod gerekir. Değer, bilgi *üretmekte*dir, hatırlamakta değil.
+6. **Bilgi soğuk-başlangıcı (v0.1 tarihsel risk kaydı)** — o sürümde web retrieval katmanı tanımlanmamıştı. Güncel risk azaltımı §33.1 federatif, kaynak/erişim/freshness kontrollü retrieval'dır; bu, web'in tamamını kapsama veya verisiz bilgi garantisi değildir.
 7. **`2^32` çözünürlük** — Q32.32'nin kesir tavanı; çok hassas bilimsel hesaplar (kafes sabitleri vb.) big-int araç katmanına düşer.
 
 ---
@@ -1641,3 +1641,79 @@ K82 — cross-tenant leakage/unauthorized source use = 0 test kapsamı.
 **Sınırlar ve geriye kalan riskler (açık):** başlangıç seed'i yine insan mühendisliği ister; seed kapsamı dardır. Free-form dil grounding eğitim olmadan gelmez; teacher error, ambiguous concepts, acquisition data coverage, rule explosion, maintenance, harmful external content, tool availability ve verifier incompleteness vardır. Formal correctness yalnız kernel'in ifade edebildiği alanı kapsar. No architecture can guarantee literally “no weaknesses”; mitigation is explicit scope, fail-closed, measurement and correction—not a promise. K75–K82 ölçülüp, gerçek görevlerde hedef kalite ve maliyet gösterilmeden bu sistemin devrimsel, genel veya pretraining'den ucuz olduğu söylenemez.
 
 *Belge sürümü: v1.6 — 2026-11-16. Genel pretraining'siz acquisition, grounding, private-to-promoted skill lifecycle ve kalite-kısıtlı hız hedefi tasarlandı; runtime uygulanmadı ve performans ölçülmedi.*
+
+## 33. v1.7 — Kapsam, akıcılık ve sürekli hizmet için dayanıklılık mimarisi
+
+Bu bölüm §0'daki üç karşı-tarafı ve bunlarla ilişkili sistem risklerini **işletilebilir alt sistemlere** dönüştürür. Her alt sistem request/task/evidence/artifact ID grafına (§29), pretraining'siz acquisition sınırlarına (§32), hız bütçesine (§30) ve LIR güvenli çalıştırma kontratına (§31) uyar. Hedef riskleri küçültmek ve arıza etkisini sınırlamaktır; zayıflıksızlık, web'in tamamını bilme veya kesintisiz çalışma garantisi fiziksel olarak verilemez.
+
+### 33.1 Web ölçekli bilgi yerine federatif, kanıt bağlı retrieval
+
+NOEMA'nın “hazır bilgisi” iki ayrı şekilde sağlanır, birbirine karıştırılmaz:
+
+- **Curated knowledge packs:** sürümlü domain pack; claims, geçerlilik aralığı, kaynak/ref, lisans ve doğrulama durumunu taşır. Büyük ağırlık checkpoint'i değildir; her pack'in kapsamı ve boşlukları manifesttedir.
+- **Federated query-time retrieval:** allowlist'li web/API/catalog connectors, sorgu başına least-privilege izin ve bütçe ile kullanılır. Her sonuçta URL/source ID, alıntı span/hash, alım zamanı, yayın zamanı (biliniyorsa), connector version, trust class ve lisans/erişim koşulu saklanır. Ham sayfa evidence değil, kaynağa bağlı observation'dır.
+
+**Retrieval pipeline:** query intent/claim'lere ayrılır → source policy ve freshness gereksinimi belirlenir → bağımsız kaynaklar paralel sorgulanır → içerik normalize edilir ama raw snapshot/ref korunur → claim-span extraction + contradiction search → obligation başına kaynak desteği/karşıt bulgu → tarihli/bağlamlı cevap veya abstention. Arama sıralaması doğruluk olasılığına tek başına karar vermez. Kaynak bağımsızlığı domain-specific provenance graph ile ölçülür; aynı basın bültenini kopyalayan 20 site 20 independent source sayılmaz. Alıntı içermeyen factual claim cevap render'ına geçemez.
+
+**Freshness/coverage:** volatile fact'lerde TTL ve revalidation vardır; kalıcı iddia ile anlık durum ayrıdır. Source unavailable/stale ise eski snapshot tarih etiketiyle kullanılabilir veya `unknown` kalır. Web bütçesi (latency, calls, bytes, cost) aşılırsa partial coverage açıkça raporlanır. Search index'in kapsamı, kırık link, robots/access, dil ve domain coverage release manifestinde görünür; “web-scale” adı index boyutu ve benchmark ile tanımlanmadan kullanılmaz.
+
+**Security & rights:** page text untrusted data'dır, instructions değildir; prompt injection parser/tool policy'yi değiştiremez. Connector credentials sandbox'a sızmaz. Paywall, terms, consent ve retention kuralları obey edilir; erişilemeyen içerik etrafından dolaşılmaz. PII/secret filtreleri hem ingest hem render aşamasında uygulanır.
+
+### 33.2 Açık-alan sohbet için dialog-state + dil yüzeyleyici
+
+Cümle akıcılığı tekil output üretimi değildir; turn'ler arası bağlam ve kullanıcı hedefini korumaktır. Her konuşma için tenant-isolated `DialogueState` tutulur: `turn_id`, `active_goal`, `participants/referents`, `confirmed_facts`, `open_questions`, `commitments`, `style/locale`, `source/evidence refs`, `expiry/consent`, `unknowns`. Bu state doğal dil mesajlarından otomatik fact sayılmaz; “kullanıcı söyledi”, “sistem çıkardı”, “kaynak doğruladı” etiketleri ayrıdır. Yanlış çıkarım kullanıcı düzeltmesiyle retraction event olur.
+
+Pipeline:
+
+1. incremental Unicode parser her turn'de tüm geçmişi baştan işlemek yerine yalnız yeni span'ı parse eder; context window'da gerekli dependency'ler stable ID ile alınır.
+2. Dialogue manager intent/ellipsis/coreference adaylarını önceki state ile eşler; çoklu plausible referent varsa en az maliyetli clarification seçer.
+3. Planner cevap içeriğini ve pragmatik biçimini ayrı tutar. Factual obligations önce çözülür; yüzeyleyici yalnız doğrulanmış content/unknown/conflict üzerinde çalışır.
+4. Locale-specific morphology/syntax/conversation templates ile linguistic realization yapılır; politeness, register ve length preference kullanıcı ayarıdır. Üretilen her proposition post-render claim audit'ten geçer.
+5. Turn transition event log'a yazılır; retry aynı request/idempotency key ile çift cevap üretmez. Uzun diyaloglarda summary yalnız derived memory'dir; original permitted turn refs korunur.
+
+Akıcılık ölçümü grammar error, coherence, reference resolution, response relevance, turn repair, latency ve user rating'i ayrı raporlar; truth/grounding metriğiyle birleştirilmez. Grammar doğal/kompozisyonel renderer yüzeysel akıcılığı artırabilir; ancak hiç öğretilmemiş dil, deyim, kültürel bağlam veya dünya bilgisini kendiliğinden yaratmaz. Kapsam dışı dil için doğru davranış translated/limited mode veya açıklanmış sınırlamadır, uydurma akıcılık değil. Template tabanlı cevaplar dar alanda tutarlı ama tekrarlı olabilir; çeşitlilik artışı grounded claim denetimini kapatmaz.
+
+### 33.3 7/24 üretim amacı için reliability architecture
+
+- **Serving plane:** stateless API/router/worker pool, versioned immutable release; requests durable queue'ya idempotency key ile alınır. Compute worker'ları crash sonrası retry edilebilir; non-idempotent tool action yalnız idempotent adapter veya explicit reconciliation ile tekrar çalışır.
+- **State plane:** replicated metadata store + append-only event log + content-addressed object store. Acknowledge yalnız configured durability level sağlandıktan sonra. WAL/checkpoint, backup ve restore ayrı failure domain'lerde; deletion/consent event'leri replikasyonla yayılır.
+- **Failure domains:** en az iki bağımsız worker/zone tasarım hedefi; router, storage, DNS, identity, connector, compiler, verifier, cache ve release registry ayrı health dependency'leri. Tek hata bütün sistemi kilitlemesin; circuit breaker, bounded queue, backpressure ve admission control cascade'i keser.
+- **Degraded modes:** retrieval yoksa grounded cache'e tarihli yanıt veya abstention; teacher/learning plane yoksa mevcut immutable release ile read-only serving; cache yoksa bütçe içinde recompute; verifier yoksa yüksek güvenli/factual output kapalı; region/storage quorum yoksa durable kabul edemediği işi açıkça reject/pause eder. Fail-open yok.
+- **Recovery:** checkpointed run/task cursor, replayable deterministic event stream, RPO/RTO ölçümü, restore drill, rollback ve corruption detection. Disaster recovery testi geçmeden “high availability” terfi etiketi verilmez.
+- **Operations:** SLI/SLO error budget, on-call owner, alert/escalation, incident log, canary, kill switch, schema migration/rollback, capacity forecast, secret rotation ve chaos/fault-injection testleri release sözleşmesinin parçası. İnsan operasyonu ve vendor/ISP bağımlılığı sıfır varsayılmaz.
+
+“24/7” bir mimari diyagramın özelliği değil, belirli servis sınırı ve gözlem döneminde ölçülen availability'dir. `availability = başarılı, zamanında cevaplanan eligible requests / eligible requests`; planlı bakım, client failure, downstream connector outage ve degraded answer sınıflandırması SLO policy'de önceden tanımlanır. Hedef SLO yalnız ölçülen baseline/iş riski ile seçilir. %100 availability vaadi yoktur; outage sırasında güvenli degradation, durable recovery ve kullanıcıya doğru status hedeflenir.
+
+### 33.4 Diğer zayıflıklar için ortak fail-safe ve düzeltme döngüsü
+
+| Risk | Tasarım önlemi | Kabul ölçümü |
+|---|---|---|
+| Cold start / dar seed | seed inventory, domain pack, onboarding; görev bazında unsupported | K75/K77, first-valid-solve cost |
+| Uydurma / kaynak eskimesi | claim→obligation→fresh source; TTL/revalidation, abstention | unsupported-claim rate, stale-source detection |
+| Rule/graph explosion | scope/index, utility+use stats, expiry, contradiction and dependency pruning; archive not silent delete | storage/lookup p95, false-prune/retention |
+| Teacher/data poisoning | untrusted input, provenance, quarantine, independent check, staged promotion | red-team injection success, quarantine recall |
+| Ambiguity / culturally poor dialogue | alternatives, locale packs, clarification/repair | per-locale grounded conversation set, subgroup gaps |
+| Learning interference/forgetting | isolated candidate, retention suites, atomic promotion/rollback | continual-learning retention and rollback drills |
+| Latency/cost spikes | budget-aware routing, queue caps, cache, graceful partial result | p50/p95/p99 + total cost under load |
+| Privacy/tenant leakage | namespace isolation, least privilege, deletion propagation, audit | cross-tenant penetration and deletion coverage |
+| Tool/verifier failure | independent verifier version, fail-closed, degraded mode | fault injection, false acceptance = 0 test scope |
+| Release/supply-chain compromise | signed manifests, reproducible builds, dependency inventory, key rotation | signature/reproducibility and recovery tests |
+| Human/vendor/operator outage | bounded autonomy, named ownership, portable format, documented manual recovery | tabletop + restore exercise, measured RTO/RPO |
+
+No single score may hide a catastrophic subgroup/failure. Hard policy/security gate fails => feature disabled/release rejected, not weighted tradeoff. Correctness and availability objectives may conflict; status should say `partial`, `stale`, `paused` or `unsupported`, not fabricate a complete answer to preserve uptime.
+
+### 33.5 Entegrasyon ve kapılar
+
+Tüm retrieval results, DialogueState facts, availability events, degradation decisions ve answer artifacts §29 kimlik grafını kullanır; cross-tenant, orphan evidence ve untracked derived summary validator'da fail olur. Training/evaluation data toplanırken consent/retention uygulanır; incident log'a hassas raw prompts varsayılan olarak yazılmaz. Service plane ve learning plane ayrı credential, queue ve failure domain'idir; learning outage mevcut release'ı bozmaz.
+
+K83 — retrieval claim coverage: answer'daki kaynak gerektiren claim'lerin tamamı current/dated source evidence veya açık unknown'a bağlı.
+K84 — retrieval resilience: connector timeout/poison/stale/conflict/empty index testlerinde doğru degrade/abstain; unauthorized fetch = 0 test kapsamı.
+K85 — dialogue continuity: held-out multi-turn task'te referent/commitment/repair başarıları, locale/subgroup bazında; factual precision düşüşü yok.
+K86 — service resilience: fault injection'da SLO, RPO/RTO, durable ack/retry semantics ölçülür; %100 availability varsayılmaz.
+K87 — recovery: clean environment'de backup restore + release rollback + deletion replay drill; veri kaybı ve recovery wall time raporu.
+K88 — operational readiness: on-call, runbook, alert, owner ve kill-switch yoksa production promotion reddi.
+K89 — aggregate quality: grounding, task success, safety, privacy, latency/cost, subgroup results ayrı; hard fail sıfır toleranslı.
+
+**Geriye kalan gerçekler:** web/API erişimi, index coverage, dil-kültür örnekleri, storage, network, power, hardware, credentials, human operations ve verifier kapsamı sınırlı/arıza verebilir. Redundancy arızayı ortadan kaldırmaz; retrieval pretraining maliyetini değil query-time/access cost'ini getirir; explicit language bootstrap her dilde doğal akıcılığı garanti etmez. Bu nedenle mimari bu zayıflıkları ölçer, izole eder ve güvenli biçimde karşılar; **“hiçbir zayıflık asla yok” garantisi vermez**. Bu kapılar implement edilip fault-injection/kalite testleri geçmeden §33 bir tasarım hedefidir, üretim kabiliyeti değildir.
+
+*Belge sürümü: v1.7 — 2026-11-16. Web retrieval, grounded conversation ve resilient serving katmanları önceki risk kaydına bağlandı; deployment/SLO/benchmark sonuçları henüz yoktur.*
