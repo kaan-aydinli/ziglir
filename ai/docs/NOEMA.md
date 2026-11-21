@@ -1,6 +1,6 @@
 # NOEMA — Analog-Doğal, Doğrulama-Kapılı Muhakeme Mimarisi
 
-**Durum:** v1.9 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
+**Durum:** v2.0 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
 **Amaç:** `ai/` çatısının dışına ve SEL'in üstüne sıfırdan kurulan, **muhakeme-öncelikli** yeni mimarinin eksiksiz tanımı.
 **Bu deponun kuralı (iddia = ölçüm) bu belge için de geçerlidir:** aşağıda geçen her "hedef", "kestirim" ya da "beklenti" açıkça **ölçülmemiştir**. Ölçülmüş tek sayılar, mevcut SEL çekirdeğine aittir ve öyle etiketlenmiştir. Bu belge bir *vaad* değil, bir *ölçülecek hipotezler listesi*dir.
 
@@ -1880,3 +1880,83 @@ Sıra: (1) production dataset manifest schema + signed source registry; (2) line
 “Piyasadaki en kaliteli” sonuç değil, karşılaştırmalı iddiadır. K98–K106 ve temsilî, lisanslı, aynı koşullu dış karşılaştırmalar tamamlanmadan NOEMA'nın eğitim veya dataset sistemine pazar lideri denmez. Hiçbir quality pipeline bütün yanlış etiketleri, unknown distribution shift'i veya gelecekteki misuse'u sıfırlayamaz; hedef ölçülebilir risk azaltımı, hızlı geri çekme ve şeffaf kapsamdır.
 
 *Belge sürümü: v1.9 — 2026-11-16. Veri tedarik zinciri, objective dataset audit CLI, split/label/coverage gates ve training release scorecard bağlandı; piyasa kıyası veya büyük corpus sonucu yok.*
+
+## 36. v2.0 — Capability Growth Graph: geniş, birleşebilir, ölçülebilir yetenek
+
+“Her alanda iyi” tek uzman veya tek skor değildir. NOEMA'nın capability architecture'ı, görevleri sürümlü bir graph'ta ifade eder ve her kapsam hücresini bağımsız öğrenir/test eder; generic pretraining checkpoint'i zorunlu değildir, fakat başlangıç seed'i, öğretim, kaynak ve ölçüm gereksinimi devam eder.
+
+### 36.1 CapabilityNode ve beceri bileşimi
+
+Her capability bir kayıt olarak tanımlanır:
+
+```
+CapabilityNode {
+  capability_id, version, task_family, locales[], input/output_contract,
+  prerequisite_ids[], allowed_tools[], risk_class, evidence_standard,
+  training_sources[], candidate_skill_refs[], verifier_ids[],
+  eval_manifest_ref, known_failure_modes[], resource_profile,
+  status: seeded | candidate | evaluated | promoted | degraded | retired
+}
+```
+
+Graph edge'leri `prerequisite`, `composes_with`, `translates_between`, `requires_tool`, `verified_by`, `invalidated_by` türündedir. Bir capability'nin varlığı onu her dil/modality/domain için geçerli yapmaz; locale, domain, data scope, version, risk ve budget birlikte route key'dir. Mümkün olmayan/ölçülmemiş bir bileşim unsupported olarak kalır. Bir skill node'un promoted olması, bağlı diğer node'ların sonucu veya frontier-level intelligence kanıtı değildir.
+
+### 36.2 Her problem için kontrollü reasoning loop
+
+```
+parse alternatives + dialogue context
+ → declare goal/constraints/unknowns/source policy
+ → decompose to typed obligations and dependency DAG
+ → retrieve only permissioned facts + eligible skills
+ → choose diverse candidate producers under budget
+ → check candidates with independent verifiers/counterexample search
+ → reconcile conflicts or ask a discriminating question
+ → render only closed/qualified claims; expose unresolved coverage
+ → log outcome/correction as private episode
+ → propose skill update offline; eval/retention/safety gates; atomic promote/rollback
+```
+
+- **Bileşimsel planlama:** her ara adım bir alt-hedef/obligation ve resource cap'tir; state transitions exact/simulator checker ile kontrol edilir. Uzun planlarda checkpoint, cycle detection, backtracking limit ve partial path coverage tutulur.
+- **Diverse solving:** candidate producer'lar farklı yöntem sınıflarından seçilir (exact algorithm, graph/rule search, retrieval+source synthesis, LIR program search, measurement/tool). Aynı model/kuralların paraphrase edilmiş çıktısı bağımsız doğrulama sayılmaz.
+- **Counterexample-first:** her accepted reusable rule için applicability sınırında en yakın yanlış örnekler saklanır; dar karşı-örnek alanı dışındaki genellemeler açıkça sınırlanır.
+- **Self-improvement:** sistem kendi başarısını label yapmaz. Başarısızlık → typed error/event → diagnosis hypothesis → teacher/independent evidence → isolated candidate. Canary/regression kapısı geçmeden canlı beceri değişmez.
+- **Coverage-aware response:** çözülmüş ve çözülmemiş obligation yüzdesi, evidence level, kaynak yaşı, kullanılan araç/bütçe ve unsupported kısmı cevapta doğru gösterilir. Kısa, akıcı cevap için bu metadata gizlenmez; kullanıcıya uygun biçimde özetlenir.
+
+### 36.3 Capabilities across modalities and languages
+
+Multilingual language, retrieval, code, exact math, perception, planning, science/causal hypotheses, preference/style and interaction each have independent node families. Ortak graf yalnız typed meaning/evidence/action contracts'ı taşır; modality içi payload ve belirsizlik kaybolmaz. Cross-modal ilişki (ör. “bu grafikteki değer ses kaydındaki ölçümle aynı mı?”) ayrı alignment obligation ve kaynak span/time koordinatı gerektirir. Adapter/eval yoksa genel node'dan capability türetilemez.
+
+Her yeni locale/domain/modality için zero-shot transfer varsayımı yerine üç mod: (1) tested supported, (2) limited with explicit constraints/ask, (3) unsupported. Öğrenim sinyalleri locale-specific örnekler ve native review'i de içerir; tek bir yüksek kaynaklı dilin skoruyla az kaynaklı dillerin kalitesi temsil edilemez.
+
+### 36.4 Frontier comparison: kazanım iddiasının kapısı
+
+“Günümüz modellerinden daha zeki/kapsamlı/yetenekli” karşılaştırması için önceden kayıtlı protokol gerekir:
+
+1. Tarih, aday sistem/version/API, fiyat/compute ve benchmark commit/hash dondurulur; lisans/şartlar ve dış sistemin tool/data erişim koşulları kayda alınır.
+2. Ortak sealed task paneli; reasoning, novel composition, multilingual dialogue (locale/dialect ayrı), factual retrieval/citation, coding, planning/tool-use, perception ve uncertainty/abstention stratified olur. Train/dev/test group/time/source-family bazında sızıntısızdır.
+3. Aynı kullanıcı talimatı, tool izinleri, kaynak erişimi, test süresi/attempt bütçesi, hardware/compute envelope ve output limits uygulanır. Eşit olmayan koşullar ayrı track olarak raporlanır, doğrudan ranking'e karıştırılmaz.
+4. Exact checker olan görevler deterministic oracle; açık uçlu dilde kör native/human evaluation, rubric, annotator agreement ve adjudication; grader model kullanılırsa insan audit + bias/correlation değerlendirmesi zorunlu.
+5. Her aile için success, coverage, factual/semantic error, calibration, abstention utility, safety/privacy, latency, total cost ve subgroup CI ayrı raporlanır. Aggregate skor yanında worst-critical-subgroup ve failure taxonomy görünür.
+6. Çoklu seed/repeat, paired bootstrap/CI, contamination probe, prompt sensitivity, paraphrase/translation variants ve red-team tests; public testte tune edilen sistem aynı setle finalist iddia edemez.
+7. Pretraining-free iddiası audited seed/data/weight provenance ile kanıtlanır; source retrieval/tool data runtime input olarak ayrı sayılır, hidden pretrained library/model dependency yasaktır.
+8. NOEMA “üstün” ancak önceden belirlenmiş anlamlı fark CI ile gösterilir, kalitede hard regression yoktur ve en az birkaç bağımsız task family + multilingual slices'ta tekrar edilirse söyler. Diğer alanlarda avantaj göstermediyse claim daraltılır; benchmark seçimini değiştirmekle kazanım sayılmaz.
+
+Bu protokol bugünkü örnek eval fixture'larıyla yapılmış değildir. “Günümüz modelleri” sabit referans değildir; model/version/tarih ve koşul olmadan karşılaştırma anlamsızdır. Özel API, kapalı test seti veya hızla değişen servis nedeniyle matched comparison yapılamıyorsa sonuç “karşılaştırılamadı”dır, üstünlük değil.
+
+### 36.5 Kalite/maliyet birlikte capability büyütme
+
+Her yeni skill için **marginal capability ledger** tutulur: yeni çözebildiği held-out task family, başarısızlıkları, kompozisyon derinliği, data/teacher minutes, verifier authoring/maintenance, CPU/J/wall/storage, inference latency, safety regression ve retention. Yeni skill yalnız capabilities eklemeli; mevcut node'u bozarsa versioned graph'ta ayrı route/candidate tutulur veya terfi reddedilir. İki node'un bileşimi ayrı benchmark olmadan “ikisini de yapıyor” diye çıkarılamaz.
+
+Acquisition optimizer hangi yeni example/teacher query'nin en çok skill sınırını daraltacağını seçebilir; bilgi kazancı tahmini untrusted heuristic'tir. Random/coverage baseline ile ablation edilir; aynı kaliteyi daha az veride sağlamadığı sürece “sample efficient” denmez. Zor görevde daha çok deliberation; kolay exact görevde bounded fast path. Bu compute adaptasyonu, son cevap kalitesini sabit tutmak için max budget yetmiyorsa otomatik fallback/abstain üretir; sessiz kalite düşüşü yoktur.
+
+K107 — capability graph correctness: prereq/effect/risk/scope refs geçerli; untested composition promoted = 0.
+K108 — transfer validity: her locale/domain/modality transfer edge'i ayrı held-out eval ve CI taşır.
+K109 — reasoning decomposition: hidden long-horizon tasks'te intermediate state, cycle, budget exhaustion ve partial coverage doğru raporlanır.
+K110 — learning validity: self-generated target'ların bağımsız evidence olmadan promoted olması = 0.
+K111 — breadth scorecard: capability matrix'teki her hücre supported/limited/unsupported ve n/CI/error/cost ile doldurulur; missing cell unsupported sayılır.
+K112 — frontier matched comparison: §36.4 tüm şartları ve preregistration; yoksa superiority claim disallowed.
+K113 — quality-cost frontier: skill başına yeni held-out capability vs full acquisition + operations cost; quality/safety regression hard fail.
+
+**Bu isteğin güvenilir yorumu:** mimari, yeni ve çeşitli görevlerde yetenek üretmek için compositional reasoning, tool/source access, memory, language-specific grounding, verifiable code, continuous skill acquisition ve failure-aware routing'i birleştirir. “Pretraining yok” yalnız büyük genel checkpoint olmaması; seed, görev verisi, insan emeği ve external knowledge'ı yok sayma değildir. Bu değişiklikler uygulandığı veya frontier seviyesine ulaştığı anlamına gelmez; repository halen NOEMA tasarımını ve demo validator'ı taşır. Hedefi kanıtlayacak ilk gerçek teslimat, tek bir dikey dilimde çalışan capability graph + data pipeline + sealed eval + ölçülü karşılaştırmadır.
+
+*Belge sürümü: v2.0 — 2026-11-16. Capability growth graph ve frontier comparison gates eklendi; NOEMA runtime, broad benchmark ve karşılaştırmalı sonuçlar henüz yoktur.*
