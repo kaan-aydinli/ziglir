@@ -331,6 +331,45 @@ fn noema_evaluate_split(b: SelBlock, row_count: i64, features: *u8, targets: *u8
     return evaluated
 }
 
+/// Evaluate classification decisions by argmax(target) vs argmax(prediction).
+/// Writes row-major confusion matrix [actual * classes + predicted].
+fn noema_confusion_split(b: SelBlock, row_count: i64, features: *u8, targets: *u8, splits: *u8, wanted_split: i64, confusion: *u8) -> i64 {
+    if row_count < 0 or row_count > FIT_MAX_ROWS or b.nin <= 0 or b.nout <= 1 or b.nout > 64 { return FIT_INVALID }
+    if wanted_split < FIT_TRAIN or wanted_split > FIT_TEST { return FIT_INVALID }
+    var a: i64 = 0
+    while a < b.nout { var p: i64 = 0 while p < b.nout { @write_u64(@ptr_add(confusion, (a * b.nout + p) * 8), 0 as u64) p = p + 1 } a = a + 1 }
+    var evaluated: i64 = 0
+    var row: i64 = 0
+    while row < row_count {
+        let split = @read_u64(@ptr_add(splits, row * 8)) as i64
+        if split < FIT_TRAIN or split > FIT_TEST { return FIT_INVALID }
+        if split == wanted_split {
+            let x = @ptr_add(features, row * b.nin * 8)
+            let target = @ptr_add(targets, row * b.nout * 8)
+            forward(b, x)
+            var actual: i64 = 0
+            var predicted: i64 = 0
+            var best_actual = 0 - 9223372036854775807
+            var best_prediction = 0 - 9223372036854775807
+            var c: i64 = 0
+            while c < b.nout {
+                let expected = @read_u64(@ptr_add(target, c * 8)) as i64
+                let output = @read_u64(@ptr_add(b.out, c * 8)) as i64
+                if expected > best_actual { best_actual = expected actual = c }
+                if output > best_prediction { best_prediction = output predicted = c }
+                c = c + 1
+            }
+            let cell = (actual * b.nout + predicted) * 8
+            let old_count = @read_u64(@ptr_add(confusion, cell)) as i64
+            @write_u64(@ptr_add(confusion, cell), (old_count + 1) as u64)
+            evaluated = evaluated + 1
+        }
+        row = row + 1
+    }
+    if evaluated == 0 { return FIT_INVALID }
+    return evaluated
+}
+
 /// Fixed-epoch deterministic fit; history stores mean training energy per epoch.
 fn noema_fit(b: SelBlock, row_count: i64, features: *u8, targets: *u8, splits: *u8, eta: i64, epochs: i64, history: *u8) -> i64 {
     if epochs <= 0 or epochs > FIT_MAX_EPOCHS { return FIT_INVALID }

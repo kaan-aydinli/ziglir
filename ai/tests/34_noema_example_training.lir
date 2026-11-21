@@ -1,0 +1,61 @@
+// NOEMA Stage 20: read repository example-coded dataset and train/evaluate in LIR.
+import "../src/noema_csv.lir"
+import "../src/noema_fit.lir"
+fn main() -> i64 {
+    var checks: i64 = 0
+    var passed: i64 = 0
+    let fd = @open("ai/noema-training/example_training.csv", 0, 0)
+    checks = checks + 1
+    if fd >= 0 { passed = passed + 1 }
+    if fd < 0 { printInt(passed) print("/") printInt(checks) println("") return 0 }
+    let bytes = @malloc(4096)
+    let nbytes = @read(fd, bytes, 4096)
+    @close(fd)
+    checks = checks + 1
+    if nbytes > 0 and nbytes < 4096 { passed = passed + 1 }
+    let features = @malloc(11 * 4 * 8)
+    let targets = @malloc(11 * 4 * 8)
+    let splits = @malloc(11 * 8)
+    let history = @malloc(200 * 8)
+    let rows = noema_csv_decode(nbytes, bytes, 4, 4, 11, features, targets, splits)
+    checks = checks + 1
+    if rows == 11 { passed = passed + 1 }
+    var train_count: i64 = 0
+    var dev_count: i64 = 0
+    var test_count: i64 = 0
+    var i: i64 = 0
+    while i < rows {
+        let split = @read_u64(@ptr_add(splits, i * 8)) as i64
+        if split == FIT_TRAIN { train_count = train_count + 1 }
+        if split == FIT_DEV { dev_count = dev_count + 1 }
+        if split == FIT_TEST { test_count = test_count + 1 }
+        i = i + 1
+    }
+    checks = checks + 1
+    if train_count == 7 and dev_count == 3 and test_count == 1 { passed = passed + 1 }
+    let model = block_new(4, 4, 4, 1729)
+    checks = checks + 1
+    if noema_fit(model, rows, features, targets, splits, ONE / 16, 200, history) == 200 { passed = passed + 1 }
+    checks = checks + 1
+    if (@read_u64(@ptr_add(history, 199 * 8)) as i64) < (@read_u64(history) as i64) { passed = passed + 1 }
+    let train_conf = @malloc(16 * 8)
+    let dev_conf = @malloc(16 * 8)
+    let test_conf = @malloc(16 * 8)
+    let tn = noema_confusion_split(model, rows, features, targets, splits, FIT_TRAIN, train_conf)
+    let dn = noema_confusion_split(model, rows, features, targets, splits, FIT_DEV, dev_conf)
+    let en = noema_confusion_split(model, rows, features, targets, splits, FIT_TEST, test_conf)
+    let train_correct = (@read_u64(train_conf) as i64) + (@read_u64(@ptr_add(train_conf, 40)) as i64) + (@read_u64(@ptr_add(train_conf, 80)) as i64) + (@read_u64(@ptr_add(train_conf, 120)) as i64)
+    let dev_correct = (@read_u64(dev_conf) as i64) + (@read_u64(@ptr_add(dev_conf, 40)) as i64) + (@read_u64(@ptr_add(dev_conf, 80)) as i64) + (@read_u64(@ptr_add(dev_conf, 120)) as i64)
+    let test_correct = (@read_u64(test_conf) as i64) + (@read_u64(@ptr_add(test_conf, 40)) as i64) + (@read_u64(@ptr_add(test_conf, 80)) as i64) + (@read_u64(@ptr_add(test_conf, 120)) as i64)
+    checks = checks + 1
+    if train_correct == 7 and tn == 7 { passed = passed + 1 }
+    checks = checks + 1
+    if dev_correct == 2 and dn == 3 { passed = passed + 1 }
+    checks = checks + 1
+    if test_correct == 1 and en == 1 { passed = passed + 1 }
+    printInt(passed)
+    print("/")
+    printInt(checks)
+    println("")
+    return 0
+}
