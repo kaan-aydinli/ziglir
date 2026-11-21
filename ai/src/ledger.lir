@@ -298,7 +298,7 @@ fn noema_train_epoch(b: SelBlock, row_count: i64, features: *u8, targets: *u8, s
         row = row + 1
     }
     if trained == 0 { return FIT_INVALID }
-    @write_u64(mean_energy_out, div(total, from_int(trained)) as u64)
+    @write_u64(mean_energy_out, div(total, from_int(trained * b.nout)) as u64)
     return trained
 }
 
