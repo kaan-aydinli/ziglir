@@ -1,6 +1,6 @@
 # NOEMA — Analog-Doğal, Doğrulama-Kapılı Muhakeme Mimarisi
 
-**Durum:** v1.4 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
+**Durum:** v1.5 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
 **Amaç:** `ai/` çatısının dışına ve SEL'in üstüne sıfırdan kurulan, **muhakeme-öncelikli** yeni mimarinin eksiksiz tanımı.
 **Bu deponun kuralı (iddia = ölçüm) bu belge için de geçerlidir:** aşağıda geçen her "hedef", "kestirim" ya da "beklenti" açıkça **ölçülmemiştir**. Ölçülmüş tek sayılar, mevcut SEL çekirdeğine aittir ve öyle etiketlenmiştir. Bu belge bir *vaad* değil, bir *ölçülecek hipotezler listesi*dir.
 
@@ -1506,3 +1506,52 @@ Run sonucu hem `raw_training_seconds` hem `cache_saved_seconds`, `validation_sec
 Başlangıç hedefi "olabildiğince hızlı" değil: aynı kabul edilen quality/evidence/security sonucunu daha düşük **toplam end-to-end run cost** ile ölçmek. K67 geçmeden hız kazancı iddia edilmez. Mevcut training core'da gerçek paralel learner/cache DAG henüz kodlanmadığı için bu turda performans sonucu yoktur.
 
 *Belge sürümü: v1.4 — 2026-11-16. Eğitim execution plan, incremental DAG/cache, deterministic parallelism ve gate pyramid §22 akışına bağlandı; hızlanma ölçülmedi.*
+
+## 31. v1.5 — LIR: mimarinin doğrulanabilir derleme ve eylem dili
+
+LIR, NOEMA için serbest biçimli doğal dil modeli veya semantik karar motoru değil; **tipli, çalıştırılabilir ve sınırlandırılmış code/effect artifact** dilidir. Natural-language istek önce TaskContract/MeaningRecord/Obligation'a çevrilir; LIR kodu ancak bu sözleşmenin dar kapsamlı alt hedefini gerçekleştiren aday olur. LIR'ın `lir check`/derleme/test sonucu yalnız o artifact/build/input kapsamına evidence sağlar; kullanıcı niyetinin doğru anlaşıldığını veya programın bütün girdilerde doğru olduğunu tek başına kanıtlamaz.
+
+### 31.1 Katman bağlantısı
+
+```
+request + permissions + resource budget
+ → code obligation (preconditions, postconditions, effects, allowed APIs)
+ → LIR candidate + compiler/schema version
+ → type/sema + IR verifier + static resource checks
+ → O0 reference run + optimized builds (O1/O2) + property tests
+ → sandbox execution record + stdout/stderr/exit + resource counters
+ → artifact hash + evidence refs → response
+```
+
+- **NLU → code contract:** belirsiz önkoşul veya efekt yetkisi bilinmiyorsa kod çalıştırılmaz; eksik şart sorulur veya `unsupported` denir.
+- **LIR frontend → IR:** parser/sema/compiler version pin'lenir. `lang --json` capability output ve generated `LANGUAGE_REFERENCE.md` gerçek implementasyon kaynağıdır; docs'taki unsupported/partial features'ı kod üretimi var saymaz.
+- **Compiler → optimizer:** O0 semantik referans; O1/O2 performans adayları. Transform geçerli değilse optimizer seviyesi fail eder; guard, trap, bounds, overflow, evaluation order ve observable effect'ler sessizce ortadan kaldırılamaz.
+- **Runner → tools:** compiler/runner ayrı `tool_call_id`, read/write permission scope, wall/CPU/memory/output cap ve side-effect classification taşır. Derlenen kullanıcı kodu default olarak izole sandbox'ta çalışır; host I/O capability yoksa kapalıdır.
+- **Evidence → output:** source artifact hash, compiler build/version, target/backend, opt level, input/property suite hash, run status ve limitler zincirlenir. `executed_test` yalnız test edilen noktalar/özellikler içindir; `formal_proof` değildir.
+
+### 31.2 Hız ve kapsam hedeflerinin doğru ayrımı
+
+**Hız** iki bağımsız maliyettir: `compile_wall_time / compile_cpu / peak_RSS` ve `run_wall_time / CPU / memory / code_size`. Sadece `-O2` output runtime'ı değil, optimizer pass süresi de toplanır; optimize binary, compile bütçesine değmiyorsa küçük/tek-shot programda O1/O0 tercih edilebilir. Scheduler target workload'lar için compile cost + expected invocation count × runtime cost karşılaştırması yapar; benchmark'sız otomatik O2 varsayımı yok.
+
+**Kapsam** desteklenen construct/backend/target/version matrisidir. Genişleme yalnız grammar eklemek değildir: lexer/parser/sema/IR lowering/verifier/codegen/VM/C/WASM semantics, error diagnostics, language reference generation ve test matrix birlikte güncellenmelidir. Partial/unsupported hücre açıkça görünür; fail-closed ve feature capability ile route edilir. Her yeni feature semantic suite'i O0/O1/O2 ve desteklenen backend'lerde geçmeden training tool capability olarak ilan edilmez.
+
+### 31.3 Eğitim hızlandırıcıyla bağ
+
+Compiler workload DAG'i §30'la aynı execution plan kullanır. Parse/typed IR artifact cache key'i compiler binary+source hash, feature flags, target, schema, parent config ve input hash içerir. Optimization cache ayrı `opt_level` ve pass-pipeline fingerprint taşır. Cache yalnız exact hash ve doğrulanmış immutable result'ta kullanılabilir; compiler, optimizer, verifier, stdlib, target veya flags değişince descendants invalid olur. Property tests değişen IR/codegen/backend dependency'lerine göre incrementaldir; tam release promotion gate'i ve safety testleri yine zorunludur.
+
+Bağımsız source shard'lar ayrı process/worker'da derlenebilir. Bir source module için mutable compiler state paylaşılmaz; sonuçlar deterministik file/module order'ında merge edilir. Benchmark worker'ları correctness suite CPU/RAM kotasını çalamaz. Cold-cache ve warm-cache derleme süreleri ayrı raporlanır; cache speedup kalite artışı veya genel LIR speedup diye sunulmaz.
+
+### 31.4 Gate'ler ve ölçümler
+
+- **L0 language conformance:** supported construct için parse + type + expected diagnostic; generated language reference golden.
+- **L1 optimizer equivalence:** deterministic fixtures/property suite'te O0 referans ile O1/O2 sonuç, trap/side effect ve exit davranışı tutarlı.
+- **L2 backend equivalence:** yalnız ilan edilmiş backend matrix; unavailable platform unsupported kalır, başka backend sonucu yerine geçmez.
+- **L3 sandbox:** path/network/process/host memory sınırı, timeout, output cap, cancel/unknown-side-effect, cleanup; fail closed.
+- **L4 performance:** sabit compiler/code/input/host; warmup ve tekrarlar; median + p95/CI, compile+run, peak RSS/code size, correctness gate sonucu.
+- **L5 promotion:** artifact provenance + evidence refs, test coverage, regression/failure IDs ve cost raporu; human review risk policy'ye göre.
+
+Capability eval fixture `code-lir-optimization-001` bu sözleşmeyi ve ölçüm kapsamını kaydeder. K70 semantic preservation O0/O1/O2 ve desteklenen backend'lerde geçiş; K71 optimizer correctness regression = 0; K72 feature matrix her release'te generated ref ile uyumlu; K73 sandbox escape = 0 test kapsamı; K74 compile+run cost aynı doğruluk/host ile ölçülür. Benchmark sonuçları olmadan speedup iddiası yok.
+
+**Uygulama sınırı:** mevcut depodaki Zig bootstrap compiler zaten O0/O1/O2, CFG/SSA tabanlı optimizer, IR verifier ve native/VM/C11/WASM execution yolları içeriyor. Bu bölüm bunların NOEMA'daki rolünü ve ortak gate'lerini tanımlar; bu turn'de optimizer algoritması veya derleyici hızı değiştirilmedi. Zig toolchain sandbox'ta bulunmadığından compiler/backend regression matrix'i çalıştırılamadı; yalnız AI fixture validator çalıştırıldı. Öncelikli devam işi: toolchain erişimli CI'da K70–K74 benchmark/equivalence fixture'larını gerçek compiler ile bağlayıp ölçülen bottleneck'e göre pass-pipeline/compiler-cache iyileştirmesi yapmak.
+
+*Belge sürümü: v1.5 — 2026-11-16. LIR'in NOEMA'daki code/effect/evidence kontratı capability evaluation ile bağlandı; hız/kapsam hedefleri ayrıldı, performans henüz ölçülmedi.*
