@@ -1,6 +1,6 @@
 # NOEMA — Analog-Doğal, Doğrulama-Kapılı Muhakeme Mimarisi
 
-**Durum:** v0.6 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
+**Durum:** v0.7 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
 **Amaç:** `ai/` çatısının dışına ve SEL'in üstüne sıfırdan kurulan, **muhakeme-öncelikli** yeni mimarinin eksiksiz tanımı.
 **Bu deponun kuralı (iddia = ölçüm) bu belge için de geçerlidir:** aşağıda geçen her "hedef", "kestirim" ya da "beklenti" açıkça **ölçülmemiştir**. Ölçülmüş tek sayılar, mevcut SEL çekirdeğine aittir ve öyle etiketlenmiştir. Bu belge bir *vaad* değil, bir *ölçülecek hipotezler listesi*dir.
 
@@ -28,7 +28,7 @@ SEL bu kısıtı zaten "yasak tablosu" olarak uyguladı. NOEMA aynı tabloyu eks
 
 Bunu bir tasarım belgesi **veremez**; yalnız bir *deney düzeneği* verebilir. NOEMA'nın cevabı:
 
-1. **Muhakeme derinliğini sabit derinlik yerine değişken derinlik yapmak** — günümüz LLM'lerinde çıkarım, eğitimle donmuş, sabit katman sayısında akar. NOEMA'da muhakeme, arama derinliğiyle sınırsız büyüyen, her adımı doğrulanabilen bir türetmedir. *Derinlik = parametre değil, enerji bütçesi.*
+1. **Muhakeme derinliğini sabit katman yerine göreve/bütçeye bağlı yapmak** — NOEMA'da arama devam etme, bitirme veya çekimser kalma kararı verir; her adımın doğrulama seviyesi kaydedilir. Derinlik zaman/bellek/enerji bütçesiyle sınırlıdır ve çözüm garantisi yoktur. *Derinlik = parametre değil, açık kaynak bütçesi.*
 2. **Kapasiteyi parametre sayısı yerine sayılabilir bilgi birikimine bağlamak** — kural deposu (procedural memory) her doğrulanmış türetmede **büyür**. LLM'de "bilmek" 12B weight'te gizlidir, ölçülemez; NOEMA'da "bilmek" = depodaki kural + bölüm sayısı, sayılabilir ve denetlenebilir.
 3. **Bilişsel yeteneği sert kapılarla ölçmek** (§10): doğrulanabilir matematik, kod sentezi, planlama zincirleri, bileşimsel genelleme, unutmasız sürekli öğrenme. Her kapının bir sayı hedefi ve bir **"dur-ölç" koşulu** vardır. Kapı geçilemiyorsa mimari değişir, iddia kabartılmaz.
 
@@ -44,7 +44,7 @@ Dürüst karşı-taraf (NOEMA'nın kaybedeceği yerler): web-ölçeğinde hazır
 | P2 | **Her adım doğrulanabilir.** Muhakeme = küçük, tipli, denetlenebilir türetme adımları. | "Neden bu cevabı verdin?" sorusuna cevap her zaman bir kanıt ağacıdır, dikkat ağırlığı haritası değil. |
 | P3 | **Temsil süreklidir; sembol tablosu yoktur.** Girdi doğrudan holografik sahaya (hypervector) kodlanır. | Tokenizer, BPE, vocabulary — hiçbiri yok. Türkçe/İngilizce/matematik ifade aynı sahaya düşer. |
 | P4 | **Öğrenme yerel ve tek geçişlidir.** Gradyan yok. | SEL'in eikonal (NLMS-ailesi) kuralı + *doğrulama-sinyalli kural türetme* (§6). |
-| P5 | **Bellek sınırsız büyür; unutma yoktur.** | Üç katmanlı bellek (§5): epizodik (tam vektör), anlamsal (holografik süperpoziyon), prosedürel (doğrulanmış kurallar). "Unutma" yalnız RAM baskısında hiyerarşik dış-depoya taşınma demektir, silme değil. |
+| P5 | **Bellek katmanlı ve provenanslıdır; kapasite sonlu, arşiv büyütülebilir.** | E/M/P katmanları ve dış depo; silme/retention politikası P5'in üstündedir. Parametre belleğinde kayıpsız öğrenme garantisi yoktur. |
 | P6 | **Substrat-bağımsızdır.** Analog-doğal; dijital yalnızca yozlaşmış (kesikli) özel hâl. | Aynı hesap Kirchhoff yasalarıyla (memristor crossbar), foton fazıyla (fotonik) ya da i64 tamsayı emülasyonuyla (bu depo, x86-64) yapılır. |
 | P7 | **Deterministiktir.** Dijital emülasyon bit-bit aynı sonucu verir. | Analog yol gürültülü olduğu için *doğrulama* analog çıktının emniyet kemeridir: analog hızlandırır, kanıt motoru karar verir (P1). |
 | P8 | **Enerji muhasebesi ikilidir:** tıkanıklık enerjisi (search-control) ve fiziksel enerji hedef (analog yol için pJ/iş). | İkincisi tasarım hedefidir, ölçülmemiştir (§10, K7). |
@@ -100,44 +100,46 @@ Veri akışı tek yönlü değildir: L6 → L4 (bütçe, doğrulama isteği), L4
 
 ### 3.1 Ne
 
-Her kavram, `d` boyutlu bir **faz vektörü**dür: `v = (e^{iθ₁}, …, e^{iθ_d})`, `θⱼ ∈ [0, 2π)`. Analog donanımda bu bir kelime hattındaki `d` göz kondüktansının fazıdır; dijital emülasyonda Q32.32 tamsayı faz dizisidir.
+Her kavram, `d` boyutlu kompleks vektördür: `vⱼ = (xⱼ,yⱼ) ≡ xⱼ+i·yⱼ`; başlangıçta faz-kodlu kavramlarda `(cos θⱼ, sin θⱼ)` kullanılır. Analog yol faz/genlik taşır; dijital yol her reel/imaginary bileşeni Q32.32 `i64` ile saklar. Böylece bağlama ile demetleme aynı tipte ve matematiksel olarak tanımlıdır. `d` koordinat, dijital ham vektör başına `16d` bayt demektir (d=512 için 8192 bayt; indeks/meta hariç).
 
-Üç işlem yeterlidir:
+| işlem | tanım | dijital emülasyon |
+|---|---|---|
+| Bağlama `⊙` | `(x+iy)⊙(a+ib)=(xa−yb)+i(xb+ya)` koordinat başına | 4 Q32.32 çarpma + 2 toplama/çıkarma; taşmada **hata**, sessiz saturasyon yok |
+| Ters bağlama `⊙*` | kompleks eşlenik `(x,y)→(x,−y)` | reel bileşeni kopyala, imajiner işaretini tersle |
+| Demetleme `⊕` | koordinat başına kompleks toplama; toplama fan-in ve aralık üst sınırı manifestte | Q32.32 toplama; taşma olasılığı varsa batch reddedilir veya daha geniş exact yol kullanılır |
+| Norm | `||v||²=Σ(x²+y²)`; normalize yalnız ölçüm/çıktı gerektiğinde | kare/toplama/isqrt/div; overflow kontrolü zorunlu |
 
-| işlem | tanım | analog maliyeti | dijital maliyeti |
-|---|---|---|---|
-| Bağlama `⊙` | `(v ⊙ w)ⱼ = e^{i(θⱼ+φⱼ)}` | `d` faz toplayıcı | `d` tamsayı toplama + 2π sarmalama (karşılaştırma+çıkarma) |
-| Ters bağlama `⊙*` | `v* = (e^{-iθ₁}, …)` | fazın işaretini tersle | `2π − θⱼ` |
-| Demetleme `⊕` | `v ⊕ w` (normalize edilmemiş süperpozisyon) | `d` akım toplayıcı | `d` tamsayı toplama |
+Benzerlik `sim(v,w)=Re(Σ conjugate(vⱼ)wⱼ)/(||v||·||w||)`; sıfır-norm vektör geçersizdir. Yaklaşık Q32.32 hesap öneri sıralaması içindir; sınır civarında karar exact/interval hesapla tekrar edilir. Faz LUT'ı ve `cos(θ−φ)` tanımı ancak ileride optimize edilmiş özel backend'de kullanılabilir; semantik otorite yukarıdaki kompleks tanımdır. İşlemlerde XOR/AND/OR/shift yoktur; dijital donanımın iç temsili ayrı fiziksel gerçektir.
 
-Benzerlik: `sim(v,w) = cos(θ−φ)` toplamının `d`'ye oranı — analogda çıkış işareti genliğidir, dijitalde tamsayı kosinüs LUT + Q32.32 MAC. **Bitwise operatör sıfırdır** (P6): bütün adımlar toplama, çarpma, karşılaştırma.
+### 3.2 Temsil seçimi ve sınırlamalar
 
-### 3.2 Neden faz-VSA (ve neden MAP değil)
+- Kompleks faz binding terslenebilir bir bileşim operatörüdür; **tek başına dil anlamı veya mantıksal kanıt değildir**. Mantık ve tipler ayrı graf/kural deposundadır.
+- Analog toplama devresi ölçek/drift/gürültü etkiler; crossbar'ın doğal akım toplaması her iki bileşende doğru faz işlemi yapıldığı anlamına gelmez. Faz/genlik okuma, kalibrasyon ve ADC/DAC kaybı ölçülmeden analog uygulama iddiası yoktur.
+- Dijital emülasyon `d=512` ile başlayabilir; gerçek bellek `16d` bayt + indeks/meta'dır. Boyut/normalize/fan-in performansı K3 ve K7 ile ölçülür; L1'e sığma varsayımı yoktur.
+- Q32.32'de her ara çarpımın ölçekleme/overflow davranışı tanımlanmalı; saturasyon benzerliği sessizce bozduğu için vektör çekirdeğinde hata döndürür ve örneği karantinaya alır.
 
-- **Faz (FHRR ailesi)**: ters bağlama birebir ve tamdır; analogda tek pas. MAP'in permütasyonu dijitalde *indeks tablosu* gerektirir ve analogda fiziksel yer değiştirme ister — zayıftır.
-- **Demetleme varyantı**: analog için normalize'süz süperpozisyon (crossbar çıkışı doğal olarak normalize değildir); benzerlik eşiği ile karar verilir.
-- **d boyutu**: analog hedef `d = 8192–16384` (enerji bütçesi analoğa bağlı); dijital emülasyon `d = 512` (4 KiB/kavram, L1 önbelleğiyle barışık).
+
 
 ### 3.3 Kapasite (teorik, ölçülecek)
 
-Holografik/hyperdimensional literatürün bilinen sonucu: `d` boyutlu bipolar/faz kodlar, `O(d)` ilişkiyi bozulmasız saklayabilir (Kanerva 2009; Plate 2003). NOEMA bu bilinen davranışa *güvenmez*; `ai/noema/` içinde gürültü enjeksiyonlu bir emülatörle ölçer (§10, K3) ve gerçek kapasiteyi yazar. Tasarım kararı: deterministik demetleme + seyrek erişimle etkili kapasiteyi `~d/10` ilişki/alan tabanında korumaktır — **bu bir hedeftir, ölçülmemiştir.**
+VSA/HD literatürü dağıtık kodlarda girişim ve kapasite için olasılıksal sınırlar verir; bu sonuçlar NOEMA'nın kompleks Q32.32 binding/bundling, retrieval ve gürültü koşullarına otomatik taşınmaz. NOEMA `ai/noema/` emülatöründe ilişki sayısı, yanlış recall, false-positive ve gürültü eğrisini ölçmelidir (§10, K3). `~d/10` başlangıç sweep noktasıdır; teorik garanti veya kapasite vaadi değildir.
 
 ### 3.4 Diziler ve zaman
 
-Konum kodlaması permütasyon yerine **faz eğimi**dir: bir dizide `t`. eleman `v ⊙ p^t` yerine `θⱼ ↦ θⱼ + t·Δⱼ` ile kodlanır (doğrusal faz kayması = frekansın zamanla kayması). Dijitalde bu tek bir Q32.32 çarpma + toplama; analogda tek bir faz referans hattı. Permütasyona gerek yok → indise dayalı bit kayması yok.
+Konum kodlaması permütasyon yerine **faz kodu** olabilir: sıra indisindeki `t` için her koordinata sabit bir unit-phase kod `pⱼ^t` bağlanır. Vektör temsilinde bu kompleks çarpımdır; dijitalde tek bir çarpma değildir, Q32.32 multiply/add fan-out ve overflow maliyeti taşır. Faz rampasının üretimi/cache'i ayrıca bütçelenir. Bu bir alternatif kodlama hipotezidir; dizi görevlerinde positional baseline'a karşı ölçülmeden varsayılan sayılmaz.
 
 ---
 
 ## 4. L4 — Muhakeme Çekirdeği: VGPS (Doğrulama-Kapılı Program Araması)
 
-Mimarının kalbi. Kullanıcı isteğinde öncelik olan eksen budur: **günümüz sistemlerinden daha derin, hatasız ve denetlenebilir muhakeme.**
+Mimarinin merkezî tasarım hipotezi budur: **bütçe-kontrollü arama ve açık evidence level ile daha derin/denetlenebilir muhakeme**. Günümüz sistemlerine göre üstünlük ya da genel hatasızlık ölçülmüş değildir; ilgili kapılarda karşılaştırılacaktır.
 
 ### 4.1 Muhakeme nedir (NOEMA'da)
 
 Bir muhakeme, **tipli bir yeniden yazma sistemi** `R` içinde, hedefe götüren bir türetmedir:
 
 - Kurallar: `lhs ~> rhs where guard` — küçük tipli LIR fonksiyonlarıdır (emülasyonda i64 giriş/çıkış; doğrulama `lir check` + koşma ile).
-- Durum: `(hedef, kısıt-kümesi, kısmi program)` üçlüsü; her üçlü bir H vektörüyle kodlanır → tekrar durumlar tek bakışta yakalanır (transposition table = faz-korelasyon LUT'u).
+- Durum: `(hedef, kısıt-kümesi, kısmi program)` üçlüsü; H vektörü aday benzerliği için kullanılır, döngü/tekrar kararı canonical serialized exact key üzerinden verilir (yaklaşık faz skoru eşitlik kanıtı değildir).
 - Amaç sınıfları: (a) **doğrulanabilir** — aritmetik, cebir, mantık (karar verilebilir parçalar), kod (derleme+test), geometri-benzeri sayısal ispat; (b) **doğrulanamaz** — açık uçlu ortak-akıl, sosyal tahmin, estetik. Sınıf (a) her adımda sertifika ister; sınıf (b) **hipotez olarak etiketlenir ve güven ≥ eşik olmadan asla kesin söylenmez** (§7.4 çekimserlik).
 
 ### 4.2 Döngü (tek çıkarım adımı)
@@ -157,13 +159,13 @@ döngü bütçe kadar:
     en iyi adayı seç (enerji inişi); çürütücü tablo güncelle
 ```
 
-- **Öneri mekanizması** H-uzayı komşuluk aramasıdır (rastgele faz projeksiyonlu LSH; `O(log|R|)` yaklaşık en-yakın). "Policy network" yoktur; merak edilen yer *karşılaştırma*dır.
+- **Öneri mekanizması:** ilk referans sürümde type/arity/guard'a göre deterministik sıralı exact rule index ve bütçeli lineer tarama. Daha sonra eklenebilecek approximate vector/LSH index yalnız aday sıralar; exact checker ve canonical key son kararı verir. Karmaşıklık ölçülmeden `O(log|R|)` hedefi vaat edilmez.
 - **Transposition table** döngüleri ve tekrarlı dalları eler → arama sonsuza gitmez.
 - **Enerji ağırlıkları** `w₁..w₄` SEL-eikonal ile çevrimdışı öğrenilir (§6.1); arama sırasında sabittir.
 
 ### 4.3 Sertifika ve "neden?" sorusu
 
-Bir türetmenin kabul edilmesi için sınıf (a) gereği **kanıt izi** gerekir: ya aritmetik eşitlik denetimi (exact i64), ya LIR programının `lir check` + birim testlerinden geçmesi, ya da karar-verilebilir mantık denetimi. İz, bellekte kuralın meta-verisinde saklanır; kullanıcıya sunulduğunda **ağaç olarak** döner:
+Bir iddianın epistemik seviyesi açıkça ayrılır: **kanıtlandı** yalnız kernel'in biçimsel olarak denetlediği proof; **çalıştırma ile sınandı** derleme + test + sandbox sonucu (genel doğruluk ispatı değildir); **ampirik destekli** ölçüm/veri sonucu; **hipotez** henüz doğrulanmamış adaydır. `lir check` veya birim testin geçmesi tek başına tüm program davranışının ispatı sayılmaz. Her seviyede kaynak/versiyon/hash kaydedilir. İz, bellekte kuralın meta-verisinde saklanır; kullanıcıya sunulduğunda kanıt/çalıştırma ayrımı görünür:
 
 ```
 gerekçe := Şu-kanıtlar-zinciri: [kural:kare-alma-karo, doğrulandı: #8412]
@@ -177,11 +179,11 @@ LLM'de "neden?"in cevabı daha çok metindir; NOEMA'da "neden?"in cevabı **çal
 
 | eksen | günümüz LLM'leri | NOEMA (tasarım) |
 |---|---|---|
-| Derinlik | sabit katman; prompt ile derinlik artmaz | enerji bütçesiyle sınırsız iterasyon |
-| Hatasızlık | olasılıksal; uzun zincirde hata birikir | her adım kapıdan geçer; yanlış adım atılmaz, geri alınır |
-| Bileşimsellik | sistematik genelleme zayıf (SCAN/COGS benzeri ayrışmalar) | ⊙/⊕ yapısı gereği bileşimsel; karşı-ölçekli kombinasyonlar bedava |
-| Bilgi büyümesi | donmuş ağırlık; güncelleme = yeniden eğitim | her doğrulanan türetme depoyu büyütür (P5) |
-| Enerji/token | ~10¹¹–10¹² FLOP/token (kestirim) | ~10⁶ tamsayı MAC/adım (hedef; §10 K7'de ölçülecek) |
+| Derinlik | sistem/bütçeye göre değişir | bütçe ve sonlandırma koşuluna bağlı arama; çözüm garantisi yok |
+| Hatasızlık | olasılıksal çıktılar olabilir | biçimsel kernel'in kapsadığı iddialar doğrulanır; test geçişi ispat değildir |
+| Bileşimsellik | görev ve temsil bağımlı | graf/kural bileşimi hedefi; genelleme K1 ve K20 ile sınanır |
+| Bilgi büyümesi | sistem politikasına bağlı | arşiv/kural deposu sürümlenir; silme ve finite storage sınırı geçerlidir |
+| Enerji/token | donanım/yöntem bağımlı | sayısal maliyet iddiası yok; K7/K21 ile ölçülür |
 
 **Neden iddia değil:** zincirin her halkası tasarımda doğru görünse de hiçbiri bu depoda koşulmamıştır. Sayısal rakamların doğrulanması §10'dur.
 
@@ -195,11 +197,11 @@ NOEMA bir "daha iyi transformer" değildir ve onlarla rekabet etmez; **doğrulan
 
 ### 5.1 Epizodik (E) — Kanerva SDM üzerine
 
-Her çıkarım "epizot"u tam olarak saklanır: `(giriş H-vektörü, türetme ağacı, sonuç, sertifika?)`. Adres = H-vektörü; okuma = eşiği aşan en yakın yazım-konumlarının süperpozisyonu (Sparse Distributed Memory; Kanerva 1988). **Tam kayıt, kayıpsız geri çağırım, benzerlik-aranabilir.** Dijital emülasyonda her epizot d×4–8 bayt (d=1024 ise 4–8 KiB) — 10⁶ epizot ~8 GB; dış depo (indeks + mmap) ile taşınır.
+Her çıkarım epizotu `(raw_ref, giriş-vektörü, türetme/çalıştırma izi, sonuç, evidence_level, consent/retention)` tutar. Ham veriyi ayrı content-addressed arşiv saklar; embedding/vektör tek başına ham kaydın kayıpsız temsili değildir. Kompleks Q32.32 vektör d koordinatta en az `16d` bayttır; d=1024 için 16 KiB, buna indeks ve değişken uzunluktaki iz dahil değildir. SDM benzerlik indeksi geri çağırma hızlandırıcısıdır; asıl kayıt key ile okunur. Silme/retention policy erişim ve depolama süresini belirler.
 
 ### 5.2 Anlamsal (M) — holografik süperpoziyon
 
-Sık tekrar eden epizotlar *sıkıştırılır*: gruplarının H-vektörleri demetlenir (⊕) ve tek kayıt olur. Kapasite ~d/10 ilişki (hedef); sorgu tek faz-korelasyon pası. Analog yol bunu doğal olarak verir; dijitalde Q32.32 LUT MAC. **Bozulma:** süperposizyona binen her ek kayıt sinyali düşürür — bu yüzden M bir *önbellek*tir; doğruluk kaynağı her zaman E'dir.
+Sık tekrar eden epizotlar M'de yaklaşık retrieval cache girdilerine bağlanabilir; raw epizot E ve exact key korunur. Kompleks vektör demeti kayıplı olabilir; `~d/10` yalnız test edilecek hipotezdir, kapasite/erişim doğruluğu değildir. M'den gelen sonuç exact key + source record ile doğrulanmadan authoritative sayılmaz. M kapatıldığında doğruluk değişmemeli; yalnız latency/recall değişimi ölçülür.
 
 ### 5.3 Prosedürel (P) — kural deposu, mimarinin "bilgisi"
 
@@ -216,9 +218,9 @@ Bu, **gradyansız öz-geliştirme**dir: sistem, kendi doğrulanmış başarılar
 
 Çevrimdışı döngü: E → M sıkıştırması + P kural türetmesi + SEL-ağırlıklarının eikonal güncellemesi. Süre ve sıklık bütçe parametresidir. Uykuda yapılan iş **hiçbir zaman** yeni doğrulanmamış bilgi olarak M/P'ye yazılmaz; yalnız doğrulananlar terfi eder.
 
-### 5.5 Unutma yoktur — ama taşınır
+### 5.5 Retention, arşiv ve unutma riski
 
-RAM dolunca en soğuk epizotlar diske (mmap) iner; kaybolan hiçbir sertifika yoktur. "Catastrophic forgetting" (günümüz continual-learning'in kronik yarası) NOEMA'da mimari olarak imkânsızdır: yeni kurallar eskilerini değiştirmez, eklenir.
+RAM dolunca izinli kayıtlar dış depoya taşınabilir; checksum/backup/restore testleri gerekir. Bu, fiziksel kayıp veya indeks hatasını imkânsız yapmaz. Yeni kural sürümlü eklenir; ancak retrieval, yönlendirici ve sınırlı parametre değişikliği eski davranışı etkileyebilir. K26 retention testleri başarısızsa aday release terfi etmez. Silme ve retention policy arşiv ömründen üstündür.
 
 ---
 
@@ -383,7 +385,7 @@ SEL'in "bütün sistem = tek ağ" iddiası geri çekilir; yerine "SEL = NOEMA'n�
 
 - NOEMA, **bilinen ve yayınlanmış** yapıtaşlarını (holografik/VSA temsil, SDM bellek, NLMS/eikonal yerel öğrenme, yeniden yazma + doğrulama, program sentezi) tek bir **muhakeme-öncelikli** makinede birleştiren, bu deponun LIR/self-hosted gerçekliğine terzi işi uyarlanmış **uygulanabilir** bir mimari tasarımıdır.
 - Her iddiası bir kapıya (K0–K10) ve her satırı bir dosya/ölçüm planına bağlıdır.
-- Substrat-bağımsızlığı (analog-doğal + tamsayı emülasyon) bugün hiçbir ticari LLM yığınında olmayan bir özelliktir; maliyeti ve kazancı K0/K9 ile belgelenecektir.
+- Analog-doğal + tamsayı emülasyon iki backend hedefidir. Bunun güncel sistemlere göre özgünlüğü, maliyet avantajı veya kazancı karşılaştırmalı araştırma/ölçüm yapılmadan iddia edilmez; K0/K9 ve dış baseline incelemesi gerekir.
 
 ## 16. Referanslar (gerçek, yayınlanmış)
 
@@ -932,3 +934,42 @@ Bu dikey dilim geçmeden ses/görüntü/robotik/çok dillilik hedefleri için "t
 NOEMA'nın "eksiksiz" iddiası burada **tasarım dokümanında gerekli arayüz, durum geçişi, veri provenance'ı, update algoritması, ölçüm, güvenlik, hata/rollback ve release artefact'larının tanımlanmış olması** anlamına gelir. Bu, her yeteneğin implementasyonu veya frontier seviyesinde performansı anlamına gelmez. Kod, validator ve testler geliştirilip kapılar ölçülmeden "bütün güncel modellerin yapabildiği her şeyi yapar" denmeyecektir.
 
 *Belge sürümü: v0.6 — 2026-11-20. Eğitim run state machine'i, deterministik scheduler, rule promotion, release paketi ve ilk dikey dilim tanımlandı; implementasyon/benchmark sonucu yoktur.*
+
+## 23. v0.7 — Zayıf noktalar için öncelikli düzeltme kararı (harici bağımlılık yok)
+
+Bu bölüm önceki sürümlerdeki riskli/çelişkili ifadeleri düzeltir. İyileştirme **yeni dependency eklemek değildir**: mevcut repo'da olan LIR/runtime ve Zig/C standard library ile başlayacak; OS dosya/işlem arayüzleri dışında paket yöneticisi, model framework'ü, tokenizer kütüphanesi, GPU SDK'sı veya internetten model/data indirme gerektirmez. Her modül önce saf deterministic fonksiyon ve fixture ile kurulmalıdır.
+
+| Öncelik | Zayıf nokta | Düzeltme / yeni varsayılan | Doğrulama |
+|---|---|---|---|
+| P0 | Faz vektöründe kompleks bind ile normalize edilmemiş demetleme karışmıştı; maliyet ve bellek hatalıydı. | §3.1 artık `(real,imag)` kompleks vektör, açık bind/conjugate/sum/norm ve Q32.32 overflow-error tanımlar. Eski 4 KiB/d=512 kestirimi 8 KiB ham vektör olarak düzeltilmiştir. | Sıfır/identity/inverse/associativity toleransı/overflow fixture; integer reference karşılaştırması. |
+| P0 | Derleme + unit test sonucu "kanıt" gibi sunulabilirdi. | §4.3 evidence ladder: formal proof ≠ executable test ≠ empirical support ≠ hypothesis; cevap bu etiketi taşımak zorunda. | Bilerek hatalı programın test geçip theorem etiketi alamaması; checker negative tests. |
+| P0 | "Sınırsız", "unutma imkânsız", her adım hatasız ifadeleri gerçek sınırları aşıyordu. | §§4.4, 5.1, 5.5 ve §18 ile bütçe, sınırlı depo, silme ve test kapsamı açıklandı. | K18/K24/K26/K28, restore ve regression drill. |
+| P1 | Faz korelasyonu/LSH exact doğruluk için fazla otoriterdi. | Vektör skoru yalnız candidate ranking ve cache key önerir; proof/search state canonical serialized exact key ile karşılaştırılır. Yaklaşık arama kanıt veya dedupe kararı vermez. | Collision adversarial set; exact-key final comparison ve fallback scan. |
+| P1 | Dil anlamına geçiş varsayımsaldı; tokenizer yokluğu parser'ın kendiliğinden ortaya çıkması gibi okunabilirdi. | Parser açık, küçük, dil/sürüm kapsamlı grammar+lexicon rule pack'tir; bilinmeyen sözcük/parse ambiguity graf üzerinde korunur; kapsamsız dil `unsupported/ask` olur. | Dil başına grammar coverage, ambiguity recall, unseen morphology tests; başarı genellenmez. |
+| P1 | Öğrenme hedefleri tek kayıp/tek puan altında karışabilirdi. | §21.4'te proof, supervised, self-supervised, preference, correction, tool outcome ve abstention ayrı; preference/proxy score doğruluk validator'ını geçersiz kılamaz. | Sinyal türü yanlış kullanımı static schema gate'te red edilir. |
+| P1 | Harici checker/retriever ile sistemin "bağımsızlığı" belirsizdi. | İlk vertical slice compiler/proof/test için bu repo'nun yerel `lir` araçlarını; indekste kendi küçük sorted-table/AVL/hash-free baseline'ını kullanır. Hızlandırıcı eklenirse aynı API ve exact fallback zorunlu. | Hermetic run: ağ kapalı; build dependency list ve fixture hashes kayıtlı. |
+| P2 | Tek seferde analog + tüm modaliteler + tüm görevler tasarlanması scope patlaması yaratıyordu. | Geliştirme sırası: text/math+LIR → train/event/replay/rollback → local retrieval → tek algı kip adaptörü → diğer kipler. Analog backend, digital reference ve testleri geçmeden bloke. | Her faz bir vertical end-to-end use case ve maliyet raporu ile kapanır. |
+
+### 23.1 İlk sürümde kesin algoritmik daraltma
+
+VGPS'in ilk referans implementasyonu approximate nearest-neighbor/LSH'a **bağlı değildir**. Küçük R için exact canonical rule index kullanılır: rule family/type/arity/guard key'ine göre sıralı tablo, sonra deterministik lineer aday taraması; `budget` ve tie-break lexicographic rule ID. Bu seçim hız rekoru değil, kolay denetlenebilir referanstır. Ölçümde aday sayısı darboğaz çıkarsa daha hızlı indeks yanına eklenir; sonuçlar canonical exact checker'dan geçmeye devam eder.
+
+Benzer biçimde SDM ve holografik M ilk release'in doğruluk kaynağı değildir. İlk bellekte raw episode object + exact content key + sorted inverted index; M yalnız cache, bulunamayan/çakışan sonucu E'den tekrar oku. Böylece muğlak faz korelasyonu kullanıcı bilgisini tek başına silemez veya doğrulayamaz.
+
+### 23.2 Hata ilkeleri
+
+Tüm public modüller sonuç tipini açıkça döndürür: `ok(value)`, `unsupported(reason)`, `ambiguous(alternatives)`, `budget_exhausted(partial_trace)`, `invalid_input(code,span)`, `overflow(operation,range)`, `policy_denied(rule_id)`. Sessiz saturation, default değer uydurma, out-of-domain'i normal sonuç gibi sunma yasaktır. Kısmi arama izi saklanabilir ama tamamlanmış cevap statüsü alamaz. Her hata deterministik kod ve test fixture'a bağlanır.
+
+### 23.3 Bağımlılık politikası ve build hermeticity
+
+- Runtime core: repo'nun ZigLIR native runtime'ı; gerekli OS primitive'leri (file read/write, clock, process isolation) ince adapter arkasında.
+- Test referansı: mevcut self-hosted `lir`/Zig compiler ve küçük C standard-library twin yalnız gerekirse; Python sadece mevcut test orchestration için olabilir, production inference dependency değildir.
+- Üçüncü taraf model weights, tokenizer, network API, pretrained corpus veya paket kurulumu olmadan core testleri çalışmalıdır.
+- Her build `dependency_manifest` yayımlar; boş değilse her öğe gerekçe, sürüm, lisans, hash, alternatif ve kapatılabilir feature ile listelenir. Harici dependency eklemek için kullanıcı kapsamı/ADR gerekir.
+- Güncelleme indirimi kapalı; training artifacts offline manifest ile içeri alınır ve hash/lisans doğrulanmadan kullanılmaz.
+
+### 23.4 Bu turun kabul kriteri
+
+Doküman içindeki ters düşen eski mutlak ifadeler yukarıdaki yeni normative kararların gerisinde kalır. Kabul edilen semantik: **exact serialized record authoritative; vector/heuristic yalnız aday bulur; tests are not proofs; no silent lossy update; unsupported or ambiguous tasks fail closed; dependency-free local baseline first.** Bu tasarım değişikliklerinin hiçbiri henüz implementasyon/benchmark sonucu değildir.
+
+*Belge sürümü: v0.7 — 2026-11-20. En riskli matematik, doğrulama, unutma ve dependency varsayımları daraltılıp uygulanabilir no-dependency referans yolu belirlendi.*
