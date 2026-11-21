@@ -1,4 +1,4 @@
-// NOEMA Stage 21 natural-language TSV vectorization.
+// NOEMA Stage 21: metadata-validated text TSV vectorization.
 import "../src/noema_text.lir"
 fn main() -> i64 {
     var checks: i64 = 0
@@ -6,23 +6,36 @@ fn main() -> i64 {
     let rowsf = @malloc(3 * 16 * 8)
     let rowst = @malloc(3 * 4 * 8)
     let splits = @malloc(3 * 8)
-    let count = @malloc(8)
-    let text = "train\tanswer\tA cat runs quickly.\ndev\task\tCan you help?\ntest\ttool\tCompile this code.\n"
-    let n = noema_text_decode(text.len as i64, text.ptr as *u8, 3, 16, rowsf, rowst, splits, count)
+    let meta = @malloc(3 * 2 * 8)
+    let text = "noema.example.v2\tid-1\ttrain\tgroup-a\t1\treasoning\texact\tlow\tanswer\tproof\tsynthetic\tdemo\ttraining\tsynthetic\tgenerator-1\tnone\tnone\tA cat runs quickly.\nnoema.example.v2\tid-2\tdev\tgroup-b\t2\tlanguage\tambiguity\tlow\task\tinsufficient\tsynthetic\tdemo\ttraining\tsynthetic\tgenerator-1\tnone\tnone\tCan you help?\nnoema.example.v2\tid-3\ttest\tgroup-c\t3\tcode\tcompile\tlow\ttool\tproperty\tsynthetic\tdemo\ttraining\tsynthetic\tgenerator-1\tnone\tnone\tCompile this code.\n"
+    let n = noema_text_decode(text.len as i64, text.ptr as *u8, 3, 16, rowsf, rowst, splits, meta)
     checks = checks + 1
-    if n == 3 and (@read_u64(count) as i64) == 3 { passed = passed + 1 }
+    if n == 3 { passed = passed + 1 }
     checks = checks + 1
     if (@read_u64(splits) as i64) == TEXT_TRAIN and (@read_u64(@ptr_add(splits, 8)) as i64) == TEXT_DEV and (@read_u64(@ptr_add(splits, 16)) as i64) == TEXT_TEST { passed = passed + 1 }
     checks = checks + 1
     if (@read_u64(rowst) as i64) == 4294967296 and (@read_u64(@ptr_add(rowst, 4 * 8 + 8)) as i64) == 4294967296 { passed = passed + 1 }
+    let bad_label = "noema.example.v2\tid-4\ttrain\tgroup-d\t4\treasoning\texact\tlow\tunknown\tproof\tsynthetic\tdemo\ttraining\tsynthetic\tgenerator-1\tnone\tnone\tA sentence.\n"
     checks = checks + 1
-    let bad = "train\tunknown\tA sentence.\n"
-    if noema_text_decode(bad.len as i64, bad.ptr as *u8, 3, 16, rowsf, rowst, splits, count) == TEXT_INVALID { passed = passed + 1 }
+    if noema_text_decode(bad_label.len as i64, bad_label.ptr as *u8, 3, 16, rowsf, rowst, splits, meta) == TEXT_INVALID { passed = passed + 1 }
+    let bad_split = "noema.example.v2\tid-5\tretention\tgroup-e\t5\treasoning\texact\tlow\tanswer\tproof\tsynthetic\tdemo\ttraining\tsynthetic\tgenerator-1\tnone\tnone\tA sentence.\n"
     checks = checks + 1
-    let bad_split = "holdout\tanswer\tA sentence.\n"
-    if noema_text_decode(bad_split.len as i64, bad_split.ptr as *u8, 3, 16, rowsf, rowst, splits, count) == TEXT_INVALID { passed = passed + 1 }
+    if noema_text_decode(bad_split.len as i64, bad_split.ptr as *u8, 3, 16, rowsf, rowst, splits, meta) == TEXT_INVALID { passed = passed + 1 }
+    let leak = "noema.example.v2\tid-6\ttrain\tshared-group\t6\treasoning\texact\tlow\tanswer\tproof\tsynthetic\tdemo\ttraining\tsynthetic\tgenerator-1\tnone\tnone\tFirst sentence.\nnoema.example.v2\tid-7\ttest\tshared-group\t7\treasoning\texact\tlow\tanswer\tproof\tsynthetic\tdemo\ttraining\tsynthetic\tgenerator-1\tnone\tnone\tDifferent sentence.\n"
     checks = checks + 1
-    if noema_text_decode(text.len as i64, text.ptr as *u8, 2, 16, rowsf, rowst, splits, count) == TEXT_INVALID { passed = passed + 1 }
+    if noema_text_decode(leak.len as i64, leak.ptr as *u8, 3, 16, rowsf, rowst, splits, meta) == TEXT_INVALID { passed = passed + 1 }
+    let duplicate = "noema.example.v2\tsame-id\ttrain\tg1\t1\treasoning\texact\tlow\tanswer\tproof\tsynthetic\tdemo\ttraining\tsynthetic\tgenerator-1\tnone\tnone\tFirst.\nnoema.example.v2\tsame-id\ttrain\tg2\t2\treasoning\texact\tlow\tanswer\tproof\tsynthetic\tdemo\ttraining\tsynthetic\tgenerator-1\tnone\tnone\tSecond.\n"
+    checks = checks + 1
+    if noema_text_decode(duplicate.len as i64, duplicate.ptr as *u8, 3, 16, rowsf, rowst, splits, meta) == TEXT_INVALID { passed = passed + 1 }
+    let no_consent = "noema.example.v2\tid-8\ttrain\tg8\t8\treasoning\texact\tlow\tanswer\tproof\tsynthetic\tdemo\tdenied\tsynthetic\tgenerator-1\tnone\tnone\tNo permission.\n"
+    checks = checks + 1
+    if noema_text_decode(no_consent.len as i64, no_consent.ptr as *u8, 3, 16, rowsf, rowst, splits, meta) == TEXT_INVALID { passed = passed + 1 }
+    let disputed = "noema.example.v2\\tid-9\\ttrain\\tg9\\t9\\treasoning\\texact\\tlow\\tanswer\\tproof\\tsynthetic\\tdemo\\ttraining\\tdisputed\\tgenerator-1\\tnone\\tnone\\tDisputed target.\\n"
+    checks = checks + 1
+    if noema_text_decode(disputed.len as i64, disputed.ptr as *u8, 3, 16, rowsf, rowst, splits, meta) == TEXT_INVALID { passed = passed + 1 }
+    let bad_pii = "noema.example.v2\\tid-10\\ttrain\\tg10\\t10\\treasoning\\texact\\tlow\\tanswer\\tproof\\tsynthetic\\tdemo\\ttraining\\tsynthetic\\tgenerator-1\\tnone\\tunknown\\tPII label missing.\\n"
+    checks = checks + 1
+    if noema_text_decode(bad_pii.len as i64, bad_pii.ptr as *u8, 3, 16, rowsf, rowst, splits, meta) == TEXT_INVALID { passed = passed + 1 }
     printInt(passed)
     print("/")
     printInt(checks)

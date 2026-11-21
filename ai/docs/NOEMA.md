@@ -1,6 +1,6 @@
 # NOEMA — LIR ile uygulanan karar-kapıları
 
-**Durum:** v3.8. LIR’de uygulanıp test edilenler: contract/evidence/scheduler/data/capability/memory-scope/release-lifecycle/task-execution guard’ları, bounded exact-rule inference/proof checks, scoped volatile record store, deficit-guided curriculum/split checks, strict integer-CSV decoder, textual TSV→hashed bag-of-words decoder, SEL fit/evaluation/confusion metrics ve örnek metin setinde uçtan uca LIR eğitimi. Bu, genel amaçlı veya üretime hazır AI framework’ünün tamamı değildir.
+**Durum:** v3.9. LIR’de uygulanıp test edilenler: contract/evidence/scheduler/data/capability/memory-scope/release-lifecycle/task-execution guard’ları, bounded exact-rule inference/proof checks, scoped volatile record store, deficit-guided curriculum/split checks, metadata/provenance/group-split doğrulayan textual TSV→hashed bag-of-words decoder, SEL fit/evaluation/confusion metrics ve örnek metin setinde uçtan uca LIR eğitimi. Eğitim verisinin kanonik kaydı `noema.example.v2` JSONL; TSV yalnız LIR learner için metadata taşıyan projection’dır. Bu, genel amaçlı veya üretime hazır AI framework’ünün tamamı değildir.
 
 ## Uygulanmış dilimler
 
@@ -21,9 +21,15 @@
 | Strict integer CSV to Q32.32 feature/target arrays | `ai/src/noema_csv.lir` | `ai/tests/32_noema_csv.lir` |
 | CSV ingestion → fit → held-out split evaluation smoke pipeline | composed LIR modules | `ai/tests/33_noema_training_pipeline.lir` |
 | Read and train on manually encoded 11-record example-set task labels; confusion matrix | `ai/train_example.lir`, `ai/noema-training/example_training.csv` | `ai/tests/34_noema_example_training.lir` |
-| Textual TSV prompts/labels → hashed bag-of-words → SEL fit/evaluation | `ai/src/noema_text.lir`, `ai/train_text_example.lir`, `ai/noema-training/example_text.tsv` | `ai/tests/35_noema_text_ingest.lir`, `ai/tests/36_noema_text_training.lir` |
+| `noema.example.v2` text episodes, metadata-checked TSV projection, hashed bag-of-words → SEL fit/evaluation | `ai/noema-training/example_text.v2.jsonl`, `ai/noema-training/example_text.tsv`, `ai/src/noema_text.lir`, `ai/train_text_example.lir` | `ai/tests/35_noema_text_ingest.lir`, `ai/tests/36_noema_text_training.lir` |
 
 The latest LIR suite passes all 103 fixture/backend executions (including Stage 21 text ingestion and Stage 22 file-backed text training checks); backend coverage varies for legacy fixtures. Zig build tests, 21 Python standard-library validator/audit tests, and example validation also pass. These results verify bounded decision logic only; they do not establish that corresponding services exist.
+
+## Dataset format and quality status
+
+The training text records now follow the architecture's `noema.example.v2` episode fields: version, id, group key, seed, task/capability/risk, raw user text, explicit context/unknowns, target decision/text, evidence kind, validator, review state, safety and provenance. `example_text.tsv` is a strict LIR training projection with ID/group/seed/task/evidence/license/consent/review metadata; the decoder fails closed on unknown split/decision/risk/evidence/review values, missing required fields, duplicate IDs, non-training consent, and group leakage across train/dev/test. The split is grouped by rule family (train 9, dev 1 causal, test 1 safety), correcting the earlier arithmetic/planning cross-split contamination and correcting plan-002's invalid unreachable label.
+
+Quality is still limited: all records are synthetic, no human/dual review, the corpus is only 11 rows, and dev/test each contain one example. The TSV is currently manually paired with JSONL (not generated/cryptographically bound by a LIR JSON parser); actual payload/hash/license authenticity is not verified. This follows the schema shape, not the architecture's full production data-quality bar.
 
 ## Not implemented
 

@@ -1,7 +1,9 @@
-// NOEMA Stage 21: LIR-only UTF-8 byte/ASCII-token text dataset ingestion.
-// TSV fields: train|dev|test<TAB>answer|ask|tool|abstain<TAB>natural language text.
-// ASCII case-folding and alphanumeric token boundaries; deterministic hashed
-// bag-of-words. Non-ASCII bytes delimit tokens; this is not Unicode NLP.
+// NOEMA Stage 21: LIR-only strict metadata-validated text TSV ingestion.
+// Training projection columns: schema,id,split,group_key,seed,task_family,
+// capability,risk,decision,evidence_kind,source,license,consent,review,
+// created_by,safety_labels,pii,input. Canonical data contract is noema.example.v2 JSONL; this
+// projection exists for the current LIR learner, which has no JSON parser.
+// ASCII alphanumeric token hashing only; this is not Unicode NLP.
 const TEXT_INVALID: i64 = -1
 const TEXT_MAX_ROWS: i64 = 256
 const TEXT_MAX_FEATURES: i64 = 256
@@ -17,82 +19,164 @@ fn text_word_byte(ch: i64) -> i64 {
     if ch >= 97 and ch <= 122 { return 1 }
     return 0
 }
+fn text_lower(ch: i64) -> i64 { if ch >= 65 and ch <= 90 { return ch + 32 } return ch }
 
-fn text_lower(ch: i64) -> i64 {
-    if ch >= 65 and ch <= 90 { return ch + 32 }
-    return ch
+fn tsv_equal(bytes: *u8, start: i64, end: i64, expected: string) -> i64 {
+    if end - start != expected.len as i64 { return 0 }
+    var i: i64 = 0
+    while i < end - start {
+        if @read_u8(@ptr_add(bytes, start + i)) != @read_u8(@ptr_add(expected.ptr, i)) { return 0 }
+        i = i + 1
+    }
+    return 1
 }
 
-fn text_split_id(bytes: *u8, start: i64, end: i64) -> i64 {
-    if end - start == 5 and @read_u8(@ptr_add(bytes, start)) == 116 and @read_u8(@ptr_add(bytes, start + 1)) == 114 and @read_u8(@ptr_add(bytes, start + 2)) == 97 and @read_u8(@ptr_add(bytes, start + 3)) == 105 and @read_u8(@ptr_add(bytes, start + 4)) == 110 { return TEXT_TRAIN }
-    if end - start == 3 and @read_u8(@ptr_add(bytes, start)) == 100 and @read_u8(@ptr_add(bytes, start + 1)) == 101 and @read_u8(@ptr_add(bytes, start + 2)) == 118 { return TEXT_DEV }
-    if end - start == 4 and @read_u8(@ptr_add(bytes, start)) == 116 and @read_u8(@ptr_add(bytes, start + 1)) == 101 and @read_u8(@ptr_add(bytes, start + 2)) == 115 and @read_u8(@ptr_add(bytes, start + 3)) == 116 { return TEXT_TEST }
+fn tsv_hash(bytes: *u8, start: i64, end: i64) -> i64 {
+    if end <= start { return 0 }
+    var hash: i64 = 5381
+    var i = start
+    while i < end { hash = (hash * 33 + (@read_u8(@ptr_add(bytes, i)) as i64)) % 2147483647 i = i + 1 }
+    return if hash == 0 { 1 } else { hash }
+}
+
+fn tsv_seed_valid(bytes: *u8, start: i64, end: i64) -> i64 {
+    if end <= start { return 0 }
+    var value: i64 = 0
+    var i = start
+    while i < end {
+        let ch = @read_u8(@ptr_add(bytes, i)) as i64
+        if ch < 48 or ch > 57 { return 0 }
+        let digit = ch - 48
+        if value > 214748364 or (value == 214748364 and digit > 7) { return 0 }
+        value = value * 10 + digit
+        i = i + 1
+    }
+    return if value > 0 { 1 } else { 0 }
+}
+
+fn text_split_id(bytes: *u8, a: i64, b: i64) -> i64 {
+    if tsv_equal(bytes, a, b, "train") == 1 { return TEXT_TRAIN }
+    if tsv_equal(bytes, a, b, "dev") == 1 { return TEXT_DEV }
+    if tsv_equal(bytes, a, b, "test") == 1 { return TEXT_TEST }
     return TEXT_INVALID
 }
-
-fn text_label_id(bytes: *u8, start: i64, end: i64) -> i64 {
-    if end - start == 6 and @read_u8(@ptr_add(bytes, start)) == 97 and @read_u8(@ptr_add(bytes, start + 1)) == 110 and @read_u8(@ptr_add(bytes, start + 2)) == 115 and @read_u8(@ptr_add(bytes, start + 3)) == 119 and @read_u8(@ptr_add(bytes, start + 4)) == 101 and @read_u8(@ptr_add(bytes, start + 5)) == 114 { return 0 }
-    if end - start == 3 and @read_u8(@ptr_add(bytes, start)) == 97 and @read_u8(@ptr_add(bytes, start + 1)) == 115 and @read_u8(@ptr_add(bytes, start + 2)) == 107 { return 1 }
-    if end - start == 4 and @read_u8(@ptr_add(bytes, start)) == 116 and @read_u8(@ptr_add(bytes, start + 1)) == 111 and @read_u8(@ptr_add(bytes, start + 2)) == 111 and @read_u8(@ptr_add(bytes, start + 3)) == 108 { return 2 }
-    if end - start == 7 and @read_u8(@ptr_add(bytes, start)) == 97 and @read_u8(@ptr_add(bytes, start + 1)) == 98 and @read_u8(@ptr_add(bytes, start + 2)) == 115 and @read_u8(@ptr_add(bytes, start + 3)) == 116 and @read_u8(@ptr_add(bytes, start + 4)) == 97 and @read_u8(@ptr_add(bytes, start + 5)) == 105 and @read_u8(@ptr_add(bytes, start + 6)) == 110 { return 3 }
+fn text_label_id(bytes: *u8, a: i64, b: i64) -> i64 {
+    if tsv_equal(bytes, a, b, "answer") == 1 { return 0 }
+    if tsv_equal(bytes, a, b, "ask") == 1 { return 1 }
+    if tsv_equal(bytes, a, b, "tool") == 1 { return 2 }
+    if tsv_equal(bytes, a, b, "abstain") == 1 { return 3 }
     return TEXT_INVALID
 }
+fn text_risk_valid(bytes: *u8, a: i64, b: i64) -> i64 {
+    if tsv_equal(bytes, a, b, "low") == 1 or tsv_equal(bytes, a, b, "medium") == 1 or tsv_equal(bytes, a, b, "high") == 1 { return 1 }
+    return 0
+}
+fn text_evidence_valid(bytes: *u8, a: i64, b: i64) -> i64 {
+    if tsv_equal(bytes, a, b, "proof") == 1 or tsv_equal(bytes, a, b, "tool_test") == 1 or tsv_equal(bytes, a, b, "measurement") == 1 or tsv_equal(bytes, a, b, "insufficient") == 1 or tsv_equal(bytes, a, b, "human") == 1 or tsv_equal(bytes, a, b, "derivation") == 1 or tsv_equal(bytes, a, b, "transition_trace") == 1 or tsv_equal(bytes, a, b, "property") == 1 or tsv_equal(bytes, a, b, "hypothesis") == 1 or tsv_equal(bytes, a, b, "ambiguity") == 1 or tsv_equal(bytes, a, b, "computed_summary") == 1 or tsv_equal(bytes, a, b, "policy_gate") == 1 { return 1 }
+    return 0
+}
+fn text_source_valid(bytes: *u8, a: i64, b: i64) -> i64 {
+    if tsv_equal(bytes, a, b, "synthetic") == 1 or tsv_equal(bytes, a, b, "synthetic-contract") == 1 or tsv_equal(bytes, a, b, "human-reviewed") == 1 or tsv_equal(bytes, a, b, "licensed") == 1 { return 1 }
+    return 0
+}
+fn text_review_valid(bytes: *u8, a: i64, b: i64) -> i64 {
+    if tsv_equal(bytes, a, b, "synthetic") == 1 or tsv_equal(bytes, a, b, "human") == 1 or tsv_equal(bytes, a, b, "dual_review") == 1 { return 1 }
+    return 0
+}
+fn text_safety_valid(bytes: *u8, a: i64, b: i64) -> i64 {
+    if tsv_equal(bytes, a, b, "none") == 1 or tsv_equal(bytes, a, b, "destructive_action") == 1 { return 1 }
+    return 0
+}
+fn text_pii_valid(bytes: *u8, a: i64, b: i64) -> i64 {
+    if tsv_equal(bytes, a, b, "none") == 1 or tsv_equal(bytes, a, b, "redacted") == 1 or tsv_equal(bytes, a, b, "restricted") == 1 { return 1 }
+    return 0
+}
 
-/// Decode natural-language TSV into hashed token-count vectors and one-hot
-/// decision targets. `feature_dim` is fixed at training/evaluation time.
-fn noema_text_decode(length: i64, bytes: *u8, row_capacity: i64, feature_dim: i64, features: *u8, targets: *u8, splits: *u8, row_count_out: *u8) -> i64 {
+/// Decode training projection with closed vocabularies and provenance checks.
+/// `metadata` stores [id_hash, group_hash] per row and is used to reject
+/// duplicate IDs and any group_key crossing train/dev/test.
+fn noema_text_decode(length: i64, bytes: *u8, row_capacity: i64, feature_dim: i64, features: *u8, targets: *u8, splits: *u8, metadata: *u8) -> i64 {
     if length <= 0 or row_capacity <= 0 or row_capacity > TEXT_MAX_ROWS or feature_dim <= 0 or feature_dim > TEXT_MAX_FEATURES { return TEXT_INVALID }
     var pos: i64 = 0
     var rows: i64 = 0
+    let starts = @malloc(18 * 8)
+    let ends = @malloc(18 * 8)
     while pos < length {
         if rows >= row_capacity { return TEXT_INVALID }
         let line_start = pos
         var line_end = pos
         while line_end < length and (@read_u8(@ptr_add(bytes, line_end)) as i64) != 10 { line_end = line_end + 1 }
+        if line_end > line_start and (@read_u8(@ptr_add(bytes, line_end - 1)) as i64) == 13 { line_end = line_end - 1 }
         if line_end - line_start > TEXT_MAX_LINE_BYTES { return TEXT_INVALID }
-        var split_end = line_start
-        while split_end < line_end and (@read_u8(@ptr_add(bytes, split_end)) as i64) != 9 { split_end = split_end + 1 }
-        if split_end == line_end { return TEXT_INVALID }
-        let split = text_split_id(bytes, line_start, split_end)
-        if split < 0 { return TEXT_INVALID }
-        let label_start = split_end + 1
-        var label_end = label_start
-        while label_end < line_end and (@read_u8(@ptr_add(bytes, label_end)) as i64) != 9 { label_end = label_end + 1 }
-        if label_end == line_end { return TEXT_INVALID }
-        let label = text_label_id(bytes, label_start, label_end)
-        if label < 0 or label >= TEXT_CLASSES { return TEXT_INVALID }
-        let text_start = label_end + 1
-        if text_start >= line_end { return TEXT_INVALID }
+        var field_count: i64 = 0
+        var field_start = line_start
+        var cursor = line_start
+        while cursor <= line_end {
+            if cursor == line_end or (@read_u8(@ptr_add(bytes, cursor)) as i64) == 9 {
+                if field_count >= 18 or cursor == field_start { return TEXT_INVALID }
+                @write_u64(@ptr_add(starts, field_count * 8), field_start as u64)
+                @write_u64(@ptr_add(ends, field_count * 8), cursor as u64)
+                field_count = field_count + 1
+                field_start = cursor + 1
+            }
+            cursor = cursor + 1
+        }
+        if field_count != 18 { return TEXT_INVALID }
+        if tsv_equal(bytes, @read_u64(starts) as i64, @read_u64(ends) as i64, "noema.example.v2") == 0 { return TEXT_INVALID }
+        let id_hash = tsv_hash(bytes, @read_u64(@ptr_add(starts, 8)) as i64, @read_u64(@ptr_add(ends, 8)) as i64)
+        let group_hash = tsv_hash(bytes, @read_u64(@ptr_add(starts, 24)) as i64, @read_u64(@ptr_add(ends, 24)) as i64)
+        if id_hash == 0 or group_hash == 0 { return TEXT_INVALID }
+        let split = text_split_id(bytes, @read_u64(@ptr_add(starts, 16)) as i64, @read_u64(@ptr_add(ends, 16)) as i64)
+        let label = text_label_id(bytes, @read_u64(@ptr_add(starts, 64)) as i64, @read_u64(@ptr_add(ends, 64)) as i64)
+        if split < 0 or label < 0 { return TEXT_INVALID }
+        if tsv_seed_valid(bytes, @read_u64(@ptr_add(starts, 32)) as i64, @read_u64(@ptr_add(ends, 32)) as i64) == 0 { return TEXT_INVALID }
+        if @read_u64(@ptr_add(starts, 40)) == @read_u64(@ptr_add(ends, 40)) or @read_u64(@ptr_add(starts, 48)) == @read_u64(@ptr_add(ends, 48)) { return TEXT_INVALID }
+        if text_risk_valid(bytes, @read_u64(@ptr_add(starts, 56)) as i64, @read_u64(@ptr_add(ends, 56)) as i64) == 0 { return TEXT_INVALID }
+        if text_evidence_valid(bytes, @read_u64(@ptr_add(starts, 72)) as i64, @read_u64(@ptr_add(ends, 72)) as i64) == 0 { return TEXT_INVALID }
+        if text_source_valid(bytes, @read_u64(@ptr_add(starts, 80)) as i64, @read_u64(@ptr_add(ends, 80)) as i64) == 0 { return TEXT_INVALID }
+        if @read_u64(@ptr_add(starts, 88)) == @read_u64(@ptr_add(ends, 88)) or tsv_equal(bytes, @read_u64(@ptr_add(starts, 96)) as i64, @read_u64(@ptr_add(ends, 96)) as i64, "training") == 0 { return TEXT_INVALID }
+        if text_review_valid(bytes, @read_u64(@ptr_add(starts, 104)) as i64, @read_u64(@ptr_add(ends, 104)) as i64) == 0 { return TEXT_INVALID }
+        if @read_u64(@ptr_add(starts, 112)) == @read_u64(@ptr_add(ends, 112)) { return TEXT_INVALID }
+        if text_safety_valid(bytes, @read_u64(@ptr_add(starts, 120)) as i64, @read_u64(@ptr_add(ends, 120)) as i64) == 0 { return TEXT_INVALID }
+        if text_pii_valid(bytes, @read_u64(@ptr_add(starts, 128)) as i64, @read_u64(@ptr_add(ends, 128)) as i64) == 0 { return TEXT_INVALID }
+        if @read_u64(@ptr_add(starts, 136)) == @read_u64(@ptr_add(ends, 136)) { return TEXT_INVALID }
+        var prior: i64 = 0
+        while prior < rows {
+            if (@read_u64(@ptr_add(metadata, prior * 16)) as i64) == id_hash { return TEXT_INVALID }
+            if (@read_u64(@ptr_add(metadata, prior * 16 + 8)) as i64) == group_hash and (@read_u64(@ptr_add(splits, prior * 8)) as i64) != split { return TEXT_INVALID }
+            prior = prior + 1
+        }
+        @write_u64(@ptr_add(metadata, rows * 16), id_hash as u64)
+        @write_u64(@ptr_add(metadata, rows * 16 + 8), group_hash as u64)
+        @write_u64(@ptr_add(splits, rows * 8), split as u64)
         let feature_base = rows * feature_dim * 8
         var d: i64 = 0
         while d < feature_dim { @write_u64(@ptr_add(features, feature_base + d * 8), 0 as u64) d = d + 1 }
         var c: i64 = 0
         while c < TEXT_CLASSES { @write_u64(@ptr_add(targets, (rows * TEXT_CLASSES + c) * 8), (if c == label { 4294967296 } else { 0 }) as u64) c = c + 1 }
-        var cursor = text_start
-        var in_word = 0
+        let text_start = @read_u64(@ptr_add(starts, 136)) as i64
+        let text_end = @read_u64(@ptr_add(ends, 136)) as i64
+        var word = 0
         var hash: i64 = 0
         var token_count: i64 = 0
-        while cursor <= line_end {
-            let ch = if cursor == line_end { 32 } else { @read_u8(@ptr_add(bytes, cursor)) as i64 }
-            if text_word_byte(ch) == 1 {
-                hash = (hash * 33 + text_lower(ch)) % 2147483647
-                in_word = 1
-            } else if in_word == 1 {
+        cursor = text_start
+        while cursor <= text_end {
+            let ch = if cursor == text_end { 32 } else { @read_u8(@ptr_add(bytes, cursor)) as i64 }
+            if text_word_byte(ch) == 1 { hash = (hash * 33 + text_lower(ch)) % 2147483647 word = 1 }
+            else if word == 1 {
                 let bucket = hash % feature_dim
                 let cell = @ptr_add(features, feature_base + bucket * 8)
                 @write_u64(cell, (@read_u64(cell) + 4294967296) as u64)
                 token_count = token_count + 1
                 hash = 0
-                in_word = 0
+                word = 0
             }
             cursor = cursor + 1
         }
         if token_count == 0 { return TEXT_INVALID }
-        @write_u64(@ptr_add(splits, rows * 8), split as u64)
         rows = rows + 1
-        pos = if line_end < length { line_end + 1 } else { length }
+        pos = if line_end < length and (@read_u8(@ptr_add(bytes, line_end)) as i64) == 13 { line_end + 2 } else if line_end < length { line_end + 1 } else { length }
     }
     if rows == 0 { return TEXT_INVALID }
-    @write_u64(row_count_out, rows as u64)
     return rows
 }

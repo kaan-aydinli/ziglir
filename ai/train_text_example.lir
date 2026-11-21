@@ -50,10 +50,10 @@ fn main() -> i64 {
     let features = @malloc(rows * dimensions * 8)
     let targets = @malloc(rows * 4 * 8)
     let splits = @malloc(rows * 8)
-    let row_count = @malloc(8)
+    let metadata = @malloc(rows * 2 * 8)
     let history = @malloc(200 * 8)
     let metric = @malloc(8)
-    let decoded = noema_text_decode(nbytes, bytes, rows, dimensions, features, targets, splits, row_count)
+    let decoded = noema_text_decode(nbytes, bytes, rows, dimensions, features, targets, splits, metadata)
     if decoded != rows { println("ERROR: text corpus rejected or row count mismatch") return 1 }
     let model = block_new(dimensions, 4, dimensions, 1729)
     let epochs = noema_fit(model, rows, features, targets, splits, ONE / 32, 200, history)
