@@ -1,6 +1,6 @@
 # NOEMA — Analog-Doğal, Doğrulama-Kapılı Muhakeme Mimarisi
 
-**Durum:** v0.4 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
+**Durum:** v0.5 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
 **Amaç:** `ai/` çatısının dışına ve SEL'in üstüne sıfırdan kurulan, **muhakeme-öncelikli** yeni mimarinin eksiksiz tanımı.
 **Bu deponun kuralı (iddia = ölçüm) bu belge için de geçerlidir:** aşağıda geçen her "hedef", "kestirim" ya da "beklenti" açıkça **ölçülmemiştir**. Ölçülmüş tek sayılar, mevcut SEL çekirdeğine aittir ve öyle etiketlenmiştir. Bu belge bir *vaad* değil, bir *ölçülecek hipotezler listesi*dir.
 
@@ -693,3 +693,99 @@ Log append-only'dir ama kişisel veri içermez. Hash/pseudonymous id bile bazı 
 Framework arayüzleri ve yaşam döngüsü burada tanımlıdır; uygulama başlamadan ADR ile sabitlenecekler: (1) LIR ABI ve worker sınırları; (2) disk object-store/index; (3) izin, retention ve silme policy'si; (4) ilk görev ailesi (öneri: LIR kod sentezi + matematik); (5) bütçe/latency profili; (6) manifest/validator imza biçimi. Kullanıcı verisi politikası netleşmeden canlı sürekli öğrenme açılmamalıdır.
 
 *Belge sürümü: v0.4 — 2026-11-20. Uçtan uca tasarım ve kayıpsız ingest/denetimli öğrenme protokolü eklendi; uygulama veya forgetting maliyet ölçümü yoktur.*
+
+## 21. v0.5 — Evrensel görev kapsaması ve veri şeması v2
+
+**Durum: tasarım ve şema örneği; hiçbir modalite adaptörü uygulanmış değildir.** "Güncel modellerin yapabildiği her şey" için kapalı ve sonsuza dek tamamlanmış bir liste yoktur; modeller ve görevler değişir. Bu nedenle framework yetenekleri aşağıdaki **sürüm kontrollü kapsam kataloğunda** tanımlar. Amaç aynı API/veri hattında her görev türünü ifade edebilmek ve her birini ayrı test etmektir; tüm görevlerde güncel frontier sistemleri aşma iddiası değildir.
+
+### 21.1 Kapsam kataloğu (görev → adaptör → çıktı → doğrulayıcı)
+
+| Aile | Kapsanan iş türleri | Gerekli girdi/çıktı | Doğrulama |
+|---|---|---|---|
+| Sohbet ve talimat | çok turlu bağlam, rol, sistem politikası, belirsiz istek, özet | mesaj dizisi + konuşma belleği referansı | yönerge koşulları, kaynak ve yanlış iddia testleri |
+| Dil | çok dillilik, çeviri, paraphrase, dil algılama, morfoloji, uzun doküman, tablo/JSON | metin parçası + dil/offset/meta | anlam koruma, kaynak span hizası, şema doğrulama |
+| Muhakeme | aritmetik, biçimsel ispat, tümdengelim, indüksiyon, karşı-olgusal, bilimsel hipotez | graf, birimler, varsayımlar, proof/hipotez | proof-kernel veya holdout/kalibrasyon |
+| Kod ve bilgisayar kullanımı | kod üretme/düzeltme, test, terminal/IDE/web arayüz eylemi | dosya/araç durumu + izinli ToolCall | derleme, test, sandbox, eylem sonrası durum |
+| Retrieval / bilgi | yerel doküman arama, alıntı, kaynak sentezi, güncel harici veri (izinli connector varsa) | indeks/URI/zaman damgası | alıntı kaynağına span doğrulaması; erişilemeyen kaynakta çekimserlik |
+| Görüntü ve belge | görüntü betimi, OCR, grafik/diagram, sayfa düzeni, çoklu görüntü kıyası | image/document ref + sayfa/kutu/koordinat | OCR span, koordinat, soru-cevap/grounding metrikleri |
+| Ses | konuşmayı tanıma, konuşmacı dönüşü, ses olayı, konuşma anlama/üretim görev tanımı | audio ref + time segments + speaker id | zaman hizası, WER/CER, konuşmacı/olay kalibrasyonu |
+| Video / canlı akış | kareler, zaman damgası, olay sırası, ses-video hizası, stream'in parça parça işlenmesi | frame/audio chunk refs + timestamp | olay zaman aralığı, sıralama, gecikme ve eksik chunk testi |
+| Uzamsal / hareket | koordinat, pose, eylem dizisi, robot durumu | birimli koordinat/transform + zaman | kinematik/geçiş validator, güvenli alan kontrolü |
+| Sayısal / bilimsel veri | CSV/array, sensör, zaman serisi, grafik, belirsizlik | typed tensor/table ref + birim/eksik değer maskesi | sayısal tolerans, birim kontrolü, split-by-entity |
+| Araçlar ve ajanlar | tool seçim, çok adımlı görev, API cevapları, hata toparlama | izinli araç şeması + sonuç artifact'i | simulator, side-effect audit, human approval |
+| Tercih ve düzeltme | tercih sıralaması, eleştiri, red-team, kullanıcı düzeltmesi | iki aday + tercih gerekçesi veya önce/sonra | tercih seti ayrımı, policy ve bias incelemesi |
+| Güvenlik / karar | red/abstain, risk sınıflama, prompt injection, privacy | tehdit örneği + izin/kapsam | saldırı başarı oranı, false positive/negative, privacy test |
+
+Her satır için eklenti manifestinde kapsanan diller, çözünürlük/duration, izinli eylemler, sınırlar ve uygun benchmark kayıt edilir. Modül yoksa sistem o işi destekli gibi göstermez; `unsupported_modality`/`unsupported_task` döndürür. Modüller arasında tek genel başarı yüzdesi kullanılmaz.
+
+### 21.2 Universal Example Record v2
+
+Tek bir JSONL satırı bir **task episode**'dur; metin ve payload aynı dosyada olmak zorunda değildir. Büyük ikili içerik adreslenmiş blob deposunda bulunur; JSONL yalnız metadata/ref taşır. Örnek üst düzey biçim:
+
+```json
+{
+  "schema": "noema.example.v2",
+  "id": "opaque-id",
+  "split": "train|dev|test|retention|redteam",
+  "group_key": "entity_or_rule_family_hash",
+  "seed": 123,
+  "task": {"family": "video_qa", "capability": "temporal_grounding", "risk": "low"},
+  "conversation": [{"role": "user", "parts": [
+    {"kind": "text", "text": "..."},
+    {"kind": "image_ref", "uri": "cas://...", "sha256": "...", "frame": 0, "time_ms": 0},
+    {"kind": "audio_ref", "uri": "cas://...", "sha256": "...", "start_ms": 0, "end_ms": 800}
+  ]}],
+  "context": {"facts": [], "units": {}, "constraints": [], "unknowns": []},
+  "target": {"decision": "answer|ask|abstain|tool", "parts": [{"kind": "text", "text": "..."}]},
+  "grounding": [{"source_ref": "cas://...", "span_or_time": [0, 800], "claim_id": "c1"}],
+  "evidence": {"kind": "human|proof|tool_test|measurement|insufficient", "ref": "..."},
+  "tools": {"allowed": [], "trace": []},
+  "safety": {"policy_version": "...", "labels": [], "pii": "none|redacted|restricted"},
+  "quality": {"review": "synthetic|human|dual_review", "disagreement": null},
+  "provenance": {"source": "synthetic", "license": "internal", "consent": "training", "created_by": "generator-v1"}
+}
+```
+
+Bu örnek şema **normatifleştirilecek taslak**tır. Gerçek JSON Schema/validator sürümü Faz 1'de ayrıca yazılmalı. Bilinmeyen alan `null` veya `unknown` olur; boş alanı tahminle doldurmak yasaktır. `target` görev tipine göre proof, metin, koordinat, zaman aralığı, program ya da `abstain` olabilir. Şema sürümü olmayan kayıt eğitime girmez.
+
+### 21.3 Payload biçimleri ve kayıpsız kaynak politikası
+
+- **Metin/doküman:** özgün byte nesnesi + encoding/MIME + sayfa/offset; parse/OCR ayrı türev. Uzun belge parçalara ayrılır ama kaynak URI/span ve sıralama tutulur.
+- **Görüntü:** orijinal dosya referansı, hash, renk/ölçü bilgisi; resize/crop/patch üretimleri ayrı türev ve dönüşüm grafına bağlıdır. Kutular normalize koordinat standardı bildirir.
+- **Ses:** codec/original blob, sample rate/channel ve segment zamanları; resample/denoise/ASR ayrı artifact. Transcript insan mı otomatik mi, confidence ve hizasıyla işaretlenir.
+- **Video:** kaynak video + frame/audio chunk indeksleri ve zaman damgası; frame sampling kayıplıysa örnekleme politikası yazılır. Gerçek zamanlı stream'de chunk sırası, gecikme ve drop sayısı tutulur.
+- **Tablo/tensör/uzamsal:** dtype/shape/unit/coordinate frame, missingness mask, transform ve quantization error metadata. Fiziksel ölçü birimleri kaybolmaz.
+- **Tool trace:** çağrı girdisi, tool/version/permission, stdout/stderr veya structured result, yan etki, timeout ve son durum artifact'i; sır/gizli token payload'a alınmaz.
+
+Her türev kaydı `parent_hash`, `transform_id`, `parameters`, `loss_description`, `created_at` tutar. "Kayıpsız ingest" yalnız kaynağın saklanmasıdır; crop/resample/transcript gibi türevler bilgi kaybedebilir ve orijinalin yerini alamaz.
+
+### 21.4 Eğitim hedefleri: örnek türüne göre ayrı loss/feedback
+
+NOEMA tek bir evrensel hedef fonksiyonu iddia etmez. Her örnek bir veya daha fazla eğitim sinyali taşır; sinyalin geçerli olduğu parça ve kanıt sınıfı açık olmalıdır.
+
+| Sinyal | Kullanım | Yasak yanlış yorum |
+|---|---|---|
+| `verified_trace` | proof/prosedür kuralı türetme; checker adım adım doğrular | trace içindeki açıklama doğru diye varsaymak |
+| `supervised_target` | anlam grafı, algı spanı, çıktı biçimi veya görev yönlendirici kalibrasyonu | sentetik etiketleri gerçek dünya kapsama kanıtı saymak |
+| `self_supervised_view` | aynı kaynağın iki dönüşümünde tutarlılık/eksik parça tahmini | kendi tahminini ground-truth diye tekrar eğitime sokmak |
+| `preference_pair` | insan tercih sırası ve gerekçe; düşük ağırlıklı yönlendirici/üslup seçimi | tercih skorunu doğruluk/proof yerine geçirmek |
+| `correction_pair` | hata türü, düzeltme, eski cevaba bağımlı rule retraction | sessiz overwrite veya correction provenansını kaybetmek |
+| `tool_outcome` | çağrı seçimi ve etkisinin öğrenilmesi | başarısız/yan etkili eylemi başarı örneği saymak |
+| `abstention_label` | yetersiz bilgi, risk, kapsam dışı durumda sorma/çekimserlik | cevap yokluğunu otomatik doğru etiketlemek |
+| `safety_adversarial` | saldırı/izin sınırı ve containment testi | yalnız anahtar kelime filtresiyle güvenlik sonucu çıkarmak |
+
+### 21.5 Bölme, sızıntı önleme ve ölçüm
+
+Bölme satır bazında rastgele yapılmaz. Aynı video, aynı kişi/konuşmacı, aynı belge, aynı template seed, aynı kural üretim ailesi veya near-duplicate farklı split'lere dağılmaz. `group_key` ile entity/family bazında split; zaman serisinde geçmiş→gelecek; continuous stream'de cutoff-time ve sonradan görülen entity holdout uygulanır. Test etiketleri üretici/induction motoruna erişmez.
+
+Her yetenek için: benchmark sürümü, kaynak/lisans, örnek sayısı, split algoritması, baseline, compute/data bütçesi, exact/soft metric, güven aralığı, altgrup ve hata örnekleri yayımlanır. Prompt varyantları benchmark'a yeni bağımsız örnek sayılmaz. Üçüncü taraf test setiyle eğitim/retrieval sızıntısı denetlenir.
+
+### 21.6 Modality-agnostic streaming record örneği
+
+Tam sentetik JSONL örneği [`ai/noema-training/universal_examples.jsonl`](../noema-training/universal_examples.jsonl) içinde yer alır: görüntü/kare, ses parçası, tool trace, düzeltme/tercih ve güvenlik kayıtları yalnız URI placeholder kullanır; gerçek medya ya da model yeteneği içermez. Bu dosya parser/schema testi içindir, benchmark değildir. JSONL meta-validasyonuna ek olarak `uri` erişilebilirliği, hash, lisans ve modality-specific payload decoder testleri ayrı çalıştırılmalıdır.
+
+### 21.7 Kapsama kabul kapısı
+
+K31: katalogdaki her task family için schema-valid örnek, en az bir independent validator/simulator, baseline, retention test ve fail-closed davranış hazır olmadan "destekleniyor" işareti verilemez. K32: her modality için bozulma (noise/occlusion/missing chunks/long context/language shift) ve out-of-domain kalibrasyonu ayrı ölçülür. K33: gerçek zamanlı görevlerde doğruluk kadar end-to-end gecikme, chunk drop ve toparlanma ölçülür. Bu kapılar geçilmeden "günümüz modellerinin yapabildiği her şeyi yapar" iddiası yayımlanamaz.
+
+*Belge sürümü: v0.5 — 2026-11-20. Yetenek katalogu ve modality-aware veri şema taslağı eklendi; kapsam/performans henüz ölçülmedi.*
