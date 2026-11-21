@@ -1,6 +1,6 @@
 # NOEMA — Analog-Doğal, Doğrulama-Kapılı Muhakeme Mimarisi
 
-**Durum:** v2.0 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
+**Durum:** v2.1 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
 **Amaç:** `ai/` çatısının dışına ve SEL'in üstüne sıfırdan kurulan, **muhakeme-öncelikli** yeni mimarinin eksiksiz tanımı.
 **Bu deponun kuralı (iddia = ölçüm) bu belge için de geçerlidir:** aşağıda geçen her "hedef", "kestirim" ya da "beklenti" açıkça **ölçülmemiştir**. Ölçülmüş tek sayılar, mevcut SEL çekirdeğine aittir ve öyle etiketlenmiştir. Bu belge bir *vaad* değil, bir *ölçülecek hipotezler listesi*dir.
 
@@ -1960,3 +1960,40 @@ K113 — quality-cost frontier: skill başına yeni held-out capability vs full 
 **Bu isteğin güvenilir yorumu:** mimari, yeni ve çeşitli görevlerde yetenek üretmek için compositional reasoning, tool/source access, memory, language-specific grounding, verifiable code, continuous skill acquisition ve failure-aware routing'i birleştirir. “Pretraining yok” yalnız büyük genel checkpoint olmaması; seed, görev verisi, insan emeği ve external knowledge'ı yok sayma değildir. Bu değişiklikler uygulandığı veya frontier seviyesine ulaştığı anlamına gelmez; repository halen NOEMA tasarımını ve demo validator'ı taşır. Hedefi kanıtlayacak ilk gerçek teslimat, tek bir dikey dilimde çalışan capability graph + data pipeline + sealed eval + ölçülü karşılaştırmadır.
 
 *Belge sürümü: v2.0 — 2026-11-16. Capability growth graph ve frontier comparison gates eklendi; NOEMA runtime, broad benchmark ve karşılaştırmalı sonuçlar henüz yoktur.*
+
+## 37. v2.1 — Darboğaz envanteri, ölçüm ve düzeltme sırası
+
+Bu bölüm statik tasarım beklentisiyle ölçülmüş repo davranışını ayırır. “Tüm mimari darboğazları bulundu/düzeltildi” iddiası yalnız bütün runtime, production yükü ve data plane ölçülünce söylenebilir; NOEMA runtime mevcut depoda yoktur. Aşağıdaki envanter bu checkout'ta görülen gerçek sınırları ve çözüm sırasını verir.
+
+| Öncelik | Gözlenen darboğaz | Şimdi yapılan düzeltme / mevcut kapı | Kalan iş |
+|---|---|---|---|
+| P0 | NOEMA tasarımı runtime değil; capability graph, CAG, memory, retrieval, HA ve training orchestrator çalışmıyor | Belgede açıkça tasarım/uygulanmadı diye işaretli; gerçek capability karşılaştırması yasak | İlk dikey dilim: typed task+evidence, exact math/LIR, dataset lineage ve sealed eval ile executable pipeline |
+| P1 | Dataset audit duplicate/group/text indekslerini Python dict/set içinde tutuyordu; büyük dosyada heap O(N) büyüyordu | `dataset_audit.py` indeksleri 8 MiB SQLite page-cache ayarıyla temporary disk'e taşıdı; kayıt başına JSON parse, findings detayları maksimum 1000, kategori özeti top-200 | I/O throughput, disk budget ve WAL/crash davranışı gerçek depolamada ölçeğe göre benchmark; disk dolmasında fail-closed |
+| P1 | Leakage audit yalnız objective exact-ID/group/normalize-text ve lisans alanı kontrolleri; fuzzy/semantic/payload/onam doğrulaması yok | sınırlı audit kapsamı ve immutable hash'li report contract; manifestte unknown gate `block_promotion` | lineage component graph, modality-aware candidate dedup, licensed consent registry, payload hash checker, PII/safety tools ve human adjudication |
+| P1 | Veri/eval corpus'ları demo boyutunda; bunlar kaliteli eğitim sonucu için kanıt değil | hiçbiri “market-leading” diye sunulmaz; scorecard eksik hücreyi unsupported sayar | lisanslı çok dilli gerçek görev setleri, annotator planı, sealed test escrow, bağımsız verifiers ve coverage audit |
+| P1 | NOEMA model/eğitim/runtime yok; eval fixture'ları görev sözleşmesi örnekleridir, model koşmuyor | capability-eval schema doğrulanıyor; performans metriği hesaplanmıyor | runner, state machine, candidate registry, evaluation harness, CI integration ve failure/recovery testi |
+| P2 | CAG, multimodal retrieval, language packs, distributed availability ve SLO implement değil | model kabiliyeti/uptime varsayılmıyor; her feature için gate listesi | component-level implementation, observability, capacity/security/fault injection, staged rollout |
+| P2 | AI fixture structural validator kayıt ID'leri için bellekte unique index tutar; whole-file list buffer yok ama index O(N)'dir | JSONL streaming; public docs bu memory-index sınırını açıklar | production-scale uniqueness index SQLite'a taşınabilir; 1M/10M fixture'da memory/throughput benchmark ve Unicode malformed-input tests |
+| P2 | Fuzzy semantic duplicate, test contamination ve benchmark leakage otomatik kesin çözülemez | exact collision hard fail; fuzzy detection tasarımda candidate+review olarak ayrı | hidden eval ACL, lineage graph, approved fuzzy tool, sensitivity/recall calibration; false merge maliyetini ölç |
+| P2 | Compiler/backend regression bu sandbox'ta Zig toolchain olmayınca doğrulanamıyor | compiler hızı hakkında bu turn'de iddia yok | Zig 0.13 pinned CI'da native/VM/C/WASM/O0/O1/O2 matrix + K70–K74 |
+
+### 37.1 Dataset audit scalability fix: measurement
+
+Synthetic 250,000-row JSONL fixture on this session's sandbox ran through the revised audit in **8.23 s**, child peak RSS **28,932 KiB**, no findings. This is one local synthetic measurement only: host CPU/disk characteristics are not standardized, no in-memory baseline run at the same size was recorded, and it says nothing about real-world leakage recall. Do not extrapolate as production throughput or quality claim. Temporary DB is removed after report; only JSON summary persists. Disk growth remains O(unique IDs + groups + text hashes), intentionally moving the scaling cost from unbounded Python object overhead to quota-controlled disk.
+
+Audit output bounds detail payload (`findings` at most 1,000, `top categories` 200); full finding totals remain available by severity/code, so a failure storm cannot exhaust heap merely by accumulating per-row diagnostic objects. If a report is truncated, `findings_truncated=true` and summary counts retain the exact totals; release gate still uses total error count, never only visible sample.
+
+### 37.2 Universal operating gate
+
+For each proposed fix: (1) record baseline condition and workload; (2) write reproduction/regression test; (3) change one bottleneck; (4) rerun all correctness/security gates; (5) benchmark cold/warm, small/large, success/failure paths; (6) compare median/p95/peak RSS/bytes/errors; (7) keep fix only if semantics and safety do not regress. Unknown layer cannot be labeled optimized. Performance tradeoff (e.g. disk-index time vs heap use) is stated, not hidden.
+
+P0-1 — deploy deterministic data contract and signed manifest in real training runner.
+P0-2 — connect validators/auditor to CI/release: sample validation cannot be bypassed by training invocation.
+P0-3 — run hidden family/language split and independent label/evidence review on production candidate data.
+P1-1 — profile training/eval DAG stage CPU, wall, queue, memory, storage and human time; optimize measured critical path.
+P1-2 — implement one vertical capability end-to-end before adding broad subsystems.
+P2 — only after baseline, run matched frontier benchmark and scale/fault-injection tests.
+
+Current successful checks validate only code-level invariants: 18 unit tests, example JSONL schema, exact split leakage audit for two tiny fixtures, plus the one synthetic 250k throughput/RSS point above. No model was trained, no true dataset was certified, no market/frontier comparison was run. This honest inventory is itself a quality gate: future session cannot accidentally convert design intent into claimed runtime capability.
+
+*Belge sürümü: v2.1 — 2026-11-16. Mevcut çalışma alanındaki darboğazlar önceliklendirildi; dataset audit memory-index darboğazı disk spill ile azaltıldı ve bir sentetik ölçek ölçümü eklendi; NOEMA runtime darboğazları açık/çözülmemiştir.*
