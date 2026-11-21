@@ -1,6 +1,6 @@
 # NOEMA — Analog-Doğal, Doğrulama-Kapılı Muhakeme Mimarisi
 
-**Durum:** v1.7 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
+**Durum:** v1.8 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
 **Amaç:** `ai/` çatısının dışına ve SEL'in üstüne sıfırdan kurulan, **muhakeme-öncelikli** yeni mimarinin eksiksiz tanımı.
 **Bu deponun kuralı (iddia = ölçüm) bu belge için de geçerlidir:** aşağıda geçen her "hedef", "kestirim" ya da "beklenti" açıkça **ölçülmemiştir**. Ölçülmüş tek sayılar, mevcut SEL çekirdeğine aittir ve öyle etiketlenmiştir. Bu belge bir *vaad* değil, bir *ölçülecek hipotezler listesi*dir.
 
@@ -1717,3 +1717,79 @@ K89 — aggregate quality: grounding, task success, safety, privacy, latency/cos
 **Geriye kalan gerçekler:** web/API erişimi, index coverage, dil-kültür örnekleri, storage, network, power, hardware, credentials, human operations ve verifier kapsamı sınırlı/arıza verebilir. Redundancy arızayı ortadan kaldırmaz; retrieval pretraining maliyetini değil query-time/access cost'ini getirir; explicit language bootstrap her dilde doğal akıcılığı garanti etmez. Bu nedenle mimari bu zayıflıkları ölçer, izole eder ve güvenli biçimde karşılar; **“hiçbir zayıflık asla yok” garantisi vermez**. Bu kapılar implement edilip fault-injection/kalite testleri geçmeden §33 bir tasarım hedefidir, üretim kabiliyeti değildir.
 
 *Belge sürümü: v1.7 — 2026-11-16. Web retrieval, grounded conversation ve resilient serving katmanları önceki risk kaydına bağlandı; deployment/SLO/benchmark sonuçları henüz yoktur.*
+
+## 34. v1.8 — Context Artifact Graph, audited memory, multilingual reasoning
+
+This section specifies NOEMA-native alternatives to raw prompt-prefix caching and opaque “chat memory” summaries. They share §29 identity/evidence, §30 exact cache invalidation, §32 acquisition/privacy boundaries and §33 service degradation. They are design proposals, not runtime components. Their purpose is lower repeated work and better continuity **without making approximate retrieval authoritative**.
+
+### 34.1 Context Artifact Graph (CAG): reuse compiled meaning, not prompt strings
+
+A raw prompt cache stores/reuses serialized input prefixes. NOEMA instead compiles each request into a typed, immutable graph of small context artifacts:
+
+```
+ContextArtifact {
+  artifact_id, kind, canonical_payload_hash, schema_version,
+  source_refs[], evidence_refs[], tenant_acl, consent_scope,
+  locale, validity_interval, freshness, producer_version,
+  sensitivity, parent_artifact_ids[], invalidation_epoch
+}
+RequestContext = ordered refs to selected ContextArtifacts + current TaskContract
+```
+
+Kinds include `dialogue_state_delta`, `confirmed_fact`, `open_obligation`, `domain_rule`, `tool_capability`, `locale_pack`, `source_snapshot_ref`, and `format_preference`. Raw user text remains separately protected as permitted source; CAG isn't a substitute for archival originals or the obligation/evidence chain.
+
+**Assembly process:** parse only new turn → derive candidate context deltas → resolve exact IDs/ACL → select by task dependency + recency/freshness + trust/scope → construct minimal ordered view → run permission and conflict checks → attach content hashes and dependency closure. Unneeded history is not serialized into every task. Distinct outputs such as “the user said X”, “a source supports X”, “rule R applies” remain distinct typed artifacts.
+
+Reuse key is `H(canonical_payload_hash, schema, producer_version, tenant/ACL scope, consent epoch, locale/normalization profile, policy, dependency hashes, validity window)`. Identical public, verified artifacts may be shared only if policy explicitly permits; user-private artifacts never cross tenant/session boundaries. A hit reuses a **context parse/compile result**, never a factual answer or permission decision. Each request re-runs current authorization, freshness, unresolved-conflict and obligation checks. If any dependency is expired, corrected, deleted, revoked, schema-updated or policy-changed, derived artifact and downstream views invalidate. Unavailable cache is a miss; the system recomputes from authorized source or asks/abstains.
+
+CAG differs from transcript truncation/summarization: selection is dependency- and task-driven, each derived summary is traceable to source turn IDs, and omission coverage is reported. This can reduce repeated parsing/serialization, but context graph build, exact authorization and storage cost count in benchmarks. It does not guarantee shorter latency for small conversations.
+
+### 34.2 Memory fabric: separate working, episodic, semantic, procedural and archive stores
+
+1. **Working state:** current task's bounded scratch graph; short TTL, no cross-request persistence unless explicit.
+2. **Dialogue/session memory:** user-approved referents, preferences, commitments and open questions; tenant/user ACL, expiry, “show/edit/forget” controls. Preferences are not factual evidence.
+3. **Episodic memory:** immutable, source-linked events: what was observed/said/done, when, by which producer, with consent and result. Event history is append-only; corrections add superseding events, not silent edits.
+4. **Semantic memory:** claim graph with `claim_id`, subject/predicate/object, qualifiers, source/evidence refs, scope, time interval, confidence/evidence level, disagreement set and retraction state. Multiple contradictory claims coexist; source count alone doesn't choose a winner.
+5. **Procedural memory:** promoted contracts/skills with explicit preconditions, postconditions, allowed effects, known counterexamples, verifier, applicability and release version. Candidate rules are isolated from promoted skills.
+6. **Archive/index/cache:** raw authorized payloads in retention-bound archive; exact key + inverted indexes for authoritative lookup; approximate embedding/vector indexes may propose candidates only; ephemeral CAG/cache is disposable and never sole copy.
+
+Memory retrieval ranks *candidate refs* with a transparent policy over task relation, permissions, source quality, freshness, scope and confidence. Ranking score is not truth. Every selected item must pass ACL, expiry/deletion, provenance and relevance checks before entering context. Memory can be empty: system asks/uses authorized retrieval, not hallucinated recollection.
+
+**User control and repair:** memory view/export/delete endpoints return scope and descendants. “Forget X” emits deletion event; it revokes retrieval immediately after policy acknowledgement and schedules replicas, backups, derived summaries, cached contexts, indexes and trained descendants for compliant deletion/invalidation. If a learned parameter cannot be reliably unlearned, either rebuild from unaffected data or disable/release-revert it; claim of deletion completion waits for coverage evidence. Retention laws may require tombstones rather than raw content; tombstone retains only minimum non-sensitive proof of deletion where legally permitted.
+
+### 34.3 Multilingual reasoning and conversational realization
+
+The shared representation is a **language-independent task/meaning graph with language-specific evidence spans attached**, not a claim that language is universal or that translation is lossless. Each language has a versioned `LocalePack`: Unicode normalization policy, script/grapheme segmentation, morphology, syntax/construction inventory, discourse markers, politeness/register, number/date/unit formats, idiom/phrase senses, tokenizer-free lexicon/aliases and test suite. Shared reasoning operates on typed meaning graphs; parser and renderer remain locale-specific modules.
+
+**Per-turn process:** detect language/script with calibrated alternatives → preserve raw source spans → parse candidates using installed LocalePack → keep ambiguity and code-switch segments → resolve reference/tense/aspect/negation/politeness only with evidence/context → solve obligations language-neutrally where valid → realize in requested locale → back-check generated claims against meaning/evidence graph. Translation is an optional intermediate with alignment/loss report; it may not silently erase scope, honorifics, gender, evidentiality, or culturally specific distinctions.
+
+**Coverage tiers:**
+
+- `L0 seeded`: explicit bootstrap/interface vocabulary and basic task/number/units; not open chat fluency.
+- `L1 parsed`: tested grammar/lexicon domain with ambiguity-aware input.
+- `L2 dialogue`: multi-turn reference, repair, register and grounded output tested.
+- `L3 domain`: retrieval and reasoning quality measured for named task/domain.
+- `unsupported/limited`: any missing tier is declared; clarifying or translation fallback is clearly labeled.
+
+No “all languages” switch. A language is promoted only with native-speaker reviewed and rights-cleared examples, dialect/script coverage declaration, contrastive morphology/idiom/negation tests, code-switch, long-context, safety and source-grounded dialogue eval, plus subgroup metrics. Closely related language transfer is an explicit hypothesis and separate test, never inherited support. Rare/minority languages with little teaching data may remain unsupported; querying the user for a correction does not itself prove that capability has generalized.
+
+### 34.4 Fast path, deep path and selective memory use
+
+The router first constructs a compact CAG view. Exact known calculations/rules use deterministic fast path. Ambiguous, novel-composition, high-risk or conflicting tasks enter a budgeted deep path: retrieve more sources, branch meaning hypotheses, ask a discriminating question, call specialized verifier or run LIR sandbox. Memory search is progressively widened (session → promoted semantic/procedural → allowed archive → federated tools), with each expansion requiring budget and ACL recheck. Approximate retrieval can order candidates but final selection is exact-ID/source verified. Early exit only when obligations close to requested evidence standard or remaining budget is insufficient; in latter case report partial/abstain.
+
+### 34.5 Capability and operational tests
+
+K90 — CAG isolation: mutate tenant, consent, locale, schema, policy or dependency hash → no cross-scope cache/context hit.
+K91 — CAG answer invariance: cache/context reuse on/off gives same authorized evidence and validator result for the same snapshot; latency may differ.
+K92 — memory lineage: every derived memory item resolves to source IDs or explicit `hypothesis`; deletion/correction invalidates complete dependency closure.
+K93 — memory controls: user view/export/delete and replica/backup rebuild drills; deletion completion only with measured descendant coverage.
+K94 — multilingual quality: per-locale tier, native-reviewed grammar/meaning, code-switch and long dialogue; factuality/calibration and unsupported rate reported separately.
+K95 — translation preservation: meaning graph and scope qualifiers survive round trip or explicit loss marker appears; no silent “equivalent” claim.
+K96 — all-locale claim gate: untested locale cannot be advertised as fluent/supported; generated capability registry matches eval results.
+K97 — selective context cost: repeated-turn workloads report CAG build, lookup, bytes, p50/p95/p99, memory and correctness vs full authorized context recomputation.
+
+CAG/memory and multilingual packs are integrated with §33 retrieval, dialogue and service recovery: storage outage cannot create false memory, stale cache cannot override source correction, learning outage cannot erase session context, and locale coverage cannot raise answer confidence. These invariants require implementation-level fault injection and multilingual measurement before production claims.
+
+**Residual limits:** memory capacity, source availability, user consent, language data/review, latency, cost, adversarial inputs and cultural interpretation remain finite. Typed graph/cache structure may improve traceability and reuse but can also add engineering complexity and latency. No context cache can make unknown facts known; no memory design guarantees perfect recall or forgetting; no architecture can be fluent in every human language without adequate grounded language resources and tests. The measurable goal is broader validated capability and faster repeated work at fixed quality gates—not universal fluency or zero weakness.
+
+*Belge sürümü: v1.8 — 2026-11-16. CAG, çok katmanlı memory fabric ve locale-pack tabanlı multilingual reasoning tanımlandı; uygulama ve ölçüm yok.*
