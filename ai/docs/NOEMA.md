@@ -1,6 +1,6 @@
 # NOEMA — Analog-Doğal, Doğrulama-Kapılı Muhakeme Mimarisi
 
-**Durum:** v1.0 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
+**Durum:** v1.1 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
 **Amaç:** `ai/` çatısının dışına ve SEL'in üstüne sıfırdan kurulan, **muhakeme-öncelikli** yeni mimarinin eksiksiz tanımı.
 **Bu deponun kuralı (iddia = ölçüm) bu belge için de geçerlidir:** aşağıda geçen her "hedef", "kestirim" ya da "beklenti" açıkça **ölçülmemiştir**. Ölçülmüş tek sayılar, mevcut SEL çekirdeğine aittir ve öyle etiketlenmiştir. Bu belge bir *vaad* değil, bir *ölçülecek hipotezler listesi*dir.
 
@@ -1188,3 +1188,72 @@ Bu SLO'lar başlangıç ölçüm planıdır; p95 hedefleri donanım bağımlıd�
 Her sürümün yanında `assurance_case` bulunur: sistem sınırı, varsayımlar, threat model, evidence level, passed/failed gates, test coverage, residual risks, known unsupported tasks ve rollback sürümü. `all weaknesses eliminated` / `risk-free` status değeri şemada yoktur. Güvenilirlik artışı, kusuru gizlememek, erken saptamak, etkisini daraltmak ve tekrarını testle önlemek üzerinden değerlendirilir.
 
 *Belge sürümü: v1.0 — 2026-11-16. Katmanlı düşük-maliyet update politikası ve kusur containment/assurance süreci eklendi; maliyet/hız hedefleri ölçülmemiştir.*
+
+## 27. v1.1 — Çıktı kipleri, akış ve dış sistem sınırları
+
+Bu bölüm, önceki kapsam kataloğunda **girdi** tarafı daha iyi tanımlanmışken üretim/streaming/connector tarafında açık kalan sözleşmeleri tamamlar. Her output adapter ayrı capability olarak kaydedilir; formatı kabul etmek o formatta üretim yeteneği olduğu anlamına gelmez.
+
+### 27.1 Ortak output artifact protokolü
+
+Her üretilen çıktı, metin dışı olsa da `OutputArtifact` olarak kaydedilir:
+
+```text
+OutputArtifact = {
+  artifact_id, kind, media_type, payload_ref, payload_hash,
+  dimensions_or_duration, encoding, units_or_color_space,
+  source_obligations[], evidence_level, generator_version,
+  safety_labels[], user_rights, created_at, expires_at
+}
+```
+
+`kind` örnekleri: `text`, `structured_data`, `code`, `image`, `audio`, `video`, `spatial_action`. Metin cevabı da iddialarını `Obligation`/`EvidenceRecord`'e bağlar. İkili payload JSONL'de inline edilmez; content-addressed artifact store'a yazılır. Streaming'de artifact `partial` → `final` event'leriyle ilerler; final hash ve chunk-index listesi dışında önceki chunk'lar sessizce değiştirilemez. Kullanıcı iptal ederse `cancelled` terminal durumu verilir ve kalan üretim durur.
+
+### 27.2 Üretim capability'leri (yalnız adapter açıkça kurulduğunda)
+
+| Capability | Girdi | Çıktı sözleşmesi | Kontrol/başarısızlık |
+|---|---|---|---|
+| Metin/structured | TTA sonucu, şema, dil ve üslup sınırı | grounded text veya JSON/CSV; her factual claim obligation ID'ye bağlanabilir | JSON schema check, unsupported claim red; dil kapsamsa üret, değilse bildir |
+| Kod | kontrat, izinli çalışma alanı, test | source artifact + build/test report + diff | compile/test sandbox; test geçişi formal proof değildir |
+| SVG/vektör görsel | sahne grafı/şekil talimatı | SVG artifact, viewBox, style/rights, alt text | XML/SVG sanitizer, geometry bounds; yalnız vektör çizim, raster diffusion değil |
+| Raster görsel | prompt/scene graph + capability manifest | image blob, dimensions, color space, seed/lineage, safety labels | bu adapter yoksa `unsupported_generation`; salt metin açıklaması görsel diye sunulmaz |
+| Ses/speech | transcript veya phonetic/score intent + voice/rights profile | audio chunks, sample rate/codec, alignment, transcript ref, voice consent | speech generator ayrı modül; model/voice yoksa unsupported; çıktı ses dosyası olarak doğrulanır |
+| Müzik | yapı/tempo/ölçü/gerekli haklar | zamanlanmış note/event score veya audio artifact | sembolik skor ve waveform farklı capability; telif taklidi/voice cloning policy gate |
+| Video | storyboard/scene events + süre/fps | frame/audio chunk dizisi, timestamps, codec metadata | frame continuity, audio sync, duration/size limit; adapter bulunmazsa video üretildi denmez |
+| Spatial/action | doğrulanmış plan + robot/API capability | typed action proposal, coordinate frame, expiry, safety envelope | simülasyon/insan onayı + postcondition; doğrudan aktüatör komutu varsayılan değil |
+
+Mevcut dependency-free ilk sürümün gerçekçi output'u metin, JSON ve LIR kodudur; SVG basit standard-library serializer ile yapılabilir. Raster/audio/video generation için harici model, kütüphane veya donanım gerekecekse bunlar **opsiyonel adapter** ve ayrı lisans/güvenlik/ölçüm kapısıdır; core'a gizli bağımlılık eklenmez.
+
+### 27.3 Oturum, uzun bağlam ve streaming protokolü
+
+- `Session` global model state değildir; tenant/user ACL'li `session_id`, version, expiration, memory refs, active tasks ve cancellation token taşır.
+- Her turn append-only event; context window dolunca özet, raw turn'ün yerine geçmez. Özet `derived_artifact` olarak kaynak spanlara bağlanır; cevap için gerekli veri kaybolmuş olabilir diye işaretlenir.
+- Uzun belge RAG/parse aşamasında sayfa/parça refs'e ayrılır; retrieval completeness listesi tutulur. Kısmi retrieval varsa yanıtta coverage bildir veya çekimser kal.
+- Streaming event türleri: `accepted`, `progress`, `partial_result`, `tool_request`, `evidence_update`, `final`, `error`, `cancelled`. Her event `seq_no`, `request_id`, `deadline`, `schema_version` taşır; duplicate/reordered event idempotent şekilde yönetilir.
+- Kullanıcı feedback'i `response_id` ve obligation refs'e bağlanır; otomatik online update olmaz. İptal edilmiş/abandoned üretim eğitim etiketi sayılmaz.
+- Concurrency/queue doluluğunda backpressure; tenant fairness için per-user quotas. Bir tenant'ın uzun task'ı başka tenant'ın hard latency budget'ını aç bırakmamalı.
+
+### 27.4 Connector / plugin güven sınırı
+
+Harici servisler core değil, `ConnectorManifest` ile tanımlı adapter'lardır: `connector_id/version`, input-output schema, network hosts, scopes/permissions, timeout/retry/rate limit, idempotency, data retention, secrets handle, side-effect class, evidence mapping. İzin verilmemiş host/scope çağrısı deny edilir. Connector sonucu `untrusted_observation` olarak TTA'ya girer; tool cevabı kendi kendini kanıtlamaz.
+
+- Core deterministic testlerinde network kapalı; connector fixture/local simulator kullanılır.
+- Gerçek connector açılışında kullanıcı/tenant consent, secret vault interface ve audit policy gerekir; secret'lar prompt, logs, training data veya release artifact'ına girmez.
+- Read-only ve side-effectful adapter ayrı capability. Write/delete/payment/physical action için preview → explicit confirmation → execute → postcondition readback.
+- Timeout/retry duplicate write oluşturabilecekse idempotency key zorunlu; belirsiz sonuç `unknown_side_effect` olarak insan incelemesine gider.
+
+### 27.5 Output-data örnekleri
+
+Yeni şema örnekleri [`ai/noema-training/output_examples.jsonl`](../noema-training/output_examples.jsonl) içindedir. Kayıtlar text/JSON, kod testi ve dependency-free SVG output sözleşmesini gösterir; gerçek raster image/audio/video üretim yeteneği iddia etmez. Diğer modality örneklerinde gerçek media payload yerine yalnız schema/unsupported kararına izin verilir.
+
+### 27.6 Yeni kapılar
+
+| Kapı | Doğrulama |
+|---|---|
+| K46 — artifact integrity | partial/final chunk manifest, payload hash ve cancellation state round-trip |
+| K47 — claim grounding | final text içindeki factual claim'lerin obligation/source eşlemesi; eşleşmeyen iddia unsupported |
+| K48 — stream protocol | duplicate/reorder/cancel/backpressure fault injection; final artifact tutarlılığı |
+| K49 — connector safety | denied host/scope, prompt injection, timeout/retry/idempotency ve unknown side effect testleri |
+| K50 — generation fidelity | yalnız implement edilmiş adapter için format, alignment, safety ve human quality değerlendirmesi; unsupported adapter'da pass yok |
+| K51 — long-context completeness | sabit belge büyüklüğü ve retrieval cutoff'larında coverage raporu; eksik parça ile kesin cevap vermeme |
+
+*Belge sürümü: v1.1 — 2026-11-16. Output artefact, session/stream ve connector protokolleri eklendi; generation adapter'ları ve kalite ölçümleri uygulanmış değildir.*
