@@ -1,6 +1,6 @@
 # NOEMA — Analog-Doğal, Doğrulama-Kapılı Muhakeme Mimarisi
 
-**Durum:** v0.7 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
+**Durum:** v0.8 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
 **Amaç:** `ai/` çatısının dışına ve SEL'in üstüne sıfırdan kurulan, **muhakeme-öncelikli** yeni mimarinin eksiksiz tanımı.
 **Bu deponun kuralı (iddia = ölçüm) bu belge için de geçerlidir:** aşağıda geçen her "hedef", "kestirim" ya da "beklenti" açıkça **ölçülmemiştir**. Ölçülmüş tek sayılar, mevcut SEL çekirdeğine aittir ve öyle etiketlenmiştir. Bu belge bir *vaad* değil, bir *ölçülecek hipotezler listesi*dir.
 
@@ -40,9 +40,9 @@ Dürüst karşı-taraf (NOEMA'nın kaybedeceği yerler): web-ölçeğinde hazır
 
 | # | İlke | Sonuç |
 |---|---|---|
-| P1 | **Muhakeme birincil, istatistik ikincil.** İstatistik aday önerir, asla kanıt değildir. | Her karar yolunun sonunda ya bir *sertificate* (doğrulama izi) ya da açık bir *hipotez* etiketi vardır. |
-| P2 | **Her adım doğrulanabilir.** Muhakeme = küçük, tipli, denetlenebilir türetme adımları. | "Neden bu cevabı verdin?" sorusuna cevap her zaman bir kanıt ağacıdır, dikkat ağırlığı haritası değil. |
-| P3 | **Temsil süreklidir; sembol tablosu yoktur.** Girdi doğrudan holografik sahaya (hypervector) kodlanır. | Tokenizer, BPE, vocabulary — hiçbiri yok. Türkçe/İngilizce/matematik ifade aynı sahaya düşer. |
+| P1 | **Muhakeme birincil, istatistik ikincil.** İstatistik aday önerir, asla kanıt değildir. | Her iddia `formal_proof`, `executed_test`, `empirical_support`, `hypothesis` veya `unsupported` evidence level taşır. |
+| P2 | **Doğrulanabilir sınırlar açık olmalı.** | Kullanıcıya gerekçe ve evidence level gösterilir; proof tree yalnız kernel'in kapsadığı biçimsel iddialar içindir, her cevap için zorunlu değildir. |
+| P3 | **Tokenizer/BPE yok; sembolik yapı ve açık parser vardır.** | Ham girdi kayıpsız saklanır, dil/modality parser'ı sürümlü rule pack'tir; kapsam dışı girdi belirsiz/unsupported olarak kalır. Holografik saha anlamın yerine geçmez. |
 | P4 | **Öğrenme yerel ve tek geçişlidir.** Gradyan yok. | SEL'in eikonal (NLMS-ailesi) kuralı + *doğrulama-sinyalli kural türetme* (§6). |
 | P5 | **Bellek katmanlı ve provenanslıdır; kapasite sonlu, arşiv büyütülebilir.** | E/M/P katmanları ve dış depo; silme/retention politikası P5'in üstündedir. Parametre belleğinde kayıpsız öğrenme garantisi yoktur. |
 | P6 | **Substrat-bağımsızdır.** Analog-doğal; dijital yalnızca yozlaşmış (kesikli) özel hâl. | Aynı hesap Kirchhoff yasalarıyla (memristor crossbar), foton fazıyla (fotonik) ya da i64 tamsayı emülasyonuyla (bu depo, x86-64) yapılır. |
@@ -175,7 +175,7 @@ gerekçe := Şu-kanıtlar-zinciri: [kural:kare-alma-karo, doğrulandı: #8412]
 
 LLM'de "neden?"in cevabı daha çok metindir; NOEMA'da "neden?"in cevabı **çalıştırılmış ve geçmiştir**. Bu, muhakeme kapasitesinin ölçülebilir tek biçimidir.
 
-### 4.4 Neden günümüzden derin? (tasarım argümanı, iddia değil)
+### 4.4 Derinlik için tasarım hipotezleri (üstünlük iddiası değil)
 
 | eksen | günümüz LLM'leri | NOEMA (tasarım) |
 |---|---|---|
@@ -973,3 +973,50 @@ Tüm public modüller sonuç tipini açıkça döndürür: `ok(value)`, `unsuppo
 Doküman içindeki ters düşen eski mutlak ifadeler yukarıdaki yeni normative kararların gerisinde kalır. Kabul edilen semantik: **exact serialized record authoritative; vector/heuristic yalnız aday bulur; tests are not proofs; no silent lossy update; unsupported or ambiguous tasks fail closed; dependency-free local baseline first.** Bu tasarım değişikliklerinin hiçbiri henüz implementasyon/benchmark sonucu değildir.
 
 *Belge sürümü: v0.7 — 2026-11-20. En riskli matematik, doğrulama, unutma ve dependency varsayımları daraltılıp uygulanabilir no-dependency referans yolu belirlendi.*
+
+## 24. v0.8 — Kapasite ve hız için kaynak-verimli çalışma tasarımı
+
+Bu bölüm "daha hızlı ve daha yüksek kapasite" isteğini compute/memory darboğazı ve eşit bütçeli testlere böler. **Performans sonucu iddia etmez.** Hedef, kolay isteklerde ucuz cevap, zor istekte kontrollü ek compute; aynı anda doğruluk ve güvenlik kapılarını korumaktır.
+
+### 24.1 İki yol: erken kesin cevap veya derin arama
+
+1. **Fast path:** policy check → incremental parse → görev tipi/kanıt standardı → exact key/rule lookup → ucuz bağımsız validator → cevap. Yalnız deterministik, düşük riskli ve evidence threshold'ı baştan sağlayan görevlerde kullanılır (exact arithmetic, bilinen LIR intrinsic, direct lookup). Her yol `fast_path_reason` üretir.
+2. **Deep path:** anlam grafında ambiguity varsa, fast-path validator başarısızsa, görev yeni/bileşimsel veya riskliyse VGPS'e geçer. Aday generator + constraint/rule search + counterexample/test runner; her birine ayrı step/time/memory limiti konur.
+3. **Anytime response:** bütçe ortasında yalnız `partial/verified_subresult` sunulabilir; final-sounding answer yok. Üst-biliş kontrol deadline yaklaşınca mevcut kanıtı özetler veya çekimser kalır.
+4. **Risk override:** yıkıcı araç eylemi, tıbbi/hukuki yüksek risk ve privacy/security durumlarında fast path atlanır; insan/ek onay ve ikinci kontrol şart.
+
+Fast path yalnız exact canonical index ile karar verir; vector cache hit'i tek başına doğruluk/route kararı değildir. Deep path'ın sonlanması için max steps + monotonic deadline + repeated-state detection + candidate cap gerekir. Kullanıcı bütçesi boşsa servis kendi düşük varsayılanını uygular ve bunu yanıtta/telemetride belirtir.
+
+### 24.2 Darboğazı ölçmeden optimizasyon yok
+
+Her request trace bu sayaçları hassas içerik olmadan taşır: parse ns, retrieval ns, candidate count, validator ns, exact MAC/operation count, bytes read/written, cache hit/miss, queue delay, p50/p95/p99 E2E latency, timeout/abstain, answer correctness/evidence level. Aynı benchmark'ta cold-cache ve warm-cache ayrı ölçülür; ölçüm koşulları (CPU, core affinity, optimize mode, dataset hash, concurrency) sonuçla birlikte yazılır.
+
+Önce flame/counter tabanlı darboğaz belirlenir. En ucuz yerel düzeltmeler sırasıyla: (a) incremental parser ve arama için allocation azaltma; (b) sıcak immutable rule index'i compile-time veya release-load'da kurup read-only tutma; (c) cold episodic store'da mmap/range read; (d) batch dot/MAC işlerinde Q32.32 pool'lardan yararlanma; (e) independent task'ları sınırlı worker'lara bölme. Her optimizasyondan önce/sonra aynı output, aynı validator ve en az interleaved benchmark round'ları gerekir. Paralellik deterministik tie-break'i değiştiremez.
+
+### 24.3 Kapasiteyi artırma, her şeyi RAM'e taşımadan
+
+- **Episodic archive:** content-addressed immutable cold object + disk index; aktif working set RAM'de. LRU eviction cache içindir, source archive retention policy'ye tabidir.
+- **Rule store:** family/type/signature/guard üzerinde exact sorted index; yüklemede immutable snapshot; rule version dependency graph ile geri izlenebilir.
+- **Semantic cache M:** yalnız approximate hint; TTL/eviction olabilir, kaynak E/P kalır. M silinince final correctness değişmemeli.
+- **Vektör:** küçük query/routing feature'ı; tüm belgeleri devasa dense vector olarak RAM'de tutmak varsayılan değil. Büyük multimodal payload disk/blob referansında, gerektiğinde pencere/chunk okunur.
+- **Kapasite limiti:** byte quota / max open file / max search node / max context span kesin. Kota aşımında `budget_exhausted`/retrieval incomplete; sessiz örnek atma ve eksik aramayı eksiksiz gibi gösterme yok.
+- **Sıkıştırma:** kayıpsız codec eklenirse raw hash ile round-trip doğrulanır. Lossy feature/embedding sıkıştırması yalnız cache için ve hata/bit-rate metadata'sıyla; authoritative archive asla bununla ikame edilmez.
+
+### 24.4 Ölçülebilir performans hedeflerinin düzeltilmesi
+
+Bu bölüm K7'nin tek sabit makine/iş-adımı eşiğini workload-family raporlamasıyla **yerine koymayı önerir**; K7 tarihsel tabloda korunur ama K34–K39 yanında tek başına hız kabulü değildir. Her ailede latency, throughput ve kalite/maliyet frontier'ı raporlanır. Tasarım hedefi (ölçülmemiş): exact low-risk math/lookup için aynı makinede request başına p95 <10 ms; 10-step küçük program search için p95 <1 s; native CPU serving'de aynı kalite eşiğinde baseline'dan en az 2× düşük median CPU-time hedefi. Bu hedefler **benchmark'ta ölçülene dek kabul kriteri değil**; platform/iş yükü uygun değilse gerekçeli olarak yeniden belirlenir.
+
+Hız karşılaştırmasında adayın yanıtsız bıraktığı veya yanlış yanıtladığı örnekler latency skoru ile saklanmaz: quality-gated performance sadece baseline ile eşit/üst kalite altkümesinde hesaplanır; ayrıca coverage ve abstention ayrı yayımlanır. Eşit hardware, core limit, dataset, context, cache durumu, concurrency ve max-output bütçesi olmadan “daha hızlı” denmez.
+
+### 24.5 Yeni kapılar
+
+| Kapı | Tanım |
+|---|---|
+| K34 — fast-path soundness | fast path'a route edilen tüm kayıtlar route gerekçesini ve validator'ı taşır; boundary/adversarial testte false-accept = 0 (test kapsamı içinde) |
+| K35 — quality-gated latency | her görev ailesinde kalite/coverage/abstention + p50/p95/p99 + CPU/memory ayrı; aynı koşulda baseline kıyası |
+| K36 — scale curve | rule/episode sayısı 10²/10³/10⁴/… artarken recall@k, exactness, RAM/disk, index build ve p95 raporu; sonuç eğri olarak yayımlanır |
+| K37 — resource honesty | timeout/node/byte limiti vurulunca explicit partial/abstain; eksiksiz cevap iddiası yok |
+| K38 — cache invariance | M açık/kapalı/bozulmuş halde final validator correctness aynı; yalnız hit/latency etkisi ölçülür |
+| K39 — concurrency determinism | aynı seed/girdi ile farklı worker scheduling altında canonical answer/evidence aynı; elapsed time değişebilir |
+
+*Belge sürümü: v0.8 — 2026-11-16. Fast/deep inference ayrımı, kapasite yönetimi ve kalite-korumalı performans protokolü eklendi; hedefler ölçülmemiştir.*
