@@ -1,0 +1,108 @@
+// NOEMA Stage 5: bounded capability graph validation and scoped routing.
+// Node table is four u64 cells per record: family, locale, risk, status.
+// All IDs/families/locales are host-assigned positive integers. This module
+// makes deterministic routing decisions; it does not parse locale or execute skills.
+
+const CAP_SEEDED: i64 = 0
+const CAP_CANDIDATE: i64 = 1
+const CAP_EVALUATED: i64 = 2
+const CAP_PROMOTED: i64 = 3
+const CAP_DEGRADED: i64 = 4
+const CAP_RETIRED: i64 = 5
+const CAP_NODE_STRIDE: i64 = 4
+const CAP_ROUTE_UNSUPPORTED: i64 = -1
+const CAP_GRAPH_INVALID: i64 = -2
+const CAP_MAX_NODES: i64 = 64
+
+/// Validate unique positive node IDs, valid prerequisite bits, and acyclicity.
+/// Edge convention: prerequisite_edges[prerequisite * n + dependent] == 1.
+fn capability_graph_valid(n: i64, node_ids: *u8, prerequisite_edges: *u8) -> i64 {
+    if n <= 0 or n > CAP_MAX_NODES { return 0 }
+    let reach = @malloc(n * n * 8)
+    var i: i64 = 0
+    while i < n {
+        let id = @read_u64(@ptr_add(node_ids, i * 8)) as i64
+        if id <= 0 { @free(reach) return 0 }
+        var j: i64 = 0
+        while j < n {
+            let edge = @read_u64(@ptr_add(prerequisite_edges, (i * n + j) * 8)) as i64
+            if edge != 0 and edge != 1 { @free(reach) return 0 }
+            if i == j and edge != 0 { @free(reach) return 0 }
+            @write_u64(@ptr_add(reach, (i * n + j) * 8), edge as u64)
+            if j < i {
+                let prior = @read_u64(@ptr_add(node_ids, j * 8)) as i64
+                if id == prior { @free(reach) return 0 }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    var k: i64 = 0
+    while k < n {
+        i = 0
+        while i < n {
+            var j: i64 = 0
+            while j < n {
+                let ik = @read_u64(@ptr_add(reach, (i * n + k) * 8)) as i64
+                let kj = @read_u64(@ptr_add(reach, (k * n + j) * 8)) as i64
+                if ik == 1 and kj == 1 { @write_u64(@ptr_add(reach, (i * n + j) * 8), 1 as u64) }
+                j = j + 1
+            }
+            i = i + 1
+        }
+        k = k + 1
+    }
+    i = 0
+    while i < n {
+        if @read_u64(@ptr_add(reach, (i * n + i) * 8)) as i64 == 1 { @free(reach) return 0 }
+        i = i + 1
+    }
+    @free(reach)
+    return 1
+}
+
+/// Route to lowest-index promoted, scope-compatible skill whose prerequisites
+/// are also promoted. The host must validate node IDs/acyclic graph on registry load.
+fn capability_route(n: i64, target_family: i64, target_locale: i64, risk_ceiling: i64, nodes: *u8, prerequisite_edges: *u8) -> i64 {
+    if n <= 0 or n > CAP_MAX_NODES { return CAP_GRAPH_INVALID }
+    if target_family <= 0 or target_locale <= 0 { return CAP_GRAPH_INVALID }
+    if risk_ceiling < 0 or risk_ceiling > 3 { return CAP_GRAPH_INVALID }
+    var i: i64 = 0
+    while i < n {
+        let base = i * CAP_NODE_STRIDE * 8
+        let family = @read_u64(@ptr_add(nodes, base)) as i64
+        let locale = @read_u64(@ptr_add(nodes, base + 8)) as i64
+        let risk = @read_u64(@ptr_add(nodes, base + 16)) as i64
+        let status = @read_u64(@ptr_add(nodes, base + 24)) as i64
+        if family <= 0 or locale <= 0 or risk < 0 or risk > 3 or status < CAP_SEEDED or status > CAP_RETIRED { return CAP_GRAPH_INVALID }
+        var j: i64 = 0
+        while j < n {
+            let edge = @read_u64(@ptr_add(prerequisite_edges, (j * n + i) * 8)) as i64
+            if edge != 0 and edge != 1 { return CAP_GRAPH_INVALID }
+            if i == j and edge != 0 { return CAP_GRAPH_INVALID }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    var candidate: i64 = 0
+    while candidate < n {
+        let base = candidate * CAP_NODE_STRIDE * 8
+        let family = @read_u64(@ptr_add(nodes, base)) as i64
+        let locale = @read_u64(@ptr_add(nodes, base + 8)) as i64
+        let risk = @read_u64(@ptr_add(nodes, base + 16)) as i64
+        let status = @read_u64(@ptr_add(nodes, base + 24)) as i64
+        if family == target_family and locale == target_locale and risk <= risk_ceiling and status == CAP_PROMOTED {
+            var prerequisites_ready = 1
+            var prerequisite: i64 = 0
+            while prerequisite < n {
+                let edge = @read_u64(@ptr_add(prerequisite_edges, (prerequisite * n + candidate) * 8)) as i64
+                let prerequisite_status = @read_u64(@ptr_add(nodes, (prerequisite * CAP_NODE_STRIDE + 3) * 8)) as i64
+                if edge == 1 and prerequisite_status != CAP_PROMOTED { prerequisites_ready = 0 }
+                prerequisite = prerequisite + 1
+            }
+            if prerequisites_ready == 1 { return candidate }
+        }
+        candidate = candidate + 1
+    }
+    return CAP_ROUTE_UNSUPPORTED
+}

@@ -1,0 +1,48 @@
+// NOEMA Stage 6: exact CAG reuse and provenance-scoped memory guards.
+// These are pure decisions. Storage, ACL backend and deletion jobs are host services.
+
+const MEMORY_DENY: i64 = 0
+const MEMORY_ALLOW: i64 = 1
+
+/// A context artifact can be reused only when its complete exact fingerprint
+/// dimensions match. Approximate/vector similarity is intentionally not accepted.
+fn cag_fingerprint_matches(payload_hash_equal: i64, schema_equal: i64, producer_equal: i64, tenant_equal: i64, consent_epoch_equal: i64, locale_equal: i64, policy_equal: i64, dependencies_fresh: i64) -> i64 {
+    if payload_hash_equal != 1 or schema_equal != 1 or producer_equal != 1 or tenant_equal != 1 { return MEMORY_DENY }
+    if consent_epoch_equal != 1 or locale_equal != 1 or policy_equal != 1 or dependencies_fresh != 1 { return MEMORY_DENY }
+    return MEMORY_ALLOW
+}
+
+/// Current-request authorization, freshness, conflict and obligation checks are
+/// re-run even after an exact context cache hit.
+fn cag_request_usable(authorized: i64, permissions_current: i64, freshness_current: i64, conflict_free: i64, obligations_current: i64) -> i64 {
+    if authorized != 1 or permissions_current != 1 or freshness_current != 1 { return MEMORY_DENY }
+    if conflict_free != 1 or obligations_current != 1 { return MEMORY_DENY }
+    return MEMORY_ALLOW
+}
+
+/// Select an episodic/semantic item only within its tenant and consent epoch,
+/// while active, unexpired, undeleted and provenance-linked.
+fn memory_item_scope_valid(source_ref: i64, item_tenant: i64, request_tenant: i64, item_consent_epoch: i64, request_consent_epoch: i64, not_expired: i64, not_deleted: i64, provenance_valid: i64) -> i64 {
+    if source_ref <= 0 or item_tenant <= 0 or request_tenant <= 0 { return MEMORY_DENY }
+    if item_tenant != request_tenant { return MEMORY_DENY }
+    if item_consent_epoch <= 0 or item_consent_epoch != request_consent_epoch { return MEMORY_DENY }
+    if not_expired != 1 or not_deleted != 1 or provenance_valid != 1 { return MEMORY_DENY }
+    return MEMORY_ALLOW
+}
+
+/// Memory selection is not factual verification; claim-level evidence and
+/// independent conflict handling remain mandatory before rendering.
+fn memory_claim_usable(scope_valid: i64, evidence_supported: i64, conflict_free: i64, permission_granted: i64) -> i64 {
+    if scope_valid != 1 or evidence_supported != 1 or conflict_free != 1 or permission_granted != 1 { return MEMORY_DENY }
+    return MEMORY_ALLOW
+}
+
+/// A forget/delete request is complete only when every known replica and
+/// derived descendant is acknowledged, or affected learned state was rebuilt.
+fn memory_deletion_complete(replica_count: i64, replica_acks: i64, descendant_count: i64, invalidated_descendants: i64, unlearning_needed: i64, rebuild_complete: i64) -> i64 {
+    if replica_count < 0 or descendant_count < 0 { return MEMORY_DENY }
+    if replica_acks != replica_count or invalidated_descendants != descendant_count { return MEMORY_DENY }
+    if unlearning_needed != 0 and unlearning_needed != 1 { return MEMORY_DENY }
+    if unlearning_needed == 1 and rebuild_complete != 1 { return MEMORY_DENY }
+    return MEMORY_ALLOW
+}

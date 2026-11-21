@@ -1,0 +1,43 @@
+// NOEMA Stage 7: fail-closed candidate/release lifecycle guard.
+// This pure transition policy does not sign artifacts, persist events, or deploy.
+
+const RELEASE_CREATED: i64 = 0
+const RELEASE_POLICY_CHECK: i64 = 1
+const RELEASE_DATA_AUDIT: i64 = 2
+const RELEASE_SPLIT_LOCKED: i64 = 3
+const RELEASE_BASELINE_CAPTURED: i64 = 4
+const RELEASE_TRAIN_CANDIDATE: i64 = 5
+const RELEASE_STATIC_CHECK: i64 = 6
+const RELEASE_EVAL: i64 = 7
+const RELEASE_REVIEW: i64 = 8
+const RELEASE_SHADOW: i64 = 9
+const RELEASE_CANARY: i64 = 10
+const RELEASE_PROMOTED: i64 = 11
+const RELEASE_PAUSED: i64 = 12
+const RELEASE_REJECTED: i64 = 13
+const RELEASE_ROLLBACK: i64 = 14
+
+/// `gate_passed` represents the checks required for this exact edge; callers
+/// must compute it from the versioned gate set and persist all results.
+fn release_transition_allowed(current: i64, next: i64, gate_passed: i64, safety_passed: i64, human_approved: i64, rollback_ready: i64) -> i64 {
+    if current < RELEASE_CREATED or current > RELEASE_ROLLBACK { return 0 }
+    if next < RELEASE_CREATED or next > RELEASE_ROLLBACK { return 0 }
+    if current == next { return 0 }
+
+    if current == RELEASE_CREATED and next == RELEASE_POLICY_CHECK { return 1 }
+    if current == RELEASE_POLICY_CHECK and next == RELEASE_DATA_AUDIT and gate_passed == 1 { return 1 }
+    if current == RELEASE_DATA_AUDIT and next == RELEASE_SPLIT_LOCKED and gate_passed == 1 { return 1 }
+    if current == RELEASE_SPLIT_LOCKED and next == RELEASE_BASELINE_CAPTURED and gate_passed == 1 { return 1 }
+    if current == RELEASE_BASELINE_CAPTURED and next == RELEASE_TRAIN_CANDIDATE { return 1 }
+    if current == RELEASE_TRAIN_CANDIDATE and next == RELEASE_STATIC_CHECK { return 1 }
+    if current == RELEASE_STATIC_CHECK and next == RELEASE_EVAL and gate_passed == 1 { return 1 }
+    if current == RELEASE_EVAL and next == RELEASE_REVIEW and gate_passed == 1 and safety_passed == 1 { return 1 }
+    if current == RELEASE_REVIEW and next == RELEASE_SHADOW and human_approved == 1 and rollback_ready == 1 { return 1 }
+    if current == RELEASE_SHADOW and next == RELEASE_CANARY and safety_passed == 1 and rollback_ready == 1 { return 1 }
+    if current == RELEASE_CANARY and next == RELEASE_PROMOTED and gate_passed == 1 and safety_passed == 1 and human_approved == 1 and rollback_ready == 1 { return 1 }
+    if current == RELEASE_PAUSED and next == RELEASE_POLICY_CHECK { return 1 }
+    if (current == RELEASE_CANARY or current == RELEASE_PROMOTED) and next == RELEASE_ROLLBACK and rollback_ready == 1 { return 1 }
+    if current >= RELEASE_POLICY_CHECK and current <= RELEASE_CANARY and next == RELEASE_PAUSED { return 1 }
+    if current >= RELEASE_POLICY_CHECK and current <= RELEASE_CANARY and next == RELEASE_REJECTED { return 1 }
+    return 0
+}
