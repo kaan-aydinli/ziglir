@@ -1,6 +1,6 @@
 # NOEMA — Analog-Doğal, Doğrulama-Kapılı Muhakeme Mimarisi
 
-**Durum:** v0.9 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
+**Durum:** v1.0 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
 **Amaç:** `ai/` çatısının dışına ve SEL'in üstüne sıfırdan kurulan, **muhakeme-öncelikli** yeni mimarinin eksiksiz tanımı.
 **Bu deponun kuralı (iddia = ölçüm) bu belge için de geçerlidir:** aşağıda geçen her "hedef", "kestirim" ya da "beklenti" açıkça **ölçülmemiştir**. Ölçülmüş tek sayılar, mevcut SEL çekirdeğine aittir ve öyle etiketlenmiştir. Bu belge bir *vaad* değil, bir *ölçülecek hipotezler listesi*dir.
 
@@ -1123,3 +1123,68 @@ Bu repo için bu turda **prior-art taraması yapılmadı**; dolayısıyla TTA ve
 8. **Yenilik denetimi:** çekirdek stabil olduktan sonra prior-art review; sonuç gelene dek isimlendirme "NOEMA önerisi", "dünya tarihinde ilk" değil.
 
 *Belge sürümü: v0.9 — 2026-11-16. Bilinen temsil/öğrenme/arama aileleri zorunlu core'dan çıkarılıp TTA özgünlük adayı olarak önerildi; prior-art ve performans sonucu yoktur.*
+
+## 26. v1.0 — Minimum maliyetli öğrenme ve kusur-kapatma politikası
+
+Hiçbir gerçek AI mimarisinde "hiç zayıflık yok" garantisi verilemez: eksik gereksinim, yeni saldırı, donanım arızası, dağılım kayması ve insan etiket hatası her zaman mümkün. Hedef, bilinen kusurları önlemek, kalan riski görünür tutmak ve etkisini sınırlamaktır. Bu bölüm maliyeti düşürmeyi *önce öğrenme kapsamını küçülterek*, sonra ölçülen darboğazı optimize ederek ele alır; performans sonucu veya maliyet üstünlüğü iddiası değildir.
+
+### 26.1 Her yeni örnekte en ucuz geçerli öğrenme yolu
+
+Gelen örnek için aşağıdaki sıra uygulanır; pahalı aşamaya gerekçe olmadan çıkılmaz:
+
+| Seviye | Eylem | Ne zaman seçilir | Tahmini maliyet sınıfı |
+|---|---|---|---|
+| U0 — Arşivle | provenanslı raw event + index kaydı; model değişikliği yok | örnek yeni ama genelleme/etiket güveni yok | O(kayıt byte + index update) |
+| U1 — Epizot ekle | exact source/evidence bağlantılı yeni çözüm olayı | görev çözüldü ve validator sonucu biliniyor; yeni genel kural kanıtlanmadı | O(trace uzunluğu) |
+| U2 — Kural adayı | yalnız ilgili task family'de iyi iz/karşıt iz çiftinden sözleşme üret | farklı seed ve verifier holdout hazır | O(yerel iz + ilgili karşıt örnekler) |
+| U3 — Yerel modül kalibrasyonu | yalnız route edilen küçük adapter/router parametrelerini izole snapshot'ta güncelle | kural/epizot yetmiyor; drift ölçülmüş; değerlendirme seti var | O(adapter parametreleri × seçilmiş minibatch) |
+| U4 — Görev ailesi yeniden eğitimi | ilgili aileye ait modül ve testlerini yeniden üret | şema/grammar/öğretim kapsamı değişmiş veya yerel update başarısız | O(ilgili family verisi + tüm family gate'leri) |
+| U5 — Tam release rebuild | tüm bağımlı modül ve kontratları yeniden kur | core ABI/proof/policy/event formatı değişikliği | O(release manifestindeki tam kapsam) |
+
+U0/U1 varsayılandır: tek örnek tüm parametreleri güncellemez. U3/U4'e geçiş için drift veya kapsama açığına dair kayıtlı sebep gerekir. U5 normal sürekli öğrenme değildir. Kendi ürettiği unlabeled tahmin, yeni etiket gibi depolanmaz. Bu politika hesap maliyetini düşürmeyi hedefler; U2–U4 doğrulama yükünü ortadan kaldırmaz.
+
+### 26.2 Bütçe yöneticisi ve erken durdurma
+
+Her run üç ayrı bütçe kullanır: `compute_budget`, `review_budget`, `storage_budget`. Scheduler her alt iş başlamadan önce worst-case tahmin ve iptal noktası bildirir. Aşağıdaki koşullarda yeni compute başlatılmaz: kalan bütçe sonucu ve zorunlu validator'ı tamamlamaya yetmiyorsa; izin/provenans incomplete ise; test/retention setleri hazır değilse. Deadline geldiğinde checkpoint + cursor yazılır; bütçe aşımı sessiz truncate değil `PAUSED` veya `budget_exhausted` sonucudur.
+
+İşlem önceliği: (1) hard safety/proof regression; (2) yeni örneğin hedeflenen family'ye katkısı; (3) retention; (4) geniş benchmark ve ikincil optimization. Kısa ve ucuz exact validator erken başarısızsa pahalı test ve training update iptal edilir. Adayın ara skorları promotion için kullanılamaz; promotion tüm zorunlu kapıları gerektirir.
+
+### 26.3 Maliyet ölçümü: gerçek toplam, yalnız accelerator süresi değil
+
+Her run başına aşağıdakiler kaydedilir: end-to-end wall time, CPU-core seconds, peak RSS, byte read/write, candidate/rejected count, validator/test zamanı, data generation zamanı, insan inceleme dakikası, enerji (sensör varsa; yoksa `unmeasured`), artifact saklama ve rollback maliyeti. Sonuçlar **başarılı kabul edilen capability update başına** hesaplanır; başarısız deneme ve evaluation giderleri paydadan çıkarılmaz.
+
+K29/K21 raporu şu karşılaştırmayı verir: aynı görev, aynı quality/coverage/abstention eşiği, aynı makine ve source data izinlerinde (a) event/rule-only U0–U2, (b) local adapter U3, (c) aile full retrain U4. Aynı testte hangi aşamanın maliyeti ne kadar olduğu ayrılır. En ucuz yol başarı eşiğini tutmazsa ucuz diye seçilmez.
+
+### 26.4 Kusur-kapatma (FMEA-lite) ve karantina
+
+Her release öncesi hata türleri `severity × likelihood × detectability` ile sıralanır; yüksek risk için owner, detection test, containment, recovery ve residual risk zorunludur. İlk minimum risk listesi:
+
+| Hata türü | Önleyici kontrol | Tespit | Containment / recovery | Kalan risk |
+|---|---|---|---|---|
+| parser yanlış anlamı kesinleştirir | ambiguity korunur; dil kapsamı pinli | paraphrase/ambiguity test | ask/unsupported; grammar version rollback | kapsanmamış dil/ifade |
+| yanlış verifier kabul eder | producer-verifier ayrımı; small checker | mutation/negative tests, independent proof fixtures | formal label'i kaldır; dependent proof invalidate | ortak spec hatası |
+| data poisoning / instruction injection | source trust, quarantine, no direct tool privilege | adversarial dataset + provenance anomaly | source lineage karantina, derived contracts retract | bilinmeyen saldırı |
+| forgetting / rule collision | snapshot, family-specific retention, scoped contracts | update sonrası test + collision fixtures | rollback, candidate disable | test edilmemiş görev kaybı |
+| silent archive loss/corruption | immutable content hash, backup, restore drill | periodic integrity scan | stop ingest, restore ve event reconciliation | ortak arıza/fiziksel afet |
+| privacy leakage | minimum collection, tenant scope, delete propagation | canary secrets, access audit | stop release, revoke access, incident process | model inversion/backup retention ihtimali |
+| budget exhaustion/DoS | per-task quotas, deadline, queue backpressure | saturation/latency metrics | reject/pause, no unsafe partial action | hizmet erişilebilirliği |
+| tool side effect | least privilege, simulator, explicit consent | postcondition + audit trace | circuit breaker, human escalation, rollback if possible | irreversibility |
+| dependency/supply-chain | dependency manifest, pinned hash, offline build | hermetic repeat build | artifact quarantine, prior signed release | compiler/OS root trust |
+| fairness/calibration drift | disaggregated evaluation, threshold policy | subgroup/shift gates | capability scope down, abstain, human review | ölçülmeyen subgroup |
+
+Severity tablosu sıfır risk kanıtı değildir; risk yüksekliği açıklanamazsa release bloke edilir. Olay sonrası `incident_event` privacy-safe audit log'a yazılır, model/rule/data lineage ile bağlı rollback planı uygulanır.
+
+### 26.5 Hızlı fakat güvenli continuous training için SLO taslağı
+
+- **Örnek kabul SLO:** valid synthetic verified-trace event'inin U0 kaydı tam manifestli run'da ölçülür; hedef p95 <5 ms (disk ve makine profili belirtilmeden genel iddia değildir).
+- **Kural adayı SLO:** aynı ailede ≤100 rule candidate için U2 build+checker süresi ölçülür; sabit sayı hedefi ancak ilk LIR dikey dilim benchmark'ından sonra belirlenir.
+- **Release SLO:** eğitim süresi değil, yeni kabiliyet başına tüm gate maliyeti K29 ile ölçülür. Zorunlu retention/safety gate kısaltılarak "hız" sağlanamaz.
+- **Fast ingestion:** queue batching ve immutable append kullanabilir; batch içi her örnek ayrı id/provenance taşır. Bir örneğin hatası batch'in tamamını sessizce düşürmez; failure kayıtları tutulur.
+
+Bu SLO'lar başlangıç ölçüm planıdır; p95 hedefleri donanım bağımlıdır ve geçerli kapıya dönüşmesi için ölçüm protokolü, fixture hash'i ve birkaç tekrar gerekir.
+
+### 26.6 Sonuç: kusur yok iddiası yerine kanıt dosyası
+
+Her sürümün yanında `assurance_case` bulunur: sistem sınırı, varsayımlar, threat model, evidence level, passed/failed gates, test coverage, residual risks, known unsupported tasks ve rollback sürümü. `all weaknesses eliminated` / `risk-free` status değeri şemada yoktur. Güvenilirlik artışı, kusuru gizlememek, erken saptamak, etkisini daraltmak ve tekrarını testle önlemek üzerinden değerlendirilir.
+
+*Belge sürümü: v1.0 — 2026-11-16. Katmanlı düşük-maliyet update politikası ve kusur containment/assurance süreci eklendi; maliyet/hız hedefleri ölçülmemiştir.*
