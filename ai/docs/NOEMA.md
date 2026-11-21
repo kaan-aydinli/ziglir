@@ -1,6 +1,6 @@
 # NOEMA — Analog-Doğal, Doğrulama-Kapılı Muhakeme Mimarisi
 
-**Durum:** v0.1 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
+**Durum:** v0.2 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
 **Amaç:** `ai/` çatısının dışına ve SEL'in üstüne sıfırdan kurulan, **muhakeme-öncelikli** yeni mimarinin eksiksiz tanımı.
 **Bu deponun kuralı (iddia = ölçüm) bu belge için de geçerlidir:** aşağıda geçen her "hedef", "kestirim" ya da "beklenti" açıkça **ölçülmemiştir**. Ölçülmüş tek sayılar, mevcut SEL çekirdeğine aittir ve öyle etiketlenmiştir. Bu belge bir *vaad* değil, bir *ölçülecek hipotezler listesi*dir.
 
@@ -401,3 +401,108 @@ SEL'in "bütün sistem = tek ağ" iddiası geri çekilir; yerine "SEL = NOEMA'n�
 ---
 
 *Son güncelleme: 2026-11-16 · Durum: Faz 0 tamamlandı (bu belge) · Sonraki adım: Faz 1 — `ai/noema/` Q32.32 faz-vektör kütüphanesi + gürültü emülatörü.*
+
+## 17. v0.2 — Geniş yetenek alanı (tasarım genişletmesi)
+
+**Bu bölüm v0.1 belgesinin üstüne eklenen tasarım katmanıdır; uygulanmamıştır.** "Her alanda daha zeki" ifadesi her görevde üstünlük vaadi değil, farklı yetenek sınıflarını kapsama hedefidir. Hiçbir genel amaçlı sistem her alanda en iyi olamaz. NOEMA'nın hedefi her alanda ölçülebilir, güven kalibreli ve yeni kanıtla güncellenebilir olmaktır.
+
+### 17.1 Ortak bilişsel omurga: uzmanlar arası sentez
+
+VGPS, görev türüne göre çalışan ve ortak kanıt biçiminde uzlaşan uzmanlar topluluğudur. Her uzman ayrı algoritmik yol izler; hiçbir uzmanın skorlaması kanıt sayılmaz.
+
+| Uzman | Görev sınıfı | Ürettiği nesne | Kabul ölçütü |
+|---|---|---|---|
+| Tümdengelimci | mantık, cebir, aritmetik | biçimsel türetme | küçük proof-kernel doğrular |
+| Endüktif bilimci | gözlemden yasa/hipotez | hipotez + ayırt edici deney | holdout + yeni deney |
+| Nedensel modelci | müdahale, karşı-olgusal | nedensel grafik + varsayımlar | müdahale testleri |
+| Program sentezleyici | kod/algoritma | çalıştırılabilir program | tip + özellik + test + sandbox |
+| Planlayıcı | eylem/kaynak/hedef | durum geçişleri dizisi | her adım geçiş denetimi |
+| Dil yorumlayıcı | çok dilli niyet/ifade | anlam grafı + belirsizlik | paraphrase, çelişki, gönderim testleri |
+| Algı uzmanı | görüntü/ses/zaman serisi | ölçüm + hata aralığı | kalibre algı testleri |
+| Sosyal/etik analist | norm çatışması/paydaş etkisi | seçenekler + varsayım/etki haritası | tek doğru iddiası yok; paydaş incelemesi |
+
+**Sentez protokolü:** isteği alt-hedeflere ayır; her birine uzman ve kanıt standardı ata; bağımsız çözüm ve çürütme üret; çelişkide ayırt edici test veya ek bilgi iste; yalnız doğrulanan bölümü kesin, kalanı belirsizlik etiketiyle sun. Eksik uzmanlık varsa `kapsam_dışı` veya `kanıt_yetersiz` döndür.
+
+### 17.2 Dil ve anlam — token id'siz, fakat dilbilgisiz değil
+
+Sürekli vektör tek başına ham yazıyı anlamaz. NOEMA'da **tokenizer/BPE yok**, ancak yüzeyden-anlam grafına ayrıştırıcı gerekir. Girdi Unicode karakter akışı olarak kayıpsız okunur; morfoloji, söz dizimi, gönderim, kiplik ve zaman ilişkileri kompozisyonel grafa çevrilir. Grafik düğüm/kenarları holografik sahaya bağlanır; saha ayrıştırıcının yerine geçmez.
+
+- Belirsiz cümlede tek yorum seçilmez; alternatif grafikler bağlam/kanıt gelene dek korunur.
+- Türkçe eklemeli yapı ve serbest sözdizimi ayrı dil kurallarıyla; dil başına kapsam ayrı ölçülür. "Tüm diller" iddiası yoktur.
+- Çeviri, kaynak/hedef anlam grafı hizalamasıdır; kaybolan nüans işaretlenir.
+- Metin, kanıt ağacının sunumudur; akıcılık doğruluk kanıtı değildir.
+
+### 17.3 Algı ve çoklu kip — ölçümden kavrama
+
+Görüntü, ses ve sensör akışı üç aşamada işlenir: ham sinyalden sabit noktalı öznitelik; zaman/uzam referanslı olay nesnesi; olayları STF dünya durumuna bağlama. Her algı sonucu `(tahmin, birim, koordinat/bağlam, belirsizlik_aralığı, kaynak_epizot)` taşır.
+
+- Ses: akustik olay → fonetik adaylar → dil grafı; konuşmacı/aksan iddiası test edilen popülasyonla sınırlıdır.
+- Görüntü: nesne/özellik/uzamsal ilişki → sahne grafı; pikselde görünmeyen özellik uydurulmaz.
+- Zaman serisi: değişim noktası, periyot ve olay sırası; kestirim aralığı kalibre edilir.
+- Gürültü, eksik veri, perspektif, hız ve dağılım kayması test edilir. Dış benchmark kullanılacaksa lisans, sürüm, veri bölmesi ve kaynak sabitlenir.
+
+### 17.4 Bilimsel ve nedensel muhakeme
+
+STF rakip açıklamaları `H₁…Hₙ` olarak tutar; her biri varsayım, öngörü ve yanlışlayıcı gözlem taşır. Deney seçici, hipotezleri farklı sonuçlara götüren ayırt edici deneyleri tercih eder. Sonuçta belirsizlik aralıkları ve alternatif açıklamalar raporlanır; korelasyon nedensellik diye sunulmaz.
+
+Nedensel grafikte gözlenen değişken, gizli varsayım ve müdahale ayrıdır. `do(X=x)` müdahalesi koşullu gözlemden farklıdır. Karşı-olgusal yanıt ancak yapısal varsayımlar ve geçerlilik alanı açıkça verildiğinde üretilir. Sentetik nedensel görevler ve sabit uzman etiketli setler ayrı ayrı ölçülür; gözlemsel veriden otomatik "gerçek neden" çıkarma vaadi yoktur.
+
+### 17.5 Planlama, eylem ve robotik güvenliği
+
+Bilinen deterministik geçişlerde A*/IDA* veya kısıt çözümü kullanılabilir. Belirsiz/gecikmeli ortamda ufuk-kısıtlı model tabanlı arama; güvenli durum kümesi, kaynak bütçesi ve geri dönüş planını korur. Eylem öncesi önkoşul doğrulanır, yan etki sınıfı belirlenir, riskli işlem için insan onayı/sandbox gerekir; son durum tekrar okunur. Üretim, para transferi, fiziksel robot ve geri alınamaz işlemde otonom icra varsayılan olarak kapalıdır.
+
+### 17.6 Sosyal muhakeme ve değer çatışması
+
+Etik yargı teorem gibi sertifikalandırılamaz. NOEMA bunu karar analizi olarak verir: etkilenen taraflar, zarar/fayda, kurallar, belirsiz varsayımlar, geri döndürülebilir seçenek ve itiraz yolu. Normatif çerçeveler ayrı ayrı uygulanır; seçim kullanıcıya/kuruma bırakılır. Grup bazlı hata ve kalibrasyon farkı ölçülmeden dağıtım yapılmaz; yüksek riskte insan denetimi ve çekimserlik zorunludur.
+
+### 17.7 Güvenlik, mahremiyet ve kötüye kullanım
+
+Tehdit modeli: talimat enjeksiyonu, bellek zehirleme, araç izin aşımı, hassas veri ifşası ve belirsiz çıktı zararı. Bellek girdisi kaynak/provenans ve erişim politikası taşır; kullanıcı verisi varsayılan olarak başka kullanıcıya genellenmez. Silme isteği epizot, indeks ve türetilmiş kurallara yayılır. Araçlar en az ayrıcalıkla çalışır; üretilen kod sandbox, zaman/bellek limitleriyle sınırlandırılır. Red-team testi sürekli kapıdır, tek seferlik filtre değildir.
+
+### 17.8 Denetimli öz-geliştirme
+
+NOEMA canlı kural tabanını sessizce değiştiremez. Aday güncelleme ayrı sürümde hazırlanır; provenans, holdout, regresyon paketi, deterministik yeniden üretim ve sürüm imzası gerekir. Kabul edilen değişiklik geri alınabilir snapshot olur. Güvenlik politikasını etkileyen değişiklikte insan onayı zorunludur.
+
+### 17.9 Yetenek kapsamı ve sınırlar
+
+| Alan | Mekanizma | Ölçülecek sonuç | Sert sınır |
+|---|---|---|---|
+| Aritmetik/mantık | exact araç + proof kernel | doğruluk, kanıt geçişi, kapsam | yalnız biçimsel dil kapsamı |
+| Bilim/matematik | türetme + hipotez/deney | çözüm, yanlış hipotez, kalibrasyon | varsayım/birim yoksa çekimser |
+| Kod | sentez + derleme/test/sandbox | pass@1/pass@k, regresyon, kaynak | test geçişi tam doğruluk değildir |
+| Dil/çeviri | anlam grafı | dil başına anlam koruma/kalibrasyon | tokenizer yok ≠ dil işleme yok |
+| Algı | sinyal/olay çıkarımı | bozulma eğrisi, sınıf skorları, ECE | dağılım dışı kesinlik yok |
+| Planlama/robotik | geçiş modeli + güvenli arama | başarı, maliyet, ihlal, toparlanma | gerçek dünyada insan kapısı |
+| Bellek/öğrenme | epizot + kural indüksiyonu | retention, mahremiyet, veri verimi | fiziksel bellek sınırlıdır |
+| Sosyal/etik | paydaş/etki haritası | uzman incelemesi, grup farkları | değer hükmü teorem değildir |
+| Güvenlik | izin, provenans, rollback | saldırı/ifşa/yan etki | sıfır risk garantisi yok |
+
+### 17.10 Yeni ölçüm kapıları
+
+K0–K10 korunur. Aşağıdakiler spekülatif tasarım hedefleridir; ölçülmüş sonuç değildir.
+
+| Kapı | Ölçüm ve dur-ölç koşulu |
+|---|---|
+| K11 | Türkçe 500 cümlelik sabit anlam grafı setinde exact-match ≥%85 hedef; aksi halde kapsam daraltılır. |
+| K12 | Çoklu kip bozulma eğrisinde ECE ≤0.10 hedef; dağılım dışı durumda çekimserlik artmalı. |
+| K13 | Sentetik SCM müdahale ve karşı-olgusal doğruluk ayrı ayrı ≥%90 hedef; gizli varsayım ablation zorunlu. |
+| K14 | 100 bilimsel yasa/karşı-örnek görevinde yanlış kesin sonuç = 0; hipotez kalibrasyonu ve deney seçimi raporlanır. |
+| K15 | Sosyal senaryolarda grup başına hata/çekimserlik farkı raporlanır; önceden belirlenen eşik aşılırsa dağıtım yok. |
+| K16 | Injection/izin aşımı testinde kritik yetkisiz eylem = 0 hedef; test sayısı ve güven aralığı yayımlanır. |
+| K17 | Silme isteği sonrası ham kayıt, indeks ve türetilmiş kural erişilemezliği doğrulanır. |
+| K18 | RAM/disk/enerji ve bellek yaşıyla gecikme ölçülür; "sınırsız" kapasite iddiası yapılmaz. |
+| K19 | Planlama 5/10/20 adımda başarı, maliyet, geri dönüş ve ihlal ayrı raporlanır. |
+| K20 | Her alanda sabit benchmark/baseline/eşit kaynak; alan skorları ayrı yayımlanır, geomean tek başına yetmez. |
+
+## 18. v0.2 düzeltmeleri
+
+Bu genişletme v0.1'deki aşırı kesin ifadeleri sınırlar:
+
+1. **Sınırsız derinlik yoktur:** arama zaman, bellek, enerji ve sonlandırma bütçesiyle sınırlıdır; çözüm bulunma garantisi yoktur.
+2. **Unutma imkânsız değildir:** fiziksel bellek sınırlı; depolama bozulabilir/silinebilir. P5, provenanslı ve geri çağrılabilir bellek hedefidir; gizlilik/silme talepleri mutlak saklamadan üstündür.
+3. **Her alanda kanıt mümkün değildir:** sertifika biçimsel/çalıştırılabilir doğrulama alanlarına; algı, bilim, nedensellik ve sosyal alana kalibre edilmiş belirsizlik uygulanır.
+4. **Holografik vektör tek başına anlam değildir:** dil, algı, birim/bağlam ve provenans modülleri açıkça gerekir.
+5. **Analog, fiziksel anlamda "bitsiz" garanti etmez:** ölçüm/arayüz sonlu çözünürlüklüdür; gürültü, drift, kalibrasyon ve ADC sınırı kaydedilmeden kapasite iddiası yoktur.
+6. **"Her alanda daha zeki" sonuç değil, test kapsamı hedefidir.** Tüm alan kapıları ve dış karşılaştırmalar tamamlanmadan ürün iddiası olarak kullanılmaz.
+
+*Belge sürümü: v0.2 — 2026-11-20. Yetenek kapsamı genişletildi; uygulama veya performans sonucu yoktur.*
