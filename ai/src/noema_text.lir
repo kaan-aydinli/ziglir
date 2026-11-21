@@ -1,0 +1,98 @@
+// NOEMA Stage 21: LIR-only UTF-8 byte/ASCII-token text dataset ingestion.
+// TSV fields: train|dev|test<TAB>answer|ask|tool|abstain<TAB>natural language text.
+// ASCII case-folding and alphanumeric token boundaries; deterministic hashed
+// bag-of-words. Non-ASCII bytes delimit tokens; this is not Unicode NLP.
+const TEXT_INVALID: i64 = -1
+const TEXT_MAX_ROWS: i64 = 256
+const TEXT_MAX_FEATURES: i64 = 256
+const TEXT_MAX_LINE_BYTES: i64 = 4096
+const TEXT_CLASSES: i64 = 4
+const TEXT_TRAIN: i64 = 0
+const TEXT_DEV: i64 = 1
+const TEXT_TEST: i64 = 2
+
+fn text_word_byte(ch: i64) -> i64 {
+    if ch >= 48 and ch <= 57 { return 1 }
+    if ch >= 65 and ch <= 90 { return 1 }
+    if ch >= 97 and ch <= 122 { return 1 }
+    return 0
+}
+
+fn text_lower(ch: i64) -> i64 {
+    if ch >= 65 and ch <= 90 { return ch + 32 }
+    return ch
+}
+
+fn text_split_id(bytes: *u8, start: i64, end: i64) -> i64 {
+    if end - start == 5 and @read_u8(@ptr_add(bytes, start)) == 116 and @read_u8(@ptr_add(bytes, start + 1)) == 114 and @read_u8(@ptr_add(bytes, start + 2)) == 97 and @read_u8(@ptr_add(bytes, start + 3)) == 105 and @read_u8(@ptr_add(bytes, start + 4)) == 110 { return TEXT_TRAIN }
+    if end - start == 3 and @read_u8(@ptr_add(bytes, start)) == 100 and @read_u8(@ptr_add(bytes, start + 1)) == 101 and @read_u8(@ptr_add(bytes, start + 2)) == 118 { return TEXT_DEV }
+    if end - start == 4 and @read_u8(@ptr_add(bytes, start)) == 116 and @read_u8(@ptr_add(bytes, start + 1)) == 101 and @read_u8(@ptr_add(bytes, start + 2)) == 115 and @read_u8(@ptr_add(bytes, start + 3)) == 116 { return TEXT_TEST }
+    return TEXT_INVALID
+}
+
+fn text_label_id(bytes: *u8, start: i64, end: i64) -> i64 {
+    if end - start == 6 and @read_u8(@ptr_add(bytes, start)) == 97 and @read_u8(@ptr_add(bytes, start + 1)) == 110 and @read_u8(@ptr_add(bytes, start + 2)) == 115 and @read_u8(@ptr_add(bytes, start + 3)) == 119 and @read_u8(@ptr_add(bytes, start + 4)) == 101 and @read_u8(@ptr_add(bytes, start + 5)) == 114 { return 0 }
+    if end - start == 3 and @read_u8(@ptr_add(bytes, start)) == 97 and @read_u8(@ptr_add(bytes, start + 1)) == 115 and @read_u8(@ptr_add(bytes, start + 2)) == 107 { return 1 }
+    if end - start == 4 and @read_u8(@ptr_add(bytes, start)) == 116 and @read_u8(@ptr_add(bytes, start + 1)) == 111 and @read_u8(@ptr_add(bytes, start + 2)) == 111 and @read_u8(@ptr_add(bytes, start + 3)) == 108 { return 2 }
+    if end - start == 7 and @read_u8(@ptr_add(bytes, start)) == 97 and @read_u8(@ptr_add(bytes, start + 1)) == 98 and @read_u8(@ptr_add(bytes, start + 2)) == 115 and @read_u8(@ptr_add(bytes, start + 3)) == 116 and @read_u8(@ptr_add(bytes, start + 4)) == 97 and @read_u8(@ptr_add(bytes, start + 5)) == 105 and @read_u8(@ptr_add(bytes, start + 6)) == 110 { return 3 }
+    return TEXT_INVALID
+}
+
+/// Decode natural-language TSV into hashed token-count vectors and one-hot
+/// decision targets. `feature_dim` is fixed at training/evaluation time.
+fn noema_text_decode(length: i64, bytes: *u8, row_capacity: i64, feature_dim: i64, features: *u8, targets: *u8, splits: *u8, row_count_out: *u8) -> i64 {
+    if length <= 0 or row_capacity <= 0 or row_capacity > TEXT_MAX_ROWS or feature_dim <= 0 or feature_dim > TEXT_MAX_FEATURES { return TEXT_INVALID }
+    var pos: i64 = 0
+    var rows: i64 = 0
+    while pos < length {
+        if rows >= row_capacity { return TEXT_INVALID }
+        let line_start = pos
+        var line_end = pos
+        while line_end < length and (@read_u8(@ptr_add(bytes, line_end)) as i64) != 10 { line_end = line_end + 1 }
+        if line_end - line_start > TEXT_MAX_LINE_BYTES { return TEXT_INVALID }
+        var split_end = line_start
+        while split_end < line_end and (@read_u8(@ptr_add(bytes, split_end)) as i64) != 9 { split_end = split_end + 1 }
+        if split_end == line_end { return TEXT_INVALID }
+        let split = text_split_id(bytes, line_start, split_end)
+        if split < 0 { return TEXT_INVALID }
+        let label_start = split_end + 1
+        var label_end = label_start
+        while label_end < line_end and (@read_u8(@ptr_add(bytes, label_end)) as i64) != 9 { label_end = label_end + 1 }
+        if label_end == line_end { return TEXT_INVALID }
+        let label = text_label_id(bytes, label_start, label_end)
+        if label < 0 or label >= TEXT_CLASSES { return TEXT_INVALID }
+        let text_start = label_end + 1
+        if text_start >= line_end { return TEXT_INVALID }
+        let feature_base = rows * feature_dim * 8
+        var d: i64 = 0
+        while d < feature_dim { @write_u64(@ptr_add(features, feature_base + d * 8), 0 as u64) d = d + 1 }
+        var c: i64 = 0
+        while c < TEXT_CLASSES { @write_u64(@ptr_add(targets, (rows * TEXT_CLASSES + c) * 8), (if c == label { 4294967296 } else { 0 }) as u64) c = c + 1 }
+        var cursor = text_start
+        var in_word = 0
+        var hash: i64 = 0
+        var token_count: i64 = 0
+        while cursor <= line_end {
+            let ch = if cursor == line_end { 32 } else { @read_u8(@ptr_add(bytes, cursor)) as i64 }
+            if text_word_byte(ch) == 1 {
+                hash = (hash * 33 + text_lower(ch)) % 2147483647
+                in_word = 1
+            } else if in_word == 1 {
+                let bucket = hash % feature_dim
+                let cell = @ptr_add(features, feature_base + bucket * 8)
+                @write_u64(cell, (@read_u64(cell) + 4294967296) as u64)
+                token_count = token_count + 1
+                hash = 0
+                in_word = 0
+            }
+            cursor = cursor + 1
+        }
+        if token_count == 0 { return TEXT_INVALID }
+        @write_u64(@ptr_add(splits, rows * 8), split as u64)
+        rows = rows + 1
+        pos = if line_end < length { line_end + 1 } else { length }
+    }
+    if rows == 0 { return TEXT_INVALID }
+    @write_u64(row_count_out, rows as u64)
+    return rows
+}

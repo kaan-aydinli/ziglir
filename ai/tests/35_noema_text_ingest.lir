@@ -1,0 +1,31 @@
+// NOEMA Stage 21 natural-language TSV vectorization.
+import "../src/noema_text.lir"
+fn main() -> i64 {
+    var checks: i64 = 0
+    var passed: i64 = 0
+    let rowsf = @malloc(3 * 16 * 8)
+    let rowst = @malloc(3 * 4 * 8)
+    let splits = @malloc(3 * 8)
+    let count = @malloc(8)
+    let text = "train\tanswer\tA cat runs quickly.\ndev\task\tCan you help?\ntest\ttool\tCompile this code.\n"
+    let n = noema_text_decode(text.len as i64, text.ptr as *u8, 3, 16, rowsf, rowst, splits, count)
+    checks = checks + 1
+    if n == 3 and (@read_u64(count) as i64) == 3 { passed = passed + 1 }
+    checks = checks + 1
+    if (@read_u64(splits) as i64) == TEXT_TRAIN and (@read_u64(@ptr_add(splits, 8)) as i64) == TEXT_DEV and (@read_u64(@ptr_add(splits, 16)) as i64) == TEXT_TEST { passed = passed + 1 }
+    checks = checks + 1
+    if (@read_u64(rowst) as i64) == 4294967296 and (@read_u64(@ptr_add(rowst, 4 * 8 + 8)) as i64) == 4294967296 { passed = passed + 1 }
+    checks = checks + 1
+    let bad = "train\tunknown\tA sentence.\n"
+    if noema_text_decode(bad.len as i64, bad.ptr as *u8, 3, 16, rowsf, rowst, splits, count) == TEXT_INVALID { passed = passed + 1 }
+    checks = checks + 1
+    let bad_split = "holdout\tanswer\tA sentence.\n"
+    if noema_text_decode(bad_split.len as i64, bad_split.ptr as *u8, 3, 16, rowsf, rowst, splits, count) == TEXT_INVALID { passed = passed + 1 }
+    checks = checks + 1
+    if noema_text_decode(text.len as i64, text.ptr as *u8, 2, 16, rowsf, rowst, splits, count) == TEXT_INVALID { passed = passed + 1 }
+    printInt(passed)
+    print("/")
+    printInt(checks)
+    println("")
+    return 0
+}

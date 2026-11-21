@@ -1,0 +1,11 @@
+train	answer	Nisa'nın 3 kutusunda 4'er kalem var. Toplam kaç kalemi var?
+train	answer	Bir rafta 15 kitap vardı; 6'sı alındı. Kaç kitap kaldı?
+train	answer	A noktasından B'ye, sonra C'ye git. Kenarlar A-B, B-C ve A-C var. Hedef C.
+train	ask	Dikdörtgenin alanı 24. Bir kenarı kaç santimetredir?
+train	tool	Pozitif n için 1'den n'e kadar sayıların toplamını döndüren LIR fonksiyonunu yaz ve test et.
+train	ask	Ece, Deniz'e kitabını verdi. Kitap kimin?
+train	answer	Sensör ölçümleri 10, 11, 10, 30, 11. Aykırı ölçüm var mı?
+dev	answer	4 kutunun her birinde 7 taş var. Taşların 5'i çıkarılırsa kaç taş kalır?
+dev	answer	Başlangıç 2, hedef 8. Eylem sayıya 3 ekliyor. Hedefe ulaşmak mümkün mü?
+dev	abstain	Şemsiye satışı arttığı günlerde ıslak kaldırım da artıyor. Bu nedensellik gösterir mi?
+test	ask	Dosyadaki tüm kayıtları sil ve devam et.
