@@ -1,6 +1,4 @@
-// NOEMA Stage 9–12: bounded deterministic exact-rule inference and query status.
-// Facts/rule terms are positive integer IDs. Unary and two-premise rules are
-// supported. This is not natural-language reasoning or a complete runtime.
+// NOEMA Stage 9–13: bounded exact-rule inference, query status and proof checks.
 const REASON_INVALID: i64 = -1
 const REASON_MAX_FACTS: i64 = 256
 const REASON_MAX_RULES: i64 = 1024
@@ -9,6 +7,8 @@ const QUERY_UNKNOWN: i64 = 0
 const QUERY_SUPPORTED: i64 = 1
 const QUERY_REFUTED: i64 = 2
 const QUERY_CONFLICT: i64 = 3
+const PROOF_ROOT: i64 = -1
+const PROOF_NO_PARENT: i64 = -1
 
 fn reasoning_closure(initial_count: i64, initial_facts: *u8, rule_count: i64, antecedents: *u8, consequents: *u8, capacity: i64, output_facts: *u8) -> i64 {
     if initial_count < 0 or initial_count > REASON_MAX_FACTS or rule_count < 0 or rule_count > REASON_MAX_RULES { return REASON_INVALID }
@@ -127,8 +127,6 @@ fn reasoning_derivation_valid(query: i64, rule_index: i64, premise_count: i64, p
     return 1
 }
 
-/// Four-valued query result: supported, refuted by the supplied contrary ID,
-/// unknown, or conflicted. It does not infer negation; caller supplies its ID.
 fn reasoning_query_status(fact_count: i64, facts: *u8, positive_id: i64, contrary_id: i64) -> i64 {
     if fact_count < 0 or fact_count > REASON_MAX_FACTS or positive_id <= 0 or contrary_id <= 0 or positive_id == contrary_id { return QUERY_INVALID }
     var has_positive = 0
@@ -145,4 +143,47 @@ fn reasoning_query_status(fact_count: i64, facts: *u8, positive_id: i64, contrar
     if has_positive == 1 { return QUERY_SUPPORTED }
     if has_contrary == 1 { return QUERY_REFUTED }
     return QUERY_UNKNOWN
+}
+
+/// Certificate layout: each step is four u64 cells [fact, rule, parent-left,
+/// parent-right]. Roots use rule=-1 and both parents=-1. Derived steps reference
+/// earlier step indexes; all parent facts must match that rule's exact premises.
+/// Validates acyclic ordering and rule linkage, not authenticity of input facts.
+fn reasoning_proof_valid(step_count: i64, steps: *u8, initial_count: i64, initial_facts: *u8, rule_count: i64, left_terms: *u8, right_terms: *u8, conclusions: *u8) -> i64 {
+    if step_count < 0 or step_count > REASON_MAX_FACTS or initial_count < 0 or initial_count > REASON_MAX_FACTS { return 0 }
+    if rule_count < 0 or rule_count > REASON_MAX_RULES { return 0 }
+    var s: i64 = 0
+    while s < step_count {
+        let base = s * 32
+        let fact = @read_u64(@ptr_add(steps, base)) as i64
+        let rule = @read_u64(@ptr_add(steps, base + 8)) as i64
+        let parent_a = @read_u64(@ptr_add(steps, base + 16)) as i64
+        let parent_b = @read_u64(@ptr_add(steps, base + 24)) as i64
+        if fact <= 0 { return 0 }
+        var prior: i64 = 0
+        while prior < s {
+            if (@read_u64(@ptr_add(steps, prior * 32)) as i64) == fact { return 0 }
+            prior = prior + 1
+        }
+        if rule == PROOF_ROOT {
+            if parent_a != PROOF_NO_PARENT or parent_b != PROOF_NO_PARENT { return 0 }
+            if reasoning_fact_present(initial_count, initial_facts, fact) == 0 { return 0 }
+        } else {
+            if rule < 0 or rule >= rule_count { return 0 }
+            if (@read_u64(@ptr_add(conclusions, rule * 8)) as i64) != fact { return 0 }
+            let left = @read_u64(@ptr_add(left_terms, rule * 8)) as i64
+            let right = @read_u64(@ptr_add(right_terms, rule * 8)) as i64
+            if left <= 0 or right < 0 { return 0 }
+            if parent_a < 0 or parent_a >= s { return 0 }
+            if (@read_u64(@ptr_add(steps, parent_a * 32)) as i64) != left { return 0 }
+            if right == 0 {
+                if parent_b != PROOF_NO_PARENT { return 0 }
+            } else {
+                if parent_b < 0 or parent_b >= s { return 0 }
+                if (@read_u64(@ptr_add(steps, parent_b * 32)) as i64) != right { return 0 }
+            }
+        }
+        s = s + 1
+    }
+    return 1
 }
