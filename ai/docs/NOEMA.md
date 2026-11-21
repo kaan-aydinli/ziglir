@@ -1,6 +1,6 @@
 # NOEMA — LIR ile uygulanan karar-kapıları
 
-**Durum:** v2.8. LIR’de uygulanıp test edilenler: contract/evidence/scheduler/data/capability/memory-scope/release-lifecycle/task-execution guard’ları ve sınırlı unary/conjunctive exact-rule forward-chaining kernel’leri. Bu, tasarlanan NOEMA AI framework’ünün tamamı değildir.
+**Durum:** v2.9. LIR’de uygulanıp test edilenler: contract/evidence/scheduler/data/capability/memory-scope/release-lifecycle/task-execution guard’ları, sınırlı unary/conjunctive exact-rule forward-chaining ve yerel türetim adımı doğrulaması. Bu, tasarlanan NOEMA AI framework’ünün tamamı değildir.
 
 ## Uygulanmış dilimler
 
@@ -14,9 +14,9 @@
 | Memory scope, retention and deletion guards | `ai/src/noema_memory.lir` | `ai/tests/20_noema_memory.lir` |
 | Release lifecycle guards | `ai/src/noema_release.lir` | `ai/tests/21_noema_release.lir` |
 | Bounded task execution lifecycle and budget admission | `ai/src/noema_execution.lir` | `ai/tests/22_noema_execution.lir` |
-| Exact-rule forward-chaining inference (unary and two-premise rules) | `ai/src/noema_reasoning.lir` | `ai/tests/23_noema_reasoning.lir`, `ai/tests/24_noema_conjunctive_reasoning.lir` |
+| Exact-rule forward-chaining inference and local derivation-step validation | `ai/src/noema_reasoning.lir` | `ai/tests/23_noema_reasoning.lir`, `ai/tests/24_noema_conjunctive_reasoning.lir`, `ai/tests/25_noema_derivation.lir` |
 
-The latest LIR suite passes all 67 fixture/backend executions (including 8 Stage 10 assertions); backend coverage varies for legacy fixtures. Zig build tests, 21 Python standard-library validator/audit tests, and example validation also pass. These results verify bounded decision logic only; they do not establish that corresponding services exist.
+The latest LIR suite passes all 70 fixture/backend executions (including 8 Stage 11 assertions); backend coverage varies for legacy fixtures. Zig build tests, 21 Python standard-library validator/audit tests, and example validation also pass. These results verify bounded decision logic only; they do not establish that corresponding services exist.
 
 ## Not implemented
 
