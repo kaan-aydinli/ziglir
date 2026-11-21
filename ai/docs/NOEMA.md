@@ -506,3 +506,90 @@ Bu genişletme v0.1'deki aşırı kesin ifadeleri sınırlar:
 6. **"Her alanda daha zeki" sonuç değil, test kapsamı hedefidir.** Tüm alan kapıları ve dış karşılaştırmalar tamamlanmadan ürün iddiası olarak kullanılmaz.
 
 *Belge sürümü: v0.2 — 2026-11-20. Yetenek kapsamı genişletildi; uygulama veya performans sonucu yoktur.*
+
+## 19. v0.3 — Ayrışan bilişsel mimari ve düşük maliyetli öğrenme planı
+
+**Durum: yalnız tasarım.** Bu bölüm istenen "transformer, Mamba, LLM/LMM ve tokenizer sistemlerinden farklı, daha yetenekli ve daha ucuz eğitilen" yönü tarif eder. Farklılık, yalnızca bu bileşenlerin adını yasaklamakla sağlanmaz: token akışını başka isimle taklit eden bir sıralı dil modeli de aynı sınıfa girer. NOEMA'nın ana hesaplama nesnesi metin dizisi değil; **kanıt taşıyan olay-grafı ve yürütülebilir geçişlerdir**.
+
+### 19.1 Farklılık sınırı: ne yapılmayacak, yerine ne gelecek
+
+| Güncel yaklaşımda sık görülen unsur | NOEMA'da yapılmayacak | NOEMA'nın yerine koyduğu ilke |
+|---|---|---|
+| Transformer / QKV self-attention | token konumları arasında öğrenilmiş yoğun attention matrisi yok | tipli olay grafında açık bağlantılar; VGPS'in kural/araç araması |
+| Mamba / SSM | öğrenilmiş sabit boyutlu recurrent state ile token akışı yok | kalıcı dış durum grafı + denetlenebilir, açık geçişler; durum saklama ayrı bellek katmanında |
+| LLM / autoregressive next-token training | sonraki token olasılığı ana öğrenme hedefi değil | görev sözleşmesi → aday çözüm/eylem → doğrulayıcıdan geri bildirim; serbest metin son sunum katmanı |
+| LMM / görsel-dil ortak token dizisi | görüntü/ses patch'lerini metin tokenlarına ekleyip tek decoder'dan üretme yok | kip-özel algı adaptörleri → ortak ölçüm/olay grafı; kaynak ve belirsizlik korunur |
+| tokenizer / BPE / sabit sözlük ID'si | kelime/parça ID akışı yok | Unicode karakter akışı kayıpsız kabul edilir, morfoloji/söz dizimi anlam grafına ayrıştırılır; görüntü/ses için sayısal olay öznitelikleri |
+| büyük uçtan uca gradyan eğitimi | end-to-end backprop varsayımı yok | küçük modül yerel kalibrasyonu + sentez/kanıt/test ile kural kabulü |
+
+Bu mimari yine de **ayrık sembolik graf düğümleri ve kod** kullanır. "Bitwise yok" sözü dijital emülasyonda bitwise operatör kullanılmaması demektir; makinenin fiziksel olarak bitlerden bağımsız olduğu anlamına gelmez. Farklı olmak kendi başına daha zeki, daha hızlı veya daha ucuz olmak değildir; üstünlük ancak eşit veri, donanım ve bütçe ile ölçülür.
+
+### 19.2 Çekirdek yürütme modeli: Sözleşme → Hipotezler → Denetleyici → Bellek
+
+Her girdi bir `TaskContract` nesnesine çevrilir:
+
+```
+TaskContract {
+  goal_graph, given_facts[], constraints[], requested_output,
+  allowed_tools[], risk_class, evidence_standard,
+  resource_budget {steps, memory, time}, provenance[]
+}
+```
+
+1. **Anlam ayrıştırma:** yüzey biçiminden bir veya daha fazla anlam grafı çıkar. Belirsiz alanlar tek varsayıma zorlanmaz; kontratta `unknown` olarak kalır.
+2. **İş türü yönlendirme:** küçük, yerel güncellenebilir yönlendirici uzman(lar)ı seçer. Yönlendirici yalnız aday sırası belirler; gerçek doğruluk kararı vermez.
+3. **Çözüm üretimi:** farklı arama motorları görev sınıfına göre çalışır: tümdengelim, kural eşleme, kısıt/plan arama, program sentezi veya deney tasarımı. Bu motorlar ortak sözleşme/kanıt şemasına uyar.
+4. **Çürütme:** ikinci yol adayın önkoşulunu, invariants'ını, karşı-örneğini ve kaynak sınırını arar. Aynı üretici ve aynı testin kendi kendini onaylaması kabul edilmez.
+5. **Kontrol çekirdeği:** küçük, bağımsız, deterministik validator; matematik/proof/kod için kesin check, ampirik görevler için kalibrasyon ve veri provenansı. Validator geçmezse yanıt kesinleştirilmez.
+6. **Bellek:** yalnız izinli provenansla epizot yaz; genellenebilir kuralı holdout/karşı-örnek kapısından sonra sürümlü kural deposuna terfi ettir.
+7. **Sunum:** kullanıcıya sonuç, gerekçe tipi, kaynak, belirsizlik, bilinen başarısızlık ve kullanılan bütçe verilir. Grafı metne dönüştürmek bir üretim rahatlığıdır, karar mekanizması değildir.
+
+### 19.3 Ucuz ve kolay eğitim: dev ön-eğitim yerine görev başına öğrenme
+
+"Düşük maliyet" için mimari iddia değil, ölçüm protokolü: aynı görev kalitesi ve hata eşiğine ulaşana dek **toplam CPU saat, joule, insan etiket saati, veri baytı, tekrar sayısı ve bakım süresi** sayılır. Ucuzluk yalnız modelin eğitim süresi değil, veri hazırlama + doğrulama + başarısız denemeleri de kapsar.
+
+Önerilen eğitim döngüsü:
+
+- **E0 — Sıfırdan başlatılabilir temel:** elle yazılmış küçük dil/aritmetik/graph kuralları ve proof kernel; ağırlık checkpoint'i veya internet ölçekli corpus gerekmez. Başlangıç kabiliyeti bu kurallar kadar sınırlıdır.
+- **E1 — Öğretmenli görev tanımı:** eğitim örnekleri doğal dil hedefi, kanonik anlam grafı, çözüm/eylem, kanıt standardı ve validator içerir. Aynı örnekten yüzey paraphrase'leri otomatik türetilir; paraphrase'ler ayrı yeni bilgi sayılmaz.
+- **E2 — Sentetik üretim:** küçük DSL'de rastgele dünya/denklem/program üret; referans çözücünün sonucu ve adım izini kaydet. Parametreleri ve random seed'i sakla. Üretici ile doğrulayıcı aynı kod yoluna bağımlı olmamalı; küçük bir bağımsız örnek kümesi elle kontrol edilir.
+- **E3 — Karşı-örnek ve kontrast:** doğru örneklerin yanına tek bir koşulu değiştiren, çelişkili veya yetersiz bilgi taşıyan örnek koy. Doğru davranış bazen çözmek, bazen soru sormak, bazen çekimser kalmaktır.
+- **E4 — Yerel kalibrasyon:** SEL/eikonal yalnız görev yönlendirici, eşik ve algı adaptörünün küçük parametrelerini günceller. Bu güncelleme bir deney dalında tutulur; önce/sonra regresyon paneli çalışmadan ana sürüme alınmaz.
+- **E5 — Kural keşfi:** tekrar eden doğru alt-izlerden anti-unification ile kural adayı çıkar. Kural, eğitim örneği dışındaki holdout ve üretilmiş çürütücüleri geçmeden kullanılabilir belleğe girmez.
+- **E6 — Müfredat:** tek değişkenli basit görev → birden çok kuralın bileşimi → belirsizlik/çelişki → dağılım dışı kombinasyon → araç ve uzun plan. Her basamakta öğrenme maliyeti, çözüm ve aşırı uyum kaydı tutulur.
+- **E7 — İnsan emeğini düşük tutma:** rutin sentetik örnekler otomatik kanıtla etiketlenir; yalnız validator uyuşmazlığı, semantik belirsizlik ve riskli örnekler insan incelemesine gider. İnsan emeği ayrıca raporlanır, sıfır varsayılmaz.
+
+Bu planın muhtemel avantajı örnek başına etiket maliyetini azaltmaktır; muhtemel dezavantajı kapsamın elle tanımlı doğrulayıcıların sınırında kalmasıdır. Yeni görev ailelerine aktarım, veri verimliliği ve toplam maliyet **ölçülmeden** LLM eğitiminden ucuz olduğu ileri sürülmez.
+
+### 19.4 Eğitim verisi biçimi ve kalite kuralları
+
+Her satır tek, bağımsız JSON nesnesidir (JSONL); aşağıdaki alanlar zorunlu:
+
+| Alan | Anlamı |
+|---|---|
+| `id`, `split`, `seed` | tekrar üretilebilir örnek kimliği, train/dev/test ayrımı, sentetik seed |
+| `task` | iş ailesi (reasoning, planning, code, perception, language, causal, abstain) |
+| `input` | kullanıcıya görünen ham girdi; tokenizer ID değil |
+| `context` | açık olgular, birimler, kısıtlar; gizli varsayım eklenmez |
+| `target_graph` | kanonik anlam/hedef grafı; örnek için boş olabilir |
+| `target` | kısa cevap, plan veya program |
+| `evidence` | biçimsel iz, test/validator sonucu, ölçüm kaynağı veya `insufficient` |
+| `decision` | `answer`, `ask`, `abstain`, `tool` |
+| `validator` | bağımsız validator adı ve beklenen koşulu |
+| `provenance` | `synthetic`, `human-reviewed` veya lisanslı kaynak metadata |
+
+Kalite kısıtları: (1) train/dev/test **seed ve kural ailesi bakımından ayrılır**, yalnız cümle şablonu değil; (2) test cevabı eğitim üreticisine/indüksiyona sızmaz; (3) her örnekte birim ve sayı taşması kuralları açık; (4) kanıtsız sosyal/ampirik hedef `proof` gibi etiketlenmez; (5) kişisel veri örnekleri yok; (6) sentetik örnekler gerçek dünya kapsamının kanıtı değildir; (7) etiket uyuşmazlığı silinmez, `disputed` olarak saklanır.
+
+Örnek paket: [`ai/noema-training/example.jsonl`](../noema-training/example.jsonl). Bu küçük dosya **eğitim benchmark'ı değildir**; şema ve pedagojik örneklerdir. Performans sayısı çıkarmak için çok küçüktür.
+
+### 19.5 Maliyet kıyaslama kapısı
+
+Yeni K21 kapısı eklenir: sabit görev ailesi ve başarı eşiğinde NOEMA'nın toplam eğitim maliyeti (CPU-saat, enerji, etiket saati, byte, başarısız deneme) hem kendi önceki sürümü hem de uygun açık baseline ile raporlanır. En az beş seed, sabit train/dev/test ayrımı ve aynı donanım bütçesi kullanılır. Sonuçlar `ai/bench/results.md` içinde sürüm ve makine bilgisiyle yayımlanır. **"Daha düşük maliyet" ancak K21 ölçümüyle söylenebilir.**
+
+K22: veri verimliliği — aynı kalite eşiğinde çözülen yeni kural ailesi başına benzersiz insan onaylı örnek sayısı ve sentetik üretim/validator maliyeti raporlanır. K23: eğitim kolaylığı — yeni görev adaptörünün sıfırdan kurulma süresi, gereken uzman müdahalesi, başarısız/geri alınan sürüm oranı ölçülür. Basit görevler sentetik veriyle kolaylaşabilir; açık uçlu dil ve algı görevleri için aynı kolaylık garanti edilmez.
+
+### 19.6 Örnek veri kümesiyle eğitim reçetesi
+
+`example.jsonl` için ilk alıştırma: `arithmetic` ve `planning` örneklerinin train altkümesinde tam çalışan deterministic validator yaz; `abstain` örneğinde eksik birim yüzünden uydurma hesap yapılmadığını doğrula; `causal` satırında korelasyonun müdahale sonucu diye sunulmadığını test et. Sonra aynı kuralları kullanan ama farklı sabit seed/kural bileşimiyle üretilmiş holdout oluştur. Örnek dosyanın kendi satırlarını hem train hem test kullanmak geçersizdir.
+
+*Belge sürümü: v0.3 — 2026-11-20. Mimari ve eğitim planı tasarımdır; implementasyon, maliyet ve yetenek sonucu henüz yoktur.*
