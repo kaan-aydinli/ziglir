@@ -748,7 +748,7 @@ Tek bir JSONL satırı bir **task episode**'dur; metin ve payload aynı dosyada 
 }
 ```
 
-Bu örnek şema **normatifleştirilecek taslak**tır. Gerçek JSON Schema/validator sürümü Faz 1'de ayrıca yazılmalı. Bilinmeyen alan `null` veya `unknown` olur; boş alanı tahminle doldurmak yasaktır. `target` görev tipine göre proof, metin, koordinat, zaman aralığı, program ya da `abstain` olabilir. Şema sürümü olmayan kayıt eğitime girmez.
+Bu örnek şema **normatifleştirilecek taslak**tır. `python3 ai/noema-training/validate_examples.py` komutundaki `validate_examples.py`, Python standard library dışında bağımlılık olmadan örnek JSONL/manifest kayıtlarının yapısal alanlarını ve temel invariant'ları kontrol eder; `python3 -m unittest discover -s ai/noema-training -p 'test_*.py'` negatif durumları sınar. Bu araç JSON Schema'nın tam validator'ı değildir ve payload hash'inin gerçekten doğru olduğunu, lisans/onamı, proof doğruluğunu veya model kalitesini denetlemez. Bilinmeyen alan `null` veya `unknown` olur; boş alanı tahminle doldurmak yasaktır. `target` görev tipine göre proof, metin, koordinat, zaman aralığı, program ya da `abstain` olabilir. Şema sürümü olmayan kayıt eğitime girmez.
 
 ### 21.3 Payload biçimleri ve kayıpsız kaynak politikası
 
