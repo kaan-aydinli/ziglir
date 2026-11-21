@@ -25,6 +25,7 @@ EVENT_TYPES = {"observation", "correction", "candidate_update", "evaluation", "p
 EXAMPLE_REQUIRED = {"id", "split", "seed", "task", "input", "context", "target_graph", "target", "evidence", "decision", "validator", "provenance"}
 UNIVERSAL_REQUIRED = {"schema", "id", "split", "group_key", "seed", "task", "conversation", "context", "target", "grounding", "evidence", "tools", "safety", "quality", "provenance"}
 OUTPUT_REQUIRED = {"schema", "id", "task", "split", "request_ref", "decision", "artifacts", "validation", "provenance"}
+EVAL_REQUIRED = {"schema", "id", "split", "group_key", "task", "language", "input", "context", "reference", "criterion", "checker", "risk", "provenance"}
 MANIFEST_REQUIRED = {"schema", "run_id", "parent_release", "data_manifests", "split_manifest", "generator_versions", "task_families", "modules_to_update", "update_methods", "seed", "compute_budget", "policy_version", "schema_versions", "gate_set", "replay_plan", "artifact_retention", "review_policy"}
 EVENT_REQUIRED = {
     "observation": {"event_id", "event_type", "schema_version", "run_id", "timestamp", "provenance_id", "raw_object", "sample_type", "consent"},
@@ -146,6 +147,24 @@ def validate_output_rows(rows: list[dict[str, Any]], where: str = "outputs") -> 
         _require(isinstance(row["validation"], dict), f"{loc}.validation: expected object")
 
 
+def validate_eval_rows(rows: list[dict[str, Any]], where: str = "capability-eval") -> None:
+    ids: set[str] = set()
+    for i, row in enumerate(rows, 1):
+        loc = f"{where}:{i}"
+        _required(row, EVAL_REQUIRED, loc)
+        _require(row["schema"] == "noema.capability_eval.v1", f"{loc}.schema: unsupported schema")
+        _nonempty_string(row["id"], f"{loc}.id")
+        _require(row["id"] not in ids, f"{loc}: duplicate id {row['id']!r}")
+        ids.add(row["id"])
+        _enum(row["split"], SPLITS, f"{loc}.split")
+        _nonempty_string(row["group_key"], f"{loc}.group_key")
+        _require(isinstance(row["task"], dict) and isinstance(row["task"].get("family"), str), f"{loc}.task.family: expected string")
+        _nonempty_string(row["language"], f"{loc}.language")
+        _require(isinstance(row["input"], str), f"{loc}.input: expected string")
+        for key in ("context", "reference", "criterion", "checker", "provenance"):
+            _require(isinstance(row[key], dict), f"{loc}.{key}: expected object")
+
+
 def validate_event_rows(rows: list[dict[str, Any]], where: str = "events") -> None:
     ids: set[str] = set()
     for i, row in enumerate(rows, 1):
@@ -184,12 +203,14 @@ def validate_all(base: Path = ROOT) -> list[str]:
         "examples": base / "example.jsonl",
         "universal": base / "universal_examples.jsonl",
         "outputs": base / "output_examples.jsonl",
+        "capability-eval": base / "capability_eval.example.jsonl",
         "events": base / "continual_events.jsonl",
     }
     validators = {
         "examples": validate_example_rows,
         "universal": validate_universal_rows,
         "outputs": validate_output_rows,
+        "capability-eval": validate_eval_rows,
         "events": validate_event_rows,
     }
     messages: list[str] = []

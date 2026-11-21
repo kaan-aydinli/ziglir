@@ -10,7 +10,7 @@ import validate_examples as validator
 class ValidatorTests(unittest.TestCase):
     def test_repository_examples_validate(self):
         messages = validator.validate_all(Path(__file__).parent)
-        self.assertEqual(len(messages), 5)
+        self.assertEqual(len(messages), 6)
 
     def test_duplicate_example_ids_are_rejected(self):
         row = {
@@ -47,6 +47,16 @@ class ValidatorTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(validator.ValidationError, "must not claim artifacts"):
             validator.validate_output_rows([row])
+
+    def test_eval_examples_require_grouped_split(self):
+        row = {
+            "schema": "noema.capability_eval.v1", "id": "e1", "split": "dev",
+            "group_key": "", "task": {"family": "nlu"}, "language": "tr",
+            "input": "x", "context": {}, "reference": {}, "criterion": {},
+            "checker": {}, "risk": "low", "provenance": {},
+        }
+        with self.assertRaisesRegex(validator.ValidationError, "group_key"):
+            validator.validate_eval_rows([row])
 
     def test_deletion_tombstone_must_not_retain_content(self):
         row = {

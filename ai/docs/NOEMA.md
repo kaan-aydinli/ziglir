@@ -1,6 +1,6 @@
 # NOEMA — Analog-Doğal, Doğrulama-Kapılı Muhakeme Mimarisi
 
-**Durum:** v1.1 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
+**Durum:** v1.2 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
 **Amaç:** `ai/` çatısının dışına ve SEL'in üstüne sıfırdan kurulan, **muhakeme-öncelikli** yeni mimarinin eksiksiz tanımı.
 **Bu deponun kuralı (iddia = ölçüm) bu belge için de geçerlidir:** aşağıda geçen her "hedef", "kestirim" ya da "beklenti" açıkça **ölçülmemiştir**. Ölçülmüş tek sayılar, mevcut SEL çekirdeğine aittir ve öyle etiketlenmiştir. Bu belge bir *vaad* değil, bir *ölçülecek hipotezler listesi*dir.
 
@@ -1257,3 +1257,74 @@ Yeni şema örnekleri [`ai/noema-training/output_examples.jsonl`](../noema-train
 | K51 — long-context completeness | sabit belge büyüklüğü ve retrieval cutoff'larında coverage raporu; eksik parça ile kesin cevap vermeme |
 
 *Belge sürümü: v1.1 — 2026-11-16. Output artefact, session/stream ve connector protokolleri eklendi; generation adapter'ları ve kalite ölçümleri uygulanmış değildir.*
+
+## 28. v1.2 — Doğal dil, düşünme, kod ve problem çözme kalite sözleşmesi
+
+İstenen kalite, tek bir "zekâ" puanı değildir. Dil anlama, metin yazma, muhakeme, kod ve problem çözme ayrı capability'lerdir; ortak bağlam/provenans ve TTA sonucu paylaşırlar, ama bir alandaki başarı diğerine aktarılmış sayılmaz. Bu tasarım bir **yetkinlik şartnamesidir**, modelin bugün bu kaliteye ulaştığı iddiası değildir.
+
+### 28.1 Beş yetenek motoru ve aralarındaki sözleşme
+
+| Motor | Girdi → ara temsil | Çıktı | Doğru kabul şartı |
+|---|---|---|---|
+| NLU: dil anlama | Unicode text + conversation → sürümlü grammar/lexicon parse forest, discourse referent, speech act, ambiguity set, source span | `MeaningRecord` | altın anlam grafı/span, paraphrase ve ambiguity testleri; bilinmeyen sözcük tahminle kesinleştirilmez |
+| NLG: metin yazma | intent + audience/style constraints + closed obligations + evidence refs | discourse plan → paragraf/çıktı | iddia eklememe, talimat/stil uyumu, kaynaklılık, tutarlılık, okunabilirlik; akıcılık doğruluk değildir |
+| Reasoning: düşünme | anlam grafı + assumptions + obligation dependencies | tanık/çelişki/kısmi sonuç | formal claim kernel ile; ampirik claim ölçümle; unresolved claim hipotez |
+| Code: kodlama | typed specification + pre/postconditions + allowed LIR API | source artifact + test trace + diff | compile/check + property/adversarial tests; test=proof değildir |
+| Problem solving | goal, constraints, resources, available tools | çözüm planı veya soru/abstain | state transition simulator/constraint checker; ara şart ve kaynak bütçesi geçmeli |
+
+**Ortak arayüz:** NLU, iddiaların kendisi değil alternatif yorumlar üretir. TTA obligation açar ve `source_span` ile ilişkilendirir. Problem solver/kod motoru candidate artifact üretir. Bağımsız checker evidence level'ı verir. NLG yalnız kabul edilmiş/kapsamı belirtilmiş obligation'ları kullanıcıya uygun dilde ifade eder; yeni olgusal iddia eklerse yeni obligation açılması gerekir.
+
+### 28.2 Tokenizer kullanmadan doğal dil öğrenmenin gerçek sınırı
+
+Token ID/BPE kullanmamak kendi başına daha yüksek kalite sağlamaz. Karakter akışından dil yeteneği için her dilde sürümlü morfoloji/sözdizimi kuralları, sözlük/lemma, bileşik sözcük, yazım varyantı, pragmatik işlev, discourse/coreference ve alana özgü terim yönetimi gerekir. NOEMA şu kademeyi uygular:
+
+1. Unicode code point stream'i koru; grapheme/word/morpheme span'ları ayrı annotation'dır, canonical source overwrite edilmez.
+2. Dil algısı emin değilse birden çok dil/parser hipotezi tut.
+3. Lexicon/grammar coverage manifest'te sürüm ve lisansla kayıtlıdır. Unknown span `UNK_SPAN` gibi görünür düğüm olur; gizlice başka sözcüğe eşlenmez.
+4. Parse forest alternatif anlamları ve olasılık yerine calibration band/rank taşır; bağlam gerektiren seçimde soru sorabilir.
+5. Türkçe için eklemeli morfoloji, ses uyumu, düşen özne, iyelik/gönderim, serbest sözdizimi ve yazım hatası ayrı testlenir; İngilizceye göre ölçülen skor Türkçe başarısı sayılmaz.
+6. NLG önce `DiscoursePlan` (claim order, rhetorical relation, audience, style, citations) kurar, sonra grammar realization yapar; plan dışı claim detector + source coverage check final kontrol olur.
+
+Bu yaklaşım geniş dil akıcılığı için emek ve veri ister. Küçük sentetik corpus, dünya bilgisi ve doğal çeşitlilik eksikliğini kapatmaz. Geniş alan kalitesi isteniyorsa izin/lisanslı insan yazımı veri, çok dilli reviewer ve gerçek paraphrase/correction setleri gerekecektir; bunlar olmadan kaliteyi iddia etmek yasaktır.
+
+### 28.3 Eğitim müfredatı, kalite sinyalleri ve kaçınılacak kısayollar
+
+- **NLU:** minimal pairs (tek ek/olumsuzluk/zaman değişimi), paraphrase cluster, ellipsis/coreference, ambiguity, discourse turn, typo/noise, domain shift; her cluster aynı split'e gider.
+- **NLG:** aynı meaning graph için farklı audience/register uzunlukları; faithful summary vs unsupported embellishment; structured output; editing/copy-edit; citation completeness. Tercih verisi truth labels yerine geçmez.
+- **Reasoning:** hidden-rule tasks, multi-step proof, contradiction/insufficient-information, unit/constraint changes, counterexample; answer trace verifier'dan bağımsız.
+- **Code:** specification, starter code, failing tests, bug report, patch, regression suite, security constraints; test generation ile test-solving setleri ayrılır.
+- **Problem solving:** plan length/branching artan environment, resource limit, impossible-goal, recovery from failed action; simulator result ile natural-language rationalization ayrılır.
+- **Sürekli öğrenme:** yeni kural family'leri zamanla gelir; test cutoff ve prior-family retention sabitlenir. Kendi cevabını unlabeled ground truth olarak üretip eğitme (self-confirmation loop) yasaktır.
+
+Maliyet azaltma: önce mevcut grammar/contract/verifier ile çöz; yalnız kapsama hatası gösterilmiş family'ye yeni veriyi yönlendir; yakın kopyaları train'e çoğaltmak yerine cluster-level ölç; sentetik datayı human-authored holdout ile kalibre et; NLG üslup değişimini core reasoning modülünden ayır. Hız uğruna ret/coverage veya evidence standardını düşürmek kalite iyileştirmesi değildir.
+
+### 28.4 Capability-eval kayıt biçimi
+
+`noema.capability_eval.v1` kayıtları training JSONL'den ayrı tutulur. Her kayıt `task`, dil, input, izinli context, reference/criterion, checker/rubric, risk ve leakage group taşır. Subjective writing için tek altın yanıt değil blinded rubric ve en az iki reviewer; kod/matematikte machine-checkable criterion; parser'da graph/span metric kullanılır. Mini fixture dosyası [`ai/noema-training/capability_eval.example.jsonl`](../noema-training/capability_eval.example.jsonl) örnek şemayı gösterir, **benchmark değildir**; dependency-free local validator bu dosyanın yapısını da denetler.
+
+### 28.5 Karşılaştırma ve kabul protokolü
+
+Transformer/tokenizer tabanlı ve diğer uygun baseline'larla karşılaştırma yapılırken aynı public/private data permission, task prompt, tool access, context limit, decoding/attempt sayısı, hardware/CPU/GPU, wall/energy budget ve scoring rubric sağlanır. Baseline'lar tarih/sürüm ve exact config ile sabitlenir; model güncellenirse yeni rapor olur. Aşağıdakiler ayrı raporlanır, tek composite score ile örtülmez:
+
+- NLU: meaning-graph F1/exact, source-span precision/recall, ambiguity calibration, language-by-language.
+- NLG: blinded human rubric (factuality, instruction adherence, coherence, style), claim support rate, edit distance değil semantic adequacy.
+- Reasoning: answer accuracy + valid witness rate + false-certification rate + abstention/coverage.
+- Code: pass@1/pass@k, hidden-test success, security/property failures, time-to-correct.
+- Problem solving: goal success, path/resource cost, safety violations, recovery, partial/abstain calibration.
+- Cost/speed: end-to-end p50/p95, compute/energy, human annotation and inference/training cost per **quality-gated accepted task**.
+
+Geniş iddia için önceden kaydedilmiş benchmark suite'inde bütün capability family'lerin kalite alt sınırı geçmesi ve hiçbir critical safety/regression metriğinin bozulmaması gerekir. Bir alanda fail varsa sonuç o alanla sınırlanır. "Daha yüksek kalite" ancak bu protokolle bağımsız tekrarlanınca söylenebilir.
+
+### 28.6 Yeni kapılar
+
+| Kapı | Ölçüm |
+|---|---|
+| K52 — language graph | dil başına ambiguity-aware graph F1 + source span precision/recall; unknown morphology zorunlu test |
+| K53 — grounded writing | blinded reviewer rubric + her factual claim için source support; unsupported claim rate ayrı |
+| K54 — reasoning | exact/independent witness validity, false certification, task coverage ve abstention birlikte |
+| K55 — coding | hidden test pass@1, security property failure ve time-to-correct; public tests tek başına yetmez |
+| K56 — problem solving | farklı plan derinliği/branching'de simulator goal rate, resources, unsafe-action ve recovery |
+| K57 — cross-lingual parity | her dilin ayrı score'u, calibration ve human review; yüksek resource dili diğerlerini temsil etmez |
+| K58 — human preference separation | preference improvement ile correctness/factuality regression ayrı; correctness düşerse tercih gain promotion sağlamaz |
+
+*Belge sürümü: v1.2 — 2026-11-16. NLU/NLG/düşünme/kod/problem çözme motorları, tokenizer'sız dil sınırı, eğitim müfredatı ve kalite kıyas protokolü eklendi; model performansı ölçülmedi.*
