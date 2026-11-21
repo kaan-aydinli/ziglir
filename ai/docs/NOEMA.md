@@ -1,6 +1,6 @@
 # NOEMA — LIR ile uygulanan karar-kapıları
 
-**Durum:** v2.5. LIR’de uygulanıp test edilenler: contract/evidence/scheduler/data/capability/memory-scope/release-lifecycle guard’ları. Bu, tasarlanan NOEMA AI framework’ünün tamamı değildir.
+**Durum:** v2.6. LIR’de uygulanıp test edilenler: contract/evidence/scheduler/data/capability/memory-scope/release-lifecycle/task-execution guard’ları. Bu, tasarlanan NOEMA AI framework’ünün tamamı değildir.
 
 ## Uygulanmış dilimler
 
@@ -13,8 +13,9 @@
 | Capability graph and scoped routing | `ai/src/noema_capability.lir` | `ai/tests/19_noema_capability.lir` |
 | Memory scope, retention and deletion guards | `ai/src/noema_memory.lir` | `ai/tests/20_noema_memory.lir` |
 | Release lifecycle guards | `ai/src/noema_release.lir` | `ai/tests/21_noema_release.lir` |
+| Bounded task execution lifecycle and budget admission | `ai/src/noema_execution.lir` | `ai/tests/22_noema_execution.lir` |
 
-The latest LIR fixture suite passes 58 fixtures across native, VM and C backends. Zig build tests, 21 Python standard-library validator/audit tests, and example validation also pass. These results verify bounded decision logic only; they do not establish that corresponding services exist.
+The latest LIR suite passes all 61 fixture/backend executions (including 15 Stage 8 assertions); backend coverage varies for legacy fixtures. Zig build tests, 21 Python standard-library validator/audit tests, and example validation also pass. These results verify bounded decision logic only; they do not establish that corresponding services exist.
 
 ## Not implemented
 

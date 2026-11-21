@@ -1,0 +1,52 @@
+// NOEMA Stage 8: bounded task-execution lifecycle decisions.
+// This is a pure controller contract; it does not execute OS/process/network work.
+const TASK_QUEUED: i64 = 0
+const TASK_READY: i64 = 1
+const TASK_RUNNING: i64 = 2
+const TASK_SUCCEEDED: i64 = 3
+const TASK_FAILED: i64 = 4
+const TASK_BLOCKED: i64 = 5
+const TASK_CANCELLED: i64 = 6
+const TASK_TIMED_OUT: i64 = 7
+
+const EXEC_ALLOW: i64 = 1
+const EXEC_DENY: i64 = 0
+
+/// Permit only explicit legal state changes. Completion needs independent
+/// verification and evidence; retry must respect its attempt ceiling.
+fn task_transition_allowed(current: i64, next: i64, attempts: i64, max_attempts: i64, evidence: i64, verifier_passed: i64, verifier_independent: i64) -> i64 {
+    if current < TASK_QUEUED or current > TASK_TIMED_OUT or next < TASK_QUEUED or next > TASK_TIMED_OUT { return EXEC_DENY }
+    if attempts < 0 or max_attempts < 1 or attempts > max_attempts { return EXEC_DENY }
+    if current == next { return EXEC_DENY }
+    if current == TASK_QUEUED and (next == TASK_READY or next == TASK_CANCELLED) { return EXEC_ALLOW }
+    if current == TASK_READY and (next == TASK_RUNNING or next == TASK_BLOCKED or next == TASK_CANCELLED) { return EXEC_ALLOW }
+    if current == TASK_RUNNING {
+        if next == TASK_SUCCEEDED {
+            if evidence != 1 or verifier_passed != 1 or verifier_independent != 1 { return EXEC_DENY }
+            return EXEC_ALLOW
+        }
+        if next == TASK_FAILED or next == TASK_TIMED_OUT or next == TASK_CANCELLED { return EXEC_ALLOW }
+    }
+    if (current == TASK_FAILED or current == TASK_TIMED_OUT) and next == TASK_READY {
+        if attempts >= max_attempts { return EXEC_DENY }
+        return EXEC_ALLOW
+    }
+    if current == TASK_BLOCKED and (next == TASK_READY or next == TASK_CANCELLED) { return EXEC_ALLOW }
+    return EXEC_DENY
+}
+
+/// Admission uses subtraction-safe checks to avoid overflow in used + cost.
+fn execution_budget_admits(used: i64, cost: i64, limit: i64) -> i64 {
+    if used < 0 or cost < 0 or limit < 0 or used > limit { return EXEC_DENY }
+    if cost > limit - used { return EXEC_DENY }
+    return EXEC_ALLOW
+}
+
+/// A run may be declared complete only when every task is terminal and no
+/// required verification or evidence obligation remains outstanding.
+fn execution_run_complete(task_count: i64, terminal_count: i64, outstanding_verifications: i64, outstanding_obligations: i64) -> i64 {
+    if task_count < 0 or terminal_count < 0 or terminal_count > task_count { return EXEC_DENY }
+    if outstanding_verifications < 0 or outstanding_obligations < 0 { return EXEC_DENY }
+    if terminal_count != task_count or outstanding_verifications != 0 or outstanding_obligations != 0 { return EXEC_DENY }
+    return EXEC_ALLOW
+}
