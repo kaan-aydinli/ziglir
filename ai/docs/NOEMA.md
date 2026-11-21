@@ -1,6 +1,6 @@
 # NOEMA — Analog-Doğal, Doğrulama-Kapılı Muhakeme Mimarisi
 
-**Durum:** v1.5 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
+**Durum:** v1.6 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
 **Amaç:** `ai/` çatısının dışına ve SEL'in üstüne sıfırdan kurulan, **muhakeme-öncelikli** yeni mimarinin eksiksiz tanımı.
 **Bu deponun kuralı (iddia = ölçüm) bu belge için de geçerlidir:** aşağıda geçen her "hedef", "kestirim" ya da "beklenti" açıkça **ölçülmemiştir**. Ölçülmüş tek sayılar, mevcut SEL çekirdeğine aittir ve öyle etiketlenmiştir. Bu belge bir *vaad* değil, bir *ölçülecek hipotezler listesi*dir.
 
@@ -1555,3 +1555,89 @@ Capability eval fixture `code-lir-optimization-001` bu sözleşmeyi ve ölçüm 
 **Uygulama sınırı:** mevcut depodaki Zig bootstrap compiler zaten O0/O1/O2, CFG/SSA tabanlı optimizer, IR verifier ve native/VM/C11/WASM execution yolları içeriyor. Bu bölüm bunların NOEMA'daki rolünü ve ortak gate'lerini tanımlar; bu turn'de optimizer algoritması veya derleyici hızı değiştirilmedi. Zig toolchain sandbox'ta bulunmadığından compiler/backend regression matrix'i çalıştırılamadı; yalnız AI fixture validator çalıştırıldı. Öncelikli devam işi: toolchain erişimli CI'da K70–K74 benchmark/equivalence fixture'larını gerçek compiler ile bağlayıp ölçülen bottleneck'e göre pass-pipeline/compiler-cache iyileştirmesi yapmak.
 
 *Belge sürümü: v1.5 — 2026-11-16. LIR'in NOEMA'daki code/effect/evidence kontratı capability evaluation ile bağlandı; hız/kapsam hedefleri ayrıldı, performans henüz ölçülmedi.*
+
+## 32. v1.6 — Genel ön-eğitimsiz, kanıta dayalı kabiliyet edinim sistemi
+
+### 32.1 Kesin kapsam: “ön-eğitimsiz” ne demek?
+
+Bu tasarım **büyük, genel amaçlı corpus üzerinde önceden ağırlık/latent temsil eğitimi yapılmamasını** hedefler. “Hiçbir başlangıç bilgisi yok”, “ilk mesajdan her dil ve alanda yetkin”, “örnek/öğretmen/veri olmadan öğrenir” demek değildir; bunlar bilgi kuramsal olarak tutarsız hedeflerdir. Sistemin başlangıç paketi açıkça yazılmış bir hesaplama/mantık çekirdeği, tipli olay grafı, küçük öğretilebilir dil/arayüz temeli, verifier'lar ve izin/policy kurallarıdır. Bu seed bilgi kod ve dokümantasyondur; gizli pretraining gibi sunulmaz ve başlangıç kabiliyetini sınırlar.
+
+“Tamamen aynı olmayan soruya cevap” iki biçimde mümkün olur: (a) edinilmiş compositional kural ve bilinen olguları yeni kombinasyona uygulamak; (b) yetkili araç/kaynakla gereken olguyu edinip kökenini saklamak. Ne kural ne dayanak olgu varsa doğru cevap garanti edilemez; sistem soru sorar, izinli kaynağa yönelir veya çekimser kalır. Genelleme yalnız held-out composition / task-family testlerinde gösterildiği ölçüde iddia edilir.
+
+### 32.2 Üç ayrı bilgi kaynağı
+
+1. **Seeded core (release ile gelen, öğrenilmiş gibi sayılmayan):** parser'ın küçük dil yüzeyi; aritmetik ve karar verilebilir mantık fragment'ları; tip/effect sistemi; graph/ID işlemleri; proof/test kernel; scheduler ve policy. Her kural version/hash ve kapsam taşır. Bu setin her elemanı açık kaynak manifestte listelenir.
+2. **Grounded episodic knowledge (sonradan edinilen):** kullanıcı/öğretmen tarafından öğretilen kavram, olgu ve ilişki; izin, tenant, zaman, kaynak ve düzeltme geçmişi ile epizot olarak tutulur. Kişi/tenant bilgisi varsayılan olarak global modele veya başka tenant'a genellenmez.
+3. **Verified procedural knowledge (terfi edilen):** tekrar kullanılabilir kural/skill, yalnız doğrulama kapsamı, bağımsız holdout, counterexample araması ve review gate'i geçince sürümlü shared library'ye alınır. Aksi halde candidate/private episode olarak kalır.
+
+Bu üç store ayrı API, retention, cache namespace ve promotion kurallarına sahiptir; episodic gözlemi “öğrenilmiş genel kural” diye sessizce yükseltmek yasaktır.
+
+### 32.3 Bootstrapping ve grounding protokolü
+
+```
+clean seeded release
+ → language/task handshake (locale, notation, domain, permissions)
+ → teach/observe pair: raw input + grounded referent/action + source
+ → candidate concept + alternate interpretations + confidence/unknowns
+ → contrastive query or independent observation (disambiguate)
+ → evidence/witness + provenance + scope
+ → private episode first; optional generalized rule candidate
+ → held-out composition + counterexample + safety/privacy review
+ → immutable skill version; atomic release promotion
+```
+
+- **Başlangıç:** önce sınırlı interaction language, sayı/birim/varlık adlandırma ve UI sembolleri açıklanır; bu, açık başlangıç müfredatıdır. Başlangıç seti olmayan bir dilde doğal konuşma yeteneği varsayılmaz.
+- **Öğretim API'si:** `teach(concept, examples, counterexamples, scope, source, consent)` her örneğe `example_id` ve `provenance_id` verir. Öğretmen etiketi tek başına truth proof değildir; iddianın türüne göre independent source/test gerekir.
+- **Belirsizlik:** farklı anlam grafı adayları korunur; ayırt edici soru en düşük maliyetli ve en yüksek information gain olan soru olarak seçilir, ama “information gain” heuristiği doğruluk yerine geçmez.
+- **Yerel kullanım:** yeni olgu özel episode'da hemen kullanılabilir, ancak güven düzeyi `interpretation`/`hypothesis`; cross-user veya global davranışa etkisi yoktur.
+- **Kural türetimi:** benzer örneklerden anti-unification yalnız aday üretir. Pre/postconditions, applicability, exceptions, refusal cases, source set ve verifier executable biçimde belirtilir.
+- **Geri çekme:** correction/deletion graph boyunca episode, derived candidate, trained adapter, cache ve rendered artifact descendants'ını invalidates; unresolved descendant coverage olduğunda affected skill serving'den çekilir.
+
+### 32.4 Kapsamlı cevap üretimi: compose, retrieve, verify, abstain
+
+Her query için immutable `AnswerPlan` oluşturulur: `intent_candidates`, `required_facts`, `required_skills`, `source_policy`, `obligations`, `budget`, `fallback`. Router yalnız uzman sırası/hesap bütçesi seçer. Çözüm yolu:
+
+1. Input'tan meaning graph çıkar; entity/unit/time/coreference boşluklarını `unknown` olarak koru.
+2. Gerekli atomik olguları episodic store, promoted rule store veya izinli external tools arasında ayır. Kaynaksız olguya “common knowledge” varsayımı verme.
+3. Goal'u obligation DAG'ine böl; her leaf için en dar doğrulayıcıyı ata (exact arithmetic, type/proof checker, LIR sandbox test, cited-source entailment, calibrated human review).
+4. Bağımsız alt-görevleri paralel çöz; shared mutable state yok. Her sonuç deltasını stable ID sırasıyla merge et.
+5. Çelişkide majority vote değil; kaynak bağımsızlığı, applicability, freshness ve test ayırt ediciliği ile çöz; çözülmezse conflict olarak kullanıcıya göster.
+6. Final cevaptaki her testable claim bir obligation/evidence'e bağlanır. Post-render claim scan yeni ref bulmazsa claim çıkarılır veya evidence deficit açıklanır.
+7. Soru yeterince belirlenmemişse en fazla faydalı tek clarification sor; deadline/budget yetmiyorsa partial coverage ile cevapla. Unsupported modality'de ilgili artifact üretme.
+
+### 32.5 Kaliteyi düşürmeden daha hızlı edinim: kalite-kısıtlı compute
+
+Kaliteyi sabit tutup her olası eğitim yükünü hızlandırma garantisi verilemez. Tasarım, **accepted quality gates sabit kalırken gereksiz işi kaldırmayı** amaçlar:
+
+- Benzerlik değil exact dependency fingerprint'i ile unchanged parsing/verification ve immutable evidence reuse (§30); cache miss yanlışlığı `MISS`, hiçbir zaman doğruluk kanıtı olmaz.
+- Curriculum: önce prerequisite'ler ve representative edge case; kolay fixture'ların tekrarını erken kes, ama stratified hidden eval/retention/safety sample'larını bırakma.
+- Active acquisition: belirsizliği veya skill applicability sınırını en çok azaltacak örnek/öğretmen sorusunu seç; seçim algoritmasının faydası ablation ile gösterilmeden maliyet tasarrufu varsayma.
+- Candidate triage: static/schema/license/verifier cheap gates önce; ilk hard fail'de downstream training iptal. Başarılı terfide bütün gerekli gate'ler çalışır veya exact signed result reuse edilir.
+- Local update: yalnız değişen skill/adapter; globale full retrain yok. Kural/episode/vector index değişimleri ayrı; gerekmedikçe weights yok. Affected eval closure graph'tan hesaplanır.
+- Deterministic shard parallelism, fixed worker budget, bounded batch, checkpoint+cursor; race/merge conflict'te sequential fallback.
+- İnsan review'e yalnız belirsizlik, disagreement, risk ve stratified audit gider; reviewer maliyeti ve disagreement oranı açık raporlanır.
+- Süre değil **quality-cost frontier** optimize edilir: correctness/coverage/abstention/privacy/safety altgrup kapılarından herhangi biri bozulursa aday reddedilir. Karşılaştırma complete data prep + failed run + validation + human time dahil edilir.
+
+Eğitim hız hedefi: göreve göre cold start ve edinim boyunca her skill'in “ilk geçerli çözüm”, “held-out composition eşiği” ve “retention stabilitesi”ne ulaşma maliyetini ölçmek. Baseline aynı seeded core ve aynı kaynak/hesap/öğretmen erişimidir. Generic pretraining yok diye zero-shot kalitesi veya daha düşük compute öne sürülmez.
+
+### 32.6 Evaluation, release ve abuse kontrolleri
+
+- **Cold-start eval:** sadece seeded core; her yetenek ilk release manifestte listelenir. Hidden task family ile composition generalization ve yanlış güven ölçülür.
+- **Acquisition eval:** kontrol edilen görevlerde k adet öğretim örneği/öğretmen dakikası sonrasında solve, ask, abstain, false-claim ve retention ölçülür; eşit bilgi içeren pretrained/baseline sistemle karşılaştırma yalnız aynı compute/provenance sınırlarında yapılır.
+- **Continual eval:** yeni skill, eski skill retention, interference, correction/deletion propagation, calibration drift; örnekler group-wise split edilir, paraphrase leakage yoktur.
+- **Open-world eval:** kaynaksız gerçek/kurmaca olgu, out-of-domain, adversarial ambiguity, prompt/data poisoning, source conflict, stale facts. Doğru davranış gerektiğinde `ask/abstain` olmalıdır.
+- **Security/privacy:** teacher prompt data olarak untrusted; instruction ve evidence ayrı. Consent revocation, tenant isolation, export/deletion, malicious rule, capability escalation red-team kapısıdır.
+- **Release:** seed manifest + promoted skill/rule hashes + memory policy + tool permission manifest + eval suite hash birlikte imzalanır. Bir capability değeri yükselirken güvenlik/retention regression'ı ortalama skorla gizlenemez.
+
+K75 — seeded-core inventory reproducible; unstated learned asset = 0.
+K76 — grounding lineage: promoted skill claim'lerinin tamamı açık source/evidence/scope taşımalı.
+K77 — compositional generalization: aynı atomik bilgiyle unseen combination başarısı ve confidence; görev ailesi bazında.
+K78 — acquisition efficiency: fixed target-quality gate için örnek, CPU/J, wall time, human minutes, verification cost.
+K79 — quality non-regression: hızlandırılmış yöntemde required quality/retention/safety/privacy gates baseline'dan eksik olamaz.
+K80 — abstention calibration: bilinmeyen/out-of-scope soru setinde unsupported fact rate ve doğru abstention birlikte ölçülür.
+K81 — correction/deletion propagation: tüm derived descendant'lar invalidated/updated; bilinmeyen coverage varsa skill kapalı.
+K82 — cross-tenant leakage/unauthorized source use = 0 test kapsamı.
+
+**Sınırlar ve geriye kalan riskler (açık):** başlangıç seed'i yine insan mühendisliği ister; seed kapsamı dardır. Free-form dil grounding eğitim olmadan gelmez; teacher error, ambiguous concepts, acquisition data coverage, rule explosion, maintenance, harmful external content, tool availability ve verifier incompleteness vardır. Formal correctness yalnız kernel'in ifade edebildiği alanı kapsar. No architecture can guarantee literally “no weaknesses”; mitigation is explicit scope, fail-closed, measurement and correction—not a promise. K75–K82 ölçülüp, gerçek görevlerde hedef kalite ve maliyet gösterilmeden bu sistemin devrimsel, genel veya pretraining'den ucuz olduğu söylenemez.
+
+*Belge sürümü: v1.6 — 2026-11-16. Genel pretraining'siz acquisition, grounding, private-to-promoted skill lifecycle ve kalite-kısıtlı hız hedefi tasarlandı; runtime uygulanmadı ve performans ölçülmedi.*
