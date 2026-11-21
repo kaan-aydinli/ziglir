@@ -1,6 +1,6 @@
 # NOEMA — Analog-Doğal, Doğrulama-Kapılı Muhakeme Mimarisi
 
-**Durum:** v0.5 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
+**Durum:** v0.6 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
 **Amaç:** `ai/` çatısının dışına ve SEL'in üstüne sıfırdan kurulan, **muhakeme-öncelikli** yeni mimarinin eksiksiz tanımı.
 **Bu deponun kuralı (iddia = ölçüm) bu belge için de geçerlidir:** aşağıda geçen her "hedef", "kestirim" ya da "beklenti" açıkça **ölçülmemiştir**. Ölçülmüş tek sayılar, mevcut SEL çekirdeğine aittir ve öyle etiketlenmiştir. Bu belge bir *vaad* değil, bir *ölçülecek hipotezler listesi*dir.
 
@@ -789,3 +789,146 @@ Tam sentetik JSONL örneği [`ai/noema-training/universal_examples.jsonl`](../no
 K31: katalogdaki her task family için schema-valid örnek, en az bir independent validator/simulator, baseline, retention test ve fail-closed davranış hazır olmadan "destekleniyor" işareti verilemez. K32: her modality için bozulma (noise/occlusion/missing chunks/long context/language shift) ve out-of-domain kalibrasyonu ayrı ölçülür. K33: gerçek zamanlı görevlerde doğruluk kadar end-to-end gecikme, chunk drop ve toparlanma ölçülür. Bu kapılar geçilmeden "günümüz modellerinin yapabildiği her şeyi yapar" iddiası yayımlanamaz.
 
 *Belge sürümü: v0.5 — 2026-11-20. Yetenek katalogu ve modality-aware veri şema taslağı eklendi; kapsam/performans henüz ölçülmedi.*
+
+## 22. v0.6 — Eğitim sisteminin baştan sona çalışma reçetesi
+
+**Durum: normatif tasarım taslağı; komutlar ve artifact formatı henüz uygulanmış CLI değildir.** Bu bölüm, eğitim ekibinin aynı girdilerle aynı adımları izleyebilmesi için eğitim turunu sonlu durum makinesi ve dosya sözleşmesi olarak tanımlar. Veri şeması v2 (21. bölüm), event log (20. bölüm) ve ölçüm kapıları (K0–K33) bunun alt katmanlarıdır.
+
+### 22.1 Eğitim turu = immutable run manifest
+
+Her tur `TrainingRunManifest` ile başlar; manifest hash'i run kimliğidir. Manifest değişirse yeni run açılır, eski run yerinde kalır. Zorunlu alanlar:
+
+```json
+{
+  "schema": "noema.training_run.v1",
+  "run_id": "derived-from-manifest-hash",
+  "parent_release": "release-id-or-null",
+  "data_manifests": ["sha256:..."],
+  "split_manifest": "sha256:...",
+  "generator_versions": ["name@version"],
+  "modules_to_update": ["router", "rule_store", "perception.text.tr.v1"],
+  "update_methods": ["eikonal_local", "verified_rule_induction"],
+  "seed": 1729,
+  "compute_budget": {"cpu_seconds": 3600, "memory_bytes": 1073741824, "energy_joules": null},
+  "policy_version": "policy-id",
+  "schema_versions": ["noema.example.v2"],
+  "gate_set": "gates-id",
+  "replay_plan": "sha256:...",
+  "artifact_retention": "retention-policy-id"
+}
+```
+
+Yukarıdaki sayılar yalnız örnektir; donanım/ölçek hedefi değildir. Manifestteki `null` bütçe "sınırsız" demek değildir; o kaynak ölçülmüyor demektir ve raporda açık görünür. Veri lisansı/onam policy kapısı geçmezse hiçbir compute işi başlamaz.
+
+### 22.2 Durum makinesi ve geçiş kuralları
+
+```
+CREATED → POLICY_CHECK → DATA_AUDIT → SPLIT_LOCKED → BASELINE_CAPTURED
+  → TRAIN_CANDIDATE → STATIC_CHECK → EVAL → REVIEW
+  → SHADOW → CANARY → PROMOTED
+Hata/limit/izin sorunu: herhangi bir aşama → REJECTED veya PAUSED
+Canary regresyon: CANARY → ROLLBACK → parent release
+```
+
+- `POLICY_CHECK`: lisans, consent, retention, tenant sınırı, silme kuyruğu; fail-closed.
+- `DATA_AUDIT`: schema, hash, duplicate, label conflict, poison/PII, provenance; tüm sayımlar raporlanır.
+- `SPLIT_LOCKED`: group/entity/time split hash'lenir; test split yalnız evaluator kimliğiyle açılır.
+- `BASELINE_CAPTURED`: parent release bütün eski yetenek panellerinde koşar; baseline yoksa eğitim devam etmez.
+- `TRAIN_CANDIDATE`: candidate artefact'ı ayrı namespace'e; online serving değişmez.
+- `STATIC_CHECK`: serialization, schema, deterministic replay, dependency/proof, resource cap.
+- `EVAL`: yeni görev, retention, regressions, safety, privacy, fairness, robustness, cost.
+- `REVIEW`: otomatik kapı + risk seviyesine göre insan imzası.
+- `SHADOW/CANARY`: gerçek kullanıcı yanıtını değiştirmeden gölge kıyaslama; sonra yalnız düşük riskli, izinli trafik.
+- `PROMOTED`: immutable release package, signature, parent pointer ve rollback yolu kaydedilir.
+- `PAUSED`: budget/capacity/data outage; cursor ve event position korunur, aynı run devam edebilir.
+- `REJECTED`: sebep kodu zorunlu; aynı manifest değiştirilmeden tekrar çalıştırılırsa aynı deterministic ret alınmalı.
+
+### 22.3 Deterministik eğitim orkestratörü
+
+Her `TRAIN_CANDIDATE` adımında scheduler örnekleri sabit ağırlıklı tek havuza karıştırmaz. Önce task-family quota ve risk sınırı uygular; her minibatch/iş paketini şu tuple ile kaydeder: `(example_id, objective_id, module_id, seed, input_artifact_hash, expected_validator)`. Farklı ailelerin ölçeği ayrı tutulur; tek bir büyük grubun örnek çokluğuyla diğerlerini ezmesi engellenir.
+
+```text
+manifest doğrula; parent snapshot'ı read-only aç
+for family in manifest.task_families (sabit sıra):
+    eligible ← consent+license+split+quality filtresinden geçen kayıtlar
+    batches ← deterministic_grouped_batches(eligible, seed, no_cross_split=true)
+    for batch in batches:
+        route by signal type:
+          verified_trace → proof checker → kural adayı (parametre gradient'i yok)
+          correction_pair → eski iz/bağımlılık bul → retraction adayı + corrected rule
+          supervised perception → ilgili modality adapter'ın yerel update'i
+          self_supervised → yalnız izinli invariance/consistency objective
+          preference → tercih yönlendirici/çıktı biçimi kalibrasyonu (truth validator değil)
+          tool_outcome → simulator'da eylem seçimi ve yan etki sonucu
+        state ← apply_to_candidate_only(state, objective, bounded_update)
+        log input hash, output hash, counters, saturation/overflow, reject reasons
+        if budget reached: checkpoint candidate + cursor; transition PAUSED
+finalize candidate snapshot; do not publish or serve it yet
+```
+
+Yerel update algoritması her modül manifestinde isim, sabit parametreleri, aralık/saturasyon ve bağımsız doğrulayıcıyla belirtilir. Algoritması belirtilmemiş modül öğrenime kapalıdır. Kanıtla türetilmiş kuralı `weight` gibi karıştırmayız: kural deposu sürümlü sembolik kayıt; SEL parametresi sayısal öğrenilebilir durumdur; retrieval epizodu kaynak kaydıdır. Üçü için update ve rollback farklıdır.
+
+### 22.4 Kural adayının terfi algoritması
+
+1. Aynı normalize edilmiş proof subtrace en az yapılandırılmış eşiği kadar bağımsız epizotta görünür; tek veri kaynağı varyantları bağımsız kanıt sayılmaz.
+2. Anti-unification ile aday şema çıkar; tip, önkoşul, postkoşul, değişken kapsamı ve kaynak izleri çıkarılır.
+3. Checker, adayın kaynak trace'lerinde birebir doğruluğunu ve side condition'larını yeniden koşar.
+4. Adayın gelmediği kural ailesi/seed'den holdout üret; nearest counterexample aramasıyla sınır koşullarını dene.
+5. Başarırsa `candidate_rule` olur; bağımsız review ve gate sonrası immutable `rule_version` yayınlanır.
+6. Sonradan çürütücü gelirse dependency graph'ta bu kuralı kullanan türevler bulunur; kural `retracted` işaretlenir, etkilenmiş cache/öneri invalid edilir, historical event kalır.
+
+Kural eşiği ve test sayısı task-family config'indedir; global sabit sayı yoktur. Kuralın yalnız eğitim örneklerini ezberlemesi, terfi için yeterli değildir.
+
+### 22.5 Aday release paketinin içeriği
+
+Bir release tek bir checkpoint değil, birlikte sürümlenen paket:
+
+- `release_manifest.json`: parent, kod/build, ABI, modül sürümleri, policy/gate set.
+- `module_state/`: küçük sayısal adaptör snapshot'ları ve format sürümü.
+- `rules/`: kabul edilmiş kurallar, proof reference, applicability ve retraction metadata.
+- `memory_index_manifest`: yalnız kalıcılaştırmaya izinli indeks/epizot alanları; özel kullanıcı belleği release'e gömülmez.
+- `data_lineage.json`: veri manifest hash'leri, consent/licence summary, dönüşüm grafı; ham kişisel içerik değil.
+- `evaluation/`: tüm skorlar, altgrup kırılımları, failed test IDs, confidence interval ve maliyet.
+- `replay/`: seed, deterministic event sequence, cursor ve test fixture refs.
+- `signature` + `parent_release`: bütünlüğü ve rollback zincirini doğrula.
+
+Üretim secret'ları, erişim token'ları ve ham kullanıcı içeriği release artifact'ına giremez. Release doğrulanamazsa yüklenmez.
+
+### 22.6 Karar tablosu: kabul, ret, erteleme
+
+| Bulgu | Eylem |
+|---|---|
+| Hard invariant/proof/sandbox critical fail | anında `REJECTED`; waiver yok |
+| Yeni yetenek artıyor, retention toleransı aşılıyor | `REJECTED` veya yeni dar kapsamlı modül/route tasarla; ortalama skorla örtme yok |
+| Şema/veri provenance/silme belirsiz | `PAUSED`; policy çözülene kadar aday eğitilmez |
+| Sonuç seed'ler arasında oynak | ek seed/CI, varyans raporu; yeterli kanıt yoksa terfi yok |
+| Yalnız tercihte üslup değişimi | düşük riskli canary; doğruluk veya güven etiketini değiştirme yetkisi yok |
+| Yeni modül o görev ailesi için test edilmemiş | `unsupported_task`; genel sürüm terfisine dahil etme |
+| Ingest storage/backup integrity başarısız | akışı durdur ve restore et; sessiz drop/overwrite yok |
+| Kapsamlı değerlendirme geçer | risk seviyesine göre onay → shadow → canary → imzalı promotion |
+
+### 22.7 Veri üretme ve insan inceleme kuyruğu
+
+Sentetik üretici görev DSL'sinden seed ile dünya/istek/çözüm/validator fixture üretir; **aynı implementasyonu** hem target hem validator olarak kullanamaz. Checker bağımsız kod yolu olmalı; ayrıca seed/kural ailesi holdout'u ve insanın rastgele seçtiği audit örnekleri vardır. İnsan reviewer arayüzü ham iddia, kaynak span, önerilen etiket, karşı-örnek ve anlaşmazlık seçeneklerini gösterir; sessiz otomatik override yoktur.
+
+Kuyruk önceliği: (1) güvenlik/PII/provenance belirsizliği; (2) üretici-checker uyuşmazlığı; (3) yeni hata sınıfı ve dağılım kayması; (4) sıradan örneklerden deterministik örnekleme. Review kararları `human_review_event` olarak sürümlenir; reviewer kimliği/rolü gizlilik policy'sine uygun tutulur. Reviewer anlaşmazlığı `disputed` statüsüdür; ortalama etikete zorlanmaz.
+
+### 22.8 İlk uygulanabilir dikey dilim (başlangıç planı)
+
+Tüm katalogu birden uygulamak yerine, framework'ün tam yaşam döngüsünü doğrulayan küçük ve ölçülebilir dikey dilim:
+
+1. `reasoning` ve `code` text-only; girdi `noema.example.v2`, küçük LIR programı ve arithmetic/array-bounds kuralları.
+2. Exact validator: parser/checker/compiler + unit/property tests; dış tool ve canlı kullanıcı verisi yok.
+3. Immutable fixture store + manifest hash + training run event log; deletion path sentetik data ile test edilir.
+4. Candidate rule induction + SEL yerel yönlendiricisi ayrı sürümlenir; online update yok.
+5. Sabit 3 split: train, rule-family holdout, adversarial/retention. Aynı üretim seed'leri testte görülmez.
+6. Run başına gate: schema/provenance → baseline → candidate → proof/tests → retention → deterministic replay → cost report → review.
+7. Başarılı package shadow'da çalışır; gerçek serving/promote sonraki ADR ve güvenlik review'ına bağlıdır.
+
+Bu dikey dilim geçmeden ses/görüntü/robotik/çok dillilik hedefleri için "tamamlandı" denmez. Yeni modalite eklendiğinde aynı yaşam döngüsü ve ortak kontratlar korunur; yalnız modül + veri decoder + validator + benchmark eklenir.
+
+### 22.9 Sonuç ve kapsam ifadesi
+
+NOEMA'nın "eksiksiz" iddiası burada **tasarım dokümanında gerekli arayüz, durum geçişi, veri provenance'ı, update algoritması, ölçüm, güvenlik, hata/rollback ve release artefact'larının tanımlanmış olması** anlamına gelir. Bu, her yeteneğin implementasyonu veya frontier seviyesinde performansı anlamına gelmez. Kod, validator ve testler geliştirilip kapılar ölçülmeden "bütün güncel modellerin yapabildiği her şeyi yapar" denmeyecektir.
+
+*Belge sürümü: v0.6 — 2026-11-20. Eğitim run state machine'i, deterministik scheduler, rule promotion, release paketi ve ilk dikey dilim tanımlandı; implementasyon/benchmark sonucu yoktur.*

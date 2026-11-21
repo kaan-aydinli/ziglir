@@ -1,0 +1,29 @@
+{
+  "schema": "noema.training_run.v1",
+  "run_id": "demo-run-derived-from-manifest-hash",
+  "parent_release": "demo-release-000",
+  "data_manifests": ["demo-manifest-training-001"],
+  "split_manifest": "demo-split-family-holdout-v1",
+  "generator_versions": ["synthetic-arithmetic@1.0", "synthetic-lir@1.0"],
+  "task_families": ["reasoning", "code"],
+  "modules_to_update": ["router.reasoning.v1", "rule_store.arithmetic.v1"],
+  "update_methods": ["bounded_local_calibration", "verified_rule_induction"],
+  "seed": 1729,
+  "compute_budget": {
+    "cpu_seconds": 3600,
+    "memory_bytes": 1073741824,
+    "energy_joules": null,
+    "wall_seconds": 7200
+  },
+  "policy_version": "demo-policy-v1",
+  "schema_versions": ["noema.example.v2", "noema.training_run.v1"],
+  "gate_set": "demo-gates-reasoning-code-v1",
+  "replay_plan": "demo-replay-plan-v1",
+  "artifact_retention": "synthetic-demo-retention",
+  "review_policy": {
+    "human_approval_required": true,
+    "risk_ceiling": "low",
+    "online_weight_update": false
+  },
+  "status": "example-only-not-executable"
+}
