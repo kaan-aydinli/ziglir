@@ -1,5 +1,5 @@
 {
-  "schema": "noema.training_run.v1",
+  "schema": "noema.training_run.v2",
   "run_id": "demo-run-derived-from-manifest-hash",
   "parent_release": "demo-release-000",
   "data_manifests": ["demo-manifest-training-001"],
@@ -16,7 +16,7 @@
     "wall_seconds": 7200
   },
   "policy_version": "demo-policy-v1",
-  "schema_versions": ["noema.example.v2", "noema.training_run.v1"],
+  "schema_versions": ["noema.example.v2", "noema.training_run.v2"],
   "gate_set": "demo-gates-reasoning-code-v1",
   "replay_plan": "demo-replay-plan-v1",
   "artifact_retention": "synthetic-demo-retention",
@@ -24,6 +24,15 @@
     "human_approval_required": true,
     "risk_ceiling": "low",
     "online_weight_update": false
+  },
+  "execution_plan": {
+    "max_workers": 2,
+    "batch_size": 32,
+    "shard_key": "group_key",
+    "incremental_cache": true,
+    "cache_namespace": "demo-content-addressed-v1",
+    "deterministic_merge": true,
+    "gate_mode": "fail_fast_then_complete_before_promotion"
   },
   "status": "example-only-not-executable"
 }

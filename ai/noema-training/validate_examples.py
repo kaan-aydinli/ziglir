@@ -63,8 +63,9 @@ def _enum(value: Any, allowed: set[str], where: str) -> None:
     _require(isinstance(value, str) and value in allowed, f"{where}: unsupported value {value!r}")
 
 
-def _load_jsonl(path: Path) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
+def _load_jsonl(path: Path) -> Iterable[dict[str, Any]]:
+    """Yield records one at a time; memory use is bounded by validator indexes."""
+    count = 0
     try:
         with path.open(encoding="utf-8") as stream:
             for line_no, raw in enumerate(stream, 1):
@@ -74,14 +75,14 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
                     value = json.loads(raw)
                 except json.JSONDecodeError as exc:
                     raise ValidationError(f"{path}:{line_no}: invalid JSON: {exc.msg}") from exc
-                rows.append(_object(value, f"{path}:{line_no}"))
+                count += 1
+                yield _object(value, f"{path}:{line_no}")
     except OSError as exc:
         raise ValidationError(f"{path}: {exc}") from exc
-    _require(bool(rows), f"{path}: no records")
-    return rows
+    _require(count > 0, f"{path}: no records")
 
 
-def validate_example_rows(rows: list[dict[str, Any]], where: str = "examples") -> None:
+def validate_example_rows(rows: Iterable[dict[str, Any]], where: str = "examples") -> int:
     ids: set[str] = set()
     for i, row in enumerate(rows, 1):
         loc = f"{where}:{i}"
@@ -99,8 +100,9 @@ def validate_example_rows(rows: list[dict[str, Any]], where: str = "examples") -
         _require(isinstance(row["validator"], dict), f"{loc}.validator: expected object")
         _require(isinstance(row["provenance"], (dict, str)), f"{loc}.provenance: expected object or string")
 
+    return len(ids)
 
-def validate_universal_rows(rows: list[dict[str, Any]], where: str = "universal") -> None:
+def validate_universal_rows(rows: Iterable[dict[str, Any]], where: str = "universal") -> int:
     ids: set[str] = set()
     for i, row in enumerate(rows, 1):
         loc = f"{where}:{i}"
@@ -126,8 +128,9 @@ def validate_universal_rows(rows: list[dict[str, Any]], where: str = "universal"
         for key in ("evidence", "tools", "safety", "quality", "provenance"):
             _require(isinstance(row[key], dict), f"{loc}.{key}: expected object")
 
+    return len(ids)
 
-def validate_output_rows(rows: list[dict[str, Any]], where: str = "outputs") -> None:
+def validate_output_rows(rows: Iterable[dict[str, Any]], where: str = "outputs") -> int:
     ids: set[str] = set()
     for i, row in enumerate(rows, 1):
         loc = f"{where}:{i}"
@@ -169,8 +172,9 @@ def validate_output_rows(rows: list[dict[str, Any]], where: str = "outputs") -> 
             _require(actual_evidence == expected_evidence, f"{loc}.artifacts[{j}]: evidence refs do not match obligation refs")
         _require(isinstance(row["validation"], dict), f"{loc}.validation: expected object")
 
+    return len(ids)
 
-def validate_eval_rows(rows: list[dict[str, Any]], where: str = "capability-eval") -> None:
+def validate_eval_rows(rows: Iterable[dict[str, Any]], where: str = "capability-eval") -> int:
     ids: set[str] = set()
     for i, row in enumerate(rows, 1):
         loc = f"{where}:{i}"
@@ -187,8 +191,9 @@ def validate_eval_rows(rows: list[dict[str, Any]], where: str = "capability-eval
         for key in ("context", "reference", "criterion", "checker", "provenance"):
             _require(isinstance(row[key], dict), f"{loc}.{key}: expected object")
 
+    return len(ids)
 
-def validate_event_rows(rows: list[dict[str, Any]], where: str = "events") -> None:
+def validate_event_rows(rows: Iterable[dict[str, Any]], where: str = "events") -> int:
     ids: set[str] = set()
     for i, row in enumerate(rows, 1):
         loc = f"{where}:{i}"
@@ -203,6 +208,7 @@ def validate_event_rows(rows: list[dict[str, Any]], where: str = "events") -> No
             _require(isinstance(row["tombstone"], dict) and "content_included" in row["tombstone"], f"{loc}.tombstone: invalid tombstone")
             _require(row["tombstone"]["content_included"] is False, f"{loc}: tombstone must not include deleted content")
 
+    return len(ids)
 
 def validate_manifest(path: Path) -> None:
     try:
@@ -210,7 +216,7 @@ def validate_manifest(path: Path) -> None:
     except (OSError, json.JSONDecodeError) as exc:
         raise ValidationError(f"{path}: {exc}") from exc
     _required(manifest, MANIFEST_REQUIRED, str(path))
-    _require(manifest["schema"] == "noema.training_run.v1", f"{path}.schema: unsupported schema")
+    _require(manifest["schema"] in {"noema.training_run.v1", "noema.training_run.v2"}, f"{path}.schema: unsupported schema")
     _require(isinstance(manifest["seed"], int), f"{path}.seed: expected integer")
     for key in ("data_manifests", "generator_versions", "task_families", "modules_to_update", "update_methods", "schema_versions"):
         _require(isinstance(manifest[key], list), f"{path}.{key}: expected list")
@@ -219,6 +225,16 @@ def validate_manifest(path: Path) -> None:
         _require(value is None or (isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0), f"{path}.compute_budget.{key}: expected non-negative number or null")
     review = _object(manifest["review_policy"], f"{path}.review_policy")
     _require(review.get("online_weight_update") is False, f"{path}: example policy must keep online weight update disabled")
+    if manifest["schema"] == "noema.training_run.v2":
+        plan = _object(manifest.get("execution_plan"), f"{path}.execution_plan")
+        for key in ("max_workers", "batch_size"):
+            _require(isinstance(plan.get(key), int) and not isinstance(plan.get(key), bool) and plan[key] > 0, f"{path}.execution_plan.{key}: expected positive integer")
+        _nonempty_string(plan.get("shard_key"), f"{path}.execution_plan.shard_key")
+        _require(isinstance(plan.get("incremental_cache"), bool), f"{path}.execution_plan.incremental_cache: expected boolean")
+        _require(isinstance(plan.get("deterministic_merge"), bool), f"{path}.execution_plan.deterministic_merge: expected boolean")
+        _require(plan.get("deterministic_merge") is True, f"{path}: deterministic merge is mandatory")
+        _nonempty_string(plan.get("cache_namespace"), f"{path}.execution_plan.cache_namespace")
+        _enum(plan.get("gate_mode"), {"fail_fast_then_complete_before_promotion"}, f"{path}.execution_plan.gate_mode")
 
 
 def validate_all(base: Path = ROOT) -> list[str]:
@@ -238,9 +254,8 @@ def validate_all(base: Path = ROOT) -> list[str]:
     }
     messages: list[str] = []
     for name, path in files.items():
-        rows = _load_jsonl(path)
-        validators[name](rows, str(path))
-        messages.append(f"{path.name}: {len(rows)} records OK")
+        count = validators[name](_load_jsonl(path), str(path))
+        messages.append(f"{path.name}: {count} records OK")
     manifest = base / "run_manifest.example.json"
     validate_manifest(manifest)
     messages.append(f"{manifest.name}: valid")

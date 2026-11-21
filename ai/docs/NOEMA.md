@@ -1,6 +1,6 @@
 # NOEMA — Analog-Doğal, Doğrulama-Kapılı Muhakeme Mimarisi
 
-**Durum:** v1.3 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
+**Durum:** v1.4 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
 **Amaç:** `ai/` çatısının dışına ve SEL'in üstüne sıfırdan kurulan, **muhakeme-öncelikli** yeni mimarinin eksiksiz tanımı.
 **Bu deponun kuralı (iddia = ölçüm) bu belge için de geçerlidir:** aşağıda geçen her "hedef", "kestirim" ya da "beklenti" açıkça **ölçülmemiştir**. Ölçülmüş tek sayılar, mevcut SEL çekirdeğine aittir ve öyle etiketlenmiştir. Bu belge bir *vaad* değil, bir *ölçülecek hipotezler listesi*dir.
 
@@ -748,7 +748,7 @@ Tek bir JSONL satırı bir **task episode**'dur; metin ve payload aynı dosyada 
 }
 ```
 
-Bu örnek şema **normatifleştirilecek taslak**tır. `python3 ai/noema-training/validate_examples.py` komutundaki `validate_examples.py`, Python standard library dışında bağımlılık olmadan örnek JSONL/manifest kayıtlarının yapısal alanlarını ve temel invariant'ları kontrol eder; `python3 -m unittest discover -s ai/noema-training -p 'test_*.py'` negatif durumları sınar. Bu araç JSON Schema'nın tam validator'ı değildir ve payload hash'inin gerçekten doğru olduğunu, lisans/onamı, proof doğruluğunu veya model kalitesini denetlemez. Bilinmeyen alan `null` veya `unknown` olur; boş alanı tahminle doldurmak yasaktır. `target` görev tipine göre proof, metin, koordinat, zaman aralığı, program ya da `abstain` olabilir. Şema sürümü olmayan kayıt eğitime girmez.
+Bu örnek şema **normatifleştirilecek taslak**tır. `python3 ai/noema-training/validate_examples.py` komutundaki `validate_examples.py`, Python standard library dışında bağımlılık olmadan JSONL kayıtlarını satır satır işleyip manifest/örneklerin yapısal alanlarını ve temel invariant'ları kontrol eder; `python3 -m unittest discover -s ai/noema-training -p 'test_*.py'` negatif durumları sınar. Bu araç JSON Schema'nın tam validator'ı değildir ve payload hash'inin gerçekten doğru olduğunu, lisans/onamı, proof doğruluğunu veya model kalitesini denetlemez. Bilinmeyen alan `null` veya `unknown` olur; boş alanı tahminle doldurmak yasaktır. `target` görev tipine göre proof, metin, koordinat, zaman aralığı, program ya da `abstain` olabilir. Şema sürümü olmayan kayıt eğitime girmez.
 
 ### 21.3 Payload biçimleri ve kayıpsız kaynak politikası
 
@@ -1417,3 +1417,92 @@ K61 — correction/deletion propagation: dependency graph üzerinden affected ou
 K62 — version migration: eski örnekler yalnız explicit migration ile kabul; raw source hash değişmez.
 
 *Belge sürümü: v1.3 — 2026-11-16. Request→task→obligation→evidence→artifact ve train→release kimlik/yaşam döngüleri tek normatif sözleşmede hizalandı; runtime cross-contract testlerinin çoğu henüz uygulanmadı.*
+
+## 30. v1.4 — Eğitim gecikme bütçesi ve kritik-yol hızlandırıcısı
+
+Bu bölüm eğitim hattındaki süreyi kısaltmak için §22 run state machine'ine entegre edilen execution plan'ı tanımlar. Hızlanma; zorunlu güvenlik, veri/provenans, retention ve promotion kontrollerini atlayarak değil, **tekrar işi kaldırıp bağımsız işi paralel çalıştırarak** sağlanır. Bu bir tasarım/ölçüm planıdır; speedup henüz ölçülmedi. Yeni run manifest uzantısı `noema.training_run.v2` olup örneği [`run_manifest.example.json`](../noema-training/run_manifest.example.json) içindedir.
+
+### 30.1 Önce ölç, sonra en yavaş stage'i hedefle
+
+Her run'da DAG node başına queue wait, wall time, CPU-core seconds, bytes, peak memory, cache hit/miss, retry, reject reason ve critical-path contribution ölçülür. Scheduler önce geçmiş **aynı fingerprint family**'nin ölçülen dağılımından p50/p95 tahmini alır; ilk kez görülen node için tahmin `unknown` olur ve konservatif per-node cap kullanılır. Tahmin yalnız planlama içindir, correctness/gate sonucu değildir. Eski `noema.training_run.v1` manifestleri yalnız import edilir; migration, konservatif `max_workers=1`, cache disabled ve tam gate profiliyle yeni v2 manifest üretir. Üretimde doğrudan v1 yürütülmez.
+
+`TrainingRunManifest.execution_plan` alanları:
+
+- `max_workers`: compute budget/CPU kotasını aşmayan sabit worker üst sınırı.
+- `batch_size`: aynı schema/module/task family içindeki bağımsız kayıt grubu.
+- `shard_key`: bölme/leakage politikasındaki entity/family key; aynı grup farklı worker/split'e dağılmaz.
+- `incremental_cache`: yalnız tam fingerprint eşleşmesinde kullanılabilecek cache izni.
+- `cache_namespace`: tenant/licence/policy ile sınırlandırılmış content-addressed namespace.
+- `deterministic_merge`: tamamlanan sonuçları stable task/object ID sırasıyla birleştirir; v2'de zorunlu `true`.
+- `gate_mode`: ucuz fail-fast kontrolleri, sonra terfi öncesi bütün zorunlu gate'ler.
+
+### 30.2 Incremental DAG + güvenli cache
+
+Her stage node fingerprint'i:
+
+```
+node_key = H(node_kind, code_hash, config_hash, input_artifact_hashes,
+             schema_version, validator_hash, policy_version,
+             parent_release, hardware_profile_if_perf_test)
+```
+
+- Aynı node key + başarılı, imzalı, bozulmamış result artifact varsa node yeniden koşmak yerine result doğrulanarak reuse edilebilir.
+- Değişen veri, parser/grammar, objective, validator, policy, compiler, parent release veya perf donanım profili downstream cache'i invalid eder.
+- İzin/tenant sınırları cache key'in ve namespace'in parçasıdır; başka tenant'ın hit'i yasaktır. Silme event'i cache descendants'ı invalid eder.
+- Hatalı/başarısız test sonucu cache'den başarı gibi dönemez. Fail sonucu da yalnız triage için cache'lenebilir ve yeni candidate promotion'ını engeller.
+- Cache checksum/manifest doğrulanamazsa `MISS` sayılır; live task'ta exact hesap tekrar yapılır. Cache semantik otorite değildir.
+
+Böylece parent baseline, unchanged schema tests, immutable proof fixtures ve hiç etkilenmeyen modüller tekrar kullanılabilir; ancak candidate'nin etkilenen tüm capability'leri, her release'in safety/privacy-critical invariant'ları ve promotion bütünlük kontrolü yeniden değerlendirilir. Cache kullanımı test atlama değil, aynı exact testin aynı exact input/config üzerindeki imzalı sonucunu reuse etmektir.
+
+### 30.3 Paralellik ve deterministic merge
+
+1. DAG hazır node'ları `risk × criticality × predicted_duration` önceliğine göre worker havuzuna verir; high-risk gate erkene alınır.
+2. Bağımsız task-family/module shard'ları paralel koşar; aynı mutable candidate state'e birden fazla worker yazmaz. Worker kendi candidate delta/event üretir.
+3. Merge aşaması delta'ları stable `(module_id, family_id, shard_key, task_id)` sırasına koyar; conflict veya write-set çakışması varsa merge durur, sequential re-run yapılır.
+4. `max_workers` runtime CPU/memory bütçesinin altındaysa unused core kullanılabilir; oversubscription ve aynı anda tüm RAM'i isteyen batch engellenir.
+5. Tek büyük batch yerine sınırlandırılmış mini-batch; early rejection kalan batch hesaplarını iptal eder, fakat her satırın status'u event log'a yazılır.
+6. Non-deterministic external connector'lar training-critical path'te kullanılmaz; gerekiyorsa frozen fixture/recorded response replay edilir.
+
+### 30.4 Gate pyramid: ucuzdan pahalıya, zorunlu kapı atlamadan
+
+| Aşama | Ne zaman | Hız kuralı |
+|---|---|---|
+| G0 schema/policy/hash/consent | her ingest ve her run | O(1)/streaming check; ilk fail'de dur |
+| G1 cheap exact/local verifier + static typing | her candidate delta | küçük bounded tests önce; hata varsa training devam etmez |
+| G2 changed-module smoke + affected-family tests | ilgili modül/veri değişince | dependency graph'taki etkilenen node'ları çalıştır; sonucu parent/config hash'e bağla |
+| G3 retention + cross-family + safety/privacy | her promotable candidate | gerekiyorsa exact cache reuse; asla model metriğiyle atlama |
+| G4 complete promotion integration | her release promotion | bütün zorunlu gate seti geçmeli; exact fingerprint'li imzalı test reuse dışında kapsam eksiltme yok |
+| G5 performance/scale benchmark | kod, model, data veya hardware değişince | yalnız sabit koşullarda karşılaştır; correctness gate'leriyle paralel olabilir ama aynı CPU budget'ı paylaşır |
+
+Tüm gate'ler final terfi için hâlâ geçerlidir. G0/G1 fail olduğunda G2+ compute harcanmaz; bu doğrudan güvenlik/doğruluk kısayolu değil, erken durdurmadır.
+
+### 30.5 Veri hattı ve eğitim adımında hız
+
+- JSONL akışı satır satır okunur; tüm corpus RAM'e yüklenmez. Duplicate IDs/reference sets için gerekli küçük indeksler memory quota ile tutulur veya sıralı external merge olarak yürütülür.
+- Deterministic generation: `(generator_version, seed, task_family, params)` ile synthetic fixture üretilir; aynı hash'li artifact tekrar üretilmez. Generator değişirse cache invalid olur.
+- Normalizasyon, parse forest, token/grapheme span ve typed graph aynı immutable raw ref'ten türetilir; downstream task'lar bu artifact'i paylaşır, fakat her dönüşüm kendi version/hash'ini taşır.
+- Yalnız değişen kontratlar için counterexample araması; bounded local neighborhood/seed expansion. Eşik/aile kapsamı değişince broader search zorunlu hale gelir.
+- İnsan incelemesi yalnız disagreement, new error family, high-risk ve stratified random audit'te; basit sentetik doğru etiket otomatik, fakat checker uyuşmazlığı varsa insan kuyruğuna yükseltilir.
+- Cache miss/hit, oluşturma zamanı ve doğruluk sonuçları ayrı raporlanır. Çok cache hit ile daha kısa eğitim, model kalitesinde gelişme anlamına gelmez.
+
+### 30.6 Early-stop, cancellation ve bütçe muhasebesi
+
+Stage, başlarken `estimated_remaining`, kill-safe checkpoint ve `cancel_safe` sınırı bildirir. Yeni sample batch başlatmadan önce: kalan CPU/wall/memory bütçesi batch + required local verifier'a yetiyor mu kontrol edilir. Yetmiyorsa `PAUSED`, `budget_exhausted`, ya da kullanıcıdan daha çok kaynak istenir; yarım batch promotion adayı sayılamaz. Bir paralel shard fail edince bağımlı shard'lar iptal edilir; bağımsız diagnostik shard'lar yalnız incident triage manifestinde devam edebilir.
+
+Run sonucu hem `raw_training_seconds` hem `cache_saved_seconds`, `validation_seconds`, `human_minutes`, `promotion_gate_seconds` raporlar. Başarılı capability başına toplam maliyet hesaplanır; cached evaluation da önceki ölçüldüğü için bedava varsayılmaz, artifact storage/verification maliyeti sayılır.
+
+### 30.7 Hızlandırma kabul kapıları
+
+| Kapı | Kriter |
+|---|---|
+| K63 — cache correctness | node fingerprint'in herhangi bir girdisi değişince cache miss; aynı fingerprint ise payload/checker sonucu hash eşleşir |
+| K64 — incremental invalidation | değişen node'un tüm downstream dependency'leri bulunur; unrelated node sabit kalabilir; etkilenen test kaçırma = 0 fixture kapsamında |
+| K65 — parallel determinism | worker sayısı/schedule değişse candidate manifest ve sorted event outputs aynı |
+| K66 — time-to-detect | fail-fast G0/G1'de geçersiz adayın detection süresi ve harcanan compute raporlanır |
+| K67 — end-to-end speedup | aynı gate sonucu/kalite/coverage ve makine altında cold-vs-warm, sequential-vs-parallel duvar saati ve CPU maliyeti; başarısız denemeler dâhil |
+| K68 — memory bounded ingest | corpus boyutu büyürken peak RSS configured bound'u aşmaz; malformed satır line number ile fail eder |
+| K69 — no gate regression | hızlandırılmış release'te zorunlu gate listesi, baseline release'ten eksik olamaz; promotion manifest set farkını denetler |
+
+Başlangıç hedefi "olabildiğince hızlı" değil: aynı kabul edilen quality/evidence/security sonucunu daha düşük **toplam end-to-end run cost** ile ölçmek. K67 geçmeden hız kazancı iddia edilmez. Mevcut training core'da gerçek paralel learner/cache DAG henüz kodlanmadığı için bu turda performans sonucu yoktur.
+
+*Belge sürümü: v1.4 — 2026-11-16. Eğitim execution plan, incremental DAG/cache, deterministic parallelism ve gate pyramid §22 akışına bağlandı; hızlanma ölçülmedi.*

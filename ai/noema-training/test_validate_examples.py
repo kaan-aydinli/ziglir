@@ -97,12 +97,22 @@ class ValidatorTests(unittest.TestCase):
         with self.assertRaisesRegex(validator.ValidationError, "must not include deleted content"):
             validator.validate_event_rows([row])
 
+    def test_manifest_requires_deterministic_execution_merge(self):
+        source = Path(__file__).parent / "run_manifest.example.json"
+        manifest = json.loads(source.read_text(encoding="utf-8"))
+        manifest["execution_plan"]["deterministic_merge"] = False
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "manifest.json"
+            path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(validator.ValidationError, "deterministic merge is mandatory"):
+                validator.validate_manifest(path)
+
     def test_invalid_jsonl_reports_line_number(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "bad.jsonl"
             path.write_text("{}\nnot-json\n", encoding="utf-8")
             with self.assertRaisesRegex(validator.ValidationError, r":2: invalid JSON"):
-                validator._load_jsonl(path)
+                list(validator._load_jsonl(path))
 
 
 if __name__ == "__main__":
