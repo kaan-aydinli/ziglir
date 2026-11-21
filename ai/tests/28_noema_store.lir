@@ -1,0 +1,43 @@
+// NOEMA Stage 14 bounded volatile record store.
+import "../src/noema_store.lir"
+fn main() -> i64 {
+    var checks: i64 = 0
+    var passed: i64 = 0
+    let rows = @malloc(2 * 7 * 8)
+    let row = @malloc(7 * 8)
+    @write_u64(row, 101 as u64)
+    @write_u64(@ptr_add(row, 8), 7 as u64)
+    @write_u64(@ptr_add(row, 16), 3 as u64)
+    @write_u64(@ptr_add(row, 24), 100 as u64)
+    @write_u64(@ptr_add(row, 32), 9001 as u64)
+    @write_u64(@ptr_add(row, 40), 5001 as u64)
+    @write_u64(@ptr_add(row, 48), STORE_ACTIVE as u64)
+    let count = memory_store_append(0, 2, rows, row)
+    checks = checks + 1
+    if count == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if memory_store_find(count, rows, 101, 7, 3, 20) == 0 { passed = passed + 1 }
+    checks = checks + 1
+    if memory_store_find(count, rows, 101, 8, 3, 20) == STORE_INVALID { passed = passed + 1 }
+    checks = checks + 1
+    if memory_store_find(count, rows, 101, 7, 4, 20) == STORE_INVALID { passed = passed + 1 }
+    checks = checks + 1
+    if memory_store_find(count, rows, 101, 7, 3, 100) == STORE_INVALID { passed = passed + 1 }
+    checks = checks + 1
+    if memory_store_append(count, 2, rows, row) == STORE_INVALID { passed = passed + 1 }
+    checks = checks + 1
+    if memory_store_tombstone(count, rows, 101, 8, 3) == STORE_INVALID { passed = passed + 1 }
+    checks = checks + 1
+    if memory_store_tombstone(count, rows, 101, 7, 3) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if memory_store_find(count, rows, 101, 7, 3, 20) == STORE_INVALID { passed = passed + 1 }
+    checks = checks + 1
+    if memory_store_tombstone(count, rows, 101, 7, 3) == STORE_INVALID { passed = passed + 1 }
+    checks = checks + 1
+    if memory_store_append(0, 0, rows, row) == STORE_INVALID { passed = passed + 1 }
+    printInt(passed)
+    print("/")
+    printInt(checks)
+    println("")
+    return 0
+}

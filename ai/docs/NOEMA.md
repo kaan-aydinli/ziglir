@@ -1,6 +1,6 @@
 # NOEMA — LIR ile uygulanan karar-kapıları
 
-**Durum:** v3.1. LIR’de uygulanıp test edilenler: contract/evidence/scheduler/data/capability/memory-scope/release-lifecycle/task-execution guard’ları, sınırlı unary/conjunctive exact-rule forward-chaining, yerel türetim adımı ve sınırlı acyclic proof-certificate doğrulaması, açık query-status sınıflaması. Bu, tasarlanan NOEMA AI framework’ünün tamamı değildir.
+**Durum:** v3.2. LIR’de uygulanıp test edilenler: contract/evidence/scheduler/data/capability/memory-scope/release-lifecycle/task-execution guard’ları, sınırlı unary/conjunctive exact-rule forward-chaining, yerel türetim ve sınırlı acyclic proof-certificate doğrulaması, açık query-status sınıflaması ve çağıranın belleğinde çalışan scoped volatile record store. Bu, tasarlanan NOEMA AI framework’ünün tamamı değildir.
 
 ## Uygulanmış dilimler
 
@@ -14,9 +14,10 @@
 | Memory scope, retention and deletion guards | `ai/src/noema_memory.lir` | `ai/tests/20_noema_memory.lir` |
 | Release lifecycle guards | `ai/src/noema_release.lir` | `ai/tests/21_noema_release.lir` |
 | Bounded task execution lifecycle and budget admission | `ai/src/noema_execution.lir` | `ai/tests/22_noema_execution.lir` |
-| Exact-rule forward chaining, local derivation and bounded proof-certificate validation, explicit query status | `ai/src/noema_reasoning.lir` | `ai/tests/23_noema_reasoning.lir`–`ai/tests/27_noema_proof_certificate.lir` |
+| Exact-rule inference, derivation/proof-certificate validation, explicit query status | `ai/src/noema_reasoning.lir` | `ai/tests/23_noema_reasoning.lir`–`ai/tests/27_noema_proof_certificate.lir` |
+| Bounded volatile scoped record store (append/find/tombstone) | `ai/src/noema_store.lir` | `ai/tests/28_noema_store.lir` |
 
-The latest LIR suite passes all 76 fixture/backend executions (including 6 Stage 13 certificate checks); backend coverage varies for legacy fixtures. Zig build tests, 21 Python standard-library validator/audit tests, and example validation also pass. These results verify bounded decision logic only; they do not establish that corresponding services exist.
+The latest LIR suite passes all 79 fixture/backend executions (including 11 Stage 14 store checks); backend coverage varies for legacy fixtures. Zig build tests, 21 Python standard-library validator/audit tests, and example validation also pass. These results verify bounded decision logic only; they do not establish that corresponding services exist.
 
 ## Not implemented
 
