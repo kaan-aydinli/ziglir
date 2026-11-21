@@ -1,6 +1,6 @@
 # NOEMA — Analog-Doğal, Doğrulama-Kapılı Muhakeme Mimarisi
 
-**Durum:** v0.8 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
+**Durum:** v0.9 — **tasarım belgesi. Uygulanmadı.** Hiçbir bileşeni bu depoda yok.
 **Amaç:** `ai/` çatısının dışına ve SEL'in üstüne sıfırdan kurulan, **muhakeme-öncelikli** yeni mimarinin eksiksiz tanımı.
 **Bu deponun kuralı (iddia = ölçüm) bu belge için de geçerlidir:** aşağıda geçen her "hedef", "kestirim" ya da "beklenti" açıkça **ölçülmemiştir**. Ölçülmüş tek sayılar, mevcut SEL çekirdeğine aittir ve öyle etiketlenmiştir. Bu belge bir *vaad* değil, bir *ölçülecek hipotezler listesi*dir.
 
@@ -43,7 +43,7 @@ Dürüst karşı-taraf (NOEMA'nın kaybedeceği yerler): web-ölçeğinde hazır
 | P1 | **Muhakeme birincil, istatistik ikincil.** İstatistik aday önerir, asla kanıt değildir. | Her iddia `formal_proof`, `executed_test`, `empirical_support`, `hypothesis` veya `unsupported` evidence level taşır. |
 | P2 | **Doğrulanabilir sınırlar açık olmalı.** | Kullanıcıya gerekçe ve evidence level gösterilir; proof tree yalnız kernel'in kapsadığı biçimsel iddialar içindir, her cevap için zorunlu değildir. |
 | P3 | **Tokenizer/BPE yok; sembolik yapı ve açık parser vardır.** | Ham girdi kayıpsız saklanır, dil/modality parser'ı sürümlü rule pack'tir; kapsam dışı girdi belirsiz/unsupported olarak kalır. Holografik saha anlamın yerine geçmez. |
-| P4 | **Öğrenme yerel ve tek geçişlidir.** Gradyan yok. | SEL'in eikonal (NLMS-ailesi) kuralı + *doğrulama-sinyalli kural türetme* (§6). |
+| P4 | **Çekirdek bilgi güncellemesi denetlenebilir ve geri alınabilir olmalı.** | §25'teki Karşıt İzden Sözleşme Derleme temel öğrenme adayıdır; SEL/eikonal yalnız uyumluluk/ablation deneyidir, çekirdek zorunluluğu değildir. |
 | P5 | **Bellek katmanlı ve provenanslıdır; kapasite sonlu, arşiv büyütülebilir.** | E/M/P katmanları ve dış depo; silme/retention politikası P5'in üstündedir. Parametre belleğinde kayıpsız öğrenme garantisi yoktur. |
 | P6 | **Substrat-bağımsızdır.** Analog-doğal; dijital yalnızca yozlaşmış (kesikli) özel hâl. | Aynı hesap Kirchhoff yasalarıyla (memristor crossbar), foton fazıyla (fotonik) ya da i64 tamsayı emülasyonuyla (bu depo, x86-64) yapılır. |
 | P7 | **Deterministiktir.** Dijital emülasyon bit-bit aynı sonucu verir. | Analog yol gürültülü olduğu için *doğrulama* analog çıktının emniyet kemeridir: analog hızlandırır, kanıt motoru karar verir (P1). |
@@ -224,7 +224,7 @@ RAM dolunca izinli kayıtlar dış depoya taşınabilir; checksum/backup/restore
 
 ---
 
-## 6. Öğrenme motoru (gradyan yok, iplik-iplik)
+## 6. Tarihsel öğrenme motoru (v0.1–v0.8; v0.9 çekirdek öğrenme için §25'e bakın)
 
 ### 6.1 Hızlı döngü (çıkarım içi) — hiçbir ağırlık değişmez
 
@@ -343,7 +343,7 @@ Her faz sonunda `ai/bench/results.md`'ye tarihli satır düşer; faz geçilemezs
 
 ---
 
-## 12. SEL'in yeni hâli — birleşim planı
+## 12. Tarihsel SEL uyumluluk haritası — v0.9 core dependency değildir
 
 | SEL bileşeni | NOEMA'daki rolü |
 |---|---|
@@ -383,7 +383,7 @@ SEL'in "bütün sistem = tek ağ" iddiası geri çekilir; yerine "SEL = NOEMA'n�
 
 ## 15. Ne iddia ediliyor
 
-- NOEMA, **bilinen ve yayınlanmış** yapıtaşlarını (holografik/VSA temsil, SDM bellek, NLMS/eikonal yerel öğrenme, yeniden yazma + doğrulama, program sentezi) tek bir **muhakeme-öncelikli** makinede birleştiren, bu deponun LIR/self-hosted gerçekliğine terzi işi uyarlanmış **uygulanabilir** bir mimari tasarımıdır.
+- Bu madde v0.1–v0.8 historical design record'dur ve v0.9 core için **geçersizdir**. Güncel çekirdek TTA + Karşıt İzden Sözleşme Derleme adayıdır; VSA/SDM/NLMS/LSH artık zorunlu core değildir (§25). Hiçbirinin uygulama/performans sonucu yoktur.
 - Her iddiası bir kapıya (K0–K10) ve her satırı bir dosya/ölçüm planına bağlıdır.
 - Analog-doğal + tamsayı emülasyon iki backend hedefidir. Bunun güncel sistemlere göre özgünlüğü, maliyet avantajı veya kazancı karşılaştırmalı araştırma/ölçüm yapılmadan iddia edilmez; K0/K9 ve dış baseline incelemesi gerekir.
 
@@ -1020,3 +1020,106 @@ Hız karşılaştırmasında adayın yanıtsız bıraktığı veya yanlış yan�
 | K39 — concurrency determinism | aynı seed/girdi ile farklı worker scheduling altında canonical answer/evidence aynı; elapsed time değişebilir |
 
 *Belge sürümü: v0.8 — 2026-11-16. Fast/deep inference ayrımı, kapasite yönetimi ve kalite-korumalı performans protokolü eklendi; hedefler ölçülmemiştir.*
+
+## 25. v0.9 — Mevcut paradigma özelliklerini çekirdekten çıkarma
+
+Bu sürüm, "başka sistemlerde kullanılan hiçbir özellik olmasın" talebini **mümkün olan en katı, dürüst yorumla** uygular: bilinen literatürde memory, search, learning, parsing, computation gibi temel kavramların daha önce hiç kullanılmadığını garanti etmek mümkün değildir. Ayrıca fiziksel hesaplama, durum saklama, girdiyi yorumlama ve sonucu üretme tüm çalışan sistemlerde ortak zorunluluklardır. Dolayısıyla global olarak "hiçbir benzeri yok" veya patent yeniliği iddiası yapılmaz. Bunun yerine NOEMA çekirdeğinde §16'da listelenen tanınabilir ailelerin (VSA/HDC, SDM, NLMS/eikonal, LSH, Hopfield/energy minimization, wake-sleep, transformer/Mamba/tokenizer/next-token) **zorunlu altyapı veya merkezî çalışma mekanizması olmasını bırakma**, mekanizmayı aşağıdaki yeni aday işlem modeline taşıma kararı alınır.
+
+### 25.1 Normatif değişiklik: önceki çizimler ne olur?
+
+- §3 H/VSA ve faz vektörü **artık çekirdek semantik değildir**; deneysel, kapatılabilir retrieval/cache backend'i olarak arşivlenir. Eğitim, doğruluk veya görev yönlendirme buna bağımlı olamaz.
+- §5 SDM/holografik M, §6 eikonal/SEL, LSH ve §4 enerji inişi **çekirdekten çıkarılır**. SEL geriye uyumluluk/karşılaştırma modülüdür, NOEMA'nın zorunlu öğrenme motoru değildir.
+- §4'teki VGPS adı, yalnızca aşağıdaki yeni işletim modeli için kullanılır; klasik program araması/kural rewrite ile eşanlamlı değildir. Kod sentezi araç/özel görev adaptörü olarak kalabilir.
+- Önceki §2 katman diyagramı tarihsel tasarım sürümüdür; aşağıdaki §25.2 çekirdek için üstün (normative) tanımdır. Eski adı taşıyan bir backend ancak etkinleştirme manifesti ve benchmark'ıyla açılır.
+- Basit tam sayı işlemleri, disk, graph, hash/checksum, queue, parser ve test yine gerekir. Bunların başka sistemlerde de kullanılması kaçınılmaz genel altyapıdır; özgünlük iddiası sayılmaz.
+
+### 25.2 Yeni merkezî primitive: Taahhüt–Tanık Akışı (TTA)
+
+NOEMA çekirdeği latent dense representation veya token state değil, **açık taahhütler ve onları kapatan tanıklar** üzerinde çalışır. Her istek, birbirine indirgenemeyen `Obligation` kayıtlarına ayrılır:
+
+```
+Obligation = {
+  id, statement, kind, scope, source_refs[], assumptions[],
+  required_witness, risk, status, deadline, parent_ids[]
+}
+Witness = {
+  obligation_id, witness_kind, artifact_ref, verifier_id,
+  verifier_result, limits[], counterexamples_checked[], provenance
+}
+State = {obligations[], witnesses[], conflicts[], resource_ledger}
+```
+
+Durum geçişi `advance(State, Event) → State' | TypedFailure`'dır. `Event` yeni kaynak, aday tanık, çelişki veya bütçe değişimidir. Geçiş immutable event üretir; geçmiş state overwrite edilmez. Sistem "en yakın embedding'i" izlemek yerine, **hangi taahhüt kapanmamış, hangi bağımsız tanık onu kapatabilir, hangi çelişki çözülmeli?** sorusunu önceliklendirir.
+
+- `kind=formal`: küçük proof kernel'in kabul ettiği tanıkla kapanır.
+- `kind=empirical`: ölçüm kaydı + yöntem + belirsizlik ve mümkünse tekrar ile `supported` olur; kesin teorem olmaz.
+- `kind=interpretive`: birden çok yorum ve kaynak spanı tutulur; uzlaşma yoksa unresolved kalır.
+- `kind=action`: önkoşul, yetki, yan etki, simüle edilen sonuç ve son durum gözlemi gerekir.
+- `kind=normative`: paydaş ve ilke çatışmaları kayıt edilir; sistem tek matematiksel doğruya indirgemez.
+
+Cevap üretimi, yalnız kullanıcının istediği çıktı kapsamındaki taahhütlerin kanıt seviyesiyle etiketlenmiş görünümüdür. TTA'da modelin iç durumu ile cevap metni aynı şey değildir; natural-language generator, taahhüt durumunu değiştiremez.
+
+### 25.3 Yeni seçim ilkesi: kapanmamış yükün kontrollü azaltılması
+
+Her açık obligation'ın kalan iş tahmini `cost_upper_bound`, zarar/risk katsayısı `risk_class` ve kullanıcı önceliği vardır. Scheduler, aday işlerin **beklenen açık-taahhüt azaltımını** kaynak maliyeti ve riskle karşılaştırır; tahminin doğruluk kaynağı olmadığını unutmaz.
+
+```text
+while budget > 0 and unresolved is not empty:
+    o ← deterministic_select(unresolved, risk, deadline, user_priority)
+    actions ← registered_witness_producers(o.kind)
+    for action in actions within per-tool budget:
+        candidate ← produce_witness(o, action)
+        result ← verifier_for(o.kind).check(candidate)
+        append Event(candidate, result, cost, provenance)
+        if result is valid within declared scope:
+            close o at that evidence level
+        else if result conflicts:
+            add explicit Conflict(obligation, candidate, counterexample)
+    if no safe progress: ask/abstain with unresolved set
+```
+
+Scheduler tie-break, producer registry ve verifier registry deterministic/sürümlüdür. Kapatma monotoniktir yalnız aynı scope/data version için; kaynak düzeltmesi eski tanığı silmez, invalidation event üretir. Her producer kendisini doğrulayamaz; `producer_id != verifier_id` kapısı uygulanır. Ortak kütüphane/algoritma bağımlılığının checker'ı da aynı hatayı paylaşma riski raporlanır.
+
+### 25.4 Yeni öğrenme primitive'i: Karşıt İzden Sözleşme Derleme
+
+Sürekli öğrenmede yeni örnek doğrudan weight veya kalıcı kural olmaz. Her örnek **iyi iz + en yakın başarısız iz + ayırt edici koşul** üçlüsüne dönüştürülmeye çalışılır:
+
+1. Örnekten `Obligation` ve kaynak sınırları çıkar.
+2. Aday çözüm/araç izi bir bağımsız verifier ile değerlendirilir.
+3. Başarısız en yakın karşıt örnek üretilir: tek bir koşulu değiştir, eski çözümün neden geçersiz olduğunu bul.
+4. İki iz arasındaki fark, tipli `TransitionContract` adayı olarak yazılır: önkoşul, izinli değişkenler, postcondition, counterexample set, geçerli scope.
+5. Yeni kontrat; farklı generator seed, dışarıda tutulan görev ailesi, adversarial örnek ve verifier çeşitliliği üzerinden sınanır.
+6. Başarırsa sürümlü producer registry'ye terfi eder; bu, parametre öğrenimi değildir. Sürekli model adaptasyonu ayrı, opsiyonel deneydir.
+7. Geçersiz kılma örneğinde kontrat `withdrawn` olur; tüm bağlı kararlar dependency graph üzerinden tekrar değerlendirilir.
+
+Böylece ana bilgi büyümesi veri-kümelenmiş latent state değil, **açık kontrat + kapsam + karşıt örnek + verifier** kümesidir. Bu tasarım daha açıklanabilir olabilir; hız, kapsam ve örnek verimliliği avantajı henüz kanıtlanmış değildir.
+
+### 25.5 Özgünlük kapısı (özgünlük iddiası için gerekli kanıt)
+
+Her çekirdek primitive için `novelty_record` oluştur: (a) amaç ve formal tanım; (b) bilinen benzer teknikler ve fark tablosu; (c) tarihli prior-art taraması/kaynaklar; (d) patent/akademik özgünlük uzmanı incelemesi gerekirse; (e) ablation: primitive kapatılınca hangi yetenek kayboluyor; (f) bağımsız implementasyon ve benchmark. Yalnızca yeni isim, yeni notasyon, birden çok eski tekniği yan yana koymak veya kaynak listesine atıf yapmamak yenilik değildir.
+
+Bu repo için bu turda **prior-art taraması yapılmadı**; dolayısıyla TTA ve Karşıt İzden Sözleşme Derleme "özgün icat" değil, NOEMA'nın **özgünlük adayı tasarım önerileri**dir. Tarama olmadan `novel`, `first`, `revolutionary` gibi doğrulanabilir tarihsel iddialar belgeye konamaz. Ürün hedefi "başka sistemlerde hiçbir ortak özellik yok" değil; **mevcut modellerin popüler merkezî mekanizmalarına zorunlu bağımlılığı olmayan, kendi işlemsel sözleşmeleriyle tarif edilen sistem** olmalıdır.
+
+### 25.6 Kabul/terk kapıları
+
+| Kapı | Test | Terk koşulu |
+|---|---|---|
+| K40 — TTA state correctness | event replay'den aynı state hash'i; invalidation ve scope değişimi fixture'ları | nondeterministic veya eski kanıtı sessizce tutarsa tasarım kabul edilmez |
+| K41 — independent witness | producer/verifier ayrımı, ortak hata envanteri, yanlış kabul testleri | verifier aynı üretim yoluna bağımlıysa formal closure yok |
+| K42 — contrastive contract | görülmeyen karşıt örnekte sözleşme sınırı doğru ayrılıyor mu | üretici/validator aynı seed/logic sızıntısıyla geçiyorsa veri seti geçersiz |
+| K43 — no-legacy-core ablation | VSA/SDM/SEL/LSH/eikonal kapalıyken dikey dilim çalışıyor mu | çalışmıyorsa bu bileşenler hâlâ core dependency'dir; iddia ve mimari düzeltilir |
+| K44 — originality review | teknik fark, prior art, ablation ve bağımsız review | tarama yok/örtüşme büyükse özgünlük iddiası yapılmaz; tasarım yeniden çalışılır |
+| K45 — quality/cost | aynı görev, kalite ve kaynak bütçesinde baseline karşılaştırması | daha iyi değilse hızlı/zeki/ucuz üstünlüğü iddiası yok; en iyi olduğu alana daraltılır |
+
+### 25.7 Yeni geliştirme sırası (önce özgünlük adayı, sonra uzman modüller)
+
+1. **TTA formal data model:** obligation/witness/conflict tipi, event replay, evidence-level invariants; yalnız stdlib/LIR.
+2. **En küçük doğrulayıcı:** exact integer ve küçük LIR programlarında ayrı verifier executable; producer/verifier bağımsızlığına test.
+3. **Küçük sentetik task DSL:** iyi iz/karşıt iz çiftleri; group split ve generator-seed holdout.
+4. **Karşıt İzden Sözleşme Derleme:** typed transition contract çıkarımı, counterexample tabanı, retraction/dependency propagation.
+5. **Fast/deep scheduler:** TTA yükünü seçme, sabit budget, deterministic event log; §24 metrikleri.
+6. **Tek vertical slice release:** LIR kod düzeltme veya exact matematikte train→candidate→evaluate→rollback uçtan uca.
+7. **Uzman modüller:** her yeni dil/algı/araç capability'si, kendi decoder, validator, dataset lineage ve K31+ kapılarıyla ayrı eklenti.
+8. **Yenilik denetimi:** çekirdek stabil olduktan sonra prior-art review; sonuç gelene dek isimlendirme "NOEMA önerisi", "dünya tarihinde ilk" değil.
+
+*Belge sürümü: v0.9 — 2026-11-16. Bilinen temsil/öğrenme/arama aileleri zorunlu core'dan çıkarılıp TTA özgünlük adayı olarak önerildi; prior-art ve performans sonucu yoktur.*
