@@ -33,6 +33,12 @@ The training text records now follow the architecture's `noema.example.v2` episo
 
 Quality is still limited: all records are synthetic, no human/dual review, the corpus is only 11 rows, and dev/test each contain one example. The TSV is currently manually paired with JSONL (not generated/cryptographically bound by a LIR JSON parser); actual payload/hash/license authenticity is not verified. This follows the schema shape, not the architecture's full production data-quality bar.
 
+## Türkçe eğitim varyantları (JSONL)
+
+`ai/noema-training/turkish_variants.v1.jsonl` 12 ayrı kayıt şemasını aynı sürümlü JSONL zarfında örnekler: supervised diyalog, tercih çifti, araç çağrı döngüsü, açıklama isteme, kanıta dayalı akıl yürütme, retrieval/atıf, kod düzeltme+test, güvenlik/onay, multimodal hizalama, zamansal seri, yapılandırılmış tablo dönüşümü ve kalibrasyon değerlendirmesi. Şema gerekçeleri ve kalite kuralları `ai/noema-training/DATASET_VARIANTS.md`; doğrulama `validate_variants.py` ve `test_validate_variants.py` içindedir. Kayıtlar sentetik ve gözden geçirilmemiş örneklerdir; benchmark veya insan verisi değildir.
+
+Bu varyantlar JSONL-only tasarım örnekleridir. Ana 99k eğitim hattının TSV projection bağımlılığı hâlâ vardır; JSONL-only talebinin LIR eğitim girişine tam entegrasyonu tamamlanmamıştır. TSV'den JSONL'ye migrasyonu yapılmadan bütün eğitim pipeline'ı JSONL kullanıyor denemez.
+
 ## Multimodal status (Stage 24)
 
 `noema_multimodal.lir` defines fail-closed LIR guards for closed MIME codes, modality-specific declared dimensions/duration/sample rate/channels/frame rate, a 64 MiB artifact cap, capability/budget admission, and result status. Host adapters must supply independently verified hash/consent outcomes and sniff actual payload bytes. This is metadata validation only. It does **not** decode image/audio/video/spatial payloads, perform OCR/ASR/generation, align synchronized streams, or provide a multimodal model. The 17/17 fixture checks exercise these guards, not media understanding.
