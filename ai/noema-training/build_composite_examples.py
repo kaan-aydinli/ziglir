@@ -18,6 +18,15 @@ PAIRS = [
     ("tr-var-structured-0001", "tr-var-sequence-0001"), # table transform + temporal reasoning
     ("tr-var-safety-0001", "tr-var-tool-0001"),      # authorization gate + tool execution
     ("tr-var-multimodal-0001", "tr-var-abstain-0001"), # media evidence + uncertainty
+    ("tr-cog-nlu-0001", "tr-var-tool-0001"),           # intent extraction + tool workflow
+    ("tr-cog-interpret-0001", "tr-var-ask-0001"),     # ambiguity + clarification
+    ("tr-cog-math-0001", "tr-var-structured-0001"),  # units + structured computation
+    ("tr-cog-plan-0001", "tr-var-code-0001"),         # planning + executable verification
+    ("tr-cog-write-0001", "tr-var-sft-0001"),         # constrained writing + supervised answer
+    ("tr-cog-translate-0001", "tr-var-sft-0001"),     # localized output + answer quality
+    ("tr-cog-summary-0001", "tr-var-retrieval-0001"), # faithful summary + citations
+    ("tr-cog-dialogue-state-0001", "tr-var-ask-0001"),# state tracking + slot clarification
+    ("tr-cog-instruction-0001", "tr-var-safety-0001"),# instruction priority + safety gate
 ]
 
 
@@ -35,7 +44,8 @@ def main() -> None:
                 "schema": "noema.composite_example.v1",
                 "id": f"tr-composite-{n:04d}",
                 "group_key": f"composite-family-{n:04d}",
-                "split": "train",
+                "split": "catalog",
+                "dataset_role": "illustration_only",
                 "variant_combo": variants,
                 "composition": {"mode": "multi_objective", "operator": "parallel_subtasks", "component_order_is_semantic": True},
                 "messages": [{"role": "user", "content": prompt}],

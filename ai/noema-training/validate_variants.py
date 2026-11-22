@@ -10,7 +10,10 @@ REQUIRED_VARIANTS = {
     "supervised_dialogue", "preference_pair", "tool_call_cycle", "clarification",
     "grounded_reasoning", "retrieval_grounded", "code_test_repair",
     "safety_refusal_or_confirm", "multimodal_alignment", "temporal_sequence",
-    "structured_table_transform", "calibration_judgment",
+    "structured_table_transform", "calibration_judgment", "natural_language_understanding",
+    "interpretation_with_alternatives", "calculation_with_units", "plan_with_dependencies",
+    "constrained_writing_revision", "translation_localization", "faithful_summarization",
+    "dialogue_state_tracking", "instruction_hierarchy",
 }
 SPLITS = {"train", "dev", "test"}
 DECISIONS = {"answer", "ask", "abstain", "tool", "unsupported"}
@@ -86,6 +89,32 @@ def validate(rows: Iterable[dict[str, Any]]) -> int:
             _need(row.get("evaluation", {}).get("expected_behavior") and row["evaluation"].get("rubric"), f"{where}: evaluation rubric missing")
         elif variant in {"supervised_dialogue", "clarification"}:
             _need(isinstance(row["target"].get("text"), str) and row["target"]["text"], f"{where}: target text missing")
+        elif variant == "natural_language_understanding":
+            frame = row.get("semantic_frame", {})
+            _need(frame.get("intent") and frame.get("constraints") is not None and frame.get("missing_slots") is not None, f"{where}: semantic frame incomplete")
+        elif variant == "interpretation_with_alternatives":
+            alternatives = row.get("interpretations", [])
+            _need(len(alternatives) >= 2 and row["target"].get("kind") == "clarification", f"{where}: ambiguity must preserve alternatives and clarify")
+        elif variant == "calculation_with_units":
+            problem, solution = row.get("problem", {}), row.get("solution", {})
+            _need(len(problem.get("givens", [])) >= 2 and solution.get("unit") and solution.get("checks"), f"{where}: unit-aware derivation incomplete")
+        elif variant == "plan_with_dependencies":
+            steps = row.get("plan", {}).get("steps", [])
+            step_ids = {s.get("id") for s in steps}
+            _need(bool(steps) and all(set(s.get("depends_on", [])) <= step_ids for s in steps), f"{where}: plan dependency is dangling")
+        elif variant == "constrained_writing_revision":
+            _need(row.get("writing_spec", {}).get("max_words", 0) > 0 and row.get("revision_checks", {}).get("within_limit") is True, f"{where}: writing constraints not checked")
+        elif variant == "translation_localization":
+            trans = row.get("translation", {})
+            _need(trans.get("source_language") and trans.get("target_locale") and trans.get("source_text") and row["target"].get("text"), f"{where}: translation metadata incomplete")
+        elif variant == "faithful_summarization":
+            source_id = row.get("source", {}).get("document_id")
+            _need(source_id and row.get("citations") and all(c.get("source_id") == source_id for c in row["citations"]), f"{where}: summary citations invalid")
+        elif variant == "dialogue_state_tracking":
+            state = row.get("dialogue_state", {})
+            _need(state.get("slots") and isinstance(state.get("unfilled"), list) and row["target"].get("kind") == "next_action", f"{where}: dialogue state incomplete")
+        elif variant == "instruction_hierarchy":
+            _need(row.get("instruction_resolution", {}).get("chosen_action") and row["target"].get("text"), f"{where}: instruction resolution missing")
         else:
             raise ValueError(f"{where}: unsupported variant {variant!r}")
         count += 1
@@ -113,6 +142,7 @@ def validate_composites(rows: Iterable[dict[str, Any]], atomic: dict[str, dict[s
     for n, row in enumerate(rows, 1):
         where = f"composite {n}"
         _need(row.get("schema") == "noema.composite_example.v1", f"{where}: invalid schema")
+        _need(row.get("split") == "catalog" and row.get("dataset_role") == "illustration_only", f"{where}: composite fixture must not masquerade as a training split")
         _need(row.get("id") not in ids, f"{where}: duplicate id")
         ids.add(row["id"])
         components = row.get("components", [])

@@ -10,7 +10,7 @@ class VariantCorpusTests(unittest.TestCase):
         cls.rows = read_jsonl(ROOT / "turkish_variants.v1.jsonl")
 
     def test_all_task_variants_validate(self):
-        self.assertEqual(validate(self.rows), 12)
+        self.assertEqual(validate(self.rows), 21)
 
     def test_duplicate_ids_rejected(self):
         rows = copy.deepcopy(self.rows)
@@ -42,7 +42,7 @@ class VariantCorpusTests(unittest.TestCase):
     def test_composite_examples_cover_all_atoms(self):
         atomic = {row["id"]: row for row in self.rows}
         composites = read_jsonl(ROOT / "turkish_composite_examples.v1.jsonl")
-        self.assertEqual(validate_composites(composites, atomic), 12)
+        self.assertEqual(validate_composites(composites, atomic), 21)
 
 
 if __name__ == "__main__":
