@@ -1,0 +1,71 @@
+// NOEMA Stage 24: bounded multimodal artifact admission contracts.
+// Metadata gates only; no media decoder, model, authorization, or host IO.
+const MM_TEXT: i64 = 0
+const MM_IMAGE: i64 = 1
+const MM_AUDIO: i64 = 2
+const MM_VIDEO: i64 = 3
+const MM_SPATIAL: i64 = 4
+const MM_OK: i64 = 1
+const MM_UNAVAILABLE: i64 = 0
+const MM_MAX_BYTES: i64 = 67108864
+const MM_MAX_IMAGE_SIDE: i64 = 16384
+const MM_MAX_AUDIO_MS: i64 = 600000
+const MM_MAX_VIDEO_MS: i64 = 600000
+const MM_MAX_VIDEO_FPS_MILLI: i64 = 120000
+const MM_MIME_TEXT_UTF8: i64 = 1
+const MM_MIME_IMAGE_JPEG: i64 = 10
+const MM_MIME_IMAGE_PNG: i64 = 11
+const MM_MIME_IMAGE_WEBP: i64 = 12
+const MM_MIME_AUDIO_WAV: i64 = 20
+const MM_MIME_AUDIO_MP3: i64 = 21
+const MM_MIME_AUDIO_OGG: i64 = 22
+const MM_MIME_AUDIO_FLAC: i64 = 23
+const MM_MIME_VIDEO_MP4: i64 = 30
+const MM_MIME_VIDEO_WEBM: i64 = 31
+const MM_MIME_SPATIAL_JSON: i64 = 40
+
+fn noema_mm_mime_matches(modality: i64, mime_code: i64) -> i64 {
+    if modality == MM_TEXT and mime_code == MM_MIME_TEXT_UTF8 { return 1 }
+    if modality == MM_IMAGE and (mime_code == MM_MIME_IMAGE_JPEG or mime_code == MM_MIME_IMAGE_PNG or mime_code == MM_MIME_IMAGE_WEBP) { return 1 }
+    if modality == MM_AUDIO and (mime_code == MM_MIME_AUDIO_WAV or mime_code == MM_MIME_AUDIO_MP3 or mime_code == MM_MIME_AUDIO_OGG or mime_code == MM_MIME_AUDIO_FLAC) { return 1 }
+    if modality == MM_VIDEO and (mime_code == MM_MIME_VIDEO_MP4 or mime_code == MM_MIME_VIDEO_WEBM) { return 1 }
+    if modality == MM_SPATIAL and mime_code == MM_MIME_SPATIAL_JSON { return 1 }
+    return 0
+}
+
+/// Validate base declared properties. `channels` is audio channels, and is
+/// otherwise zero. Video frame rate is checked by noema_mm_video_rate_valid.
+fn noema_mm_artifact_valid(modality: i64, mime_code: i64, byte_length: i64, duration_ms: i64, width: i64, height: i64, sample_rate: i64, channels: i64) -> i64 {
+    if modality < MM_TEXT or modality > MM_SPATIAL or noema_mm_mime_matches(modality, mime_code) != 1 { return 0 }
+    if byte_length <= 0 or byte_length > MM_MAX_BYTES { return 0 }
+    if duration_ms < 0 or width < 0 or height < 0 or sample_rate < 0 or channels < 0 { return 0 }
+    if modality == MM_IMAGE {
+        if width <= 0 or height <= 0 or width > MM_MAX_IMAGE_SIDE or height > MM_MAX_IMAGE_SIDE or duration_ms != 0 or sample_rate != 0 or channels != 0 { return 0 }
+    } else if modality == MM_AUDIO {
+        if duration_ms <= 0 or duration_ms > MM_MAX_AUDIO_MS or sample_rate < 8000 or sample_rate > 192000 or channels <= 0 or channels > 8 or width != 0 or height != 0 { return 0 }
+    } else if modality == MM_VIDEO {
+        if duration_ms <= 0 or duration_ms > MM_MAX_VIDEO_MS or width <= 0 or height <= 0 or width > MM_MAX_IMAGE_SIDE or height > MM_MAX_IMAGE_SIDE or sample_rate != 0 or channels != 0 { return 0 }
+    } else {
+        if duration_ms != 0 or width != 0 or height != 0 or sample_rate != 0 or channels != 0 { return 0 }
+    }
+    return 1
+}
+
+/// Host must independently verify payload digest and consent before accepting.
+fn noema_mm_integrity_valid(hash_verified: i64, consent_verified: i64) -> i64 {
+    if hash_verified == 1 and consent_verified == 1 { return 1 }
+    return 0
+}
+fn noema_mm_video_rate_valid(fps_milli: i64) -> i64 {
+    if fps_milli > 0 and fps_milli <= MM_MAX_VIDEO_FPS_MILLI { return 1 }
+    return 0
+}
+fn noema_mm_task_admissible(input_count: i64, valid_input_count: i64, output_mode: i64, capability_available: i64, budget_available: i64) -> i64 {
+    if input_count <= 0 or valid_input_count != input_count { return 0 }
+    if output_mode < MM_TEXT or output_mode > MM_SPATIAL or capability_available != 1 or budget_available != 1 { return 0 }
+    return 1
+}
+fn noema_mm_result_status(capability_available: i64, execution_completed: i64, validator_passed: i64) -> i64 {
+    if capability_available != 1 or execution_completed != 1 or validator_passed != 1 { return MM_UNAVAILABLE }
+    return MM_OK
+}

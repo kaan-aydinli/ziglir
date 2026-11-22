@@ -476,7 +476,9 @@ fn buildCFGInfo(f: *const IRFn, info: *CFGInfo) void {
     @memset(&info.dom_child_cnt, 0);
     @memset(&info.df, 0);
     info.rpo_len = 0;
-    if (n == 0) return;
+    // Dominance and frontier sets use u128 bitsets. Large functions still
+    // receive empty CFG metadata so callers safely fall back to local passes.
+    if (n == 0 or n > 128) return;
 
     // Build preds
     for (0..n) |bi| {
@@ -2630,7 +2632,7 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
                         // Associative constant reassociation: (x OP c1) OP c2 -> x OP (c1 OP c2)
                         if (inst.src1 > 0 and inst.src1 < MAX_TRACKED_VREGS and def_gen[inst.src1] == cur_gen) {
                             const dii = def_inst[inst.src1];
-                            if (b.insts[dii].dest == inst.src1) {
+                            if (dii < b.inst_count and b.insts[dii].dest == inst.src1) {
                                 const prev = b.insts[dii];
                                 if (prev.src2 > 0 and prev.src2 < MAX_TRACKED_VREGS and const_known[prev.src2]) {
                                     const c1 = const_val[prev.src2];

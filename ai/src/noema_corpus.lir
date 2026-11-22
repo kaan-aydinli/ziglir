@@ -1,0 +1,205 @@
+// NOEMA Stage 23: deterministic Turkish synthetic corpus generator.
+// Emits canonical noema.example.v2 JSONL plus the strict LIR training projection.
+// The records are synthetic/template-based and must not be presented as human or
+// real-world data. Each template family is wholly assigned to one split.
+const CORPUS_INVALID: i64 = -1
+const CORPUS_MAX_ROWS_PER_TEMPLATE: i64 = 2475
+
+fn corpus_write(fd: i64, text: string) {
+    var pos: i64 = 0
+    while pos < text.len as i64 {
+        let written = @write(fd, @ptr_add(text.ptr, pos), (text.len as i64) - pos)
+        if written <= 0 { exit(1) }
+        pos = pos + written
+    }
+}
+fn corpus_write_i64(fd: i64, value: i64) {
+    let digits = @malloc(24)
+    var n = value
+    var len: i64 = 0
+    if n == 0 { @write_u8(digits, 48 as u8) len = 1 }
+    while n > 0 { @write_u8(@ptr_add(digits, len), (48 + n % 10) as u8) len = len + 1 n = n / 10 }
+    var lo: i64 = 0
+    var hi = len - 1
+    while lo < hi {
+        let a = @read_u8(@ptr_add(digits, lo))
+        let b = @read_u8(@ptr_add(digits, hi))
+        @write_u8(@ptr_add(digits, lo), b)
+        @write_u8(@ptr_add(digits, hi), a)
+        lo = lo + 1
+        hi = hi - 1
+    }
+    var pos: i64 = 0
+    while pos < len {
+        let written = @write(fd, @ptr_add(digits, pos), len - pos)
+        if written <= 0 { exit(1) }
+        pos = pos + written
+    }
+}
+fn corpus_write_id(fd: i64, template: i64, sample: i64) {
+    corpus_write(fd, "tr-sentetik-")
+    corpus_write_i64(fd, template)
+    corpus_write(fd, "-")
+    corpus_write_i64(fd, sample)
+}
+fn corpus_family(fd: i64, class_id: i64) {
+    if class_id == 0 or class_id == 1 { corpus_write(fd, "reasoning") return }
+    if class_id == 2 { corpus_write(fd, "causal") return }
+    corpus_write(fd, "code")
+}
+fn corpus_capability(fd: i64, class_id: i64) {
+    if class_id == 0 { corpus_write(fd, "exact_arithmetic") return }
+    if class_id == 1 { corpus_write(fd, "insufficient_information") return }
+    if class_id == 2 { corpus_write(fd, "correlation_vs_causation") return }
+    corpus_write(fd, "code_execution")
+}
+fn corpus_decision(fd: i64, class_id: i64) {
+    if class_id == 0 { corpus_write(fd, "answer") return }
+    if class_id == 1 { corpus_write(fd, "ask") return }
+    if class_id == 2 { corpus_write(fd, "abstain") return }
+    corpus_write(fd, "tool")
+}
+fn corpus_evidence(fd: i64, class_id: i64) {
+    if class_id == 0 { corpus_write(fd, "proof") return }
+    if class_id == 1 { corpus_write(fd, "insufficient") return }
+    if class_id == 2 { corpus_write(fd, "hypothesis") return }
+    corpus_write(fd, "property")
+}
+fn corpus_write_prompt(fd: i64, template: i64, a: i64, b: i64) {
+    let variant = template % 10
+    if template < 10 {
+        if variant == 0 { corpus_write(fd, "İki sayının toplamı kaçtır? Birinci sayı ") corpus_write_i64(fd, a) corpus_write(fd, ", ikinci sayı ") corpus_write_i64(fd, b) corpus_write(fd, ".") return }
+        if variant == 1 { corpus_write(fd, "Sepette ") corpus_write_i64(fd, a) corpus_write(fd, " elma ve ") corpus_write_i64(fd, b) corpus_write(fd, " armut var. Toplam meyve sayısı kaçtır?") return }
+        if variant == 2 { corpus_write(fd, "Bir sınıfta ") corpus_write_i64(fd, a) corpus_write(fd, " öğrenci vardı, ") corpus_write_i64(fd, b) corpus_write(fd, " öğrenci daha geldi. Toplam kaç öğrenci oldu?") return }
+        if variant == 3 { corpus_write(fd, "Bir çiftlikte ") corpus_write_i64(fd, a) corpus_write(fd, " koyun ve ") corpus_write_i64(fd, b) corpus_write(fd, " keçi var. Hayvanların toplamı kaçtır?") return }
+        if variant == 4 { corpus_write(fd, "Bir sepette ") corpus_write_i64(fd, a) corpus_write(fd, " armut ve ") corpus_write_i64(fd, b) corpus_write(fd, " elma var. Toplam meyve sayısı kaçtır?") return }
+        if variant == 5 { corpus_write(fd, "Bir rafta ") corpus_write_i64(fd, a) corpus_write(fd, " kitap vardı ve rafa ") corpus_write_i64(fd, b) corpus_write(fd, " kitap daha kondu. Yeni sayı nedir?") return }
+        if variant == 6 { corpus_write(fd, "Bir depoda ") corpus_write_i64(fd, a) corpus_write(fd, " koli vardı; ") corpus_write_i64(fd, b) corpus_write(fd, " koli daha geldi. Kaç koli oldu?") return }
+        if variant == 7 { corpus_write(fd, "Bir otobüste ") corpus_write_i64(fd, a) corpus_write(fd, " yolcu vardı ve ") corpus_write_i64(fd, b) corpus_write(fd, " kişi bindi. Son durumda kaç yolcu var?") return }
+        if variant == 8 { corpus_write(fd, "Bir mahalleye ") corpus_write_i64(fd, a) corpus_write(fd, " kişi taşındı, sonra ") corpus_write_i64(fd, b) corpus_write(fd, " kişi daha geldi. Toplam kaç kişi geldi?") return }
+        corpus_write(fd, "Bahçeye ") corpus_write_i64(fd, a) corpus_write(fd, " fidan dikildi ve ") corpus_write_i64(fd, b) corpus_write(fd, " fidan daha eklendi. Yeni toplam kaçtır?") return
+    }
+    if template < 20 {
+        if variant == 0 { corpus_write(fd, "Dikdörtgenin alanı ") corpus_write_i64(fd, a) corpus_write(fd, " santimetrekare. Bir kenarın uzunluğu nedir?") return }
+        if variant == 1 { corpus_write(fd, "Bir kutunun kütlesi ") corpus_write_i64(fd, a) corpus_write(fd, " gram. İçindeki tek bir parçanın kütlesi kaçtır?") return }
+        if variant == 2 { corpus_write(fd, "Bir yolculuk ") corpus_write_i64(fd, a) corpus_write(fd, " saat sürdü. Alınan yol kaç kilometredir?") return }
+        if variant == 3 { corpus_write(fd, "Bir sınıfta ") corpus_write_i64(fd, a) corpus_write(fd, " öğrenci var. Kız öğrenci sayısı kaçtır?") return }
+        if variant == 4 { corpus_write(fd, "Bir ürünün etiket fiyatı ") corpus_write_i64(fd, a) corpus_write(fd, " liradır. İndirimli fiyat nedir?") return }
+        if variant == 5 { corpus_write(fd, "Bir havuzda ") corpus_write_i64(fd, a) corpus_write(fd, " litre su var. Havuzun derinliği nedir?") return }
+        if variant == 6 { corpus_write(fd, "Bir tarlanın çevresi ") corpus_write_i64(fd, a) corpus_write(fd, " metredir. Uzun kenarı kaç metredir?") return }
+        if variant == 7 { corpus_write(fd, "Bir şeklin alanı ") corpus_write_i64(fd, a) corpus_write(fd, " birimkare ve çevresi ") corpus_write_i64(fd, b) corpus_write(fd, " birim. Kenarları nedir?") return }
+        if variant == 8 { corpus_write(fd, "Bir gezi ") corpus_write_i64(fd, a) corpus_write(fd, " saat sürdü. Aracın ortalama hızı nedir?") return }
+        corpus_write(fd, "Bir pakette ") corpus_write_i64(fd, a) corpus_write(fd, " parça var. Her parçanın ağırlığı nedir?") return
+    }
+    if template < 30 {
+        if variant == 0 { corpus_write(fd, "Şemsiye satışı ") corpus_write_i64(fd, a) corpus_write(fd, " iken ıslak kaldırım sayısı ") corpus_write_i64(fd, b) corpus_write(fd, " oldu. Bu ilişki nedenselliği kanıtlar mı?") return }
+        if variant == 1 { corpus_write(fd, "Dondurma satışı ") corpus_write_i64(fd, a) corpus_write(fd, ", sağlık başvuruları ") corpus_write_i64(fd, b) corpus_write(fd, ". Dondurma başvurulara neden oldu mu?") return }
+        if variant == 2 { corpus_write(fd, "Reklam harcaması ") corpus_write_i64(fd, a) corpus_write(fd, " liraya, satışlar ") corpus_write_i64(fd, b) corpus_write(fd, " ürüne çıktı. Reklam artışın nedeni midir?") return }
+        if variant == 3 { corpus_write(fd, "Ayakkabı numarası ortalaması ") corpus_write_i64(fd, a) corpus_write(fd, ", gelir ortalaması ") corpus_write_i64(fd, b) corpus_write(fd, ". Biri diğerine neden olur mu?") return }
+        if variant == 4 { corpus_write(fd, "Kahve tüketimi ") corpus_write_i64(fd, a) corpus_write(fd, " fincana, üretkenlik puanı ") corpus_write_i64(fd, b) corpus_write(fd, " değerine yükseldi. Kahve artışa neden oldu mu?") return }
+        if variant == 5 { corpus_write(fd, "Çalışma süresi ") corpus_write_i64(fd, a) corpus_write(fd, " saat, sınav puanı ") corpus_write_i64(fd, b) corpus_write(fd, ". Bu tek gözlem nedensellik gösterir mi?") return }
+        if variant == 6 { corpus_write(fd, "Bisiklet sayısı ") corpus_write_i64(fd, a) corpus_write(fd, ", güneşli gün sayısı ") corpus_write_i64(fd, b) corpus_write(fd, ". Bisikletler güneşli havaya neden olur mu?") return }
+        if variant == 7 { corpus_write(fd, "Bir bölgede yağış ") corpus_write_i64(fd, a) corpus_write(fd, " mm iken şemsiye kullanımı ") corpus_write_i64(fd, b) corpus_write(fd, " oldu. Hangi değişken hangisine neden oldu?") return }
+        if variant == 8 { corpus_write(fd, "Dondurma tüketimi ") corpus_write_i64(fd, a) corpus_write(fd, " porsiyon, sıcaklık ") corpus_write_i64(fd, b) corpus_write(fd, " derece olarak kaydedildi. Tüketim sıcaklığı artırdı mı?") return }
+        corpus_write(fd, "Bir ankette ekran süresi ") corpus_write_i64(fd, a) corpus_write(fd, " saat, uyku süresi ") corpus_write_i64(fd, b) corpus_write(fd, " saat çıktı. Tek başına neden-sonuç çıkar mı?") return
+    }
+    if variant == 0 { corpus_write(fd, "n=") corpus_write_i64(fd, a) corpus_write(fd, " için toplamı bulan LIR fonksiyonunu yaz, derle ve test et.") return }
+    if variant == 1 { corpus_write(fd, "Uzunluğu ") corpus_write_i64(fd, a) corpus_write(fd, " olan listedeki en büyük değeri bulan LIR fonksiyonunu yaz.") return }
+    if variant == 2 { corpus_write(fd, "En çok ") corpus_write_i64(fd, a) corpus_write(fd, " satırlı dosyanın satırlarını sayan LIR programı oluştur.") return }
+    if variant == 3 { corpus_write(fd, "En fazla ") corpus_write_i64(fd, a) corpus_write(fd, " elemanlı diziyi sıralayan LIR fonksiyonu üret ve test et.") return }
+    if variant == 4 { corpus_write(fd, "Bir LIR fonksiyonunun ") corpus_write_i64(fd, a) corpus_write(fd, " girdi örneği için çıktısını doğrulayacak test yaz.") return }
+    if variant == 5 { corpus_write(fd, "Metindeki ") corpus_write_i64(fd, a) corpus_write(fd, " kelimeyi sayan LIR programını derle ve çalıştır.") return }
+    if variant == 6 { corpus_write(fd, "Dosyada ") corpus_write_i64(fd, a) corpus_write(fd, " kaydı tarayıp eşleşmeyi bulan LIR kodu yaz.") return }
+    if variant == 7 { corpus_write(fd, "Verilen ") corpus_write_i64(fd, a) corpus_write(fd, " koşul için LIR fonksiyonu üret, derle ve test et.") return }
+    if variant == 8 { corpus_write(fd, "Dizideki ") corpus_write_i64(fd, a) corpus_write(fd, " elemanı filtreleyen LIR programı yazıp çalıştır.") return }
+    corpus_write(fd, "Bir metin dosyasından en fazla ") corpus_write_i64(fd, a) corpus_write(fd, " bayt okuyup sonucu test eden LIR kodu üret.")
+}
+fn corpus_write_target(fd: i64, class_id: i64, a: i64, b: i64) {
+    if class_id == 0 { corpus_write(fd, "Toplam ") corpus_write_i64(fd, a + b) corpus_write(fd, ".") return }
+    if class_id == 1 { corpus_write(fd, "Tek bir yanıt için ek ölçü veya ikinci koşul gerekir.") return }
+    if class_id == 2 { corpus_write(fd, "Bu gözlem tek başına nedenselliği göstermez; ortak neden veya müdahale verisi gerekir.") return }
+    corpus_write(fd, "Bu istek için LIR kodu üretip derleme ve test aracı kullanmalıyım.")
+}
+fn corpus_write_group(fd: i64, class_id: i64, variant: i64) {
+    corpus_write(fd, "tr-sentetik-gorev-")
+    corpus_write_i64(fd, class_id)
+    corpus_write(fd, "-sablon-")
+    corpus_write_i64(fd, variant)
+}
+fn corpus_risk(fd: i64, class_id: i64) {
+    if class_id == 2 { corpus_write(fd, "medium") } else { corpus_write(fd, "low") }
+}
+fn corpus_split(template: i64) -> i64 {
+    let variant = template % 10
+    // Whole template groups stay in one split: 8/1/1 groups per class.
+    if variant < 8 { return 0 }
+    if variant < 9 { return 1 }
+    return 2
+}
+fn corpus_split_name(fd: i64, split: i64) {
+    if split == 0 { corpus_write(fd, "train") return }
+    if split == 1 { corpus_write(fd, "dev") return }
+    corpus_write(fd, "test")
+}
+
+/// Write paired canonical v2 JSONL and metadata-rich TSV. Returns record count.
+fn generate_turkish_corpus(rows_per_template: i64) -> i64 {
+    if rows_per_template <= 0 or rows_per_template > CORPUS_MAX_ROWS_PER_TEMPLATE { return CORPUS_INVALID }
+    let json_fd = @open("ai/noema-training/turkish_synthetic.v2.jsonl", 577, 420)
+    let tsv_fd = @open("ai/noema-training/turkish_synthetic.tsv", 577, 420)
+    if json_fd < 0 or tsv_fd < 0 { return CORPUS_INVALID }
+    var template: i64 = 0
+    var total: i64 = 0
+    while template < 40 {
+        let class_id = template / 10
+        let variant = template % 10
+        let split = corpus_split(template)
+        var sample: i64 = 0
+        while sample < rows_per_template {
+            let seed = template * 100000 + sample + 1
+            let a = 2 + (sample * 7 + template * 3) % 97
+            let b = 1 + (sample * 13 + template) % 89
+            let answer = a + b
+
+            corpus_write(json_fd, "{\"schema\":\"noema.example.v2\",\"id\":\"")
+            corpus_write_id(json_fd, template, sample)
+            corpus_write(json_fd, "\",\"split\":\"") corpus_split_name(json_fd, split)
+            corpus_write(json_fd, "\",\"group_key\":\"") corpus_write_group(json_fd, class_id, variant)
+            corpus_write(json_fd, "\",\"seed\":") corpus_write_i64(json_fd, seed)
+            corpus_write(json_fd, ",\"task\":{\"family\":\"") corpus_family(json_fd, class_id)
+            corpus_write(json_fd, "\",\"capability\":\"") corpus_capability(json_fd, class_id)
+            corpus_write(json_fd, "\",\"risk\":\"") corpus_risk(json_fd, class_id)
+            corpus_write(json_fd, "\"},\"conversation\":[{\"role\":\"user\",\"parts\":[{\"kind\":\"text\",\"text\":\"")
+            corpus_write_prompt(json_fd, template, a, b)
+            corpus_write(json_fd, "\"}]}],\"context\":{\"facts\":[],\"units\":{},\"constraints\":[],\"unknowns\":[\"Bu örnek sentetik üretimden gelir.\"]},\"target_graph\":{\"template\":")
+            corpus_write_i64(json_fd, template)
+            if class_id == 0 { corpus_write(json_fd, ",\"answer\":") corpus_write_i64(json_fd, answer) }
+            corpus_write(json_fd, "},\"target\":{\"decision\":\"") corpus_decision(json_fd, class_id)
+            corpus_write(json_fd, "\",\"parts\":[{\"kind\":\"text\",\"text\":\"") corpus_write_target(json_fd, class_id, a, b)
+            corpus_write(json_fd, "\"}]},\"grounding\":[],\"evidence\":{\"kind\":\"") corpus_evidence(json_fd, class_id)
+            corpus_write(json_fd, "\",\"ref\":\"synthetic-seed-") corpus_write_i64(json_fd, seed)
+            corpus_write(json_fd, "\"},\"validator\":{\"name\":\"generator_contract\",\"condition\":\"template and class contract\"},\"tools\":{\"allowed\":[] ,\"trace\":[]},\"safety\":{\"policy_version\":\"synthetic-v1\",\"labels\":[],\"pii\":\"none\"},\"quality\":{\"review\":\"synthetic\",\"disagreement\":null},\"provenance\":{\"source\":\"synthetic\",\"license\":\"internal-demo\",\"consent\":\"training\",\"created_by\":\"lir-generator-v1\"}}\n")
+
+            corpus_write(tsv_fd, "noema.example.v2\t") corpus_write_id(tsv_fd, template, sample)
+            corpus_write(tsv_fd, "\t") corpus_split_name(tsv_fd, split)
+            corpus_write(tsv_fd, "\t") corpus_write_group(tsv_fd, class_id, variant)
+            corpus_write(tsv_fd, "\t") corpus_write_i64(tsv_fd, seed)
+            corpus_write(tsv_fd, "\t") corpus_family(tsv_fd, class_id)
+            corpus_write(tsv_fd, "\t") corpus_capability(tsv_fd, class_id)
+            corpus_write(tsv_fd, "\t") corpus_risk(tsv_fd, class_id)
+            corpus_write(tsv_fd, "\t") corpus_decision(tsv_fd, class_id)
+            corpus_write(tsv_fd, "\t") corpus_evidence(tsv_fd, class_id)
+            corpus_write(tsv_fd, "\tsynthetic\tinternal-demo\ttraining\tsynthetic\tlir-generator-v1\t")
+            if class_id == 2 { corpus_write(tsv_fd, "none\tnone\t") }
+            else { corpus_write(tsv_fd, "none\tnone\t") }
+            corpus_write_prompt(tsv_fd, template, a, b)
+            corpus_write(tsv_fd, "\t") corpus_write_target(tsv_fd, class_id, a, b)
+            corpus_write(tsv_fd, "\n")
+            sample = sample + 1
+            total = total + 1
+        }
+        template = template + 1
+    }
+    if @close(json_fd) != 0 or @close(tsv_fd) != 0 { return CORPUS_INVALID }
+    return total
+}

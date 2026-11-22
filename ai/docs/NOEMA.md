@@ -17,6 +17,7 @@
 | Exact-rule inference, derivation/proof-certificate validation, explicit query status | `ai/src/noema_reasoning.lir` | `ai/tests/23_noema_reasoning.lir`–`ai/tests/27_noema_proof_certificate.lir` |
 | Bounded volatile scoped record store (append/find/tombstone/compact with expiry and vacated-cell clearing) | `ai/src/noema_store.lir` | `ai/tests/28_noema_store.lir`, `ai/tests/29_noema_store_compaction.lir` |
 | Deficit-guided curriculum frontier selection and group split leakage check | `ai/src/noema_training.lir` | `ai/tests/30_noema_training_data.lir` |
+| Multimodal episode/artifact admission guards (text/image/audio/video/spatial metadata; no media decoder) | `ai/src/noema_multimodal.lir` | `ai/tests/37_noema_multimodal.lir` |
 | Typed-array SEL regression fit, split-isolated evaluation and epoch loss history | `ai/src/noema_fit.lir`, `ai/src/ledger.lir` | `ai/tests/31_noema_fit.lir` |
 | Strict integer CSV to Q32.32 feature/target arrays | `ai/src/noema_csv.lir` | `ai/tests/32_noema_csv.lir` |
 | CSV ingestion → fit → held-out split evaluation smoke pipeline | composed LIR modules | `ai/tests/33_noema_training_pipeline.lir` |
@@ -30,6 +31,10 @@ The latest LIR suite passes all 103 fixture/backend executions (including Stage 
 The training text records now follow the architecture's `noema.example.v2` episode fields: version, id, group key, seed, task/capability/risk, raw user text, explicit context/unknowns, target decision/text, evidence kind, validator, review state, safety and provenance. `example_text.tsv` is a strict LIR training projection with ID/group/seed/task/evidence/license/consent/review metadata; the decoder fails closed on unknown split/decision/risk/evidence/review values, missing required fields, duplicate IDs, non-training consent, and group leakage across train/dev/test. The split is grouped by rule family (train 9, dev 1 causal, test 1 safety), correcting the earlier arithmetic/planning cross-split contamination and correcting plan-002's invalid unreachable label.
 
 Quality is still limited: all records are synthetic, no human/dual review, the corpus is only 11 rows, and dev/test each contain one example. The TSV is currently manually paired with JSONL (not generated/cryptographically bound by a LIR JSON parser); actual payload/hash/license authenticity is not verified. This follows the schema shape, not the architecture's full production data-quality bar.
+
+## Multimodal status (Stage 24)
+
+`noema_multimodal.lir` defines fail-closed LIR guards for closed MIME codes, modality-specific declared dimensions/duration/sample rate/channels/frame rate, a 64 MiB artifact cap, capability/budget admission, and result status. Host adapters must supply independently verified hash/consent outcomes and sniff actual payload bytes. This is metadata validation only. It does **not** decode image/audio/video/spatial payloads, perform OCR/ASR/generation, align synchronized streams, or provide a multimodal model. The 17/17 fixture checks exercise these guards, not media understanding.
 
 ## Not implemented
 

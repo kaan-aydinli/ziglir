@@ -273,7 +273,7 @@ fn learn(b: SelBlock, x: *u8, target: *u8, eta: i64) -> i64 {
 
 // NOEMA Stage 17: deterministic typed-array fit/evaluation loop.
 const FIT_INVALID: i64 = -1
-const FIT_MAX_ROWS: i64 = 4096
+const FIT_MAX_ROWS: i64 = 100000
 const FIT_MAX_EPOCHS: i64 = 10000
 const FIT_TRAIN: i64 = 0
 const FIT_DEV: i64 = 1
@@ -388,4 +388,89 @@ fn mean_energy(b: SelBlock, e: i64) -> i64 {
         return e
     }
     return div(e, from_int(b.nout))
+}
+
+// Portable SELQ32V2 classifier artifact; checksum detects accidental corruption only.
+const SELQ_MAX_NIN: i64 = 4096
+const SELQ_MAX_NOUT: i64 = 64
+const SELQ_MAX_K: i64 = 4096
+fn selq_write_all(fd: i64, data: *u8, length: i64) -> i64 {
+    var pos: i64 = 0
+    while pos < length { let n = @write(fd, @ptr_add(data, pos), length - pos) if n <= 0 { return 0 } pos = pos + n }
+    return 1
+}
+fn selq_read_all(fd: i64, data: *u8, length: i64) -> i64 {
+    var pos: i64 = 0
+    while pos < length { let n = @read(fd, @ptr_add(data, pos), length - pos) if n <= 0 { return 0 } pos = pos + n }
+    return 1
+}
+fn selq_write_u64le(fd: i64, value: i64) -> i64 {
+    let bytes = @malloc(8)
+    var i: i64 = 0
+    while i < 8 { @write_u8(@ptr_add(bytes, i), (value >> (i * 8)) as u8) i = i + 1 }
+    return selq_write_all(fd, bytes, 8)
+}
+fn selq_read_u64le(fd: i64, output: *u8) -> i64 {
+    let bytes = @malloc(8)
+    if selq_read_all(fd, bytes, 8) != 1 { return 0 }
+    var value: u64 = 0
+    var i: i64 = 0
+    while i < 8 { value = value + ((@read_u8(@ptr_add(bytes, i)) as u64) << (i * 8)) i = i + 1 }
+    @write_u64(output, value)
+    return 1
+}
+fn selq_checksum(bytes: *u8, length: i64) -> i64 {
+    var hash: i64 = 2166136261
+    var i: i64 = 0
+    while i < length { hash = (hash * 16777619 + (@read_u8(@ptr_add(bytes, i)) as i64)) % 2147483647 i = i + 1 }
+    return hash
+}
+fn selq_encode_cells(source: *u8, payload: *u8, cells: i64) {
+    var i: i64 = 0
+    while i < cells { let value = @read_u64(@ptr_add(source, i * 8)) var b: i64 = 0 while b < 8 { @write_u8(@ptr_add(payload, i * 8 + b), (value >> (b * 8)) as u8) b = b + 1 } i = i + 1 }
+}
+fn selq_decode_cells(payload: *u8, target: *u8, cells: i64) {
+    var i: i64 = 0
+    while i < cells { var value: u64 = 0 var b: i64 = 0 while b < 8 { value = value + ((@read_u8(@ptr_add(payload, i * 8 + b)) as u64) << (b * 8)) b = b + 1 } @write_u64(@ptr_add(target, i * 8), value) i = i + 1 }
+}
+fn sel_checkpoint_save(b: SelBlock, path: string, training_rows: i64, epochs: i64, seed: i64) -> i64 {
+    if b.nin <= 0 or b.nin > SELQ_MAX_NIN or b.nout <= 0 or b.nout > SELQ_MAX_NOUT or b.k <= 0 or b.k > SELQ_MAX_K or training_rows <= 0 or epochs <= 0 or seed <= 0 { return 0 }
+    let edge_cells = b.nout * b.k * EDGE_STRIDE
+    let cells = edge_cells + b.nout
+    let payload = @malloc(cells * 8)
+    selq_encode_cells(b.edges, payload, edge_cells)
+    selq_encode_cells(b.bias, @ptr_add(payload, edge_cells * 8), b.nout)
+    let checksum = selq_checksum(payload, cells * 8)
+    let fd = @open(path, 577, 420)
+    if fd < 0 { return 0 }
+    let magic = "SELQ32V2"
+    if selq_write_all(fd, magic.ptr as *u8, 8) != 1 { @close(fd) return 0 }
+    if selq_write_u64le(fd, 2) != 1 or selq_write_u64le(fd, 4294967296) != 1 or selq_write_u64le(fd, b.nin) != 1 or selq_write_u64le(fd, b.nout) != 1 or selq_write_u64le(fd, b.k) != 1 or selq_write_u64le(fd, 1) != 1 or selq_write_u64le(fd, 1) != 1 or selq_write_u64le(fd, training_rows) != 1 or selq_write_u64le(fd, epochs) != 1 or selq_write_u64le(fd, seed) != 1 or selq_write_u64le(fd, checksum) != 1 { @close(fd) return 0 }
+    if selq_write_all(fd, payload, cells * 8) != 1 { @close(fd) return 0 }
+    return if @close(fd) == 0 { 1 } else { 0 }
+}
+fn sel_checkpoint_load(b: SelBlock, path: string) -> i64 {
+    if b.nin <= 0 or b.nin > SELQ_MAX_NIN or b.nout <= 0 or b.nout > SELQ_MAX_NOUT or b.k <= 0 or b.k > SELQ_MAX_K { return 0 }
+    let fd = @open(path, 0, 0)
+    if fd < 0 { return 0 }
+    let magic = "SELQ32V2"
+    let found = @malloc(8)
+    if selq_read_all(fd, found, 8) != 1 { @close(fd) return 0 }
+    var i: i64 = 0
+    while i < 8 { if @read_u8(@ptr_add(found, i)) != @read_u8(@ptr_add(magic.ptr, i)) { @close(fd) return 0 } i = i + 1 }
+    let meta = @malloc(88)
+    i = 0
+    while i < 11 { if selq_read_u64le(fd, @ptr_add(meta, i * 8)) != 1 { @close(fd) return 0 } i = i + 1 }
+    if (@read_u64(meta) as i64) != 2 or (@read_u64(@ptr_add(meta, 8)) as i64) != 4294967296 or (@read_u64(@ptr_add(meta, 16)) as i64) != b.nin or (@read_u64(@ptr_add(meta, 24)) as i64) != b.nout or (@read_u64(@ptr_add(meta, 32)) as i64) != b.k or (@read_u64(@ptr_add(meta, 40)) as i64) != 1 or (@read_u64(@ptr_add(meta, 48)) as i64) != 1 or (@read_u64(@ptr_add(meta, 56)) as i64) <= 0 or (@read_u64(@ptr_add(meta, 64)) as i64) <= 0 or (@read_u64(@ptr_add(meta, 72)) as i64) <= 0 { @close(fd) return 0 }
+    let edge_cells = b.nout * b.k * EDGE_STRIDE
+    let cells = edge_cells + b.nout
+    let payload = @malloc(cells * 8)
+    if selq_read_all(fd, payload, cells * 8) != 1 { @close(fd) return 0 }
+    let trailing = @malloc(1)
+    if @read(fd, trailing, 1) != 0 { @close(fd) return 0 }
+    if @close(fd) != 0 { return 0 }
+    if selq_checksum(payload, cells * 8) != (@read_u64(@ptr_add(meta, 80)) as i64) { return 0 }
+    selq_decode_cells(payload, b.edges, edge_cells)
+    selq_decode_cells(@ptr_add(payload, edge_cells * 8), b.bias, b.nout)
+    return 1
 }

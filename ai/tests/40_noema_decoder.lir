@@ -1,0 +1,40 @@
+import "../src/noema_decoder.lir"
+fn main() -> i64 {
+    let weights = @malloc(DECODER_CELLS * 8)
+    let output = @malloc(DECODER_MAX_OUTPUT)
+    let features = @malloc(DECODER_INPUT_DIM * 8)
+    var d: i64 = 0
+    while d < DECODER_INPUT_DIM { @write_u64(@ptr_add(features, d * 8), 0 as u64) d = d + 1 }
+    @write_u64(features, 4294967296 as u64)
+    noema_decoder_zero(weights)
+    let target = "weights"
+    var passed: i64 = 0
+    var checks: i64 = 0
+    checks = checks + 1
+    if noema_decoder_train(weights, 2, target.ptr as *u8, target.len as i64, features, DECODER_INPUT_DIM) == 7 { passed = passed + 1 }
+    checks = checks + 1
+    if noema_decoder_train(weights, 2, target.ptr as *u8, target.len as i64, features, DECODER_INPUT_DIM) == 7 { passed = passed + 1 }
+    checks = checks + 1
+    if noema_decoder_train(weights, 4, target.ptr as *u8, target.len as i64, features, DECODER_INPUT_DIM) == 0 { passed = passed + 1 }
+    checks = checks + 1
+    if noema_decoder_save(weights, "ai/tests/noema_decoder_fixture.seltok", 2, 1, 9) == 1 { passed = passed + 1 }
+    noema_decoder_zero(weights)
+    checks = checks + 1
+    if noema_decoder_load(weights, "ai/tests/noema_decoder_fixture.seltok") == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if noema_decoder_generate(weights, 2, features, DECODER_INPUT_DIM, output, DECODER_MAX_OUTPUT) == 7 { passed = passed + 1 }
+    var same = 1
+    var i: i64 = 0
+    while i < 7 { if @read_u8(@ptr_add(output, i)) != @read_u8(@ptr_add(target.ptr, i)) { same = 0 } i = i + 1 }
+    checks = checks + 1
+    if same == 1 { passed = passed + 1 }
+    @unlink("ai/tests/noema_decoder_fixture.seltok")
+    checks = checks + 1
+    if noema_decoder_generate(weights, 1, features, DECODER_INPUT_DIM, output, DECODER_MAX_OUTPUT) == 0 { passed = passed + 1 }
+    printInt(passed)
+    println("")
+    print("/")
+    printInt(checks)
+    println("")
+    return 0
+}

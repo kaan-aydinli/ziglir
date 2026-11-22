@@ -5,7 +5,7 @@
 // projection exists for the current LIR learner, which has no JSON parser.
 // ASCII alphanumeric token hashing only; this is not Unicode NLP.
 const TEXT_INVALID: i64 = -1
-const TEXT_MAX_ROWS: i64 = 256
+const TEXT_MAX_ROWS: i64 = 100000
 const TEXT_MAX_FEATURES: i64 = 256
 const TEXT_MAX_LINE_BYTES: i64 = 4096
 const TEXT_CLASSES: i64 = 4
@@ -99,8 +99,18 @@ fn noema_text_decode(length: i64, bytes: *u8, row_capacity: i64, feature_dim: i6
     if length <= 0 or row_capacity <= 0 or row_capacity > TEXT_MAX_ROWS or feature_dim <= 0 or feature_dim > TEXT_MAX_FEATURES { return TEXT_INVALID }
     var pos: i64 = 0
     var rows: i64 = 0
-    let starts = @malloc(18 * 8)
-    let ends = @malloc(18 * 8)
+    let starts = @malloc(19 * 8)
+    let ends = @malloc(19 * 8)
+    let table_size = row_capacity * 2 + 1
+    let id_table = @malloc(table_size * 8)
+    let group_table = @malloc(table_size * 16)
+    var slot: i64 = 0
+    while slot < table_size {
+        @write_u64(@ptr_add(id_table, slot * 8), 0 as u64)
+        @write_u64(@ptr_add(group_table, slot * 16), 0 as u64)
+        @write_u64(@ptr_add(group_table, slot * 16 + 8), 0 as u64)
+        slot = slot + 1
+    }
     while pos < length {
         if rows >= row_capacity { return TEXT_INVALID }
         let line_start = pos
@@ -113,7 +123,7 @@ fn noema_text_decode(length: i64, bytes: *u8, row_capacity: i64, feature_dim: i6
         var cursor = line_start
         while cursor <= line_end {
             if cursor == line_end or (@read_u8(@ptr_add(bytes, cursor)) as i64) == 9 {
-                if field_count >= 18 or cursor == field_start { return TEXT_INVALID }
+                if field_count >= 19 or cursor == field_start { return TEXT_INVALID }
                 @write_u64(@ptr_add(starts, field_count * 8), field_start as u64)
                 @write_u64(@ptr_add(ends, field_count * 8), cursor as u64)
                 field_count = field_count + 1
@@ -121,7 +131,8 @@ fn noema_text_decode(length: i64, bytes: *u8, row_capacity: i64, feature_dim: i6
             }
             cursor = cursor + 1
         }
-        if field_count != 18 { return TEXT_INVALID }
+        if field_count != 18 and field_count != 19 { return TEXT_INVALID }
+        if field_count == 19 and @read_u64(@ptr_add(starts, 144)) == @read_u64(@ptr_add(ends, 144)) { return TEXT_INVALID }
         if tsv_equal(bytes, @read_u64(starts) as i64, @read_u64(ends) as i64, "noema.example.v2") == 0 { return TEXT_INVALID }
         let id_hash = tsv_hash(bytes, @read_u64(@ptr_add(starts, 8)) as i64, @read_u64(@ptr_add(ends, 8)) as i64)
         let group_hash = tsv_hash(bytes, @read_u64(@ptr_add(starts, 24)) as i64, @read_u64(@ptr_add(ends, 24)) as i64)
@@ -140,11 +151,24 @@ fn noema_text_decode(length: i64, bytes: *u8, row_capacity: i64, feature_dim: i6
         if text_safety_valid(bytes, @read_u64(@ptr_add(starts, 120)) as i64, @read_u64(@ptr_add(ends, 120)) as i64) == 0 { return TEXT_INVALID }
         if text_pii_valid(bytes, @read_u64(@ptr_add(starts, 128)) as i64, @read_u64(@ptr_add(ends, 128)) as i64) == 0 { return TEXT_INVALID }
         if @read_u64(@ptr_add(starts, 136)) == @read_u64(@ptr_add(ends, 136)) { return TEXT_INVALID }
-        var prior: i64 = 0
-        while prior < rows {
-            if (@read_u64(@ptr_add(metadata, prior * 16)) as i64) == id_hash { return TEXT_INVALID }
-            if (@read_u64(@ptr_add(metadata, prior * 16 + 8)) as i64) == group_hash and (@read_u64(@ptr_add(splits, prior * 8)) as i64) != split { return TEXT_INVALID }
-            prior = prior + 1
+        var id_slot = id_hash % table_size
+        while (@read_u64(@ptr_add(id_table, id_slot * 8)) as i64) != 0 {
+            if (@read_u64(@ptr_add(id_table, id_slot * 8)) as i64) == id_hash { return TEXT_INVALID }
+            id_slot = (id_slot + 1) % table_size
+        }
+        @write_u64(@ptr_add(id_table, id_slot * 8), id_hash as u64)
+        var group_slot = group_hash % table_size
+        var group_found = 0
+        while group_found == 0 {
+            let stored_group = @read_u64(@ptr_add(group_table, group_slot * 16)) as i64
+            if stored_group == 0 {
+                @write_u64(@ptr_add(group_table, group_slot * 16), group_hash as u64)
+                @write_u64(@ptr_add(group_table, group_slot * 16 + 8), split as u64)
+                group_found = 1
+            } else if stored_group == group_hash {
+                if (@read_u64(@ptr_add(group_table, group_slot * 16 + 8)) as i64) != split { return TEXT_INVALID }
+                group_found = 1
+            } else { group_slot = (group_slot + 1) % table_size }
         }
         @write_u64(@ptr_add(metadata, rows * 16), id_hash as u64)
         @write_u64(@ptr_add(metadata, rows * 16 + 8), group_hash as u64)
@@ -179,4 +203,30 @@ fn noema_text_decode(length: i64, bytes: *u8, row_capacity: i64, feature_dim: i6
     }
     if rows == 0 { return TEXT_INVALID }
     return rows
+}
+
+/// Encode an inference prompt with the same hashed-byte token-count scheme used
+/// by TSV ingestion. This encoder is intentionally explicit and deterministic.
+fn noema_text_encode_prompt(length: i64, bytes: *u8, feature_dim: i64, output: *u8) -> i64 {
+    if length <= 0 or length > TEXT_MAX_LINE_BYTES or feature_dim <= 0 or feature_dim > TEXT_MAX_FEATURES { return TEXT_INVALID }
+    var d: i64 = 0
+    while d < feature_dim { @write_u64(@ptr_add(output, d * 8), 0 as u64) d = d + 1 }
+    var cursor: i64 = 0
+    var in_word = 0
+    var hash: i64 = 0
+    var tokens: i64 = 0
+    while cursor <= length {
+        let ch = if cursor == length { 32 } else { @read_u8(@ptr_add(bytes, cursor)) as i64 }
+        if text_word_byte(ch) == 1 { hash = (hash * 33 + text_lower(ch)) % 2147483647 in_word = 1 }
+        else if in_word == 1 {
+            let bucket = hash % feature_dim
+            let cell = @ptr_add(output, bucket * 8)
+            @write_u64(cell, (@read_u64(cell) + 4294967296) as u64)
+            tokens = tokens + 1
+            hash = 0
+            in_word = 0
+        }
+        cursor = cursor + 1
+    }
+    return if tokens > 0 { tokens } else { TEXT_INVALID }
 }
