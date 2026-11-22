@@ -34,6 +34,14 @@ checks = checks + 1
     if (@read_u64(@ptr_add(history, 56)) as i64) <= (@read_u64(history) as i64) { passed = passed + 1 }
     checks = checks + 1
     if noema_fit(model, 3, features, targets, splits, ONE / 8, 0, history) == FIT_INVALID { passed = passed + 1 }
+    let early_config = @malloc(32)
+    @write_u64(early_config, (ONE / 8) as u64)
+    @write_u64(@ptr_add(early_config, 8), 8 as u64)
+    @write_u64(@ptr_add(early_config, 16), 2 as u64)
+    @write_u64(@ptr_add(early_config, 24), 0 as u64)
+    checks = checks + 1
+    let early_epochs = noema_fit_early_stop(model, 3, features, targets, splits, early_config, history)
+    if early_epochs > 0 and early_epochs <= 8 { passed = passed + 1 }
     @write_u64(@ptr_add(splits, 16), 9 as u64)
     checks = checks + 1
     if noema_train_epoch(model, 3, features, targets, splits, ONE / 8, metric) == FIT_INVALID { passed = passed + 1 }

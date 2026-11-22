@@ -86,14 +86,19 @@ fn main() -> i64 {
         }
         row = row + 1
     }
-    if decoder_rows != 3960 or noema_decoder_save(decoder, "ai/noema-training/turkish_decoder.seltok", decoder_rows, 100, 1729) != 1 { println("RESPONSE_WEIGHT_SAVE_FAILED") return 1 }
+    if decoder_rows != 3960 or noema_decoder_save(decoder, "ai/noema-training/turkish_decoder.seltok", decoder_rows, 1, 1729) != 1 { println("RESPONSE_WEIGHT_SAVE_FAILED") return 1 }
     println("RESPONSE_WEIGHT_ARTIFACT_SAVED")
 
     // Fit classifier and persist/reload before any evaluation.
     let history = @malloc(10 * 8)
+    let fit_config = @malloc(32)
+    @write_u64(fit_config, (ONE / 64) as u64)
+    @write_u64(@ptr_add(fit_config, 8), 10 as u64)
+    @write_u64(@ptr_add(fit_config, 16), 2 as u64)
+    @write_u64(@ptr_add(fit_config, 24), 0 as u64)
     let model = block_new(dim, 4, dim, 1729)
-    let epochs = noema_fit(model, rows, features, targets, splits, ONE / 64, 10, history)
-    if epochs != 10 { println("CLASSIFIER_TRAINING_FAILED") return 1 }
+    let epochs = noema_fit_early_stop(model, rows, features, targets, splits, fit_config, history)
+    if epochs <= 0 or epochs > 10 { println("CLASSIFIER_TRAINING_FAILED") return 1 }
     if sel_checkpoint_save(model, "ai/noema-training/turkish_model.selcp", 79200, epochs, 1729) != 1 { println("CLASSIFIER_WEIGHT_SAVE_FAILED") return 1 }
     @write_u64(model.bias, 0 as u64)
     if sel_checkpoint_load(model, "ai/noema-training/turkish_model.selcp") != 1 { println("CLASSIFIER_WEIGHT_RELOAD_FAILED") return 1 }
@@ -163,6 +168,7 @@ fn main() -> i64 {
     let test_correct = (@read_u64(test_matrix) as i64) + (@read_u64(@ptr_add(test_matrix, 40)) as i64) + (@read_u64(@ptr_add(test_matrix, 80)) as i64) + (@read_u64(@ptr_add(test_matrix, 120)) as i64)
     println("LIR classifier + prompt-conditioned response-byte weights; synthetic-only evaluation")
     print("rows train/dev/test: ") print_inline(train_n) print("/") print_inline(dev_n) print("/") print_inline(test_n) println("")
+    print("classifier epochs used: ") print_inline(epochs) println("")
     print("decoder train rows: ") print_inline(decoder_rows) print("; heldout generated outputs: ") print_inline(decoder_rows_test) println("")
     print("accuracy train/dev/test: ") print_inline(train_correct) print("/") print_inline(train_n) print("; ") print_inline(dev_correct) print("/") print_inline(dev_n) print("; ") print_inline(test_correct) print("/") print_inline(test_n) println("")
     print("dev/test MSE Q32.32 raw: ") print_inline(dev_loss) print("/") print_inline(test_loss) println("")

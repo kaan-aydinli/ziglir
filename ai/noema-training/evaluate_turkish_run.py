@@ -56,7 +56,7 @@ def main() -> None:
     decoder = (ROOT / "turkish_decoder.seltok").read_bytes()
     assert decoder[:8] == b"SELTOK07"
     dm = struct.unpack("<11Q", decoder[8:96])
-    assert dm[:10] == (7, 4, 128, 32, 96, 258, 4 * 32 * 96 * 258, 3960, 100, 1729)
+    assert dm[:10] == (7, 4, 128, 32, 96, 258, 4 * 32 * 96 * 258, 3960, 1, 1729)
     assert len(decoder) == 96 + dm[6] * 8
     assert checksum(decoder[96:]) == dm[10]
 

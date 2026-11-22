@@ -382,6 +382,46 @@ fn noema_fit(b: SelBlock, row_count: i64, features: *u8, targets: *u8, splits: *
     return epochs
 }
 
+/// Train with dev-only early stopping and restore the best observed parameters.
+/// `patience` counts consecutive non-improving epochs; `min_delta` is Q32.32.
+/// Test rows are never consulted. Returns epochs executed, or FIT_INVALID.
+fn noema_fit_early_stop(b: SelBlock, row_count: i64, features: *u8, targets: *u8, splits: *u8, config: *u8, history: *u8) -> i64 {
+    let eta = @read_u64(config) as i64
+    let max_epochs = @read_u64(@ptr_add(config, 8)) as i64
+    let patience = @read_u64(@ptr_add(config, 16)) as i64
+    let min_delta = @read_u64(@ptr_add(config, 24)) as i64
+    if max_epochs <= 0 or max_epochs > FIT_MAX_EPOCHS or patience <= 0 or min_delta < 0 or eta <= 0 or b.nout <= 0 or b.k <= 0 { return FIT_INVALID }
+    let dev_metric = @malloc(8)
+    let edge_bytes = b.nout * b.k * EDGE_STRIDE * 8
+    let bias_bytes = b.nout * 8
+    let best_edges = @malloc(edge_bytes)
+    let best_bias = @malloc(bias_bytes)
+    var best_loss: i64 = 9223372036854775807
+    var stale: i64 = 0
+    var epoch: i64 = 0
+    var have_best: i64 = 0
+    while epoch < max_epochs {
+        if noema_train_epoch(b, row_count, features, targets, splits, eta, @ptr_add(history, epoch * 8)) == FIT_INVALID { return FIT_INVALID }
+        if noema_evaluate_split(b, row_count, features, targets, splits, FIT_DEV, dev_metric) == FIT_INVALID { return FIT_INVALID }
+        let loss = @read_u64(dev_metric) as i64
+        if have_best == 0 or (loss < best_loss and best_loss - loss > min_delta) {
+            best_loss = loss
+            @memcpy(best_edges, b.edges, edge_bytes)
+            @memcpy(best_bias, b.bias, bias_bytes)
+            have_best = 1
+            stale = 0
+        } else {
+            stale = stale + 1
+        }
+        epoch = epoch + 1
+        if stale >= patience { break }
+    }
+    if have_best == 0 { return FIT_INVALID }
+    @memcpy(b.edges, best_edges, edge_bytes)
+    @memcpy(b.bias, best_bias, bias_bytes)
+    return epoch
+}
+
 /// Ortalama enerji (enerji / nout), Q32.32.
 fn mean_energy(b: SelBlock, e: i64) -> i64 {
     if b.nout == 0 {
