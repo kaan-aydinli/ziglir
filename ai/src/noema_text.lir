@@ -1,4 +1,5 @@
-// NOEMA Stage 21: LIR-only strict metadata-validated text TSV ingestion.
+// NOEMA text feature extraction and legacy TSV decoder (for compatibility).
+// The production training paths use the canonical JSONL decoder in noema_text_jsonl.lir.
 // Training projection columns: schema,id,split,group_key,seed,task_family,
 // capability,risk,decision,evidence_kind,source,license,consent,review,
 // created_by,safety_labels,pii,input. Canonical data contract is noema.example.v2 JSONL; this
@@ -206,7 +207,7 @@ fn noema_text_decode(length: i64, bytes: *u8, row_capacity: i64, feature_dim: i6
 }
 
 /// Encode an inference prompt with the same hashed-byte token-count scheme used
-/// by TSV ingestion. This encoder is intentionally explicit and deterministic.
+/// by the JSONL and legacy TSV input paths. This encoder is deterministic.
 fn noema_text_encode_prompt(length: i64, bytes: *u8, feature_dim: i64, output: *u8) -> i64 {
     if length <= 0 or length > TEXT_MAX_LINE_BYTES or feature_dim <= 0 or feature_dim > TEXT_MAX_FEATURES { return TEXT_INVALID }
     var d: i64 = 0

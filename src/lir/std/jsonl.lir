@@ -1,0 +1,36 @@
+// LIR Standard Library — bounded JSON Lines record framing.
+// Returns each raw UTF-8 record as a string slice into the input buffer;
+// caller validates/parses the record with its JSON parser. CRLF and a final
+// record without LF are supported. Empty rows and BOM-prefixed files fail closed.
+const JSONL_OK: i64 = 1
+const JSONL_EOF: i64 = 0
+const JSONL_INVALID: i64 = -1
+const JSONL_LINE_TOO_LONG: i64 = -2
+
+struct JsonlReader {
+    source: string
+    pos: i64
+    line: i64
+    max_line_bytes: i64
+    status: i64
+
+    fn init(source: string, max_line_bytes: i64) -> JsonlReader {
+        JsonlReader { source: source, pos: 0, line: 0, max_line_bytes: max_line_bytes, status: JSONL_OK }
+    }
+
+    fn next(self: *JsonlReader) -> string {
+        if self.pos >= self.source.len { self.status = JSONL_EOF return string { ptr: "", len: 0 } }
+        let start = self.pos
+        var end = start
+        while end < self.source.len and self.source.ptr[end] != 10 { end += 1 }
+        self.pos = if end < self.source.len { end + 1 } else { end }
+        self.line += 1
+        if end > start and self.source.ptr[end - 1] == 13 { end -= 1 }
+        let size = end - start
+        if size == 0 { self.status = JSONL_INVALID return string { ptr: "", len: 0 } }
+        if size > self.max_line_bytes { self.status = JSONL_LINE_TOO_LONG return string { ptr: "", len: 0 } }
+        if self.line == 1 and size >= 3 and self.source.ptr[start] == 239 and self.source.ptr[start + 1] == 187 and self.source.ptr[start + 2] == 191 { self.status = JSONL_INVALID return string { ptr: "", len: 0 } }
+        self.status = JSONL_OK
+        return string { ptr: &self.source.ptr[start], len: size }
+    }
+}

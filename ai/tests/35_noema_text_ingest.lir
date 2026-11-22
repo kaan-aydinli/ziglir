@@ -1,4 +1,4 @@
-// NOEMA Stage 21: metadata-validated text TSV vectorization.
+// Legacy TSV decoder compatibility fixture; canonical training uses JSONL.
 import "../src/noema_text.lir"
 fn main() -> i64 {
     var checks: i64 = 0

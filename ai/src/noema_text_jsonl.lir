@@ -1,0 +1,145 @@
+// Strict, bounded decoder for canonical noema.example.v2 JSONL records.
+// It consumes raw JSONL records, validates training-critical fields, performs
+// group/ID leakage checks and builds the same hashed token-count arrays as the
+// legacy TSV decoder. This is a schema-specific reader, not a general JSON AST.
+import "noema_text.lir"
+
+fn noema_jsonl_find_string(bytes: *u8, from: i64, line_end: i64, key: string, span: *u8) -> i64 {
+    var pos = from
+    while pos < line_end {
+        if @read_u8(@ptr_add(bytes, pos)) as i64 == 34 {
+            let token_start = pos + 1
+            var token_end = token_start
+            while token_end < line_end {
+                let token_ch = @read_u8(@ptr_add(bytes, token_end)) as i64
+                if token_ch == 92 { token_end = token_end + 2 }
+                else if token_ch == 34 { break }
+                else { token_end = token_end + 1 }
+            }
+            if token_end >= line_end { return 0 }
+            var after = token_end + 1
+            while after < line_end and ((@read_u8(@ptr_add(bytes, after)) as i64) == 32 or (@read_u8(@ptr_add(bytes, after)) as i64) == 9) { after = after + 1 }
+            if after < line_end and (@read_u8(@ptr_add(bytes, after)) as i64) == 58 and token_end - token_start == key.len as i64 {
+                var j: i64 = 0
+                var equal = 1
+                while j < key.len as i64 { if @read_u8(@ptr_add(bytes, token_start + j)) != @read_u8(@ptr_add(key.ptr, j)) { equal = 0 } j = j + 1 }
+                if equal == 1 {
+                    var value = after + 1
+                    while value < line_end and ((@read_u8(@ptr_add(bytes, value)) as i64) == 32 or (@read_u8(@ptr_add(bytes, value)) as i64) == 9) { value = value + 1 }
+                    if value >= line_end or (@read_u8(@ptr_add(bytes, value)) as i64) != 34 { return 0 }
+                    let value_start = value + 1
+                    var value_end = value_start
+                    while value_end < line_end {
+                        let value_ch = @read_u8(@ptr_add(bytes, value_end)) as i64
+                        if value_ch == 92 { value_end = value_end + 2 }
+                        else if value_ch == 34 { @write_u64(span, value_start as u64) @write_u64(@ptr_add(span, 8), value_end as u64) return 1 }
+                        else { value_end = value_end + 1 }
+                    }
+                    return 0
+                }
+            }
+            pos = token_end + 1
+        } else { pos = pos + 1 }
+    }
+    return 0
+}
+fn noema_jsonl_find_key_position(bytes: *u8, from: i64, line_end: i64, key: string, output: *u8) -> i64 {
+    var pos = from
+    while pos < line_end {
+        if @read_u8(@ptr_add(bytes, pos)) as i64 == 34 {
+            let token_start = pos + 1
+            var token_end = token_start
+            while token_end < line_end {
+                let ch = @read_u8(@ptr_add(bytes, token_end)) as i64
+                if ch == 92 { token_end = token_end + 2 } else if ch == 34 { break } else { token_end = token_end + 1 }
+            }
+            if token_end >= line_end { return 0 }
+            var after = token_end + 1
+            while after < line_end and ((@read_u8(@ptr_add(bytes, after)) as i64) == 32 or (@read_u8(@ptr_add(bytes, after)) as i64) == 9) { after = after + 1 }
+            if after < line_end and (@read_u8(@ptr_add(bytes, after)) as i64) == 58 and token_end - token_start == key.len as i64 {
+                var j: i64 = 0
+                var equal = 1
+                while j < key.len as i64 { if @read_u8(@ptr_add(bytes, token_start + j)) != @read_u8(@ptr_add(key.ptr, j)) { equal = 0 } j = j + 1 }
+                if equal == 1 { @write_u64(output, (after + 1) as u64) return 1 }
+            }
+            pos = token_end + 1
+        } else { pos = pos + 1 }
+    }
+    return 0
+}
+fn noema_jsonl_equal(bytes: *u8, span: *u8, expected: string) -> i64 {
+    return tsv_equal(bytes, @read_u64(span) as i64, @read_u64(@ptr_add(span, 8)) as i64, expected)
+}
+fn noema_jsonl_hash(bytes: *u8, span: *u8) -> i64 {
+    return tsv_hash(bytes, @read_u64(span) as i64, @read_u64(@ptr_add(span, 8)) as i64)
+}
+fn noema_jsonl_target_span(bytes: *u8, line_start: i64, line_end: i64, output: *u8) -> i64 {
+    let target_value = @malloc(8)
+    if noema_jsonl_find_key_position(bytes, line_start, line_end, "target", target_value) != 1 { return 0 }
+    return noema_jsonl_find_string(bytes, @read_u64(target_value) as i64, line_end, "text", output)
+}
+
+/// Decode canonical episode JSONL directly into SEL arrays.
+/// Expects each non-empty line to be one noema.example.v2 JSON object.
+fn noema_text_decode_jsonl(length: i64, bytes: *u8, row_capacity: i64, feature_dim: i64, features: *u8, targets: *u8, splits: *u8, metadata: *u8) -> i64 {
+    if length <= 0 or row_capacity <= 0 or row_capacity > TEXT_MAX_ROWS or feature_dim <= 0 or feature_dim > TEXT_MAX_FEATURES { return TEXT_INVALID }
+    let span = @malloc(16)
+    let table_size = row_capacity * 2 + 1
+    let id_table = @malloc(table_size * 8)
+    let group_table = @malloc(table_size * 16)
+    var bucket: i64 = 0
+    while bucket < table_size { @write_u64(@ptr_add(id_table, bucket * 8), 0 as u64) @write_u64(@ptr_add(group_table, bucket * 16), 0 as u64) @write_u64(@ptr_add(group_table, bucket * 16 + 8), 0 as u64) bucket = bucket + 1 }
+    var pos: i64 = 0
+    var rows: i64 = 0
+    while pos < length {
+        if rows >= row_capacity { return TEXT_INVALID }
+        let line_start = pos
+        var line_end = pos
+        while line_end < length and (@read_u8(@ptr_add(bytes, line_end)) as i64) != 10 { line_end = line_end + 1 }
+        if line_end > line_start and (@read_u8(@ptr_add(bytes, line_end - 1)) as i64) == 13 { line_end = line_end - 1 }
+        if line_end == line_start or line_end - line_start > TEXT_MAX_LINE_BYTES { return TEXT_INVALID }
+        if noema_jsonl_find_string(bytes, line_start, line_end, "schema", span) != 1 or noema_jsonl_equal(bytes, span, "noema.example.v2") != 1 { return TEXT_INVALID }
+        if noema_jsonl_find_string(bytes, line_start, line_end, "id", span) != 1 { return TEXT_INVALID }
+        let id_hash = noema_jsonl_hash(bytes, span)
+        if id_hash == 0 { return TEXT_INVALID }
+        if noema_jsonl_find_string(bytes, line_start, line_end, "group_key", span) != 1 { return TEXT_INVALID }
+        let group_hash = noema_jsonl_hash(bytes, span)
+        if group_hash == 0 { return TEXT_INVALID }
+        if noema_jsonl_find_string(bytes, line_start, line_end, "split", span) != 1 { return TEXT_INVALID }
+        let split = text_split_id(bytes, @read_u64(span) as i64, @read_u64(@ptr_add(span, 8)) as i64)
+        if split < 0 { return TEXT_INVALID }
+        if noema_jsonl_find_string(bytes, line_start, line_end, "decision", span) != 1 { return TEXT_INVALID }
+        let label = text_label_id(bytes, @read_u64(span) as i64, @read_u64(@ptr_add(span, 8)) as i64)
+        if label < 0 { return TEXT_INVALID }
+        if noema_jsonl_find_string(bytes, line_start, line_end, "risk", span) != 1 or text_risk_valid(bytes, @read_u64(span) as i64, @read_u64(@ptr_add(span, 8)) as i64) != 1 { return TEXT_INVALID }
+        if noema_jsonl_find_string(bytes, line_start, line_end, "source", span) != 1 or text_source_valid(bytes, @read_u64(span) as i64, @read_u64(@ptr_add(span, 8)) as i64) != 1 { return TEXT_INVALID }
+        if noema_jsonl_find_string(bytes, line_start, line_end, "license", span) != 1 or @read_u64(span) == @read_u64(@ptr_add(span, 8)) { return TEXT_INVALID }
+        if noema_jsonl_find_string(bytes, line_start, line_end, "consent", span) != 1 or noema_jsonl_equal(bytes, span, "training") != 1 { return TEXT_INVALID }
+        if noema_jsonl_find_string(bytes, line_start, line_end, "review", span) != 1 or text_review_valid(bytes, @read_u64(span) as i64, @read_u64(@ptr_add(span, 8)) as i64) != 1 { return TEXT_INVALID }
+        if noema_jsonl_find_string(bytes, line_start, line_end, "pii", span) != 1 or text_pii_valid(bytes, @read_u64(span) as i64, @read_u64(@ptr_add(span, 8)) as i64) != 1 { return TEXT_INVALID }
+        var id_slot = id_hash % table_size
+        while (@read_u64(@ptr_add(id_table, id_slot * 8)) as i64) != 0 { if (@read_u64(@ptr_add(id_table, id_slot * 8)) as i64) == id_hash { return TEXT_INVALID } id_slot = (id_slot + 1) % table_size }
+        @write_u64(@ptr_add(id_table, id_slot * 8), id_hash as u64)
+        var group_slot = group_hash % table_size
+        var group_done = 0
+        while group_done == 0 {
+            let old_group = @read_u64(@ptr_add(group_table, group_slot * 16)) as i64
+            if old_group == 0 { @write_u64(@ptr_add(group_table, group_slot * 16), group_hash as u64) @write_u64(@ptr_add(group_table, group_slot * 16 + 8), split as u64) group_done = 1 }
+            else if old_group == group_hash { if (@read_u64(@ptr_add(group_table, group_slot * 16 + 8)) as i64) != split { return TEXT_INVALID } group_done = 1 }
+            else { group_slot = (group_slot + 1) % table_size }
+        }
+        @write_u64(@ptr_add(metadata, rows * 16), id_hash as u64)
+        @write_u64(@ptr_add(metadata, rows * 16 + 8), group_hash as u64)
+        @write_u64(@ptr_add(splits, rows * 8), split as u64)
+        var c: i64 = 0
+        while c < TEXT_CLASSES { @write_u64(@ptr_add(targets, (rows * TEXT_CLASSES + c) * 8), (if c == label { 4294967296 } else { 0 }) as u64) c = c + 1 }
+        if noema_jsonl_find_string(bytes, line_start, line_end, "text", span) != 1 { return TEXT_INVALID }
+        let input_start = @read_u64(span) as i64
+        let input_end = @read_u64(@ptr_add(span, 8)) as i64
+        let feature_base = rows * feature_dim * 8
+        if noema_text_encode_prompt(input_end - input_start, @ptr_add(bytes, input_start), feature_dim, @ptr_add(features, feature_base)) <= 0 { return TEXT_INVALID }
+        rows = rows + 1
+        pos = if line_end < length and (@read_u8(@ptr_add(bytes, line_end)) as i64) == 13 { line_end + 2 } else if line_end < length { line_end + 1 } else { length }
+    }
+    return if rows > 0 { rows } else { TEXT_INVALID }
+}

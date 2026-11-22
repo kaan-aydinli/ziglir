@@ -24,16 +24,13 @@ def main() -> None:
     groups: dict[str, str] = {}
     split_counts = collections.Counter()
     labels = collections.Counter()
-    with (ROOT / "turkish_synthetic.v2.jsonl").open(encoding="utf-8") as jf, (ROOT / "turkish_synthetic.tsv").open(encoding="utf-8") as tf:
-        for n, (raw, line) in enumerate(zip(jf, tf), 1):
+    with (ROOT / "turkish_synthetic.v2.jsonl").open(encoding="utf-8") as jf:
+        for n, raw in enumerate(jf, 1):
             row = json.loads(raw)
-            cols = line.rstrip("\n").split("\t")
-            assert len(cols) == 19, (n, len(cols))
-            assert row["schema"] == cols[0] == "noema.example.v2"
-            assert row["id"] == cols[1] and row["split"] == cols[2]
-            assert row["group_key"] == cols[3]
-            assert row["conversation"][0]["parts"][0]["text"] == cols[17]
-            assert row["target"]["parts"][0]["text"] == cols[18]
+            assert row["schema"] == "noema.example.v2"
+            assert row["id"] and row["group_key"] and row["split"] in {"train", "dev", "test"}
+            assert row["conversation"][0]["parts"][0]["text"]
+            assert row["target"]["parts"][0]["text"]
             assert row["provenance"]["source"] == "synthetic"
             group = row["group_key"]
             assert group not in groups or groups[group] == row["split"]
@@ -42,7 +39,6 @@ def main() -> None:
             records.append(row)
             split_counts[row["split"]] += 1
             labels[(row["split"], label)] += 1
-        assert jf.readline() == "" and tf.readline() == ""
     assert len(records) == 99000 and split_counts == {"train": 79200, "dev": 9900, "test": 9900}
     assert len(groups) == 40
 
@@ -61,21 +57,21 @@ def main() -> None:
     assert checksum(decoder[96:]) == dm[10]
 
     predictions = {}
-    with (ROOT / "turkish_test_predictions.tsv").open(encoding="utf-8") as f:
-        assert f.readline().rstrip("\n") == "row_index\tactual_class\tpredicted_class"
-        for line in f:
-            index, actual, predicted = map(int, line.rstrip("\n").split("\t"))
+    with (ROOT / "turkish_test_predictions.v1.jsonl").open(encoding="utf-8") as f:
+        for raw in f:
+            row = json.loads(raw)
+            index, actual, predicted = row["row_index"], row["actual_class"], row["predicted_class"]
             assert 0 <= index < len(records) and records[index]["split"] == "test"
             assert actual == LABELS.index(records[index]["target"]["decision"])
             predictions[index] = (actual, predicted)
     assert len(predictions) == 9900
 
     generated = {}
-    with (ROOT / "turkish_decoder_predictions.tsv").open(encoding="utf-8") as f:
-        assert f.readline().rstrip("\n") == "row_index\tactual_class\tpredicted_class\tgenerated_text"
-        for line in f:
-            index_s, actual_s, predicted_s, text = line.rstrip("\n").split("\t", 3)
-            index, actual, predicted = int(index_s), int(actual_s), int(predicted_s)
+    with (ROOT / "turkish_decoder_predictions.v1.jsonl").open(encoding="utf-8") as f:
+        for raw in f:
+            row = json.loads(raw)
+            index, actual, predicted = row["row_index"], row["actual_class"], row["predicted_class"]
+            text = row["generated_text"]
             assert index in predictions and predictions[index] == (actual, predicted)
             assert text and len(text.encode("utf-8")) <= 96
             generated[index] = text

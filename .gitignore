@@ -47,11 +47,10 @@ target/
 /examples/browser-counter/app.wasm
 
 # Generated NOEMA training artifacts (rebuild with ai/train_turkish_corpus.lir)
-ai/noema-training/turkish_synthetic.tsv
 ai/noema-training/turkish_synthetic.v2.jsonl
 ai/noema-training/turkish_model.selcp
 ai/noema-training/turkish_decoder.seltok
-ai/noema-training/turkish_test_predictions.tsv
-ai/noema-training/turkish_decoder_predictions.tsv
+ai/noema-training/turkish_test_predictions.v1.jsonl
+ai/noema-training/turkish_decoder_predictions.v1.jsonl
 ai/noema-training/turkish_training_stdout.txt
 ai/noema-training/turkish_training_time.txt

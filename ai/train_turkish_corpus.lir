@@ -3,6 +3,7 @@
 // Run from repository root: ./zig-out/bin/lir run ai/train_turkish_corpus.lir --backend=native
 import "src/noema_corpus.lir"
 import "src/noema_text.lir"
+import "src/noema_text_jsonl.lir"
 import "src/noema_fit.lir"
 import "src/ledger.lir"
 import "src/noema_decoder.lir"
@@ -30,19 +31,19 @@ fn main() -> i64 {
     let per_template: i64 = 2475
     let expected_rows = per_template * 40
     if generate_turkish_corpus(per_template) != expected_rows { println("CORPUS_GENERATION_FAILED") return 1 }
-    let fd = @open("ai/noema-training/turkish_synthetic.tsv", 0, 0)
-    if fd < 0 { println("TRAINING_TSV_MISSING") return 1 }
+    let fd = @open("ai/noema-training/turkish_synthetic.v2.jsonl", 0, 0)
+    if fd < 0 { println("TRAINING_JSONL_MISSING") return 1 }
     let bytes = @malloc(134217728)
     let nbytes = @read(fd, bytes, 134217728)
     @close(fd)
-    if nbytes <= 0 or nbytes >= 134217728 { println("TRAINING_TSV_READ_FAILED") return 1 }
+    if nbytes <= 0 or nbytes >= 134217728 { println("TRAINING_JSONL_READ_FAILED") return 1 }
     let dim: i64 = 128
     let features = @malloc(expected_rows * dim * 8)
     let targets = @malloc(expected_rows * 4 * 8)
     let splits = @malloc(expected_rows * 8)
     let metadata = @malloc(expected_rows * 2 * 8)
-    let rows = noema_text_decode(nbytes, bytes, expected_rows, dim, features, targets, splits, metadata)
-    if rows != expected_rows { println("TRAINING_TSV_SCHEMA_INVALID") return 1 }
+    let rows = noema_text_decode_jsonl(nbytes, bytes, expected_rows, dim, features, targets, splits, metadata)
+    if rows != expected_rows { println("TRAINING_JSONL_SCHEMA_INVALID") return 1 }
 
     let reply_spans = @malloc(rows * 16)
     var scan_pos: i64 = 0
@@ -51,18 +52,7 @@ fn main() -> i64 {
         let line_start = scan_pos
         var line_end = line_start
         while line_end < nbytes and (@read_u8(@ptr_add(bytes, line_end)) as i64) != 10 { line_end = line_end + 1 }
-        var cursor = line_start
-        var field_start = line_start
-        var field: i64 = 0
-        while cursor <= line_end {
-            if cursor == line_end or (@read_u8(@ptr_add(bytes, cursor)) as i64) == 9 {
-                if field == 18 { @write_u64(@ptr_add(reply_spans, row * 16), field_start as u64) @write_u64(@ptr_add(reply_spans, row * 16 + 8), cursor as u64) }
-                field = field + 1
-                field_start = cursor + 1
-            }
-            cursor = cursor + 1
-        }
-        if field != 19 { println("TRAINING_ROW_SCHEMA_INVALID") return 1 }
+        if noema_jsonl_target_span(bytes, line_start, line_end, @ptr_add(reply_spans, row * 16)) != 1 { println("TRAINING_JSONL_TARGET_MISSING") return 1 }
         scan_pos = if line_end < nbytes { line_end + 1 } else { nbytes }
         row = row + 1
     }
@@ -111,11 +101,9 @@ fn main() -> i64 {
     let train_n = noema_confusion_split(model, rows, features, targets, splits, FIT_TRAIN, train_matrix)
     let dev_n = noema_confusion_split(model, rows, features, targets, splits, FIT_DEV, dev_matrix)
     let test_n = noema_confusion_split(model, rows, features, targets, splits, FIT_TEST, test_matrix)
-    let prediction_fd = @open("ai/noema-training/turkish_test_predictions.tsv", 577, 420)
-    let decoder_fd = @open("ai/noema-training/turkish_decoder_predictions.tsv", 577, 420)
+    let prediction_fd = @open("ai/noema-training/turkish_test_predictions.v1.jsonl", 577, 420)
+    let decoder_fd = @open("ai/noema-training/turkish_decoder_predictions.v1.jsonl", 577, 420)
     if prediction_fd < 0 or decoder_fd < 0 { println("EVALUATION_OUTPUT_OPEN_FAILED") return 1 }
-    corpus_write(prediction_fd, "row_index\tactual_class\tpredicted_class\n")
-    corpus_write(decoder_fd, "row_index\tactual_class\tpredicted_class\tgenerated_text\n")
     let sample_counts = @malloc(32)
     var c: i64 = 0
     while c < 4 { @write_u64(@ptr_add(sample_counts, c * 8), 0 as u64) c = c + 1 }
@@ -140,16 +128,16 @@ fn main() -> i64 {
                 if p > best_p { best_p = p predicted = c }
                 c = c + 1
             }
-            corpus_write_i64(prediction_fd, row) corpus_write(prediction_fd, "\t") corpus_write_i64(prediction_fd, actual) corpus_write(prediction_fd, "\t") corpus_write_i64(prediction_fd, predicted) corpus_write(prediction_fd, "\n")
+            corpus_write(prediction_fd, "{\"row_index\":") corpus_write_i64(prediction_fd, row) corpus_write(prediction_fd, ",\"actual_class\":") corpus_write_i64(prediction_fd, actual) corpus_write(prediction_fd, ",\"predicted_class\":") corpus_write_i64(prediction_fd, predicted) corpus_write(prediction_fd, "}\n")
             prediction_rows = prediction_rows + 1
             let used = @read_u64(@ptr_add(sample_counts, actual * 8)) as i64
             if used < 10 {
                 let generated_len = noema_decoder_generate(decoder_runtime, predicted, x, dim, generated, DECODER_MAX_OUTPUT)
                 if generated_len <= 0 { @close(prediction_fd) @close(decoder_fd) println("HELDOUT_DECODER_EMPTY") return 1 }
-                corpus_write_i64(decoder_fd, row) corpus_write(decoder_fd, "\t") corpus_write_i64(decoder_fd, actual) corpus_write(decoder_fd, "\t") corpus_write_i64(decoder_fd, predicted) corpus_write(decoder_fd, "\t")
+                corpus_write(decoder_fd, "{\"row_index\":") corpus_write_i64(decoder_fd, row) corpus_write(decoder_fd, ",\"actual_class\":") corpus_write_i64(decoder_fd, actual) corpus_write(decoder_fd, ",\"predicted_class\":") corpus_write_i64(decoder_fd, predicted) corpus_write(decoder_fd, ",\"generated_text\":\"")
                 var outpos: i64 = 0
                 while outpos < generated_len { let written = @write(decoder_fd, @ptr_add(generated, outpos), generated_len - outpos) if written <= 0 { @close(decoder_fd) println("HELDOUT_DECODER_WRITE_FAILED") return 1 } outpos = outpos + written }
-                corpus_write(decoder_fd, "\n")
+                corpus_write(decoder_fd, "\"}\n")
                 @write_u64(@ptr_add(sample_counts, actual * 8), (used + 1) as u64)
                 decoder_rows_test = decoder_rows_test + 1
             }

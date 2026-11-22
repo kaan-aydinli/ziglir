@@ -1,5 +1,5 @@
 // NOEMA Stage 23: deterministic Turkish synthetic corpus generator.
-// Emits canonical noema.example.v2 JSONL plus the strict LIR training projection.
+// Emits canonical noema.example.v2 JSONL plus a strict JSONL learner projection.
 // The records are synthetic/template-based and must not be presented as human or
 // real-world data. Each template family is wholly assigned to one split.
 const CORPUS_INVALID: i64 = -1
@@ -142,12 +142,11 @@ fn corpus_split_name(fd: i64, split: i64) {
     corpus_write(fd, "test")
 }
 
-/// Write paired canonical v2 JSONL and metadata-rich TSV. Returns record count.
+/// Write canonical noema.example.v2 JSONL records. Returns record count.
 fn generate_turkish_corpus(rows_per_template: i64) -> i64 {
     if rows_per_template <= 0 or rows_per_template > CORPUS_MAX_ROWS_PER_TEMPLATE { return CORPUS_INVALID }
     let json_fd = @open("ai/noema-training/turkish_synthetic.v2.jsonl", 577, 420)
-    let tsv_fd = @open("ai/noema-training/turkish_synthetic.tsv", 577, 420)
-    if json_fd < 0 or tsv_fd < 0 { return CORPUS_INVALID }
+    if json_fd < 0 { return CORPUS_INVALID }
     var template: i64 = 0
     var total: i64 = 0
     while template < 40 {
@@ -180,26 +179,11 @@ fn generate_turkish_corpus(rows_per_template: i64) -> i64 {
             corpus_write(json_fd, "\",\"ref\":\"synthetic-seed-") corpus_write_i64(json_fd, seed)
             corpus_write(json_fd, "\"},\"validator\":{\"name\":\"generator_contract\",\"condition\":\"template and class contract\"},\"tools\":{\"allowed\":[] ,\"trace\":[]},\"safety\":{\"policy_version\":\"synthetic-v1\",\"labels\":[],\"pii\":\"none\"},\"quality\":{\"review\":\"synthetic\",\"disagreement\":null},\"provenance\":{\"source\":\"synthetic\",\"license\":\"internal-demo\",\"consent\":\"training\",\"created_by\":\"lir-generator-v1\"}}\n")
 
-            corpus_write(tsv_fd, "noema.example.v2\t") corpus_write_id(tsv_fd, template, sample)
-            corpus_write(tsv_fd, "\t") corpus_split_name(tsv_fd, split)
-            corpus_write(tsv_fd, "\t") corpus_write_group(tsv_fd, class_id, variant)
-            corpus_write(tsv_fd, "\t") corpus_write_i64(tsv_fd, seed)
-            corpus_write(tsv_fd, "\t") corpus_family(tsv_fd, class_id)
-            corpus_write(tsv_fd, "\t") corpus_capability(tsv_fd, class_id)
-            corpus_write(tsv_fd, "\t") corpus_risk(tsv_fd, class_id)
-            corpus_write(tsv_fd, "\t") corpus_decision(tsv_fd, class_id)
-            corpus_write(tsv_fd, "\t") corpus_evidence(tsv_fd, class_id)
-            corpus_write(tsv_fd, "\tsynthetic\tinternal-demo\ttraining\tsynthetic\tlir-generator-v1\t")
-            if class_id == 2 { corpus_write(tsv_fd, "none\tnone\t") }
-            else { corpus_write(tsv_fd, "none\tnone\t") }
-            corpus_write_prompt(tsv_fd, template, a, b)
-            corpus_write(tsv_fd, "\t") corpus_write_target(tsv_fd, class_id, a, b)
-            corpus_write(tsv_fd, "\n")
             sample = sample + 1
             total = total + 1
         }
         template = template + 1
     }
-    if @close(json_fd) != 0 or @close(tsv_fd) != 0 { return CORPUS_INVALID }
+    if @close(json_fd) != 0 { return CORPUS_INVALID }
     return total
 }
