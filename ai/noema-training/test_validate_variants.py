@@ -1,7 +1,7 @@
 import copy
 import unittest
 
-from validate_variants import ROOT, read_jsonl, validate
+from validate_variants import ROOT, read_jsonl, validate, validate_composites
 
 
 class VariantCorpusTests(unittest.TestCase):
@@ -38,6 +38,11 @@ class VariantCorpusTests(unittest.TestCase):
         row["tool_trace"]["verified"] = False
         with self.assertRaisesRegex(ValueError, "must be verified"):
             validate(rows)
+
+    def test_composite_examples_cover_all_atoms(self):
+        atomic = {row["id"]: row for row in self.rows}
+        composites = read_jsonl(ROOT / "turkish_composite_examples.v1.jsonl")
+        self.assertEqual(validate_composites(composites, atomic), 12)
 
 
 if __name__ == "__main__":

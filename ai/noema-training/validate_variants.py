@@ -106,10 +106,37 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def validate_composites(rows: Iterable[dict[str, Any]], atomic: dict[str, dict[str, Any]]) -> int:
+    ids: set[str] = set()
+    covered: set[str] = set()
+    count = 0
+    for n, row in enumerate(rows, 1):
+        where = f"composite {n}"
+        _need(row.get("schema") == "noema.composite_example.v1", f"{where}: invalid schema")
+        _need(row.get("id") not in ids, f"{where}: duplicate id")
+        ids.add(row["id"])
+        components = row.get("components", [])
+        _need(len(components) >= 2, f"{where}: needs at least two components")
+        combo = [c.get("variant") for c in components]
+        _need(combo == row.get("variant_combo"), f"{where}: variant_combo does not match components")
+        _need(len(set(combo)) == len(combo), f"{where}: duplicate component variant")
+        for component in components:
+            _need(component.get("id") in atomic and atomic[component["id"]] == component, f"{where}: component is not an exact atomic example")
+            covered.add(component["variant"])
+        _need(row.get("composition", {}).get("operator") == "parallel_subtasks", f"{where}: unknown composition operator")
+        _need(len(row.get("target", {}).get("items", [])) == len(components), f"{where}: target/component count mismatch")
+        count += 1
+    _need(covered == REQUIRED_VARIANTS, f"composite coverage mismatch: {sorted(REQUIRED_VARIANTS - covered)}")
+    return count
+
+
 def main() -> None:
     path = ROOT / "turkish_variants.v1.jsonl"
-    count = validate(read_jsonl(path))
-    print(f"valid JSONL variants={count}; task families={len(REQUIRED_VARIANTS)}; train/dev/test splits are group-isolated")
+    atomic_rows = read_jsonl(path)
+    count = validate(atomic_rows)
+    composite_path = ROOT / "turkish_composite_examples.v1.jsonl"
+    composite_count = validate_composites(read_jsonl(composite_path), {r["id"]: r for r in atomic_rows})
+    print(f"valid atomic JSONL variants={count}; composite examples={composite_count}; covered task families={len(REQUIRED_VARIANTS)}")
 
 
 if __name__ == "__main__":

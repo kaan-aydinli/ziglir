@@ -1,6 +1,6 @@
 # Türkçe eğitim verisi: JSONL varyant tasarımı v1
 
-`turkish_variants.v1.jsonl` her satırda tek UTF-8 JSON nesnesi olacak şekilde 12 görev varyantı içerir. Ortak zarf; `schema`, kararlı `id`, `group_key`, `split`, `variant`, `task`, `messages`, hedef/etiket ve `provenance` alanlarını kullanır. Göreve özgü alanlar ayrı nesnelerde tutulur; boş veya anlamı olmayan alanlar her satıra doldurulmaz. Büyük nesneler tek satırdır, satır içi yeni satırlar JSON escape edilir.
+`turkish_variants.v1.jsonl` her satırda tek UTF-8 JSON nesnesi olacak şekilde 12 görev varyantı içerir. `turkish_composite_examples.v1.jsonl` ise bunlardan ikişerini birden taşıyan 12 multi-objective örnek içerir; bütün 12 atomik varyant en az bir kompozisyonda yer alır. Ortak zarf; `schema`, kararlı `id`, `group_key`, `split`, `variant`, `task`, `messages`, hedef/etiket ve `provenance` alanlarını kullanır. Göreve özgü alanlar ayrı nesnelerde tutulur; boş veya anlamı olmayan alanlar her satıra doldurulmaz. Büyük nesneler tek satırdır, satır içi yeni satırlar JSON escape edilir.
 
 ## Kapsanan varyantlar
 
@@ -26,6 +26,15 @@
 - Preference kayıtlarında chosen/rejected ve sıralar farklıdır; tool kayıtlarında sonuç mesajı ve doğrulama işareti bulunur; retrieval/reasoning atıfları mevcut kanıta bağlanır; kod için test sonucu; zaman serisi için gözlem sınırı ve missing mask zorunludur.
 - Medya payload'ları JSONL içine gömülmez. Hash/izinli object-store referansı ve hizalama anotasyonu saklanır; içerik anotasyonunun doğruluğu ayrıca incelenmelidir.
 - Sentetik train/dev/test örnekleri tek başına kalite kanıtı değildir. Her görev ailesinde gerçek, lisanslı ve insan gözden geçirmeli veri eklenmeden model genellemesi iddia edilmez.
+
+## Kaç tür/kompozisyon?
+
+- Tasarlanmış atomik görev türü: **12**.
+- Bu 12 türden yinelenmeyen, sırasız, boş olmayan alt kümelerin kuramsal sayısı: `2^12 - 1 = 4.095` (tekli türler dahil).
+- En az iki tür içeren kuramsal alt küme: `4.095 - 12 = 4.083`.
+- Yalnız tam ikili seçim sayısı: `C(12, 2) = 66`.
+- Bunların hepsi anlamlı/uyumlu eğitim örneği değildir. Örneğin tablo+hesap makinesi doğal birleşirken alakasız güvenlik+hava tahmini bileşimi anlamsız olabilir. Uygulanabilir kombinasyon sayısı görev tanımına, etiketlerin uyumuna, lisans/kanıt koşullarına ve değerlendirme protokolüne bağlıdır; bu yüzden matematiksel 4.095 sayısı “geçerli veri türü” iddiası değildir.
+- Mevcut kompozit dosya tüm kombinasyonlar değil, her atomik türü kapsayan **12 örnek kompozisyondur**. Generator aynı kaynak örneklerden yeniden üretilebilir.
 
 Kontrol komutları:
 
