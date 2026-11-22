@@ -1,0 +1,22 @@
+// Microbenchmark: duplicate incremental update and exact lookup in a 4k-slot
+// matrix-free memory. Single-entry result only; not a corpus-scale latency claim.
+import "../src/noema_sparse_memory.lir"
+fn main() -> i64 {
+    let memory = noema_sparse_new(4096)
+    let prompt = "Trabzon hangi deniz kıyısındadır?"
+    let answer = "Karadeniz kıyısındadır."
+    noema_sparse_train(memory, prompt.len as i64, prompt.ptr as *u8, answer.len as i64, answer.ptr as *u8)
+    let start_train = @time_ns()
+    var i: i64 = 0
+    while i < 10000 { noema_sparse_train(memory, prompt.len as i64, prompt.ptr as *u8, answer.len as i64, answer.ptr as *u8) i = i + 1 }
+    let end_train = @time_ns()
+    let output = @malloc(256)
+    let start_query = @time_ns()
+    i = 0
+    while i < 10000 { noema_sparse_reply(memory, prompt.len as i64, prompt.ptr as *u8, output, 256, 900) i = i + 1 }
+    let end_query = @time_ns()
+    print("single-prompt update ns/op: ") printInt(((end_train - start_train) / 10000) as i64) println("")
+    print("single-entry exact lookup ns/op: ") printInt(((end_query - start_query) / 10000) as i64) println("")
+    @free(output) noema_sparse_free(memory)
+    return 0
+}

@@ -3,7 +3,7 @@
 // The records are synthetic/template-based and must not be presented as human or
 // real-world data. Each template family is wholly assigned to one split.
 const CORPUS_INVALID: i64 = -1
-const CORPUS_MAX_ROWS_PER_TEMPLATE: i64 = 2475
+const CORPUS_MAX_ROWS_PER_TEMPLATE: i64 = 2750
 
 fn corpus_write(fd: i64, text: string) {
     var pos: i64 = 0

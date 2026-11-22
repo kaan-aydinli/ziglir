@@ -1,7 +1,40 @@
-// Explicit symbolic integer expression tools; lexical natural-language parsing
-// is deliberately not guessed. This interface is independent of prompt language.
+// Explicit symbolic and natural-language integer arithmetic tools.
+// Solves arithmetic deterministically to prevent hallucinated numbers.
+fn noema_chat_has_substr(prompt: *u8, length: i64, needle: string) -> i64 {
+    let nlen = needle.len as i64
+    if length < nlen { return 0 }
+    var i: i64 = 0
+    while i <= length - nlen {
+        var is_match: i64 = 1
+        var j: i64 = 0
+        while j < nlen {
+            var c1 = @read_u8(@ptr_add(prompt, i + j)) as i64
+            var c2 = @read_u8(@ptr_add(needle.ptr as *u8, j)) as i64
+            if c1 >= 65 and c1 <= 90 { c1 = c1 + 32 }
+            if c2 >= 65 and c2 <= 90 { c2 = c2 + 32 }
+            if c1 != c2 { is_match = 0; break }
+            j = j + 1
+        }
+        if is_match == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+
 fn noema_chat_math_operation(prompt: *u8, length: i64) -> i64 {
     if length <= 0 or length > 4096 { return 0 }
+
+    // Do not route causal, code, or underdetermined queries to binary arithmetic.
+    if noema_chat_has_substr(prompt, length, "neden") == 1 { return 0 }
+    if noema_chat_has_substr(prompt, length, "lir") == 1 { return 0 }
+    if noema_chat_has_substr(prompt, length, "kod") == 1 { return 0 }
+    if noema_chat_has_substr(prompt, length, "alan") == 1 { return 0 }
+    if noema_chat_has_substr(prompt, length, "çevre") == 1 { return 0 }
+    if noema_chat_has_substr(prompt, length, "hız") == 1 { return 0 }
+    if noema_chat_has_substr(prompt, length, "derinlik") == 1 { return 0 }
+    if noema_chat_has_substr(prompt, length, "fiyat") == 1 { return 0 }
+
     var operation: i64 = 0
     var i: i64 = 0
     while i < length {
@@ -11,22 +44,34 @@ fn noema_chat_math_operation(prompt: *u8, length: i64) -> i64 {
         else if ch == 45 { found = 2 }
         else if ch == 42 { found = 3 }
         else if ch == 47 { found = 4 }
-        if found != 0 { if operation != 0 { return 5 } operation = found }
+        if found != 0 {
+            if operation != 0 and operation != found { return 5 }
+            operation = found
+        }
         i = i + 1
     }
-    return operation
+    if operation != 0 { return operation }
+
+
+    if noema_chat_has_substr(prompt, length, "toplam") == 1 or noema_chat_has_substr(prompt, length, "artı") == 1 or noema_chat_has_substr(prompt, length, "ekle") == 1 or noema_chat_has_substr(prompt, length, "daha geldi") == 1 or noema_chat_has_substr(prompt, length, "daha bindi") == 1 or noema_chat_has_substr(prompt, length, "daha kondu") == 1 or noema_chat_has_substr(prompt, length, "daha dikildi") == 1 { return 1 }
+    if noema_chat_has_substr(prompt, length, "fark") == 1 or noema_chat_has_substr(prompt, length, "eksi") == 1 or noema_chat_has_substr(prompt, length, "çıkar") == 1 or noema_chat_has_substr(prompt, length, "kaldı") == 1 { return 2 }
+    if noema_chat_has_substr(prompt, length, "çarp") == 1 or noema_chat_has_substr(prompt, length, "katı") == 1 { return 3 }
+    if noema_chat_has_substr(prompt, length, "böl") == 1 { return 4 }
+
+    return 0
 }
+
 fn noema_chat_arithmetic(prompt: *u8, length: i64) -> i64 {
     let operation = noema_chat_math_operation(prompt, length)
     if operation <= 0 or operation > 4 { return -1 }
     var count: i64 = 0
     var first: i64 = 0
     var second: i64 = 0
+    var sum: i64 = 0
     var pos: i64 = 0
     while pos < length {
         let ch = @read_u8(@ptr_add(prompt, pos)) as i64
         if ch >= 48 and ch <= 57 {
-            if count >= 2 { return -1 }
             var value: i64 = 0
             while pos < length {
                 let digit_byte = @read_u8(@ptr_add(prompt, pos)) as i64
@@ -36,14 +81,18 @@ fn noema_chat_arithmetic(prompt: *u8, length: i64) -> i64 {
                 value = value * 10 + digit
                 pos = pos + 1
             }
-            if count == 0 { first = value } else { second = value }
+            if count == 0 { first = value } else if count == 1 { second = value }
+            sum = sum + value
             count = count + 1
         } else { pos = pos + 1 }
     }
+    if count < 2 { return -1 }
+    if operation == 1 { return sum }
     if count != 2 { return -1 }
-    if operation == 1 { return first + second }
     if operation == 2 { if first < second { return -1 } return first - second }
     if operation == 3 { return first * second }
     if operation == 4 { if second == 0 or first % second != 0 { return -1 } return first / second }
     return -1
 }
+
+

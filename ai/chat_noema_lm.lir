@@ -1,0 +1,25 @@
+// Minimal local inference: uses only the LIR-trained NOEMA checkpoint.
+import "src/noema_lm.lir"
+fn main() -> i64 {
+    let model = noema_lm_new(16, 128, 0)
+    if noema_lm_load(model, "ai/noema-training/noema_lm_demo.lmcp") != 1 { println("LOCAL_CHECKPOINT_MISSING_OR_INVALID") noema_lm_free(model) return 1 }
+    let input = @malloc(129)
+    let n = @read(0, input, 128)
+    if n <= 0 or n > model.context { println("PROMPT_EMPTY_OR_TOO_LONG") @free(input) noema_lm_free(model) return 1 }
+    var prompt_len = n
+    while prompt_len > 0 and ((@read_u8(@ptr_add(input, prompt_len - 1)) as i64) == 10 or (@read_u8(@ptr_add(input, prompt_len - 1)) as i64) == 13) { prompt_len = prompt_len - 1 }
+    let prompt = @malloc(model.context)
+    let prefix = "User: "
+    let middle = "\nAssistant: "
+    let max_user = model.context - prefix.len as i64 - middle.len as i64
+    if prompt_len > max_user { prompt_len = max_user }
+    @memcpy(prompt, prefix.ptr, prefix.len as i64)
+    @memcpy(@ptr_add(prompt, prefix.len as i64), input, prompt_len)
+    @memcpy(@ptr_add(prompt, prefix.len as i64 + prompt_len), middle.ptr, middle.len as i64)
+    let total = prefix.len as i64 + prompt_len + middle.len as i64
+    let output = @malloc(model.context)
+    let generated = noema_lm_generate(model, prompt, total, output, model.context - total)
+    if generated > 0 { @write(1, output, generated) println("") } else { println("INFERENCE_FAILED") }
+    @free(input) @free(prompt) @free(output) noema_lm_free(model)
+    return if generated > 0 { 0 } else { 1 }
+}

@@ -1,0 +1,212 @@
+// NOEMA-native numerical primitives for in-process model training/inference.
+// Row-major f64 tensors; all execution and model state stay inside LIR.
+// This layer intentionally does not load foreign model files or call services.
+const NOEMA_TENSOR_MAX_CELLS: i64 = 16777216
+const NOEMA_TENSOR_MAX_CONTEXT: i64 = 2048
+const NOEMA_LN2: f64 = 0.693147180559945309417232121458176568
+
+struct NoemaTensor {
+    data: *f64
+    rows: i64
+    cols: i64
+}
+
+fn noema_tensor_new(rows: i64, cols: i64) -> NoemaTensor {
+    if rows <= 0 or cols <= 0 or rows > NOEMA_TENSOR_MAX_CELLS / cols { exit(2) }
+    let cells = rows * cols
+    if cells > NOEMA_TENSOR_MAX_CELLS { exit(2) }
+    return NoemaTensor { data: @malloc(cells * 8) as *f64, rows: rows, cols: cols }
+}
+fn noema_tensor_free(t: NoemaTensor) {
+    @free(t.data as *u8)
+}
+fn noema_tensor_zero(t: NoemaTensor) {
+    var t_data = t.data
+    var i: i64 = 0
+    while i < t.rows * t.cols { t_data[i] = 0.0 i = i + 1 }
+}
+fn noema_tensor_copy(dst: NoemaTensor, src: NoemaTensor) -> i64 {
+    if dst.rows != src.rows or dst.cols != src.cols { return 0 }
+    @memcpy(dst.data as *u8, src.data as *u8, dst.rows * dst.cols * 8)
+    return 1
+}
+fn noema_tensor_fill(t: NoemaTensor, value: f64) {
+    var t_data = t.data
+    var i: i64 = 0
+    while i < t.rows * t.cols { t_data[i] = value i = i + 1 }
+}
+fn noema_tensor_get(t: NoemaTensor, row: i64, col: i64) -> f64 {
+    if row < 0 or row >= t.rows or col < 0 or col >= t.cols { return 0.0 }
+    return t.data[row * t.cols + col]
+}
+fn noema_tensor_set(t: NoemaTensor, row: i64, col: i64, value: f64) -> i64 {
+    var t_data = t.data
+    if row < 0 or row >= t.rows or col < 0 or col >= t.cols { return 0 }
+    t_data[row * t.cols + col] = value
+    return 1
+}
+fn noema_tensor_add(dst: NoemaTensor, a: NoemaTensor, b: NoemaTensor) -> i64 {
+    var dst_data = dst.data
+    if dst.rows != a.rows or dst.cols != a.cols or a.rows != b.rows or a.cols != b.cols { return 0 }
+    var i: i64 = 0
+    while i < dst.rows * dst.cols { dst_data[i] = a.data[i] + b.data[i] i = i + 1 }
+    return 1
+}
+fn noema_tensor_scale(dst: NoemaTensor, src: NoemaTensor, scalar: f64) -> i64 {
+    var dst_data = dst.data
+    if dst.rows != src.rows or dst.cols != src.cols { return 0 }
+    var i: i64 = 0
+    while i < dst.rows * dst.cols { dst_data[i] = src.data[i] * scalar i = i + 1 }
+    return 1
+}
+fn noema_tensor_transpose(dst: NoemaTensor, src: NoemaTensor) -> i64 {
+    var dst_data = dst.data
+    if dst.rows != src.cols or dst.cols != src.rows { return 0 }
+    var r: i64 = 0
+    while r < src.rows { var c: i64 = 0 while c < src.cols { dst_data[c * dst.cols + r] = src.data[r * src.cols + c] c = c + 1 } r = r + 1 }
+    return 1
+}
+fn noema_tensor_matmul(dst: NoemaTensor, a: NoemaTensor, b: NoemaTensor) -> i64 {
+    var dst_data = dst.data
+    if a.cols != b.rows or dst.rows != a.rows or dst.cols != b.cols { return 0 }
+    noema_tensor_zero(dst)
+    var i: i64 = 0
+    while i < a.rows {
+        var k: i64 = 0
+        while k < a.cols {
+            let av = a.data[i * a.cols + k]
+            let aoff = i * dst.cols
+            let boff = k * b.cols
+            var j: i64 = 0
+            while j < b.cols { dst_data[aoff + j] = dst_data[aoff + j] + av * b.data[boff + j] j = j + 1 }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return 1
+}
+fn noema_tensor_dot(a: *f64, b: *f64, count: i64) -> f64 {
+    var sum: f64 = 0.0
+    var i: i64 = 0
+    while i < count { sum = sum + a[i] * b[i] i = i + 1 }
+    return sum
+}
+
+// Range-reduced Taylor exp. Clamp avoids infinities in softmax; range reduction
+// keeps the 14-term polynomial in a small interval around zero.
+fn noema_exp(x: f64) -> f64 {
+    if x <= -80.0 { return 0.0 }
+    if x >= 80.0 { return 5.54062238439351e34 }
+    let k = (x / NOEMA_LN2) as i64
+    let r = x - k as f64 * NOEMA_LN2
+    var term: f64 = 1.0
+    var sum: f64 = 1.0
+    var i: i64 = 1
+    while i <= 14 { term = term * r / i as f64 sum = sum + term i = i + 1 }
+    var scale = k
+    while scale > 0 { sum = sum * 2.0 scale = scale - 1 }
+    while scale < 0 { sum = sum * 0.5 scale = scale + 1 }
+    return sum
+}
+fn noema_log(x: f64) -> f64 {
+    if x <= 0.0 { return -1.0e300 }
+    var m = x
+    var exponent: i64 = 0
+    while m >= 2.0 { m = m * 0.5 exponent = exponent + 1 }
+    while m < 1.0 { m = m * 2.0 exponent = exponent - 1 }
+    let z = (m - 1.0) / (m + 1.0)
+    let z2 = z * z
+    var term = z
+    var total = z
+    var denominator: i64 = 3
+    while denominator <= 41 { term = term * z2 total = total + term / denominator as f64 denominator = denominator + 2 }
+    return 2.0 * total + exponent as f64 * NOEMA_LN2
+}
+fn noema_tensor_softmax_rows(t: NoemaTensor) -> i64 {
+    var t_data = t.data
+    if t.rows <= 0 or t.cols <= 0 { return 0 }
+    var r: i64 = 0
+    while r < t.rows {
+        let base = r * t.cols
+        var maximum = t_data[base]
+        var c: i64 = 1
+        while c < t.cols { if t_data[base + c] > maximum { maximum = t_data[base + c] } c = c + 1 }
+        var total: f64 = 0.0
+        c = 0
+        while c < t.cols { let e = noema_exp(t_data[base + c] - maximum) t_data[base + c] = e total = total + e c = c + 1 }
+        if total <= 0.0 { return 0 }
+        c = 0
+        while c < t.cols { t_data[base + c] = t_data[base + c] / total c = c + 1 }
+        r = r + 1
+    }
+    return 1
+}
+fn noema_tensor_layer_norm(x: NoemaTensor, gamma: *f64, beta: *f64, epsilon: f64) -> i64 {
+    var x_data = x.data
+    if x.cols <= 0 or epsilon <= 0.0 { return 0 }
+    var r: i64 = 0
+    while r < x.rows {
+        let base = r * x.cols
+        var mean: f64 = 0.0
+        var c: i64 = 0
+        while c < x.cols { mean = mean + x_data[base + c] c = c + 1 }
+        mean = mean / x.cols as f64
+        var variance: f64 = 0.0
+        c = 0
+        while c < x.cols { let d = x_data[base + c] - mean variance = variance + d * d c = c + 1 }
+        variance = variance / x.cols as f64
+        let inv = 1.0 / @sqrt(variance + epsilon)
+        c = 0
+        while c < x.cols { x_data[base + c] = (x_data[base + c] - mean) * inv * gamma[c] + beta[c] c = c + 1 }
+        r = r + 1
+    }
+    return 1
+}
+
+// One-head causal self-attention over row-major Q/K/V [time, width].
+// Scores are normalized only over positions <= query index; future tokens never
+// contribute. Workspace is bounded by the configured context.
+fn noema_causal_attention(q: NoemaTensor, k: NoemaTensor, v: NoemaTensor, out: NoemaTensor, workspace: *f64) -> i64 {
+    var out_data = out.data
+    if q.rows <= 0 or q.rows > NOEMA_TENSOR_MAX_CONTEXT or q.cols <= 0 or q.cols > 1024 { return 0 }
+    if k.rows != q.rows or v.rows != q.rows or out.rows != q.rows or k.cols != q.cols or v.cols != q.cols or out.cols != q.cols { return 0 }
+    let inv_scale = 1.0 / @sqrt(q.cols as f64)
+    var t: i64 = 0
+    while t < q.rows {
+        let qoff = t * q.cols
+        var max_score = -1.0e300
+        var j: i64 = 0
+        while j <= t {
+            let score = noema_tensor_dot(@ptr_add(q.data as *u8, qoff * 8) as *f64, @ptr_add(k.data as *u8, j * q.cols * 8) as *f64, q.cols) * inv_scale
+            workspace[j] = score
+            if score > max_score { max_score = score }
+            j = j + 1
+        }
+        var denom: f64 = 0.0
+        j = 0
+        while j <= t { workspace[j] = noema_exp(workspace[j] - max_score) denom = denom + workspace[j] j = j + 1 }
+        if denom <= 0.0 { return 0 }
+        var d: i64 = 0
+        while d < q.cols {
+            var value: f64 = 0.0
+            j = 0
+            while j <= t { value = value + (workspace[j] / denom) * v.data[j * v.cols + d] j = j + 1 }
+            out_data[t * out.cols + d] = value
+            d = d + 1
+        }
+        t = t + 1
+    }
+    return 1
+}
+
+// Causal next-token objective helper: stable cross-entropy for one logits row.
+fn noema_cross_entropy(logits: *f64, vocab: i64, target: i64) -> f64 {
+    if vocab <= 1 or vocab > 65536 or target < 0 or target >= vocab { return -1.0 }
+    var maximum = logits[0]
+    var i: i64 = 1
+    while i < vocab { if logits[i] > maximum { maximum = logits[i] } i = i + 1 }
+    var sum: f64 = 0.0
+    i = 0
+    while i < vocab { sum = sum + noema_exp(logits[i] - maximum) i = i + 1 }
+    return maximum + noema_log(sum) - logits[target]
+}

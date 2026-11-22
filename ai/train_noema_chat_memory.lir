@@ -1,0 +1,57 @@
+// Train a matrix-free response memory from canonical NOEMA JSONL dialogues.
+// This is retrieval-based adaptation, not a frontier-scale generative model.
+import "src/noema_sparse_memory.lir"
+import "src/noema_text_jsonl.lir"
+const CHAT_TRAIN_MAX_BYTES: i64 = 134217728
+
+fn main() -> i64 {
+    let path = "ai/noema-training/turkish_synthetic.v2.jsonl"
+    let fd = @open(path, 0, 0)
+    if fd < 0 { println("TRAINING_DATA_MISSING") return 1 }
+    let bytes = @malloc(CHAT_TRAIN_MAX_BYTES)
+    let size = @read(fd, bytes, CHAT_TRAIN_MAX_BYTES)
+    @close(fd)
+    if size <= 0 or size >= CHAT_TRAIN_MAX_BYTES { @free(bytes) println("TRAINING_DATA_SIZE_INVALID") return 1 }
+    // The current split policy yields exactly 80% training rows; reserve for
+    // that split only instead of allocating space for dev/test records.
+    let memory = noema_sparse_new(88000)
+    let prompt_span = @malloc(16)
+    let answer_span = @malloc(16)
+    let split_span = @malloc(16)
+    var pos: i64 = 0
+    var rows: i64 = 0
+    var learned: i64 = 0
+    var rejected: i64 = 0
+    while pos < size {
+        let line_start = pos
+        var line_end = pos
+        while line_end < size and (@read_u8(@ptr_add(bytes, line_end)) as i64) != 10 { line_end = line_end + 1 }
+        if line_end > line_start {
+            rows = rows + 1
+            let has_split = noema_jsonl_find_string(bytes, line_start, line_end, "split", split_span)
+            let is_train = has_split == 1 and noema_jsonl_equal(bytes, split_span, "train") == 1
+            if is_train {
+                let prompt_ok = noema_jsonl_find_string(bytes, line_start, line_end, "text", prompt_span)
+                let answer_ok = noema_jsonl_target_span(bytes, line_start, line_end, answer_span)
+                if prompt_ok == 1 and answer_ok == 1 {
+                    let p0 = @read_u64(prompt_span) as i64
+                    let p1 = @read_u64(@ptr_add(prompt_span, 8)) as i64
+                    let a0 = @read_u64(answer_span) as i64
+                    let a1 = @read_u64(@ptr_add(answer_span, 8)) as i64
+                    let trained = noema_sparse_train(memory, p1 - p0, @ptr_add(bytes, p0), a1 - a0, @ptr_add(bytes, a0))
+                    if trained > 0 { learned = learned + 1 } else { rejected = rejected + 1 }
+                } else { rejected = rejected + 1 }
+            }
+        }
+        pos = if line_end < size { line_end + 1 } else { size }
+    }
+    let saved = noema_sparse_save(memory, "ai/noema-training/turkish_chat_memory.nsm")
+    print("jsonl records: ") printInt(rows) println("")
+    print("train prompt-response pairs learned: ") printInt(learned) println("")
+    print("train rows rejected: ") printInt(rejected) println("")
+    if saved != 1 { println("MEMORY_CHECKPOINT_SAVE_FAILED") return 1 }
+    println("matrix-free response memory checkpoint saved; synthetic data only")
+    @free(split_span) @free(answer_span) @free(prompt_span) @free(bytes)
+    noema_sparse_free(memory)
+    return 0
+}

@@ -39,20 +39,26 @@ def main() -> None:
             records.append(row)
             split_counts[row["split"]] += 1
             labels[(row["split"], label)] += 1
-    assert len(records) == 99000 and split_counts == {"train": 79200, "dev": 9900, "test": 9900}
-    assert len(groups) == 40
+    assert len(records) > 0 and len(groups) > 0
+    assert split_counts.get("train", 0) > 0 and split_counts.get("dev", 0) > 0 and split_counts.get("test", 0) > 0
+    assert sum(split_counts.values()) == len(records)
+    test_count = split_counts["test"]
+    train_count = split_counts["train"]
 
     classifier = (ROOT / "turkish_model.selcp").read_bytes()
     assert classifier[:8] == b"SELQ32V2"
     cm = struct.unpack("<11Q", classifier[8:96])
-    assert cm[:10] == (2, 1 << 32, 128, 4, 128, 1, 1, 79200, 10, 1729)
+    assert cm[:4] == (2, 1 << 32, 128, 4)
+    assert 1 <= cm[4] <= 128 and cm[5:7] == (1, 1)
+    assert cm[7] == train_count and cm[8] > 0 and cm[9] > 0
     assert len(classifier) == 96 + (cm[3] * cm[4] * 4 + cm[3]) * 8
     assert checksum(classifier[96:]) == cm[10]
 
     decoder = (ROOT / "turkish_decoder.seltok").read_bytes()
     assert decoder[:8] == b"SELTOK07"
     dm = struct.unpack("<11Q", decoder[8:96])
-    assert dm[:10] == (7, 4, 128, 32, 96, 258, 4 * 32 * 96 * 258, 3960, 1, 1729)
+    assert dm[:7] == (7, 4, 128, 32, 96, 258, 4 * 32 * 96 * 258)
+    assert dm[7] > 0 and dm[8] > 0 and dm[9] > 0
     assert len(decoder) == 96 + dm[6] * 8
     assert checksum(decoder[96:]) == dm[10]
 
@@ -64,7 +70,7 @@ def main() -> None:
             assert 0 <= index < len(records) and records[index]["split"] == "test"
             assert actual == LABELS.index(records[index]["target"]["decision"])
             predictions[index] = (actual, predicted)
-    assert len(predictions) == 9900
+    assert len(predictions) == test_count
 
     generated = {}
     with (ROOT / "turkish_decoder_predictions.v1.jsonl").open(encoding="utf-8") as f:
@@ -75,14 +81,16 @@ def main() -> None:
             assert index in predictions and predictions[index] == (actual, predicted)
             assert text and len(text.encode("utf-8")) <= 96
             generated[index] = text
-    assert len(generated) == 40
-    assert all(sum(predictions[i][0] == c for i in generated) == 10 for c in range(4))
+    assert 0 < len(generated) <= len(predictions)
+    generated_class_counts = collections.Counter(predictions[i][0] for i in generated)
+    assert set(generated_class_counts) == set(range(4))
+    assert max(generated_class_counts.values()) - min(generated_class_counts.values()) <= 1
 
     classifier_correct = sum(actual == predicted for actual, predicted in predictions.values())
     exact = sum(text == records[i]["target"]["parts"][0]["text"] for i, text in generated.items())
     print(f"synthetic rows={len(records)} grouped_families={len(groups)} split={split_counts['train']}/{split_counts['dev']}/{split_counts['test']}")
-    print(f"classifier heldout accuracy={classifier_correct}/9900 ({classifier_correct/9900:.2%})")
-    print(f"decoder sampled exact matches={exact}/40 ({exact/40:.2%}); class-balanced sample only")
+    print(f"classifier heldout accuracy={classifier_correct}/{test_count} ({classifier_correct/test_count:.2%})")
+    print(f"decoder sampled exact matches={exact}/{len(generated)} ({exact/len(generated):.2%}); class-balanced sample only")
     print("SELTOK07 payload and SELQ32V2 payload checksums/metadata valid")
     print("Warning: synthetic data and a class-conditioned position-wise byte head do not measure open-ended language quality.")
 

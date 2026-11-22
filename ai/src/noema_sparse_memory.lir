@@ -1,0 +1,257 @@
+// Matrix-free incremental conversational memory for the NOEMA LIR system.
+// Train/update cost is linear in text bytes; retrieval uses compact 256-bit
+// token fingerprints and popcount similarity, never a dense model matrix.
+const NOEMA_MEM_MAX_RECORDS: i64 = 110000
+const NOEMA_MEM_MAX_TEXT: i64 = 256
+const NOEMA_MEM_SIG_WORDS: i64 = 4
+
+struct NoemaSparseMemory {
+    signatures: *u8
+    prompts: *u8
+    answers: *u8
+    meta: *u8
+    slots: *u8
+    table_size: i64
+    capacity: i64
+    count: *u8
+}
+
+fn noema_sparse_new(capacity: i64) -> NoemaSparseMemory {
+    if capacity <= 0 or capacity > NOEMA_MEM_MAX_RECORDS { exit(2) }
+    let signatures = @malloc(capacity * NOEMA_MEM_SIG_WORDS * 8)
+    let prompts = @malloc(capacity * NOEMA_MEM_MAX_TEXT)
+    let answers = @malloc(capacity * NOEMA_MEM_MAX_TEXT)
+    let meta = @malloc(capacity * 16)
+    let table_size = capacity * 2 + 1
+    let slots = @malloc(table_size * 8)
+    return NoemaSparseMemory { signatures: signatures, prompts: prompts, answers: answers, meta: meta, slots: slots, table_size: table_size, capacity: capacity, count: @malloc(8) }
+}
+fn noema_sparse_count(memory: NoemaSparseMemory) -> i64 { return @read_u64(memory.count) as i64 }
+fn noema_sparse_free(memory: NoemaSparseMemory) {
+    @free(memory.signatures) @free(memory.prompts) @free(memory.answers) @free(memory.meta) @free(memory.slots) @free(memory.count)
+}
+fn noema_sparse_is_delimiter(ch: i64) -> i64 {
+    if ch <= 32 or ch == 33 or ch == 34 or ch == 39 or ch == 40 or ch == 41 or ch == 44 or ch == 45 or ch == 46 or ch == 58 or ch == 59 or ch == 63 { return 1 }
+    return 0
+}
+fn noema_sparse_lower(ch: i64) -> i64 {
+    if ch >= 65 and ch <= 90 { return ch + 32 }
+    return ch
+}
+fn noema_sparse_set_feature(output: *u8, bit: i64) {
+    let bucket = bit % 256
+    let offset = (bucket / 64) * 8
+    let mask = (1 as i64) << (bucket % 64)
+    let value = @read_u64(@ptr_add(output, offset)) as i64
+    @write_u64(@ptr_add(output, offset), (value | mask) as u64)
+}
+fn noema_sparse_signature(length: i64, text: *u8, output: *u8) -> i64 {
+    if length <= 0 or length > NOEMA_MEM_MAX_TEXT { return 0 }
+    @write_u64(output, 0 as u64) @write_u64(@ptr_add(output, 8), 0 as u64)
+    @write_u64(@ptr_add(output, 16), 0 as u64) @write_u64(@ptr_add(output, 24), 0 as u64)
+    var pos: i64 = 0
+    var words: i64 = 0
+    var previous_hash: i64 = 0
+    var have_previous: i64 = 0
+    while pos < length {
+        while pos < length and noema_sparse_is_delimiter(@read_u8(@ptr_add(text, pos)) as i64) == 1 { pos = pos + 1 }
+        if pos < length {
+            var hash: i64 = 216613626
+            var in_word = 1
+            while pos < length and in_word == 1 {
+                let ch = @read_u8(@ptr_add(text, pos)) as i64
+                if noema_sparse_is_delimiter(ch) == 1 { in_word = 0 }
+                else { hash = (hash * 33 + noema_sparse_lower(ch)) % 2147483647 pos = pos + 1 }
+            }
+            noema_sparse_set_feature(output, hash % 256)
+            noema_sparse_set_feature(output, (hash / 257) % 256)
+            if have_previous == 1 {
+                let pair_hash = (previous_hash * 33 + hash) % 2147483647
+                noema_sparse_set_feature(output, pair_hash % 256)
+                noema_sparse_set_feature(output, (pair_hash / 257) % 256)
+            }
+            previous_hash = hash
+            have_previous = 1
+            words = words + 1
+        }
+    }
+    return words
+}
+fn noema_sparse_prompt_hash(length: i64, text: *u8) -> i64 {
+    var hash: i64 = 146959810
+    var i: i64 = 0
+    while i < length { hash = (hash * 33 + noema_sparse_lower(@read_u8(@ptr_add(text, i)) as i64)) % 2147483647 i = i + 1 }
+    return if hash == 0 { 1 } else { hash }
+}
+fn noema_sparse_exact(memory: NoemaSparseMemory, record: i64, length: i64, text: *u8) -> i64 {
+    let old_len = @read_u64(@ptr_add(memory.meta, record * 16)) as i64
+    if old_len != length { return 0 }
+    var i: i64 = 0
+    while i < length { if @read_u8(@ptr_add(memory.prompts, record * NOEMA_MEM_MAX_TEXT + i)) != @read_u8(@ptr_add(text, i)) { return 0 } i = i + 1 }
+    return 1
+}
+fn noema_sparse_train(memory: NoemaSparseMemory, prompt_len: i64, prompt: *u8, answer_len: i64, answer: *u8) -> i64 {
+    if prompt_len <= 0 or prompt_len > NOEMA_MEM_MAX_TEXT or answer_len <= 0 or answer_len > NOEMA_MEM_MAX_TEXT { return 0 }
+    let sig = @malloc(32)
+    if noema_sparse_signature(prompt_len, prompt, sig) <= 0 { @free(sig) return 0 }
+    let used = @read_u64(memory.count) as i64
+    let prompt_hash = noema_sparse_prompt_hash(prompt_len, prompt)
+    var slot = prompt_hash % memory.table_size
+    var probes: i64 = 0
+    var record: i64 = -1
+    while probes < memory.table_size {
+        let entry = @read_u64(@ptr_add(memory.slots, slot * 8)) as i64
+        if entry == 0 { break }
+        let candidate = entry - 1
+        if noema_sparse_exact(memory, candidate, prompt_len, prompt) == 1 { record = candidate break }
+        slot = (slot + 1) % memory.table_size
+        probes = probes + 1
+    }
+    if record >= 0 {
+        @memcpy(@ptr_add(memory.answers, record * NOEMA_MEM_MAX_TEXT), answer, answer_len)
+        @write_u64(@ptr_add(memory.meta, record * 16 + 8), answer_len as u64)
+        @memcpy(@ptr_add(memory.signatures, record * 32), sig, 32)
+        @free(sig)
+        return 2 // exact prompt replaced; no duplicate slot consumed
+    }
+    if used >= memory.capacity or probes >= memory.table_size { @free(sig) return 0 }
+    record = used
+    @memcpy(@ptr_add(memory.signatures, record * 32), sig, 32)
+    @memcpy(@ptr_add(memory.prompts, record * NOEMA_MEM_MAX_TEXT), prompt, prompt_len)
+    @memcpy(@ptr_add(memory.answers, record * NOEMA_MEM_MAX_TEXT), answer, answer_len)
+    @write_u64(@ptr_add(memory.meta, record * 16), prompt_len as u64)
+    @write_u64(@ptr_add(memory.meta, record * 16 + 8), answer_len as u64)
+    @write_u64(@ptr_add(memory.slots, slot * 8), (record + 1) as u64)
+    @write_u64(memory.count, (used + 1) as u64)
+    @free(sig)
+    return 1
+}
+fn noema_sparse_similarity(query: *u8, candidate: *u8) -> i64 {
+    var intersection: i64 = 0
+    var union_count: i64 = 0
+    var i: i64 = 0
+    while i < NOEMA_MEM_SIG_WORDS {
+        let q = @read_u64(@ptr_add(query, i * 8))
+        let c = @read_u64(@ptr_add(candidate, i * 8))
+        intersection = intersection + @popcount(q & c)
+        union_count = union_count + @popcount(q | c)
+        i = i + 1
+    }
+    if union_count == 0 { return 0 }
+    return (intersection * 1000) / union_count
+}
+fn noema_sparse_reply(memory: NoemaSparseMemory, prompt_len: i64, prompt: *u8, output: *u8, capacity: i64, threshold: i64) -> i64 {
+    if prompt_len <= 0 or prompt_len > NOEMA_MEM_MAX_TEXT or capacity <= 0 or threshold < 0 or threshold > 1000 { return -1 }
+    let query = @malloc(32)
+    if noema_sparse_signature(prompt_len, prompt, query) <= 0 { @free(query) return -1 }
+    var best = -1
+    var best_score: i64 = -1
+    let used = @read_u64(memory.count) as i64
+    var i: i64 = 0
+    while i < used {
+        let score = noema_sparse_similarity(query, @ptr_add(memory.signatures, i * 32))
+        if score > best_score { best_score = score best = i }
+        if score == 1000 and noema_sparse_exact(memory, i, prompt_len, prompt) == 1 { best = i best_score = 1000 i = used }
+        else { i = i + 1 }
+    }
+    @free(query)
+    if best < 0 or best_score < threshold { return 0 }
+    let answer_len = @read_u64(@ptr_add(memory.meta, best * 16 + 8)) as i64
+    if answer_len > capacity { return -1 }
+    @memcpy(output, @ptr_add(memory.answers, best * NOEMA_MEM_MAX_TEXT), answer_len)
+    return answer_len
+}
+
+fn noema_sparse_write_all(fd: i64, bytes: *u8, length: i64) -> i64 {
+    var pos: i64 = 0
+    while pos < length { let n = @write(fd, @ptr_add(bytes, pos), length - pos) if n <= 0 { return 0 } pos = pos + n }
+    return 1
+}
+fn noema_sparse_read_all(fd: i64, bytes: *u8, length: i64) -> i64 {
+    var pos: i64 = 0
+    while pos < length { let n = @read(fd, @ptr_add(bytes, pos), length - pos) if n <= 0 { return 0 } pos = pos + n }
+    return 1
+}
+fn noema_sparse_checksum(memory: NoemaSparseMemory) -> i64 {
+    var h: i64 = 216613626
+    let used = noema_sparse_count(memory)
+    var row: i64 = 0
+    while row < used {
+        let prompt_len = @read_u64(@ptr_add(memory.meta, row * 16)) as i64
+        let answer_len = @read_u64(@ptr_add(memory.meta, row * 16 + 8)) as i64
+        h = (h * 31 + prompt_len) % 2147483647
+        h = (h * 31 + answer_len) % 2147483647
+        var i: i64 = 0
+        while i < prompt_len { h = (h * 31 + (@read_u8(@ptr_add(memory.prompts, row * NOEMA_MEM_MAX_TEXT + i)) as i64)) % 2147483647 i = i + 1 }
+        i = 0
+        while i < answer_len { h = (h * 31 + (@read_u8(@ptr_add(memory.answers, row * NOEMA_MEM_MAX_TEXT + i)) as i64)) % 2147483647 i = i + 1 }
+        row = row + 1
+    }
+    return h
+}
+fn noema_sparse_save(memory: NoemaSparseMemory, path: string) -> i64 {
+    let fd = @open(path, 577, 420)
+    if fd < 0 { return 0 }
+    let magic = "NOEMASM01"
+    let header = @malloc(32)
+    let used = noema_sparse_count(memory)
+    @write_u64(header, 1 as u64) @write_u64(@ptr_add(header, 8), memory.capacity as u64)
+    @write_u64(@ptr_add(header, 16), used as u64) @write_u64(@ptr_add(header, 24), noema_sparse_checksum(memory) as u64)
+    var ok = noema_sparse_write_all(fd, magic.ptr as *u8, 9)
+    if ok == 1 { ok = noema_sparse_write_all(fd, header, 32) }
+    var row: i64 = 0
+    while row < used and ok == 1 {
+        let prompt_len = @read_u64(@ptr_add(memory.meta, row * 16)) as i64
+        let answer_len = @read_u64(@ptr_add(memory.meta, row * 16 + 8)) as i64
+        let sizes = @malloc(16)
+        @write_u64(sizes, prompt_len as u64) @write_u64(@ptr_add(sizes, 8), answer_len as u64)
+        ok = noema_sparse_write_all(fd, sizes, 16)
+        @free(sizes)
+        if ok == 1 { ok = noema_sparse_write_all(fd, @ptr_add(memory.prompts, row * NOEMA_MEM_MAX_TEXT), prompt_len) }
+        if ok == 1 { ok = noema_sparse_write_all(fd, @ptr_add(memory.answers, row * NOEMA_MEM_MAX_TEXT), answer_len) }
+        row = row + 1
+    }
+    @free(header)
+    if @close(fd) != 0 { return 0 }
+    return ok
+}
+fn noema_sparse_load(path: string) -> NoemaSparseMemory {
+    let empty = NoemaSparseMemory { signatures: 0 as *u8, prompts: 0 as *u8, answers: 0 as *u8, meta: 0 as *u8, slots: 0 as *u8, table_size: 0, capacity: 0, count: 0 as *u8 }
+    let fd = @open(path, 0, 0)
+    if fd < 0 { return empty }
+    let magic = @malloc(9)
+    let expected = "NOEMASM01"
+    let header = @malloc(32)
+    var ok = noema_sparse_read_all(fd, magic, 9)
+    if ok == 1 { ok = noema_sparse_read_all(fd, header, 32) }
+    if ok == 0 { @close(fd) @free(magic) @free(header) return empty }
+    var i: i64 = 0
+    while i < 9 and ok == 1 { if @read_u8(@ptr_add(magic, i)) != @read_u8(@ptr_add(expected.ptr as *u8, i)) { ok = 0 } i = i + 1 }
+    let version = @read_u64(header) as i64
+    let capacity = @read_u64(@ptr_add(header, 8)) as i64
+    let count = @read_u64(@ptr_add(header, 16)) as i64
+    if version != 1 or capacity <= 0 or capacity > NOEMA_MEM_MAX_RECORDS or count < 0 or count > capacity { ok = 0 }
+    if ok == 0 { @close(fd) @free(magic) @free(header) return empty }
+    var memory = noema_sparse_new(capacity)
+    let sizes = @malloc(16)
+    let prompt = @malloc(NOEMA_MEM_MAX_TEXT)
+    let answer = @malloc(NOEMA_MEM_MAX_TEXT)
+    var row: i64 = 0
+    while row < count and ok == 1 {
+        if noema_sparse_read_all(fd, sizes, 16) != 1 { ok = 0 }
+        let prompt_len = @read_u64(sizes) as i64
+        let answer_len = @read_u64(@ptr_add(sizes, 8)) as i64
+        if prompt_len <= 0 or prompt_len > NOEMA_MEM_MAX_TEXT or answer_len <= 0 or answer_len > NOEMA_MEM_MAX_TEXT { ok = 0 }
+        if ok == 1 and noema_sparse_read_all(fd, prompt, prompt_len) != 1 { ok = 0 }
+        if ok == 1 and noema_sparse_read_all(fd, answer, answer_len) != 1 { ok = 0 }
+        if ok == 1 and noema_sparse_train(memory, prompt_len, prompt, answer_len, answer) != 1 { ok = 0 }
+        row = row + 1
+    }
+    let trailing = @malloc(1)
+    if @read(fd, trailing, 1) != 0 { ok = 0 }
+    if @close(fd) != 0 { ok = 0 }
+    if ok == 1 and noema_sparse_checksum(memory) != (@read_u64(@ptr_add(header, 24)) as i64) { ok = 0 }
+    @free(trailing) @free(answer) @free(prompt) @free(sizes) @free(magic) @free(header)
+    if ok == 0 { noema_sparse_free(memory) return empty }
+    return memory
+}

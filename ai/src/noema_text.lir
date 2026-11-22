@@ -6,7 +6,7 @@
 // projection exists for the current LIR learner, which has no JSON parser.
 // ASCII alphanumeric token hashing only; this is not Unicode NLP.
 const TEXT_INVALID: i64 = -1
-const TEXT_MAX_ROWS: i64 = 100000
+const TEXT_MAX_ROWS: i64 = 110000
 const TEXT_MAX_FEATURES: i64 = 256
 const TEXT_MAX_LINE_BYTES: i64 = 4096
 const TEXT_CLASSES: i64 = 4

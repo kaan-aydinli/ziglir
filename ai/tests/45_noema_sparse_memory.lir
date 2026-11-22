@@ -1,0 +1,59 @@
+// Fast matrix-free incremental learning and bounded lexical retrieval.
+import "../src/noema_sparse_memory.lir"
+fn main() -> i64 {
+    var checks: i64 = 0
+    var passed: i64 = 0
+    var memory = noema_sparse_new(2)
+    let p1 = "Trabzon nerede?"
+    let a1 = "Karadeniz kıyısında."
+    let p2 = "2 + 3 kaç eder?"
+    let a2 = "5"
+    checks += 1
+    if noema_sparse_train(memory, p1.len as i64, p1.ptr as *u8, a1.len as i64, a1.ptr as *u8) == 1 { passed += 1 }
+    checks += 1
+    if noema_sparse_train(memory, p2.len as i64, p2.ptr as *u8, a2.len as i64, a2.ptr as *u8) == 1 { passed += 1 }
+    let output = @malloc(256)
+    checks += 1
+    let exact = noema_sparse_reply(memory, p1.len as i64, p1.ptr as *u8, output, 256, 700)
+    if exact == a1.len as i64 and @read_u8(output) == @read_u8(a1.ptr as *u8) { passed += 1 }
+    let a1new = "Trabzon, Türkiye'nin Karadeniz kıyısındadır."
+    checks += 1
+    if noema_sparse_train(memory, p1.len as i64, p1.ptr as *u8, a1new.len as i64, a1new.ptr as *u8) == 2 and noema_sparse_count(memory) == 2 { passed += 1 }
+    let updated = noema_sparse_reply(memory, p1.len as i64, p1.ptr as *u8, output, 256, 1000)
+    checks += 1
+    if updated == a1new.len as i64 { passed += 1 }
+    let contradiction = "Trabzon nerede değildir?"
+    checks += 1
+    if noema_sparse_reply(memory, contradiction.len as i64, contradiction.ptr as *u8, output, 256, 700) == 0 { passed += 1 }
+    let unknown = "Müzik teorisi nedir?"
+    checks += 1
+    if noema_sparse_reply(memory, unknown.len as i64, unknown.ptr as *u8, output, 256, 900) == 0 { passed += 1 }
+    let p3 = "Yeni bir kayıt"
+    checks += 1
+    if noema_sparse_train(memory, p3.len as i64, p3.ptr as *u8, a2.len as i64, a2.ptr as *u8) == 0 { passed += 1 }
+    let checkpoint = "/tmp/noema_sparse_roundtrip.testbin"
+    checks += 1
+    var restored = noema_sparse_load(checkpoint)
+    if noema_sparse_save(memory, checkpoint) == 1 {
+        restored = noema_sparse_load(checkpoint)
+        if restored.capacity == 2 and noema_sparse_count(restored) == 2 and noema_sparse_reply(restored, p1.len as i64, p1.ptr as *u8, output, 256, 1000) == a1new.len as i64 { passed += 1 }
+    }
+    @unlink(checkpoint)
+    noema_sparse_free(restored)
+    checks += 1
+    let missing = noema_sparse_load("/tmp/noema_sparse_missing.testbin")
+    if missing.capacity == 0 { passed += 1 }
+    let broken_path = "/tmp/noema_sparse_truncated.testbin"
+    let broken_fd = @open(broken_path, 577, 420)
+    let one_byte = "X"
+    @write(broken_fd, one_byte.ptr as *u8, 1)
+    @close(broken_fd)
+    checks += 1
+    let broken = noema_sparse_load(broken_path)
+    if broken.capacity == 0 { passed += 1 }
+    @unlink(broken_path)
+    @free(output)
+    noema_sparse_free(memory)
+    printInt(passed) print("/") printInt(checks) println("")
+    return if passed == checks { 0 } else { 1 }
+}

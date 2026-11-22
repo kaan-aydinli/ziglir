@@ -1,46 +1,65 @@
-// Runtime inference: classifier + prompt-conditioned byte-response weights.
-// Training rows/examples are not opened by this process.
-import "src/noema_text.lir"
-import "src/noema_fit.lir"
-import "src/ledger.lir"
-import "src/noema_decoder.lir"
+// Production-facing local NOEMA chat entry point.
+// It prefers exact arithmetic tools, then bounded local-memory retrieval;
+// unsupported requests receive an explicit abstention instead of fabricated text.
+import "src/noema_sparse_memory.lir"
 import "src/noema_chat.lir"
+fn chat_print_int(value: i64) {
+    let buf = @malloc(32)
+    var n = value
+    var len: i64 = 0
+    if n == 0 { @write_u8(buf, 48 as u8) len = 1 }
+    else {
+        if n < 0 { @write_u8(buf, 45 as u8) len = 1 n = 0 - n }
+        let start = len
+        while n > 0 { @write_u8(@ptr_add(buf, len), (48 + n % 10) as u8) len = len + 1 n = n / 10 }
+        var lo = start
+        var hi = len - 1
+        while lo < hi { let a = @read_u8(@ptr_add(buf, lo)) let b = @read_u8(@ptr_add(buf, hi)) @write_u8(@ptr_add(buf, lo), b) @write_u8(@ptr_add(buf, hi), a) lo = lo + 1 hi = hi - 1 }
+    }
+    @write(1, buf, len)
+    @free(buf)
+}
+
 fn main() -> i64 {
-    let input = @malloc(4097)
-    let length = @read(0, input, 4097)
-    if length <= 0 or length > 4096 { println("INPUT_EMPTY_OR_TOO_LONG") return 1 }
-    var prompt_len = length
-    while prompt_len > 0 {
-        let ch = @read_u8(@ptr_add(input, prompt_len - 1)) as i64
-        if ch == 10 or ch == 13 { prompt_len = prompt_len - 1 } else { break }
+    let input = @malloc(257)
+    let read = @read(0, input, 256)
+    if read <= 0 { @free(input) println("EMPTY_INPUT") return 1 }
+    var length = read
+    while length > 0 {
+        let ch = @read_u8(@ptr_add(input, length - 1)) as i64
+        if ch == 10 or ch == 13 { length = length - 1 } else { break }
     }
-    if prompt_len <= 0 { println("EMPTY_INPUT") return 1 }
-    let operation = noema_chat_math_operation(input, prompt_len)
-    if operation != 0 {
-        let result = noema_chat_arithmetic(input, prompt_len)
-        if result >= 0 { print("= ") printInt(result) println("") }
-        else { println("UNSUPPORTED_OR_AMBIGUOUS_EXPRESSION") }
-        return 0
+    if length <= 0 { @free(input) println("EMPTY_INPUT") return 1 }
+
+    let operation = noema_chat_math_operation(input, length)
+    if operation != 0 and operation != 5 {
+        let result = noema_chat_arithmetic(input, length)
+        if result >= 0 {
+            if noema_chat_has_substr(input, length, "toplam") == 1 {
+                print("Toplam ") chat_print_int(result) println(".")
+            } else if noema_chat_has_substr(input, length, "kaldı") == 1 {
+                print("Kalan ") chat_print_int(result) println(".")
+            } else {
+                print("= ") chat_print_int(result) println("")
+            }
+            @free(input)
+            return 0
+        }
     }
-    let model = block_new(128, 4, 128, 1729)
-    if sel_checkpoint_load(model, "ai/noema-training/turkish_model.selcp") != 1 { println("CLASSIFIER_WEIGHTS_INVALID") return 1 }
-    let features = @malloc(128 * 8)
-    if noema_text_encode_prompt(prompt_len, input, 128, features) <= 0 { println("INPUT_HAS_NO_ENCODABLE_FEATURES") return 1 }
-    forward(model, features)
-    var label: i64 = 0
-    var best = 0 - 9223372036854775807
-    var i: i64 = 0
-    while i < 4 {
-        let score = @read_u64(@ptr_add(model.out, i * 8)) as i64
-        if score > best { best = score label = i }
-        i = i + 1
+
+
+    let memory = noema_sparse_load("ai/noema-training/turkish_chat_memory.nsm")
+    if memory.capacity == 0 {
+        @free(input)
+        println("LOCAL_MEMORY_CHECKPOINT_MISSING_OR_INVALID; train with ai/train_noema_chat_memory.lir")
+        return 1
     }
-    let decoder = @malloc(DECODER_CELLS * 8)
-    if noema_decoder_load(decoder, "ai/noema-training/turkish_decoder.seltok") != 1 { println("RESPONSE_WEIGHTS_INVALID") return 1 }
-    let output = @malloc(DECODER_MAX_OUTPUT)
-    let output_len = noema_decoder_generate(decoder, label, features, 128, output, DECODER_MAX_OUTPUT)
-    if output_len <= 0 { println("NO_CONDITIONAL_OUTPUT") return 0 }
-    @write(1, output, output_len)
-    println("")
+    let output = @malloc(257)
+    let written = noema_sparse_reply(memory, length, input, output, 256, 400)
+    if written > 0 { @write(1, output, written) println("") }
+    else { println("Bu soruya eğitim belleğimde yeterince güvenilir bir eşleşme bulamadım. Daha fazla bağlam verebilir misiniz?") }
+    @free(output)
+    @free(input)
+    noema_sparse_free(memory)
     return 0
 }

@@ -273,7 +273,7 @@ fn learn(b: SelBlock, x: *u8, target: *u8, eta: i64) -> i64 {
 
 // NOEMA Stage 17: deterministic typed-array fit/evaluation loop.
 const FIT_INVALID: i64 = -1
-const FIT_MAX_ROWS: i64 = 100000
+const FIT_MAX_ROWS: i64 = 110000
 const FIT_MAX_EPOCHS: i64 = 10000
 const FIT_TRAIN: i64 = 0
 const FIT_DEV: i64 = 1
