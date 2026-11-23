@@ -41,6 +41,10 @@ python3 ai/bench/run.py          # ölçüm tablosu
 
 Tam belge: [`docs/DESIGN.md`](docs/DESIGN.md).
 
+**Yeni mimari (v0.1, uygulanmadı):** [`docs/NOEMA.md`](docs/NOEMA.md) — SEL'i
+alt-bileşen olarak kapsayan, muhakeme-öncelikli, analog-doğal + tamsayı-emülasyon
+tasarımı; kapı ölçümleri (K0–K10) tanımlı.
+
 - **Sayı formatı:** Q32.32 sabit nokta, tamamen `i64`. Float yok, 16-bit yok,
   bit tabanlı yok.
 - **Öğrenme kuralı:** eikonal (NLMS) güncelleme — gradyan yok, momentum yok,

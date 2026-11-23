@@ -1,0 +1,3 @@
+// NOEMA Stage 17 training APIs live alongside SelBlock in ledger.lir because
+// LIR currently cannot use imported struct types in another module's signature.
+import "ledger.lir"

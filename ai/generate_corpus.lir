@@ -1,0 +1,6 @@
+import "src/noema_corpus.lir"
+fn main() -> i64 {
+    let rows = generate_turkish_corpus(409)
+    printInt(rows)
+    return 0
+}

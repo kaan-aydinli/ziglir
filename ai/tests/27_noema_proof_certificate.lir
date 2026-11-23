@@ -1,0 +1,65 @@
+// NOEMA Stage 13: bounded acyclic proof-certificate checking.
+import "../src/noema_reasoning.lir"
+fn main() -> i64 {
+    var checks: i64 = 0
+    var passed: i64 = 0
+    let steps = @malloc(4 * 4 * 8)
+    let initials = @malloc(2 * 8)
+    let left = @malloc(2 * 8)
+    let right = @malloc(2 * 8)
+    let conclusions = @malloc(2 * 8)
+    @write_u64(initials, 1 as u64)
+    @write_u64(@ptr_add(initials, 8), 2 as u64)
+    @write_u64(left, 1 as u64)
+    @write_u64(right, 2 as u64)
+    @write_u64(conclusions, 3 as u64)
+    @write_u64(@ptr_add(left, 8), 3 as u64)
+    @write_u64(@ptr_add(right, 8), 0 as u64)
+    @write_u64(@ptr_add(conclusions, 8), 4 as u64)
+    // Root fact 1.
+    @write_u64(steps, 1 as u64)
+    @write_u64(@ptr_add(steps, 8), -1 as u64)
+    @write_u64(@ptr_add(steps, 16), -1 as u64)
+    @write_u64(@ptr_add(steps, 24), -1 as u64)
+    // Root fact 2.
+    @write_u64(@ptr_add(steps, 32), 2 as u64)
+    @write_u64(@ptr_add(steps, 40), -1 as u64)
+    @write_u64(@ptr_add(steps, 48), -1 as u64)
+    @write_u64(@ptr_add(steps, 56), -1 as u64)
+    // 1 AND 2 -> 3.
+    @write_u64(@ptr_add(steps, 64), 3 as u64)
+    @write_u64(@ptr_add(steps, 72), 0 as u64)
+    @write_u64(@ptr_add(steps, 80), 0 as u64)
+    @write_u64(@ptr_add(steps, 88), 1 as u64)
+    // 3 -> 4.
+    @write_u64(@ptr_add(steps, 96), 4 as u64)
+    @write_u64(@ptr_add(steps, 104), 1 as u64)
+    @write_u64(@ptr_add(steps, 112), 2 as u64)
+    @write_u64(@ptr_add(steps, 120), -1 as u64)
+    checks = checks + 1
+    if reasoning_proof_valid(4, steps, 2, initials, 2, left, right, conclusions) == 1 { passed = passed + 1 }
+    // A forward reference is rejected, preventing cyclic/unordered certificates.
+    @write_u64(@ptr_add(steps, 80), 3 as u64)
+    checks = checks + 1
+    if reasoning_proof_valid(4, steps, 2, initials, 2, left, right, conclusions) == 0 { passed = passed + 1 }
+    @write_u64(@ptr_add(steps, 80), 0 as u64)
+    // Wrong claimed conclusion, unsupported root, wrong unary parent shape.
+    @write_u64(@ptr_add(steps, 64), 9 as u64)
+    checks = checks + 1
+    if reasoning_proof_valid(4, steps, 2, initials, 2, left, right, conclusions) == 0 { passed = passed + 1 }
+    @write_u64(@ptr_add(steps, 64), 3 as u64)
+    @write_u64(@ptr_add(steps, 32), 9 as u64)
+    checks = checks + 1
+    if reasoning_proof_valid(4, steps, 2, initials, 2, left, right, conclusions) == 0 { passed = passed + 1 }
+    @write_u64(@ptr_add(steps, 32), 2 as u64)
+    @write_u64(@ptr_add(steps, 120), 1 as u64)
+    checks = checks + 1
+    if reasoning_proof_valid(4, steps, 2, initials, 2, left, right, conclusions) == 0 { passed = passed + 1 }
+    checks = checks + 1
+    if reasoning_proof_valid(257, steps, 2, initials, 2, left, right, conclusions) == 0 { passed = passed + 1 }
+    printInt(passed)
+    print("/")
+    printInt(checks)
+    println("")
+    return 0
+}

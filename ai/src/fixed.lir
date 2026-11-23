@@ -170,11 +170,29 @@ fn clamp_i(a: i64, lo: i64, hi: i64) -> i64 {
     return a
 }
 
-/// Tamsayı karekök (Newton), tamamen i64.  Q32.32 -> Q32.32.
+/// Tamsayı karekök — ikili basamak (bit-shift) yöntemi.
 ///
-/// Ölçek: sonuç = isqrt(x >> 16) << 24.  isqrt her zaman taban değerini
-/// verdiği için göreli hata en fazla 2^-16 — Q32.32 için yeterli.
-/// (Ölçüldü: sqrt(4.0) -> 2.0, sqrt(9.0) -> 3.0, sqrt(2.0) -> 1.41421)
+/// Ölçek: sonuç = isqrt(x >> 16) << 24, yani `floor(sqrt(x >> 16)) << 24`.
+///
+/// Önceki sürüm Newton iterasyonuydu: tur başına bir **tamsayı bölmesi**
+/// (`y / g`), tipik olarak ~32 tur. Bu sürüm yalnızca kaydırma, toplama ve
+/// çıkarma yapıyor. Aynı taban (floor) sonucu veriyor — 5999 farklı büyüklük
+/// için birebir karşılaştırıldı (`ai/tests/11_isqrt.lir`), 0 fark.
+///
+/// Ölçüldü (bu makine, 2 çekirdek, `-O2`, 9 tur medyanı):
+///
+///   izole, 400k çağrı   Newton 96 ns/çağrı, bit-shift 32 ns/çağrı = **3.04x**
+///
+/// ## Uçtan uca etki: ölçülemedi
+///
+/// `b_train` (3 katman, 5000 adım) üzerinde 15 eşleştirilmiş tur:
+/// medyan oranı **0.91x**, yeni sürüm 6/15 turda hızlı, en iyi tur oranı
+/// 1.07x. Yani `learn` içindeki diğer işler (kenar okuma/yazma, `mul`,
+/// `div`) kazancı örtüyor ve makinenin gürültüsü (~%40 turdan tura
+/// oynama) farkı ayırt etmeye izin vermiyor.
+///
+/// Bu yüzden bu değişiklik **izole kazanç** olarak kaydedildi, uçtan uca
+/// hızlanma iddiası olarak değil.
 fn sqrt(x: i64) -> i64 {
     if x <= 0 {
         return 0
@@ -183,20 +201,49 @@ fn sqrt(x: i64) -> i64 {
     if y <= 0 {
         return 0
     }
-    // Newton: g basamak basamak yaklaşır; next >= g olunca durur, ki
-    // bu taban (floor) kökü verir. Tek istisna: y = 1 için g = 0 çıkabilir,
-    // bu yüzden g >= 1 ile başlıyoruz.
-    var g = y
-    var next = (g + 1) / 2
-    var rounds: i64 = 0
-    while next < g and rounds < 64 {
-        g = next
-        if g == 0 { g = 1 }
-        next = (g + y / g) / 2
-        rounds = rounds + 1
+    // En yüksek "çift bit" konumunu bul: 4^k <= y olan en büyük k.
+    //
+    // TAŞMA KORUMASI: `bit << 2` 2^63'ü aşınca negatife döner ve
+    // `(bit << 2) <= y` her zaman doğru kalır → SONSUZ DÖNGÜ (ölçüldü:
+    // y = 2^62'de kilitlenme, `learn` içinde segfault). Bu yüzden üst sınır
+    // `bit < (1 << 62)` ile kapatılıyor.
+    // En yüksek "çift bit" konumunu SAYARAK bul.
+    //
+    // `while (bit << 2) <= y { bit = bit << 2 }` biçimi iki nedenle terk
+    // edildi:
+    //   1) `bit << 2` 2^63'ü aşınca negatife döner → sonsuz döngü
+    //      (ölçüldü: y = 2^62'de kilitlenme).
+    //   2) Üst sınırı `and` ile eklemek `-O2` kod üretimini bozuyor:
+    //      `learn` ile birlikte derlenince segfault (ölçüldü; `-O0`/`-O1`
+    //      doğru sonuç veriyordu). İç içe `if` de aynı şekilde bozuk.
+    //
+    // Sayaç tabanlı bu biçim ikisini de çözüyor: `bit` hiçbir zaman
+    // 2^62'yi aşmaz ve döngü koşulu tek bir karşılaştırma.
+    var sh: i64 = 0
+    var tmp: i64 = y
+    while tmp > 3 {
+        tmp = tmp >> 2
+        sh = sh + 1
     }
-    if g < 1 { g = 1 }
-    return g << 24
+    var bit: i64 = 1
+    var z: i64 = 0
+    while z < sh {
+        bit = bit << 2
+        z = z + 1
+    }
+    // Klasik ikili karekök: her adımda bir biti sonuca eklemeyi dene.
+    var res: i64 = 0
+    var n: i64 = y
+    while bit != 0 {
+        if n >= res + bit {
+            n = n - (res + bit)
+            res = (res >> 1) + bit
+        } else {
+            res = res >> 1
+        }
+        bit = bit >> 2
+    }
+    return res << 24
 }
 
 /// |E|^(1/2) — eikonal güncellemesinin ölçek faktörü.

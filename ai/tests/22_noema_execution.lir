@@ -1,0 +1,41 @@
+// NOEMA Stage 8 bounded execution lifecycle guards.
+import "../src/noema_execution.lir"
+fn main() -> i64 {
+    var checks: i64 = 0
+    var passed: i64 = 0
+    checks = checks + 1
+    if task_transition_allowed(TASK_QUEUED, TASK_READY, 0, 2, 0, 0, 0) == EXEC_ALLOW { passed = passed + 1 }
+    checks = checks + 1
+    if task_transition_allowed(TASK_READY, TASK_RUNNING, 1, 2, 0, 0, 0) == EXEC_ALLOW { passed = passed + 1 }
+    checks = checks + 1
+    if task_transition_allowed(TASK_RUNNING, TASK_SUCCEEDED, 1, 2, 1, 1, 1) == EXEC_ALLOW { passed = passed + 1 }
+    checks = checks + 1
+    if task_transition_allowed(TASK_RUNNING, TASK_SUCCEEDED, 1, 2, 1, 1, 0) == EXEC_DENY { passed = passed + 1 }
+    checks = checks + 1
+    if task_transition_allowed(TASK_RUNNING, TASK_SUCCEEDED, 1, 2, 0, 1, 1) == EXEC_DENY { passed = passed + 1 }
+    checks = checks + 1
+    if task_transition_allowed(TASK_FAILED, TASK_READY, 1, 2, 0, 0, 0) == EXEC_ALLOW { passed = passed + 1 }
+    checks = checks + 1
+    if task_transition_allowed(TASK_FAILED, TASK_READY, 2, 2, 0, 0, 0) == EXEC_DENY { passed = passed + 1 }
+    checks = checks + 1
+    if task_transition_allowed(TASK_QUEUED, TASK_SUCCEEDED, 0, 2, 1, 1, 1) == EXEC_DENY { passed = passed + 1 }
+    checks = checks + 1
+    if execution_budget_admits(4, 6, 10) == EXEC_ALLOW { passed = passed + 1 }
+    checks = checks + 1
+    if execution_budget_admits(4, 7, 10) == EXEC_DENY { passed = passed + 1 }
+    checks = checks + 1
+    if execution_budget_admits(9223372036854775800, 20, 9223372036854775807) == EXEC_DENY { passed = passed + 1 }
+    checks = checks + 1
+    if execution_budget_admits(-1, 0, 4) == EXEC_DENY { passed = passed + 1 }
+    checks = checks + 1
+    if execution_run_complete(3, 3, 0, 0) == EXEC_ALLOW { passed = passed + 1 }
+    checks = checks + 1
+    if execution_run_complete(3, 3, 1, 0) == EXEC_DENY { passed = passed + 1 }
+    checks = checks + 1
+    if execution_run_complete(3, 2, 0, 0) == EXEC_DENY { passed = passed + 1 }
+    printInt(passed)
+    print("/")
+    printInt(checks)
+    println("")
+    return 0
+}

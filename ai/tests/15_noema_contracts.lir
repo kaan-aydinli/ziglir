@@ -1,0 +1,49 @@
+// NOEMA Stage 1: transition/evidence contract regression tests.
+import "../src/noema_contracts.lir"
+
+fn main() -> i64 {
+    var checks: i64 = 0
+    var passed: i64 = 0
+
+    checks = checks + 1
+    if obligation_transition_allowed(OBLIGATION_OPEN, OBLIGATION_CANDIDATE, 0, 0, 0, 0) == 1 { passed = passed + 1 }
+
+    checks = checks + 1
+    if obligation_transition_allowed(OBLIGATION_OPEN, OBLIGATION_UNRESOLVED, 0, 0, 0, 0) == 1 { passed = passed + 1 }
+
+    checks = checks + 1
+    if obligation_transition_allowed(OBLIGATION_CANDIDATE, OBLIGATION_CLOSED, 1, 1, 1, 1) == 1 { passed = passed + 1 }
+
+    checks = checks + 1
+    if obligation_transition_allowed(OBLIGATION_CANDIDATE, OBLIGATION_CLOSED, 0, 1, 1, 1) == 0 { passed = passed + 1 }
+
+    checks = checks + 1
+    if obligation_transition_allowed(OBLIGATION_CANDIDATE, OBLIGATION_CLOSED, 1, 0, 1, 1) == 0 { passed = passed + 1 }
+
+    checks = checks + 1
+    if obligation_transition_allowed(OBLIGATION_CANDIDATE, OBLIGATION_CLOSED, 1, 1, 0, 1) == 0 { passed = passed + 1 }
+
+    checks = checks + 1
+    if obligation_transition_allowed(OBLIGATION_CANDIDATE, OBLIGATION_CLOSED, 1, 1, 1, 0) == 0 { passed = passed + 1 }
+
+    checks = checks + 1
+    if obligation_transition_allowed(OBLIGATION_CLOSED, OBLIGATION_INVALIDATED, 0, 0, 0, 0) == 1 { passed = passed + 1 }
+
+    checks = checks + 1
+    if obligation_transition_allowed(OBLIGATION_INVALIDATED, OBLIGATION_OPEN, 0, 0, 0, 0) == 1 { passed = passed + 1 }
+
+    checks = checks + 1
+    if obligation_transition_allowed(OBLIGATION_CLOSED, OBLIGATION_OPEN, 1, 1, 1, 1) == 0 { passed = passed + 1 }
+
+    checks = checks + 1
+    if obligation_transition_allowed(99, OBLIGATION_CLOSED, 1, 1, 1, 1) == 0 { passed = passed + 1 }
+
+    checks = checks + 1
+    if evidence_can_close(1, 1, 1, 1) == 1 { passed = passed + 1 }
+
+    printInt(passed)
+    print("/")
+    printInt(checks)
+    println("")
+    return 0
+}

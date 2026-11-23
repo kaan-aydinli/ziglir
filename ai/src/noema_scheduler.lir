@@ -1,0 +1,49 @@
+// NOEMA Stage 3: deterministic bounded DAG scheduler primitive.
+// Edge matrix convention: edges[prerequisite * task_count + dependent] == 1.
+// `done` is one u64 cell per task. Caller owns buffers and persists events.
+const DAG_COMPLETE: i64 = -1
+const DAG_CYCLE: i64 = -2
+const DAG_INVALID: i64 = -3
+const DAG_MAX_TASKS: i64 = 64
+
+/// Return the lowest-index ready task, DAG_COMPLETE, DAG_CYCLE, or DAG_INVALID.
+/// The function is deterministic and does not mutate the graph or done vector.
+fn dag_next_ready(task_count: i64, edges: *u8, done: *u8) -> i64 {
+    if task_count < 0 or task_count > DAG_MAX_TASKS { return DAG_INVALID }
+    if task_count == 0 { return DAG_COMPLETE }
+
+    var pending: i64 = 0
+    var i: i64 = 0
+    while i < task_count {
+        let state = @read_u64(@ptr_add(done, i * 8)) as i64
+        if state != 0 and state != 1 { return DAG_INVALID }
+        if state == 0 { pending = pending + 1 }
+        var j: i64 = 0
+        while j < task_count {
+            let edge = @read_u64(@ptr_add(edges, (i * task_count + j) * 8)) as i64
+            if edge != 0 and edge != 1 { return DAG_INVALID }
+            if i == j and edge != 0 { return DAG_INVALID }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    if pending == 0 { return DAG_COMPLETE }
+
+    var task: i64 = 0
+    while task < task_count {
+        let task_state = @read_u64(@ptr_add(done, task * 8)) as i64
+        if task_state == 0 {
+            var ready = 1
+            var prerequisite: i64 = 0
+            while prerequisite < task_count {
+                let edge = @read_u64(@ptr_add(edges, (prerequisite * task_count + task) * 8)) as i64
+                let prerequisite_state = @read_u64(@ptr_add(done, prerequisite * 8)) as i64
+                if edge == 1 and prerequisite_state == 0 { ready = 0 }
+                prerequisite = prerequisite + 1
+            }
+            if ready == 1 { return task }
+        }
+        task = task + 1
+    }
+    return DAG_CYCLE
+}

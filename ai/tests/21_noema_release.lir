@@ -1,0 +1,55 @@
+// NOEMA Stage 7: promotion requires gates, safety, approval and rollback path.
+import "../src/noema_release.lir"
+
+fn main() -> i64 {
+    var checks: i64 = 0
+    var passed: i64 = 0
+    checks = checks + 1
+    if release_transition_allowed(RELEASE_CREATED, RELEASE_POLICY_CHECK, 0, 0, 0, 0) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if release_transition_allowed(RELEASE_POLICY_CHECK, RELEASE_DATA_AUDIT, 1, 0, 0, 0) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if release_transition_allowed(RELEASE_POLICY_CHECK, RELEASE_DATA_AUDIT, 0, 0, 0, 0) == 0 { passed = passed + 1 }
+    checks = checks + 1
+    if release_transition_allowed(RELEASE_DATA_AUDIT, RELEASE_SPLIT_LOCKED, 1, 0, 0, 0) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if release_transition_allowed(RELEASE_SPLIT_LOCKED, RELEASE_BASELINE_CAPTURED, 1, 0, 0, 0) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if release_transition_allowed(RELEASE_BASELINE_CAPTURED, RELEASE_TRAIN_CANDIDATE, 0, 0, 0, 0) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if release_transition_allowed(RELEASE_TRAIN_CANDIDATE, RELEASE_STATIC_CHECK, 0, 0, 0, 0) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if release_transition_allowed(RELEASE_STATIC_CHECK, RELEASE_EVAL, 1, 0, 0, 0) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if release_transition_allowed(RELEASE_EVAL, RELEASE_REVIEW, 1, 1, 0, 0) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if release_transition_allowed(RELEASE_EVAL, RELEASE_REVIEW, 1, 0, 0, 0) == 0 { passed = passed + 1 }
+    checks = checks + 1
+    if release_transition_allowed(RELEASE_REVIEW, RELEASE_SHADOW, 0, 1, 1, 1) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if release_transition_allowed(RELEASE_REVIEW, RELEASE_SHADOW, 0, 1, 0, 1) == 0 { passed = passed + 1 }
+    checks = checks + 1
+    if release_transition_allowed(RELEASE_SHADOW, RELEASE_CANARY, 0, 1, 0, 1) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if release_transition_allowed(RELEASE_CANARY, RELEASE_PROMOTED, 1, 1, 1, 1) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if release_transition_allowed(RELEASE_CANARY, RELEASE_PROMOTED, 1, 0, 1, 1) == 0 { passed = passed + 1 }
+    checks = checks + 1
+    if release_transition_allowed(RELEASE_CANARY, RELEASE_ROLLBACK, 0, 0, 0, 1) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if release_transition_allowed(RELEASE_PROMOTED, RELEASE_ROLLBACK, 0, 0, 0, 1) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if release_transition_allowed(RELEASE_PAUSED, RELEASE_POLICY_CHECK, 0, 0, 0, 0) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if release_transition_allowed(RELEASE_REJECTED, RELEASE_POLICY_CHECK, 1, 1, 1, 1) == 0 { passed = passed + 1 }
+    checks = checks + 1
+    if release_transition_allowed(99, RELEASE_PROMOTED, 1, 1, 1, 1) == 0 { passed = passed + 1 }
+    checks = checks + 1
+    if release_transition_allowed(RELEASE_CREATED, RELEASE_CREATED, 1, 1, 1, 1) == 0 { passed = passed + 1 }
+
+    printInt(passed)
+    print("/")
+    printInt(checks)
+    println("")
+    return 0
+}

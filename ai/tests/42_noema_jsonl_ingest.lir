@@ -1,0 +1,35 @@
+// Direct canonical JSONL → validated split/label arrays + hashed natural-text features.
+import "../src/noema_text.lir"
+import "../src/noema_text_jsonl.lir"
+fn main() -> i64 {
+    var checks: i64 = 0
+    var passed: i64 = 0
+    let rowsf = @malloc(3 * 16 * 8)
+    let rowst = @malloc(3 * 4 * 8)
+    let splits = @malloc(3 * 8)
+    let meta = @malloc(3 * 2 * 8)
+    let good = "{\"schema\":\"noema.example.v2\",\"id\":\"id-1\",\"split\":\"train\",\"group_key\":\"g1\",\"seed\":1,\"task\":{\"family\":\"reasoning\",\"capability\":\"exact\",\"risk\":\"low\"},\"conversation\":[{\"role\":\"user\",\"parts\":[{\"kind\":\"text\",\"text\":\"A cat runs quickly.\"}]}],\"target\":{\"decision\":\"answer\",\"parts\":[{\"kind\":\"text\",\"text\":\"Yes.\"}]},\"evidence\":{\"kind\":\"proof\"},\"quality\":{\"review\":\"synthetic\"},\"provenance\":{\"source\":\"synthetic\",\"license\":\"demo\",\"consent\":\"training\"},\"safety\":{\"pii\":\"none\"}}\n{\"schema\":\"noema.example.v2\",\"id\":\"id-2\",\"split\":\"dev\",\"group_key\":\"g2\",\"seed\":2,\"task\":{\"family\":\"language\",\"capability\":\"clarify\",\"risk\":\"low\"},\"conversation\":[{\"role\":\"user\",\"parts\":[{\"kind\":\"text\",\"text\":\"Can you help?\"}]}],\"target\":{\"decision\":\"ask\",\"parts\":[{\"kind\":\"text\",\"text\":\"Please clarify.\"}]},\"evidence\":{\"kind\":\"insufficient\"},\"quality\":{\"review\":\"synthetic\"},\"provenance\":{\"source\":\"synthetic\",\"license\":\"demo\",\"consent\":\"training\"},\"safety\":{\"pii\":\"none\"}}\n"
+    var first_end: i64 = 0
+    while first_end < good.len as i64 and (@read_u8(@ptr_add(good.ptr, first_end)) as i64) != 10 { first_end = first_end + 1 }
+    let targetspan = @malloc(16)
+    checks += 1
+    if noema_jsonl_target_span(good.ptr as *u8, 0, first_end, targetspan) == 1 and (@read_u64(@ptr_add(targetspan, 8)) as i64) - (@read_u64(targetspan) as i64) == 4 { passed += 1 }
+    let n = noema_text_decode_jsonl(good.len as i64, good.ptr as *u8, 3, 16, rowsf, rowst, splits, meta)
+    checks += 1
+    if n == 2 { passed += 1 }
+    checks += 1
+    if (@read_u64(splits) as i64) == 0 and (@read_u64(@ptr_add(splits, 8)) as i64) == 1 { passed += 1 }
+    checks += 1
+    if (@read_u64(rowst) as i64) == 4294967296 and (@read_u64(@ptr_add(rowst, 8)) as i64) == 0 and (@read_u64(@ptr_add(rowst, 4 * 8 + 8)) as i64) == 4294967296 { passed += 1 }
+    let bad = "{\"schema\":\"noema.example.v2\",\"id\":\"bad\",\"split\":\"train\",\"group_key\":\"g3\",\"seed\":3,\"task\":{\"risk\":\"low\"},\"conversation\":[{\"parts\":[{\"text\":\"text mentions \\\"id\\\": \\\"fake\\\" safely\"}]}],\"target\":{\"decision\":\"answer\"},\"evidence\":{\"kind\":\"proof\"},\"quality\":{\"review\":\"synthetic\"},\"provenance\":{\"source\":\"synthetic\",\"license\":\"demo\",\"consent\":\"denied\"},\"safety\":{\"pii\":\"none\"}}\n"
+    checks += 1
+    if noema_text_decode_jsonl(bad.len as i64, bad.ptr as *u8, 3, 16, rowsf, rowst, splits, meta) == TEXT_INVALID { passed += 1 }
+    let leak = "{\"schema\":\"noema.example.v2\",\"id\":\"id-a\",\"split\":\"train\",\"group_key\":\"same\",\"seed\":1,\"task\":{\"risk\":\"low\"},\"conversation\":[{\"parts\":[{\"text\":\"First phrase.\"}]}],\"target\":{\"decision\":\"answer\"},\"evidence\":{\"kind\":\"proof\"},\"quality\":{\"review\":\"synthetic\"},\"provenance\":{\"source\":\"synthetic\",\"license\":\"demo\",\"consent\":\"training\"},\"safety\":{\"pii\":\"none\"}}\n{\"schema\":\"noema.example.v2\",\"id\":\"id-b\",\"split\":\"test\",\"group_key\":\"same\",\"seed\":2,\"task\":{\"risk\":\"low\"},\"conversation\":[{\"parts\":[{\"text\":\"Second phrase.\"}]}],\"target\":{\"decision\":\"answer\"},\"evidence\":{\"kind\":\"proof\"},\"quality\":{\"review\":\"synthetic\"},\"provenance\":{\"source\":\"synthetic\",\"license\":\"demo\",\"consent\":\"training\"},\"safety\":{\"pii\":\"none\"}}\n"
+    checks += 1
+    if noema_text_decode_jsonl(leak.len as i64, leak.ptr as *u8, 3, 16, rowsf, rowst, splits, meta) == TEXT_INVALID { passed += 1 }
+    printInt(passed)
+    print("/")
+    printInt(checks)
+    println("")
+    return 0
+}

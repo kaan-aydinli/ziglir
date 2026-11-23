@@ -1,0 +1,51 @@
+// NOEMA Stage 2: evidence identity, scope and independent-verifier contracts.
+// This module is pure. Storage, hashing, authentication and payload inspection
+// remain caller responsibilities until their adapters are implemented.
+
+/// Validate one proposed evidence-to-obligation closure.
+/// IDs must be non-zero, producer and verifier must differ, evidence must pass,
+/// and the evidence scope must exactly match the required obligation scope.
+fn evidence_record_valid(evidence_id: i64, obligation_id: i64, producer_id: i64, verifier_id: i64, evidence_scope: i64, required_scope: i64, verifier_passed: i64) -> i64 {
+    if evidence_id <= 0 { return 0 }
+    if obligation_id <= 0 { return 0 }
+    if producer_id <= 0 { return 0 }
+    if verifier_id <= 0 { return 0 }
+    if producer_id == verifier_id { return 0 }
+    if evidence_scope <= 0 { return 0 }
+    if evidence_scope != required_scope { return 0 }
+    if verifier_passed != 1 { return 0 }
+    return 1
+}
+
+/// Check an artifact's ordered (obligation_id, evidence_id) pairs against a
+/// canonical relation table stored as two u64 arrays. Duplicate artifact pairs
+/// are rejected. A zero count is valid only for an artifact that makes no claims.
+/// Caller guarantees all buffers cover count/record_count cells.
+fn artifact_evidence_refs_valid(ref_count: i64, ref_obligation_ids: *u8, ref_evidence_ids: *u8, record_count: i64, record_obligation_ids: *u8, record_evidence_ids: *u8) -> i64 {
+    if ref_count < 0 or record_count < 0 { return 0 }
+    if ref_count > 256 or record_count > 256 { return 0 }
+    var i: i64 = 0
+    while i < ref_count {
+        let oid = @read_u64(@ptr_add(ref_obligation_ids, i * 8)) as i64
+        let eid = @read_u64(@ptr_add(ref_evidence_ids, i * 8)) as i64
+        if oid <= 0 or eid <= 0 { return 0 }
+        var found = 0
+        var j: i64 = 0
+        while j < record_count {
+            let record_oid = @read_u64(@ptr_add(record_obligation_ids, j * 8)) as i64
+            let record_eid = @read_u64(@ptr_add(record_evidence_ids, j * 8)) as i64
+            if oid == record_oid and eid == record_eid { found = 1 }
+            j = j + 1
+        }
+        if found == 0 { return 0 }
+        var k: i64 = 0
+        while k < i {
+            let prior_oid = @read_u64(@ptr_add(ref_obligation_ids, k * 8)) as i64
+            let prior_eid = @read_u64(@ptr_add(ref_evidence_ids, k * 8)) as i64
+            if oid == prior_oid and eid == prior_eid { return 0 }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return 1
+}

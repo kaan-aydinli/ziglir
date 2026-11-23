@@ -1,0 +1,53 @@
+// NOEMA Stage 17 typed-array fit/evaluation smoke test.
+import "../src/noema_fit.lir"
+fn main() -> i64 {
+    var checks: i64 = 0
+    var passed: i64 = 0
+    let model = block_new(1, 1, 1, 0)
+    let features = @malloc(3 * 8)
+    let targets = @malloc(3 * 8)
+    let splits = @malloc(3 * 8)
+    let history = @malloc(8 * 8)
+    let metric = @malloc(8)
+    @write_u64(features, ONE as u64)
+    @write_u64(@ptr_add(features, 8), (2 * ONE) as u64)
+    @write_u64(@ptr_add(features, 16), (3 * ONE) as u64)
+    @write_u64(targets, ONE as u64)
+    @write_u64(@ptr_add(targets, 8), (2 * ONE) as u64)
+    @write_u64(@ptr_add(targets, 16), (3 * ONE) as u64)
+    @write_u64(splits, FIT_TRAIN as u64)
+    @write_u64(@ptr_add(splits, 8), FIT_DEV as u64)
+    @write_u64(@ptr_add(splits, 16), FIT_TEST as u64)
+    checks = checks + 1
+    if noema_train_epoch(model, 3, features, targets, splits, ONE / 4, metric) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if noema_evaluate_split(model, 3, features, targets, splits, FIT_DEV, metric) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if noema_evaluate_split(model, 3, features, targets, splits, FIT_TEST, metric) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if noema_evaluate_split(model, 3, features, targets, splits, 3, metric) == FIT_INVALID { passed = passed + 1 }
+    checks = checks + 1
+    if noema_evaluate_split(model, 0, features, targets, splits, FIT_DEV, metric) == FIT_INVALID { passed = passed + 1 }
+checks = checks + 1
+    if noema_fit(model, 3, features, targets, splits, ONE / 8, 8, history) == 8 { passed = passed + 1 }
+    checks = checks + 1
+    if (@read_u64(@ptr_add(history, 56)) as i64) <= (@read_u64(history) as i64) { passed = passed + 1 }
+    checks = checks + 1
+    if noema_fit(model, 3, features, targets, splits, ONE / 8, 0, history) == FIT_INVALID { passed = passed + 1 }
+    let early_config = @malloc(32)
+    @write_u64(early_config, (ONE / 8) as u64)
+    @write_u64(@ptr_add(early_config, 8), 8 as u64)
+    @write_u64(@ptr_add(early_config, 16), 2 as u64)
+    @write_u64(@ptr_add(early_config, 24), 0 as u64)
+    checks = checks + 1
+    let early_epochs = noema_fit_early_stop(model, 3, features, targets, splits, early_config, history)
+    if early_epochs > 0 and early_epochs <= 8 { passed = passed + 1 }
+    @write_u64(@ptr_add(splits, 16), 9 as u64)
+    checks = checks + 1
+    if noema_train_epoch(model, 3, features, targets, splits, ONE / 8, metric) == FIT_INVALID { passed = passed + 1 }
+    printInt(passed)
+    print("/")
+    printInt(checks)
+    println("")
+    return 0
+}

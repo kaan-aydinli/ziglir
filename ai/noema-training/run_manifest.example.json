@@ -1,0 +1,46 @@
+{
+  "schema": "noema.training_run.v2",
+  "run_id": "demo-run-derived-from-manifest-hash",
+  "parent_release": "demo-release-000",
+  "data_manifests": ["demo-manifest-training-001"],
+  "split_manifest": "demo-split-family-holdout-v1",
+  "generator_versions": ["synthetic-arithmetic@1.0", "synthetic-lir@1.0"],
+  "task_families": ["reasoning", "code"],
+  "modules_to_update": ["router.reasoning.v1", "rule_store.arithmetic.v1"],
+  "update_methods": ["bounded_local_calibration", "verified_rule_induction"],
+  "seed": 1729,
+  "compute_budget": {
+    "cpu_seconds": 3600,
+    "memory_bytes": 1073741824,
+    "energy_joules": null,
+    "wall_seconds": 7200
+  },
+  "policy_version": "demo-policy-v1",
+  "schema_versions": ["noema.example.v2", "noema.training_run.v2"],
+  "gate_set": "demo-gates-reasoning-code-v1",
+  "replay_plan": "demo-replay-plan-v1",
+  "artifact_retention": "synthetic-demo-retention",
+  "review_policy": {
+    "human_approval_required": true,
+    "risk_ceiling": "low",
+    "online_weight_update": false
+  },
+  "dataset_quality": {
+    "audit_schema": "noema.dataset_audit.v1",
+    "report_ref": "demo-dataset-quality-report",
+    "dataset_manifest": "demo-dataset-manifest",
+    "fail_on": ["missing_id", "duplicate_id", "missing_split", "group_split_leakage", "exact_text_split_leakage", "missing_source_or_license"],
+    "warn_on": ["provenance_not_structured", "unresolved_label_disagreement"],
+    "unknown_policy": "block_promotion"
+  },
+  "execution_plan": {
+    "max_workers": 2,
+    "batch_size": 32,
+    "shard_key": "group_key",
+    "incremental_cache": true,
+    "cache_namespace": "demo-content-addressed-v1",
+    "deterministic_merge": true,
+    "gate_mode": "fail_fast_then_complete_before_promotion"
+  },
+  "status": "example-only-not-executable"
+}

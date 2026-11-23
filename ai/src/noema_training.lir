@@ -1,0 +1,62 @@
+// NOEMA Stage 16: typed-array curriculum and split-integrity primitives.
+// Host-side JSONL decoding, hashing, and durable manifest IO are not included.
+const TRAIN_INVALID: i64 = -1
+const TRAIN_MAX_SAMPLES: i64 = 4096
+const TRAIN_MAX_TASKS: i64 = 64
+
+/// Select a stable curriculum frontier sample: among eligible samples below
+/// their task's readiness ceiling, prioritize the greatest task deficit, then
+/// the greatest difficulty not exceeding that ceiling, then lowest row index.
+/// task_ids are zero-based; deficits/ceilings are caller-computed typed signals.
+fn dataset_curriculum_pick(sample_count: i64, task_ids: *u8, difficulties: *u8, eligible: *u8, task_deficits: *u8, task_ceilings: *u8, task_count: i64) -> i64 {
+    if sample_count < 0 or sample_count > TRAIN_MAX_SAMPLES or task_count <= 0 or task_count > TRAIN_MAX_TASKS { return TRAIN_INVALID }
+    var best = TRAIN_INVALID
+    var best_deficit: i64 = -1
+    var best_difficulty: i64 = -1
+    var i: i64 = 0
+    while i < sample_count {
+        let task = @read_u64(@ptr_add(task_ids, i * 8)) as i64
+        let difficulty = @read_u64(@ptr_add(difficulties, i * 8)) as i64
+        let allowed = @read_u64(@ptr_add(eligible, i * 8)) as i64
+        if task < 0 or task >= task_count or difficulty < 0 or allowed < 0 or allowed > 1 { return TRAIN_INVALID }
+        if allowed == 1 {
+            let deficit = @read_u64(@ptr_add(task_deficits, task * 8)) as i64
+            let ceiling = @read_u64(@ptr_add(task_ceilings, task * 8)) as i64
+            if deficit < 0 or ceiling < 0 { return TRAIN_INVALID }
+            if deficit > 0 and difficulty <= ceiling {
+                if deficit > best_deficit or (deficit == best_deficit and difficulty > best_difficulty) {
+                    best = i
+                    best_deficit = deficit
+                    best_difficulty = difficulty
+                }
+            }
+        }
+        i = i + 1
+    }
+    return best
+}
+
+/// Decrement a positive deficit after a successful exposure; zero remains zero.
+fn dataset_deficit_after_exposure(deficit: i64) -> i64 {
+    if deficit <= 0 { return 0 }
+    return deficit - 1
+}
+
+/// Reject split leakage when a group key appears in more than one split.
+/// split IDs are 0=train, 1=dev, 2=test; group IDs must be positive.
+fn dataset_group_splits_valid(record_count: i64, group_ids: *u8, split_ids: *u8) -> i64 {
+    if record_count < 0 or record_count > TRAIN_MAX_SAMPLES { return 0 }
+    var i: i64 = 0
+    while i < record_count {
+        let group = @read_u64(@ptr_add(group_ids, i * 8)) as i64
+        let split = @read_u64(@ptr_add(split_ids, i * 8)) as i64
+        if group <= 0 or split < 0 or split > 2 { return 0 }
+        var j: i64 = 0
+        while j < i {
+            if (@read_u64(@ptr_add(group_ids, j * 8)) as i64) == group and (@read_u64(@ptr_add(split_ids, j * 8)) as i64) != split { return 0 }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return 1
+}

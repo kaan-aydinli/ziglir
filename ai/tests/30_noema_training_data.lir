@@ -1,0 +1,67 @@
+// NOEMA Stage 16 curriculum-frontier selection and split leakage checks.
+import "../src/noema_training.lir"
+fn main() -> i64 {
+    var checks: i64 = 0
+    var passed: i64 = 0
+    let tasks = @malloc(4 * 8)
+    let diffs = @malloc(4 * 8)
+    let eligible = @malloc(4 * 8)
+    let deficits = @malloc(2 * 8)
+    let ceilings = @malloc(2 * 8)
+    let groups = @malloc(4 * 8)
+    let splits = @malloc(4 * 8)
+    @write_u64(tasks, 0 as u64)
+    @write_u64(@ptr_add(tasks, 8), 0 as u64)
+    @write_u64(@ptr_add(tasks, 16), 1 as u64)
+    @write_u64(@ptr_add(tasks, 24), 1 as u64)
+    @write_u64(diffs, 3 as u64)
+    @write_u64(@ptr_add(diffs, 8), 7 as u64)
+    @write_u64(@ptr_add(diffs, 16), 5 as u64)
+    @write_u64(@ptr_add(diffs, 24), 8 as u64)
+    @write_u64(eligible, 1 as u64)
+    @write_u64(@ptr_add(eligible, 8), 1 as u64)
+    @write_u64(@ptr_add(eligible, 16), 1 as u64)
+    @write_u64(@ptr_add(eligible, 24), 0 as u64)
+    @write_u64(deficits, 4 as u64)
+    @write_u64(@ptr_add(deficits, 8), 9 as u64)
+    @write_u64(ceilings, 6 as u64)
+    @write_u64(@ptr_add(ceilings, 8), 10 as u64)
+    checks = checks + 1
+    if dataset_curriculum_pick(4, tasks, diffs, eligible, deficits, ceilings, 2) == 2 { passed = passed + 1 }
+    @write_u64(@ptr_add(deficits, 8), 0 as u64)
+    checks = checks + 1
+    if dataset_curriculum_pick(4, tasks, diffs, eligible, deficits, ceilings, 2) == 0 { passed = passed + 1 }
+    @write_u64(deficits, 0 as u64)
+    checks = checks + 1
+    if dataset_curriculum_pick(4, tasks, diffs, eligible, deficits, ceilings, 2) == TRAIN_INVALID { passed = passed + 1 }
+    checks = checks + 1
+    if dataset_deficit_after_exposure(1) == 0 { passed = passed + 1 }
+    checks = checks + 1
+    if dataset_deficit_after_exposure(0) == 0 { passed = passed + 1 }
+    @write_u64(groups, 10 as u64)
+    @write_u64(@ptr_add(groups, 8), 10 as u64)
+    @write_u64(@ptr_add(groups, 16), 20 as u64)
+    @write_u64(@ptr_add(groups, 24), 30 as u64)
+    @write_u64(splits, 0 as u64)
+    @write_u64(@ptr_add(splits, 8), 0 as u64)
+    @write_u64(@ptr_add(splits, 16), 1 as u64)
+    @write_u64(@ptr_add(splits, 24), 2 as u64)
+    checks = checks + 1
+    if dataset_group_splits_valid(4, groups, splits) == 1 { passed = passed + 1 }
+    @write_u64(@ptr_add(splits, 8), 1 as u64)
+    checks = checks + 1
+    if dataset_group_splits_valid(4, groups, splits) == 0 { passed = passed + 1 }
+    @write_u64(@ptr_add(splits, 8), 0 as u64)
+    @write_u64(@ptr_add(groups, 24), 10 as u64)
+    checks = checks + 1
+    if dataset_group_splits_valid(4, groups, splits) == 0 { passed = passed + 1 }
+    @write_u64(@ptr_add(groups, 24), 30 as u64)
+    @write_u64(@ptr_add(splits, 24), 3 as u64)
+    checks = checks + 1
+    if dataset_group_splits_valid(4, groups, splits) == 0 { passed = passed + 1 }
+    printInt(passed)
+    print("/")
+    printInt(checks)
+    println("")
+    return 0
+}

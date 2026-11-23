@@ -1,0 +1,34 @@
+// 13_mod_order — `-O2` loop rotasyonu `mod`'u döngü gövdesinden çıkarıp
+// bozuk sonuç üretiyordu. Bu test o hatayı kalıcı olarak yakalar.
+//
+//   let t = x % y; x = y; y = t
+//
+// `-O2`'de `mod` koşul bloğuna taşınıp `gcd(24,18)` 6 yerine 18 dönüyordu
+// (loop rotasyonu `isPureHeaderOp` listesinde `mod`/`umod` vardı).
+fn gcd(a: i64, b: i64) -> i64 {
+    var x = a
+    var y = b
+    while y != 0 {
+        let t = x % y
+        x = y
+        y = t
+    }
+    return x
+}
+// Çarpışan tanımlar: x ve y birbirine atanırken `mod` arada okunur.
+fn collatz_steps(n0: i64) -> i64 {
+    var n = n0
+    var c: i64 = 0
+    while n != 1 and c < 10000 {
+        if n % 2 == 0 { n = n / 2 } else { n = 3 * n + 1 }
+        c = c + 1
+    }
+    return c
+}
+fn main() -> i64 {
+    printInt(gcd(24, 18)); printInt(gcd(1071, 462)); printInt(gcd(17, 5))
+    println("")
+    printInt(collatz_steps(27)); printInt(collatz_steps(97))
+    println("")
+    return 0
+}

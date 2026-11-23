@@ -1,0 +1,21 @@
+// LIR-only demonstration of local dialogue training and artifact persistence.
+// The miniature hand-written corpus is a smoke test, not a quality dataset.
+import "src/noema_lm.lir"
+fn main() -> i64 {
+    let model = noema_lm_new(16, 128, 2026)
+    var epoch: i64 = 0
+    var last_loss: f64 = 0.0
+    while epoch < 40 {
+        last_loss = noema_lm_train_chat_pair(model, "Merhaba", "Merhaba! Nasıl yardımcı olabilirim?", 0.05)
+        last_loss = noema_lm_train_chat_pair(model, "Adın ne?", "Ben NOEMA, yerel bir LIR modeliyim.", 0.05)
+        last_loss = noema_lm_train_chat_pair(model, "Trabzon nerededir?", "Trabzon, Türkiye'nin Karadeniz kıyısındadır.", 0.05)
+        last_loss = noema_lm_train_chat_pair(model, "Teşekkürler", "Rica ederim.", 0.05)
+        if last_loss < 0.0 { println("DEMO_TRAINING_FAILED") noema_lm_free(model) return 1 }
+        epoch = epoch + 1
+    }
+    if noema_lm_save(model, "ai/noema-training/noema_lm_demo.lmcp") != 1 { println("CHECKPOINT_SAVE_FAILED") noema_lm_free(model) return 1 }
+    print("optimizer updates: ") printInt(epoch * 4) print(" last example loss: ") printFloat(last_loss) println("")
+    println("saved local LIR checkpoint; toy dialogue only, no generalization claim")
+    noema_lm_free(model)
+    return 0
+}

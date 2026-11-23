@@ -1,0 +1,35 @@
+// Bounded JSONL framing: CRLF, final record, blank rows, BOM and size limit.
+import jsonl
+fn main() -> i64 {
+    var checks: i64 = 0
+    var passed: i64 = 0
+    let input = "{\"id\":\"one\",\"split\":\"train\"}\r\n{\"id\":\"two\",\"meta\":{\"ok\":true}}"
+    var reader = JsonlReader.init(input, 256)
+    let first = reader.next()
+    checks += 1
+    if reader.status == JSONL_OK and first.len > 0 and first.ptr[0] == 123 { passed += 1 }
+    let second = reader.next()
+    checks += 1
+    if reader.status == JSONL_OK and second.len > 0 and second.ptr[0] == 123 { passed += 1 }
+    let done = reader.next()
+    checks += 1
+    if done.len == 0 and reader.status == JSONL_EOF { passed += 1 }
+    var blank = JsonlReader.init("{}\n\n", 20)
+    let _first_blank_test_row = blank.next()
+    let bad_blank = blank.next()
+    checks += 1
+    if bad_blank.len == 0 and blank.status == JSONL_INVALID { passed += 1 }
+    var too_long = JsonlReader.init("{\"long\":12345}", 4)
+    let bad_long = too_long.next()
+    checks += 1
+    if bad_long.len == 0 and too_long.status == JSONL_LINE_TOO_LONG { passed += 1 }
+    var bom = JsonlReader.init("﻿{\"id\":1}\n", 64)
+    let bad_bom = bom.next()
+    checks += 1
+    if bad_bom.len == 0 and bom.status == JSONL_INVALID { passed += 1 }
+    printInt(passed)
+    print("/")
+    printInt(checks)
+    println("")
+    return 0
+}

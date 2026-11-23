@@ -1,0 +1,38 @@
+// NOEMA Stage 18 strict integer CSV decoder.
+import "../src/noema_csv.lir"
+fn main() -> i64 {
+    var checks: i64 = 0
+    var passed: i64 = 0
+    let features = @malloc(4 * 8)
+    let targets = @malloc(2 * 8)
+    let splits = @malloc(2 * 8)
+    let csv = "0,2,-3,9\r\n1,4,5,12\n"
+    let rows = noema_csv_decode(csv.len as i64, csv.ptr as *u8, 2, 1, 2, features, targets, splits)
+    checks = checks + 1
+    if rows == 2 { passed = passed + 1 }
+    checks = checks + 1
+    if (@read_u64(features) as i64) == from_int(2) { passed = passed + 1 }
+    checks = checks + 1
+    if (@read_u64(@ptr_add(features, 8)) as i64) == from_int(-3) { passed = passed + 1 }
+    checks = checks + 1
+    if (@read_u64(@ptr_add(targets, 8)) as i64) == from_int(12) { passed = passed + 1 }
+    checks = checks + 1
+    if (@read_u64(@ptr_add(splits, 8)) as i64) == 1 { passed = passed + 1 }
+    let bad = "0,1\n1,2"
+    checks = checks + 1
+    if noema_csv_decode(bad.len as i64, bad.ptr as *u8, 1, 1, 2, features, targets, splits) == CSV_INVALID { passed = passed + 1 }
+    let bad_split = "3,1,2\n"
+    checks = checks + 1
+    if noema_csv_decode(bad_split.len as i64, bad_split.ptr as *u8, 1, 1, 2, features, targets, splits) == CSV_INVALID { passed = passed + 1 }
+    let bad_decimal = "0,1.5,2\n"
+    checks = checks + 1
+    if noema_csv_decode(bad_decimal.len as i64, bad_decimal.ptr as *u8, 1, 1, 2, features, targets, splits) == CSV_INVALID { passed = passed + 1 }
+    let bad_capacity = "0,1,2\n1,2,3\n"
+    checks = checks + 1
+    if noema_csv_decode(bad_capacity.len as i64, bad_capacity.ptr as *u8, 1, 1, 1, features, targets, splits) == CSV_INVALID { passed = passed + 1 }
+    printInt(passed)
+    print("/")
+    printInt(checks)
+    println("")
+    return 0
+}

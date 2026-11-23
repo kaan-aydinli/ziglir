@@ -1,0 +1,22 @@
+// Local retrieval-augmented chat over the LIR-trained response memory.
+// Unknown or weakly matched questions are refused rather than fabricated.
+import "src/noema_sparse_memory.lir"
+fn main() -> i64 {
+    let memory = noema_sparse_load("ai/noema-training/turkish_chat_memory.nsm")
+    if memory.capacity == 0 { println("LOCAL_MEMORY_CHECKPOINT_MISSING_OR_INVALID") return 1 }
+    let input = @malloc(257)
+    let n = @read(0, input, 256)
+    if n <= 0 { @free(input) noema_sparse_free(memory) println("EMPTY_INPUT") return 1 }
+    var length = n
+    while length > 0 {
+        let ch = @read_u8(@ptr_add(input, length - 1)) as i64
+        if ch == 10 or ch == 13 { length = length - 1 } else { break }
+    }
+    if length <= 0 { @free(input) noema_sparse_free(memory) println("EMPTY_INPUT") return 1 }
+    let output = @malloc(257)
+    let written = noema_sparse_reply(memory, length, input, output, 256, 400)
+    if written > 0 { @write(1, output, written) println("") }
+    else { println("Bu soruya eğitim belleğimde yeterince güvenilir bir eşleşme bulamadım. Daha fazla bağlam verebilir misiniz?") }
+    @free(output) @free(input) noema_sparse_free(memory)
+    return 0
+}

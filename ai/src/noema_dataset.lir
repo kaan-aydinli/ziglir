@@ -1,0 +1,57 @@
+// NOEMA Stage 4: pure dataset eligibility and deterministic split decisions.
+// Host code handles JSONL, source registry, hashes, and disk I/O; this module
+// consumes typed status values and never inspects untrusted payload bytes.
+
+const DATA_REJECT: i64 = 0
+const DATA_QUARANTINE: i64 = 1
+const DATA_ELIGIBLE: i64 = 2
+
+const DATA_STATUS_UNKNOWN: i64 = 0
+const DATA_STATUS_PASS: i64 = 1
+const DATA_STATUS_FAIL: i64 = 2
+
+const DATA_SPLIT_TRAIN: i64 = 0
+const DATA_SPLIT_DEV: i64 = 1
+const DATA_SPLIT_TEST: i64 = 2
+const DATA_SPLIT_INVALID: i64 = -1
+
+/// Each status is UNKNOWN/PASS/FAIL. Explicit policy/schema/privacy denials
+/// reject; incomplete evidence or disputed labels quarantine, never train.
+fn dataset_record_eligibility(source_allowed: i64, consent_valid: i64, license_valid: i64, schema_valid: i64, provenance_valid: i64, privacy_clear: i64, label_agreement: i64, target_verified: i64) -> i64 {
+    if source_allowed == DATA_STATUS_FAIL or consent_valid == DATA_STATUS_FAIL or license_valid == DATA_STATUS_FAIL { return DATA_REJECT }
+    if schema_valid == DATA_STATUS_FAIL or privacy_clear == DATA_STATUS_FAIL { return DATA_REJECT }
+    if source_allowed < DATA_STATUS_UNKNOWN or source_allowed > DATA_STATUS_FAIL { return DATA_REJECT }
+    if consent_valid < DATA_STATUS_UNKNOWN or consent_valid > DATA_STATUS_FAIL { return DATA_REJECT }
+    if license_valid < DATA_STATUS_UNKNOWN or license_valid > DATA_STATUS_FAIL { return DATA_REJECT }
+    if schema_valid < DATA_STATUS_UNKNOWN or schema_valid > DATA_STATUS_FAIL { return DATA_REJECT }
+    if provenance_valid < DATA_STATUS_UNKNOWN or provenance_valid > DATA_STATUS_FAIL { return DATA_REJECT }
+    if privacy_clear < DATA_STATUS_UNKNOWN or privacy_clear > DATA_STATUS_FAIL { return DATA_REJECT }
+    if label_agreement < DATA_STATUS_UNKNOWN or label_agreement > DATA_STATUS_FAIL { return DATA_REJECT }
+    if target_verified < DATA_STATUS_UNKNOWN or target_verified > DATA_STATUS_FAIL { return DATA_REJECT }
+    if provenance_valid == DATA_STATUS_FAIL or privacy_clear == DATA_STATUS_FAIL { return DATA_REJECT }
+    if label_agreement == DATA_STATUS_FAIL { return DATA_QUARANTINE }
+    if source_allowed != DATA_STATUS_PASS or consent_valid != DATA_STATUS_PASS or license_valid != DATA_STATUS_PASS { return DATA_QUARANTINE }
+    if schema_valid != DATA_STATUS_PASS or provenance_valid != DATA_STATUS_PASS or privacy_clear != DATA_STATUS_PASS { return DATA_QUARANTINE }
+    if label_agreement != DATA_STATUS_PASS or target_verified != DATA_STATUS_PASS { return DATA_QUARANTINE }
+    return DATA_ELIGIBLE
+}
+
+/// Deterministic group split from a stable host-computed bucket in [0, 10000).
+/// `train_end` and `dev_end` are cumulative boundaries; final remainder is test.
+fn dataset_split_for_bucket(bucket: i64, train_end: i64, dev_end: i64) -> i64 {
+    if bucket < 0 or bucket >= 10000 { return DATA_SPLIT_INVALID }
+    if train_end <= 0 or train_end >= 10000 { return DATA_SPLIT_INVALID }
+    if dev_end <= train_end or dev_end >= 10000 { return DATA_SPLIT_INVALID }
+    if bucket < train_end { return DATA_SPLIT_TRAIN }
+    if bucket < dev_end { return DATA_SPLIT_DEV }
+    return DATA_SPLIT_TEST
+}
+
+/// Promotion guard for a frozen audit report. Unknown policy outcomes, missing
+/// manifest linkage, empty sets, errors, or split leakage block promotion.
+fn dataset_report_promotable(record_count: i64, error_count: i64, split_leak_count: i64, unknown_policy_passed: i64, manifest_link_valid: i64) -> i64 {
+    if record_count <= 0 or error_count < 0 or split_leak_count < 0 { return 0 }
+    if error_count != 0 or split_leak_count != 0 { return 0 }
+    if unknown_policy_passed != 1 or manifest_link_valid != 1 { return 0 }
+    return 1
+}

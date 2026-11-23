@@ -1,0 +1,51 @@
+// NOEMA Stage 22: canonical natural-language JSONL to LIR fit and held-out metrics.
+import "../src/noema_text.lir"
+import "../src/noema_text_jsonl.lir"
+import "../src/noema_fit.lir"
+fn main() -> i64 {
+    var checks: i64 = 0
+    var passed: i64 = 0
+    let fd = @open("ai/noema-training/example_text.v2.jsonl", 0, 0)
+    checks = checks + 1
+    if fd >= 0 { passed = passed + 1 }
+    if fd < 0 { printInt(passed) print("/") printInt(checks) println("") return 0 }
+    let bytes = @malloc(65536)
+    let nbytes = @read(fd, bytes, 65536)
+    @close(fd)
+    let features = @malloc(11 * 64 * 8)
+    let targets = @malloc(11 * 4 * 8)
+    let splits = @malloc(11 * 8)
+    let metadata = @malloc(11 * 2 * 8)
+    let history = @malloc(200 * 8)
+    let rows = noema_text_decode_jsonl(nbytes, bytes, 11, 64, features, targets, splits, metadata)
+    checks = checks + 1
+    if rows == 11 { passed = passed + 1 }
+    let model = block_new(64, 4, 64, 1729)
+    checks = checks + 1
+    if noema_fit(model, rows, features, targets, splits, ONE / 32, 200, history) == 200 { passed = passed + 1 }
+    checks = checks + 1
+    if (@read_u64(@ptr_add(history, 199 * 8)) as i64) < (@read_u64(history) as i64) { passed = passed + 1 }
+    let train_conf = @malloc(16 * 8)
+    let dev_conf = @malloc(16 * 8)
+    let test_conf = @malloc(16 * 8)
+    let train_n = noema_confusion_split(model, rows, features, targets, splits, FIT_TRAIN, train_conf)
+    let dev_n = noema_confusion_split(model, rows, features, targets, splits, FIT_DEV, dev_conf)
+    let test_n = noema_confusion_split(model, rows, features, targets, splits, FIT_TEST, test_conf)
+    checks = checks + 1
+    if train_n == 9 { passed = passed + 1 }
+    checks = checks + 1
+    if dev_n == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if test_n == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if (@read_u64(train_conf) as i64) == 6 and (@read_u64(@ptr_add(train_conf, 40)) as i64) == 2 and (@read_u64(@ptr_add(train_conf, 80)) as i64) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if (@read_u64(@ptr_add(test_conf, 56)) as i64) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if noema_evaluate_split(model, rows, features, targets, splits, FIT_TEST, @malloc(8)) == 1 { passed = passed + 1 }
+    printInt(passed)
+    print("/")
+    printInt(checks)
+    println("")
+    return 0
+}

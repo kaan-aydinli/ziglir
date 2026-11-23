@@ -1,0 +1,66 @@
+// backends: native
+// SEL test 09 — kalıcı işçi havuzu, seri `forward` ile eşitlik.
+//
+// Havuzun ürettiği çıktı, tek çekirdekteki `forward` ile BİREBİR aynı olmalı:
+// aynı aritmetik, aynı kenar düzeni, yalnızca nöron aralıkları bölünmüş.
+// Beklenen: 0 farklı nöron, sonra 1 farklı nöron (bilerek bozulmuş referans).
+import "../src/pool.lir"
+import "../src/ledger.lir"
+
+fn main() -> i64 {
+    let nout = 256
+    let b = block_new(64, nout, 8, 5)
+    let x = @malloc(64 * 8)
+    var i: i64 = 0
+    while i < 64 { @write_u64(@ptr_add(x, i*8), ((i * 7) % 13) as u64) i = i + 1 }
+
+    // 1) Seri referansı al ve sakla.
+    forward(b, x)
+    let ref = @malloc(nout * 8)
+    i = 0
+    i = 0
+    while i < nout {
+        @write_u64(@ptr_add(ref, i*8), @read_u64(@ptr_add(b.out, i*8)))
+        i = i + 1
+    }
+
+    // 2) Çıktıyı kirlet, sonra havuzla yeniden hesapla.
+    i = 0
+    while i < nout { @write_u64(@ptr_add(b.out, i*8), 12345 as u64) i = i + 1 }
+
+    let p = pool_new(2)
+    let h = @malloc(16 * 8)
+    pool_start(p, 2, h)
+    pset(p, P_EDGES, b.edges as i64)
+    pset(p, P_BIAS, b.bias as i64)
+    pset(p, P_OUT, b.out as i64)
+    pset(p, P_K, b.k)
+    pset(p, P_X, x as i64)
+    pool_run_fwd(p, 0, nout, 64)
+    pool_shutdown(p, h)
+
+    // 3) Karşılaştır.
+    var diff: i64 = 0
+    i = 0
+    while i < nout {
+        if (@read_u64(@ptr_add(b.out, i*8)) as i64) != (@read_u64(@ptr_add(ref, i*8)) as i64) {
+            diff = diff + 1
+        }
+        i = i + 1
+    }
+    printInt(diff)
+
+    // 4) Havuz gerçekten yazdı mı? Referansı tek hücrede bozup farkın
+    //    görünür olduğunu doğrula (havuz sessizce hiçbir şey yapmıyor olmasın).
+    @write_u64(@ptr_add(ref, 0), 0 as u64)
+    i = 0
+    var diff2: i64 = 0
+    while i < nout {
+        if (@read_u64(@ptr_add(b.out, i*8)) as i64) != (@read_u64(@ptr_add(ref, i*8)) as i64) {
+            diff2 = diff2 + 1
+        }
+        i = i + 1
+    }
+    printInt(diff2)
+    return 0
+}

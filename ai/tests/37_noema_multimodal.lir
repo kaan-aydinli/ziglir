@@ -1,0 +1,45 @@
+// NOEMA Stage 24: multimodal metadata-admission guards, not media model tests.
+import "../src/noema_multimodal.lir"
+fn main() -> i64 {
+    var checks: i64 = 0
+    var passed: i64 = 0
+    checks = checks + 1
+    if noema_mm_artifact_valid(MM_IMAGE, MM_MIME_IMAGE_PNG, 1024, 0, 640, 480, 0, 0) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if noema_mm_artifact_valid(MM_IMAGE, MM_MIME_AUDIO_WAV, 1024, 0, 640, 480, 0, 0) == 0 { passed = passed + 1 }
+    checks = checks + 1
+    if noema_mm_artifact_valid(MM_IMAGE, MM_MIME_IMAGE_JPEG, 1024, 0, 20000, 480, 0, 0) == 0 { passed = passed + 1 }
+    checks = checks + 1
+    if noema_mm_artifact_valid(MM_AUDIO, MM_MIME_AUDIO_WAV, 12000, 2500, 0, 0, 48000, 2) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if noema_mm_artifact_valid(MM_AUDIO, MM_MIME_AUDIO_WAV, 12000, 2500, 0, 0, 1000, 2) == 0 { passed = passed + 1 }
+    checks = checks + 1
+    if noema_mm_artifact_valid(MM_VIDEO, MM_MIME_VIDEO_MP4, 200000, 10000, 1280, 720, 0, 0) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if noema_mm_artifact_valid(MM_VIDEO, MM_MIME_VIDEO_WEBM, 200000, 10000, 1280, 720, 0, 0) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if noema_mm_artifact_valid(MM_SPATIAL, MM_MIME_SPATIAL_JSON, 800, 0, 0, 0, 0, 0) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if noema_mm_integrity_valid(1, 1) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if noema_mm_integrity_valid(1, 0) == 0 { passed = passed + 1 }
+    checks = checks + 1
+    if noema_mm_video_rate_valid(30000) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if noema_mm_video_rate_valid(240000) == 0 { passed = passed + 1 }
+    checks = checks + 1
+    if noema_mm_task_admissible(2, 2, MM_TEXT, 1, 1) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if noema_mm_task_admissible(2, 1, MM_TEXT, 1, 1) == 0 { passed = passed + 1 }
+    checks = checks + 1
+    if noema_mm_task_admissible(1, 1, MM_AUDIO, 0, 1) == 0 { passed = passed + 1 }
+    checks = checks + 1
+    if noema_mm_result_status(1, 1, 1) == MM_OK { passed = passed + 1 }
+    checks = checks + 1
+    if noema_mm_result_status(0, 1, 1) == MM_UNAVAILABLE { passed = passed + 1 }
+    printInt(passed)
+    print("/")
+    printInt(checks)
+    println("")
+    return 0
+}

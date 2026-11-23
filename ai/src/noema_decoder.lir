@@ -1,0 +1,159 @@
+// NOEMA: prompt-conditioned byte-response decoder.
+// Sparse text encoding bins vote into per-class/per-position output-byte weights.
+// This small supervised decoder is meaningful only for its trained data/domain;
+// it is not a substitute for a large pretrained autoregressive language model.
+const DECODER_CLASSES: i64 = 4
+const DECODER_INPUT_DIM: i64 = 128
+const DECODER_FEATURES: i64 = 32
+const DECODER_VOCAB: i64 = 258 // bytes 0..255, EOS=257
+const DECODER_MAX_OUTPUT: i64 = 96
+const DECODER_CELLS: i64 = DECODER_CLASSES * DECODER_FEATURES * DECODER_MAX_OUTPUT * DECODER_VOCAB
+
+fn noema_decoder_zero(weights: *u8) {
+    @memset(weights, 0, DECODER_CELLS * 8)
+}
+fn noema_decoder_cell(class_id: i64, feature: i64, pos: i64, byte: i64) -> i64 {
+    return (((class_id * DECODER_FEATURES + feature) * DECODER_MAX_OUTPUT + pos) * DECODER_VOCAB + byte) * 8
+}
+
+/// Teacher-forced supervised output-byte training conditioned on prompt features.
+fn noema_decoder_train(weights: *u8, class_id: i64, text: *u8, length: i64, input_features: *u8, input_dim: i64) -> i64 {
+    if class_id < 0 or class_id >= DECODER_CLASSES or length <= 0 or length >= DECODER_MAX_OUTPUT or input_dim != DECODER_INPUT_DIM { return 0 }
+    let active = @malloc(input_dim * 8)
+    var active_count: i64 = 0
+    var d: i64 = 0
+    while d < input_dim {
+        if ((@read_u64(@ptr_add(input_features, d * 8)) as i64) >> 32) > 0 {
+            let feature = d % DECODER_FEATURES
+            var seen = 0
+            var j: i64 = 0
+            while j < active_count { if (@read_u64(@ptr_add(active, j * 8)) as i64) == feature { seen = 1 } j = j + 1 }
+            if seen == 0 { @write_u64(@ptr_add(active, active_count * 8), feature as u64) active_count = active_count + 1 }
+        }
+        d = d + 1
+    }
+    if active_count == 0 { return 0 }
+    var pos: i64 = 0
+    while pos <= length {
+        let byte = if pos == length { 257 } else { @read_u8(@ptr_add(text, pos)) as i64 }
+        var j: i64 = 0
+        while j < active_count {
+            let feature = @read_u64(@ptr_add(active, j * 8)) as i64
+            let cell = noema_decoder_cell(class_id, feature, pos, byte)
+            @write_u64(@ptr_add(weights, cell), (@read_u64(@ptr_add(weights, cell)) + 1) as u64)
+            j = j + 1
+        }
+        pos = pos + 1
+    }
+    return length
+}
+fn noema_decoder_write_all(fd: i64, data: *u8, length: i64) -> i64 {
+    var pos: i64 = 0
+    while pos < length { let n = @write(fd, @ptr_add(data, pos), length - pos) if n <= 0 { return 0 } pos = pos + n }
+    return 1
+}
+fn noema_decoder_read_all(fd: i64, data: *u8, length: i64) -> i64 {
+    var pos: i64 = 0
+    while pos < length { let n = @read(fd, @ptr_add(data, pos), length - pos) if n <= 0 { return 0 } pos = pos + n }
+    return 1
+}
+fn noema_decoder_write_u64le(fd: i64, value: i64) -> i64 {
+    let bytes = @malloc(8)
+    var i: i64 = 0
+    while i < 8 { @write_u8(@ptr_add(bytes, i), (value >> (i * 8)) as u8) i = i + 1 }
+    return noema_decoder_write_all(fd, bytes, 8)
+}
+fn noema_decoder_read_u64le(fd: i64, output: *u8) -> i64 {
+    let bytes = @malloc(8)
+    if noema_decoder_read_all(fd, bytes, 8) != 1 { return 0 }
+    var value: u64 = 0
+    var i: i64 = 0
+    while i < 8 { value = value + ((@read_u8(@ptr_add(bytes, i)) as u64) << (i * 8)) i = i + 1 }
+    @write_u64(output, value)
+    return 1
+}
+fn noema_decoder_checksum(bytes: *u8, length: i64) -> i64 {
+    var hash: i64 = 2166136261
+    var i: i64 = 0
+    while i < length { hash = (hash * 16777619 + (@read_u8(@ptr_add(bytes, i)) as i64)) % 2147483647 i = i + 1 }
+    return hash
+}
+fn noema_decoder_payload(weights: *u8, payload: *u8, decode: i64) {
+    var cell: i64 = 0
+    while cell < DECODER_CELLS {
+        if decode == 0 {
+            let value = @read_u64(@ptr_add(weights, cell * 8))
+            var b: i64 = 0
+            while b < 8 { @write_u8(@ptr_add(payload, cell * 8 + b), (value >> (b * 8)) as u8) b = b + 1 }
+        } else {
+            var value: u64 = 0
+            var b: i64 = 0
+            while b < 8 { value = value + ((@read_u8(@ptr_add(payload, cell * 8 + b)) as u64) << (b * 8)) b = b + 1 }
+            @write_u64(@ptr_add(weights, cell * 8), value)
+        }
+        cell = cell + 1
+    }
+}
+fn noema_decoder_save(weights: *u8, path: string, training_rows: i64, epochs: i64, seed: i64) -> i64 {
+    if training_rows <= 0 or epochs <= 0 or seed <= 0 { return 0 }
+    let payload = @malloc(DECODER_CELLS * 8)
+    noema_decoder_payload(weights, payload, 0)
+    let hash = noema_decoder_checksum(payload, DECODER_CELLS * 8)
+    let fd = @open(path, 577, 420)
+    if fd < 0 { return 0 }
+    let magic = "SELTOK07"
+    if noema_decoder_write_all(fd, magic.ptr as *u8, 8) != 1 { @close(fd) return 0 }
+    if noema_decoder_write_u64le(fd, 7) != 1 or noema_decoder_write_u64le(fd, DECODER_CLASSES) != 1 or noema_decoder_write_u64le(fd, DECODER_INPUT_DIM) != 1 or noema_decoder_write_u64le(fd, DECODER_FEATURES) != 1 or noema_decoder_write_u64le(fd, DECODER_MAX_OUTPUT) != 1 or noema_decoder_write_u64le(fd, DECODER_VOCAB) != 1 or noema_decoder_write_u64le(fd, DECODER_CELLS) != 1 or noema_decoder_write_u64le(fd, training_rows) != 1 or noema_decoder_write_u64le(fd, epochs) != 1 or noema_decoder_write_u64le(fd, seed) != 1 or noema_decoder_write_u64le(fd, hash) != 1 { @close(fd) return 0 }
+    if noema_decoder_write_all(fd, payload, DECODER_CELLS * 8) != 1 { @close(fd) return 0 }
+    return if @close(fd) == 0 { 1 } else { 0 }
+}
+fn noema_decoder_load(weights: *u8, path: string) -> i64 {
+    let fd = @open(path, 0, 0)
+    if fd < 0 { return 0 }
+    let magic = "SELTOK07"
+    let found = @malloc(8)
+    if noema_decoder_read_all(fd, found, 8) != 1 { @close(fd) return 0 }
+    var i: i64 = 0
+    while i < 8 { if @read_u8(@ptr_add(found, i)) != @read_u8(@ptr_add(magic.ptr, i)) { @close(fd) return 0 } i = i + 1 }
+    let header = @malloc(11 * 8)
+    i = 0
+    while i < 11 { if noema_decoder_read_u64le(fd, @ptr_add(header, i * 8)) != 1 { @close(fd) return 0 } i = i + 1 }
+    if (@read_u64(header) as i64) != 7 or (@read_u64(@ptr_add(header, 8)) as i64) != DECODER_CLASSES or (@read_u64(@ptr_add(header, 16)) as i64) != DECODER_INPUT_DIM or (@read_u64(@ptr_add(header, 24)) as i64) != DECODER_FEATURES or (@read_u64(@ptr_add(header, 32)) as i64) != DECODER_MAX_OUTPUT or (@read_u64(@ptr_add(header, 40)) as i64) != DECODER_VOCAB or (@read_u64(@ptr_add(header, 48)) as i64) != DECODER_CELLS or (@read_u64(@ptr_add(header, 56)) as i64) <= 0 or (@read_u64(@ptr_add(header, 64)) as i64) <= 0 or (@read_u64(@ptr_add(header, 72)) as i64) <= 0 { @close(fd) return 0 }
+    let payload = @malloc(DECODER_CELLS * 8)
+    if noema_decoder_read_all(fd, payload, DECODER_CELLS * 8) != 1 { @close(fd) return 0 }
+    let trailing = @malloc(1)
+    if @read(fd, trailing, 1) != 0 { @close(fd) return 0 }
+    if @close(fd) != 0 { return 0 }
+    if noema_decoder_checksum(payload, DECODER_CELLS * 8) != (@read_u64(@ptr_add(header, 80)) as i64) { return 0 }
+    noema_decoder_payload(weights, payload, 1)
+    return 1
+}
+
+/// Greedy conditional decoding; each output position scores weights for the
+/// active prompt feature bins. Generation depends on both the input and weights.
+fn noema_decoder_generate(weights: *u8, class_id: i64, input_features: *u8, input_dim: i64, output: *u8, capacity: i64) -> i64 {
+    if class_id < 0 or class_id >= DECODER_CLASSES or input_dim != DECODER_INPUT_DIM or capacity <= 0 or capacity > DECODER_MAX_OUTPUT { return 0 }
+    var pos: i64 = 0
+    while pos < capacity {
+        var best: i64 = 0
+        var selected: i64 = -1
+        var byte: i64 = 0
+        while byte < DECODER_VOCAB {
+            var score: i64 = 0
+            var d: i64 = 0
+            while d < input_dim {
+                if ((@read_u64(@ptr_add(input_features, d * 8)) as i64) >> 32) > 0 {
+                    score = score + (@read_u64(@ptr_add(weights, noema_decoder_cell(class_id, d % DECODER_FEATURES, pos, byte))) as i64)
+                }
+                d = d + 1
+            }
+            if score > best or (byte == 257 and score == best and score > 0) { best = score selected = byte }
+            byte = byte + 1
+        }
+        if selected < 0 or best <= 0 or selected == 257 { return pos }
+        if selected > 255 { return pos }
+        @write_u8(@ptr_add(output, pos), selected as u8)
+        pos = pos + 1
+    }
+    return pos
+}

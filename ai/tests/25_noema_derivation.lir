@@ -1,0 +1,41 @@
+// NOEMA Stage 11: exact local derivation-step validation.
+import "../src/noema_reasoning.lir"
+fn main() -> i64 {
+    var checks: i64 = 0
+    var passed: i64 = 0
+    let premises = @malloc(3 * 8)
+    let left = @malloc(2 * 8)
+    let right = @malloc(2 * 8)
+    let conclusions = @malloc(2 * 8)
+    @write_u64(premises, 1 as u64)
+    @write_u64(@ptr_add(premises, 8), 2 as u64)
+    @write_u64(@ptr_add(premises, 16), 3 as u64)
+    @write_u64(@ptr_add(left, 0), 1 as u64)
+    @write_u64(@ptr_add(right, 0), 2 as u64)
+    @write_u64(@ptr_add(conclusions, 0), 3 as u64)
+    @write_u64(@ptr_add(left, 8), 3 as u64)
+    @write_u64(@ptr_add(right, 8), 0 as u64)
+    @write_u64(@ptr_add(conclusions, 8), 4 as u64)
+    checks = checks + 1
+    if reasoning_derivation_valid(3, 0, 2, premises, 2, left, right, conclusions) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if reasoning_derivation_valid(4, 1, 3, premises, 2, left, right, conclusions) == 1 { passed = passed + 1 }
+    @write_u64(@ptr_add(premises, 16), 3 as u64)
+    checks = checks + 1
+    if reasoning_derivation_valid(4, 1, 3, premises, 2, left, right, conclusions) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if reasoning_derivation_valid(3, 1, 3, premises, 2, left, right, conclusions) == 0 { passed = passed + 1 }
+    checks = checks + 1
+    if reasoning_derivation_valid(3, 0, 1, premises, 2, left, right, conclusions) == 0 { passed = passed + 1 }
+    checks = checks + 1
+    if reasoning_derivation_valid(3, 2, 3, premises, 2, left, right, conclusions) == 0 { passed = passed + 1 }
+    checks = checks + 1
+    if reasoning_derivation_valid(0, 0, 3, premises, 2, left, right, conclusions) == 0 { passed = passed + 1 }
+    checks = checks + 1
+    if reasoning_derivation_valid(3, 0, 3, premises, 2, left, right, conclusions) == 1 { passed = passed + 1 }
+    printInt(passed)
+    print("/")
+    printInt(checks)
+    println("")
+    return 0
+}

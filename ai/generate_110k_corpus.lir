@@ -1,0 +1,8 @@
+import "src/noema_corpus.lir"
+fn main() -> i64 {
+    let count = generate_turkish_corpus(2750)
+    println("Generated synthetic canonical JSONL rows: ")
+    if count != 110000 { println("CORPUS_GENERATION_FAILED") return 1 }
+    println("110000 (synthetic/template-generated; not human-authored data)")
+    return 0
+}

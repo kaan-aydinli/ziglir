@@ -6,11 +6,13 @@ Kullanım: python3 ai/run_tests.py
 """
 import glob
 import os
+import tempfile
 import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LIR = os.path.join(ROOT, "zig-out", "bin", "lir")
+TMPDIR = tempfile.mkdtemp(prefix="lirtest_")
 BACKENDS = ["native", "vm", "c"]
 
 
@@ -32,9 +34,41 @@ def main():
             continue
         with open(exp_path) as f:
             expected = [l for l in f.read().splitlines() if l.strip()]
-        for b in BACKENDS:
-            r = subprocess.run([LIR, "run", t, "--backend=" + b],
-                               capture_output=True, text=True)
+
+        # Test dosyasının ilk satırında `// backends: native` varsa yalnızca
+        # o backend(ler) koşulur. Gerçek thread kullanan testler VM ve C
+        # backend'lerinde anlamlı değil: VM tek iş parçacıklı, spin-loop
+        # tabanlı bariyer orada ilerlemez.
+        backends = BACKENDS
+        with open(t) as f:
+            head = [f.readline() for _ in range(4)]
+        if head[0].startswith("// backends:"):
+            backends = [x.strip() for x in head[0].split(":", 1)[1].split(",")]
+
+        # `// opt: -O1` — varsayılan optimizasyon seviyesini değiştirir.
+        # `12_learn_batch` bunu kullanıyor: aynı kaynak `-O2`'de segfault
+        # veriyor (bkz. ai/tests/O2_SEGFAULT.md), `-O0/-O1/-O3` doğru.
+        opt = "-O2"
+        for line in head:
+            if line.startswith("// opt:"):
+                opt = line.split(":", 1)[1].strip()
+
+        for b in backends:
+            if opt == "-O2":
+                # Varsayılan yol: `run` alt komutu (backend seçilebilir).
+                r = subprocess.run([LIR, "run", t, "--backend=" + b],
+                                   capture_output=True, text=True)
+            else:
+                # Özel optimizasyon seviyesi: önce derle, sonra çalıştır.
+                exe = os.path.join(TMPDIR, "lirtest_" + name + "_" + b)
+                bc = subprocess.run([LIR, "build", t, opt, "-o", exe],
+                                    capture_output=True, text=True)
+                if bc.returncode != 0:
+                    print(f"  FAIL {name:<16} {b} (derleme: -O opt)")
+                    print(f"       {bc.stderr[:300]}")
+                    failed += 1
+                    continue
+                r = subprocess.run([exe], capture_output=True, text=True)
             got = [l for l in r.stdout.splitlines() if l.strip()]
             ok = got == expected
             if ok:

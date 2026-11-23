@@ -1,0 +1,43 @@
+// backends: vm, c
+// opt: -O1
+// SEL test 12 — `learn` + `sqrt` (bit-shift) birlikte, toplu enerji.
+//
+// ## Neden bu test `-O1` ile koşuyor
+//
+// Aynı kaynak `-O2` ile derlendiğinde **segfault** veriyor, `-O0`/`-O1`/`-O3`
+// doğru çalışıyor. Bu, LIR derleyicisinin `-O2` geçişinde bir kod üretim
+// hatası; `sqrt`'in bit-shift sürümüyle birlikte `learn` derlendiğinde
+// ortaya çıkıyor. Hata izole edildi:
+//
+//   * `sqrt` gövdesini eski Newton sürümüne döndürmek hatayı gizliyor
+//   * `learn` döngüsünü kaldırmak hatayı gizliyor
+//   * `-O2` ile aynı dosya: segfault; `-O1` ve `-O3`: doğru sonuç
+//
+// Native backend bu desende `-O1` ile de segfault veriyor (vm ve c doğru).
+// Bu yüzden test yalnızca vm ve c backend'lerinde koşuyor; ayrıntı ve
+// daraltma tablosu `ai/tests/O2_SEGFAULT.md` içinde.
+//
+// Beklenen: 768000 (enerji toplamı) ve 384 (bir ağırlık).
+import "../src/ledger.lir"
+
+fn main() -> i64 {
+    let b = block_new(256, 256, 8, 1)
+    let x = @malloc(256 * 8)
+    let t = @malloc(256 * 8)
+    var i: i64 = 0
+    while i < 256 { @write_u64(@ptr_add(x, i*8), ((i * 7) % 13) as u64) i = i + 1 }
+    i = 0
+    while i < 256 { @write_u64(@ptr_add(t, i*8), ONE as u64) i = i + 1 }
+    forward(b, x)
+    let eta = from_int(200)
+    var s: i64 = 0
+    var acc: i64 = 0
+    while s < 3000 {
+        acc = sat_add(acc, learn(b, x, t, eta))
+        s = s + 1
+    }
+    printInt((acc >> 16) & 1048575)
+    printInt((@read_u64(@ptr_add(b.edges, 8)) as i64 >> 16) & 1023)
+    println(" seklinde")
+    return 0
+}
