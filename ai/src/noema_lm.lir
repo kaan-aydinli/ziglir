@@ -52,6 +52,10 @@ fn noema_lm_new(width: i64, context: i64, seed: i64) -> NoemaLM {
     noema_lm_init_matrix(w1, width * width, seed + 6, 1000.0)
     noema_lm_init_matrix(w2, width * width, seed + 7, 1000.0)
     noema_lm_init_matrix(lm, width * NOEMA_LM_VOCAB, seed + 8, 8000.0)
+    // The output bias must be initialised too: @malloc returns uninitialised
+    // memory, and a NaN/garbage bias makes every logit NaN, which then turns
+    // into a trap (silent SIGILL) instead of a diagnosable wrong answer.
+    noema_lm_init_matrix(bias, NOEMA_LM_VOCAB, seed + 9, 8000.0)
     return NoemaLM { token_embedding: token, position_embedding: position, wq: wq, wk: wk, wv: wv, wo: wo, w1: w1, w2: w2, lm_head: lm, lm_bias: bias, width: width, context: context }
 }
 fn noema_lm_free(m: NoemaLM) {
