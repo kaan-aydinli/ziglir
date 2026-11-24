@@ -253,6 +253,9 @@ pub const IRCodegen = struct {
     /// hardware register instead of being re-materialised with `movabs` at
     /// every use.
     vreg_keep_const_reg: [MAX_VREGS]bool = undefined,
+    /// For a wide constant that duplicates an already-kept one: the vreg whose
+    /// register holds the same bits. 0 means "not a duplicate".
+    vreg_keep_const_dup: [MAX_VREGS]u16 = undefined,
     vreg_copy_hint: [MAX_VREGS]u16 = undefined,
     vreg_pref_hw_reg: [MAX_VREGS]u8 = undefined,
     /// Magic multipliers of constant divisors used inside a loop, parked in a
@@ -1089,6 +1092,7 @@ pub const IRCodegen = struct {
         @memset(self.vreg_const_imm[0..nv], 0);
         @memset(self.vreg_elided_const[0..nv], false);
         @memset(self.vreg_keep_const_reg[0..nv], false);
+        @memset(self.vreg_keep_const_dup[0..nv], 0);
         @memset(self.vreg_def_cnt[0..nv], 0);
 
         for (0..ir_fn.block_count) |bi| {
@@ -1255,6 +1259,28 @@ pub const IRCodegen = struct {
                 keep_n += 1;
             }
         }
+        // A function can define the same wide literal more than once (the
+        // unroller copies constant definitions into each body, and separate
+        // expressions may spell the same literal). One register can serve all
+        // of them: they are the same bits. Collapsing duplicates keeps the
+        // register budget for distinct values.
+        var di: usize = 0;
+        while (di < keep_n) : (di += 1) {
+            const dv = keep_const_vregs[di];
+            const dimm = self.vreg_const_imm[dv];
+            var dj: usize = di + 1;
+            while (dj < keep_n) {
+                const ov = keep_const_vregs[dj];
+                if (self.vreg_const_imm[ov] == dimm) {
+                    self.vreg_keep_const_dup[ov] = dv;
+                    keep_const_vregs[dj] = keep_const_vregs[keep_n - 1];
+                    keep_n -= 1;
+                } else {
+                    dj += 1;
+                }
+            }
+        }
+
         // Most-used constants first: they save the most `movabs` bytes.
         var ki: usize = 1;
         while (ki < keep_n) : (ki += 1) {
@@ -1281,7 +1307,7 @@ pub const IRCodegen = struct {
     /// are handed out here, before the vreg allocator runs, so it simply never
     /// sees them as free; they are saved/restored like any other callee-saved
     /// register the allocator would have used.
-    fn analyzeParkedMagic(self: *IRCodegen, ir_fn: *const IRFn, peak_live: u32) void {
+    fn analyzeParkedMagic(self: *IRCodegen, ir_fn: *const IRFn, peak_live: u32, kept_constants: usize) void {
         self.cur_magic_count = 0;
         self.cur_extra_callee_count = 0;
         for (&self.cur_magic_regs) |*r| r.* = NO_REG;
@@ -1378,9 +1404,42 @@ pub const IRCodegen = struct {
         // parked multiplier removes one register from the pool for the whole
         // function, so it can only be afforded while the peak live-vreg count
         // stays below the pool size.
+        // `peak_live` already counts the kept constants, which hold permanent
+        // registers. What matters for parking is the pressure from the *other*
+        // live values: those are the ones a callee-saved register would have to
+        // serve if it were not parked.
+        var peak_no_consts: u32 = 0;
+        {
+            var live_delta: [MAX_VREGS + 2]i32 = .{0} ** (MAX_VREGS + 2);
+            const span = @min(@as(usize, peak_live) + 2, MAX_VREGS);
+            _ = span;
+            var max_pos: u32 = 0;
+            for (1..@min(@as(usize, ir_fn.vreg_count) + 2, MAX_VREGS)) |lv| {
+                if (self.vreg_elided_const[lv] or self.vreg_keep_const_reg[lv]) continue;
+                if (self.vreg_start[lv] > self.vreg_end[lv]) continue;
+                const ls: usize = @min(self.vreg_start[lv], @as(u32, @intCast(MAX_VREGS - 1)));
+                const le: usize = @min(self.vreg_end[lv] + 1, @as(u32, @intCast(MAX_VREGS - 1)));
+                live_delta[ls] += 1;
+                live_delta[le] -= 1;
+                max_pos = @max(max_pos, self.vreg_end[lv]);
+            }
+            var run: i32 = 0;
+            const stop = @min(@as(usize, max_pos) + 2, MAX_VREGS);
+            for (0..stop) |lp| {
+                run += live_delta[lp];
+                if (run > 0 and @as(u32, @intCast(run)) > peak_no_consts) peak_no_consts = @intCast(run);
+            }
+        }
+        // One callee-saved register is kept back as headroom, and the kept
+        // constants are already out of the pool.
         const capacity: u32 = ALL_ALLOC_REGS.len;
-        if (peak_live + 1 >= capacity) return;
-        const room: usize = @intCast(capacity - peak_live - 1);
+        if (peak_no_consts + 1 >= capacity) return;
+        const room_all: usize = @intCast(capacity - peak_no_consts - 1);
+        const callee_free: usize = if (kept_constants + 1 >= CALLEE_SAVED_POOL.len)
+            0
+        else
+            CALLEE_SAVED_POOL.len - kept_constants - 1;
+        const room = @min(room_all, callee_free);
         if (cand_n > room) cand_n = room;
         for (0..cand_n) |k| {
             self.cur_magic_vals[k] = cand_imm[k];
@@ -1389,6 +1448,35 @@ pub const IRCodegen = struct {
             self.cur_extra_callee_count += 1;
         }
         self.cur_magic_count = cand_n;
+    }
+
+    /// Hand back the callee-saved register whose current owner dies soonest,
+    /// evicting it to a spill slot. Used only for values that must live in a
+    /// callee-saved register.
+    fn stealCalleeReg(self: *IRCodegen, reg_owner: *[16]u16, used_callee_mask: *u16, next_spill: *u32) u8 {
+        _ = used_callee_mask;
+        var best_r: u8 = NO_REG;
+        var best_end: u32 = std.math.maxInt(u32);
+        for (CALLEE_SAVED_POOL) |r| {
+            if (self.isParkedMagicReg(r)) continue;
+            const own = reg_owner[r];
+            if (own == 0) continue;
+            // Never evict a kept wide constant: its register is what allows the
+            // prologue to define it at all, so eviction would leave the value
+            // undefined instead of merely slower.
+            if (self.vreg_keep_const_reg[own]) continue;
+            if (self.vreg_end[own] < best_end) {
+                best_end = self.vreg_end[own];
+                best_r = r;
+            }
+        }
+        if (best_r == NO_REG) return NO_REG;
+        const evicted = reg_owner[best_r];
+        self.vreg_reg[evicted] = NO_REG;
+        self.vreg_spill_slot[evicted] = self.cur_total_locals + next_spill.*;
+        next_spill.* += 1;
+        reg_owner[best_r] = 0;
+        return best_r;
     }
 
     /// True when `r` was taken out of the allocator pool by
@@ -1700,13 +1788,57 @@ pub const IRCodegen = struct {
         // force their live range over the whole function so the allocator both
         // assigns one and never evicts them (eviction would re-issue the
         // `movabs` inside the loop, which is the cost this avoids).
+        //
+        // A register can only be promised while callee-saved ones are left. The
+        // allocator hands out caller-saved registers first for values that do
+        // not cross a call, but a kept constant must survive the whole function,
+        // so it can only live in the five callee-saved registers. Keeping more
+        // constants than that was a correctness bug: the extras received no
+        // register, yet both the prologue materialisation and the defining
+        // `const_int` instruction skipped them, so every later read saw whatever
+        // happened to be in the register the allocator reused. Function entry
+        // holds no live values, so the count of live values at position zero
+        // plus the kept constants is a safe upper bound on the pressure.
+        var live_at_entry: u32 = 0;
+        for (1..@min(@as(usize, max_vreg) + 1, MAX_VREGS)) |lv| {
+            if (self.vreg_elided_const[lv] or vreg_fused_skip[lv]) continue;
+            if (self.vreg_start[lv] > self.vreg_end[lv]) continue;
+            if (self.vreg_start[lv] == 0) live_at_entry += 1;
+        }
+        const kept_room: usize = if (live_at_entry + 1 >= CALLEE_SAVED_POOL.len)
+            0
+        else
+            @as(usize, CALLEE_SAVED_POOL.len - 1 - live_at_entry);
+        // The list is ordered most-used first; keep as many as the register
+        // budget allows. A constant that is not kept is fully elided-or-plain
+        // (see below), so a partial selection stays consistent: only `kept_n`
+        // entries are marked, and the rest fall back to the untouched analysis.
+        // A duplicate has no register of its own, so the allocator must skip it
+        // and the prologue must not write it. Marking it as elided keeps the
+        // live-range machinery from reserving anything for it, and the
+        // defining instruction is skipped separately below.
+        for (1..@min(@as(usize, max_vreg) + 1, MAX_VREGS)) |dv| {
+            if (self.vreg_keep_const_dup[dv] != 0) self.vreg_elided_const[dv] = true;
+        }
+
+        var kept_n: usize = 0;
         for (self.cur_keep_const_vregs[0..self.cur_keep_const_count]) |kv| {
+            if (kept_n >= kept_room) break;
             self.vreg_keep_const_reg[kv] = true;
             self.vreg_start[kv] = 0;
             self.vreg_end[kv] = pos + 1;
             self.vreg_crosses_call[kv] = true;
             vreg_weight[kv] +|= 1 << 20;
+            self.cur_keep_const_vregs[kept_n] = kv;
+            kept_n += 1;
         }
+        // Anything beyond the budget must not stay marked as kept by the
+        // analysis pass, or it would be skipped by both the prologue and the
+        // defining `const_int`.
+        for (self.cur_keep_const_vregs[kept_n..self.cur_keep_const_count]) |kv| {
+            self.vreg_keep_const_reg[kv] = false;
+        }
+        self.cur_keep_const_count = kept_n;
 
         // Live ranges are known now, so the peak number of simultaneously live
         // vregs can be measured. That is what decides whether the allocator has
@@ -1731,7 +1863,11 @@ pub const IRCodegen = struct {
                 if (run > 0 and @as(u32, @intCast(run)) > peak_live) peak_live = @intCast(run);
             }
         }
-        self.analyzeParkedMagic(ir_fn, peak_live);
+        // Kept constants and parked magic multipliers compete for the same five
+        // callee-saved registers. Budget them together: whatever the kept
+        // constants left over is what parking may use, otherwise the two
+        // decisions independently believe they have room for more.
+        self.analyzeParkedMagic(ir_fn, peak_live, kept_n);
 
         var i: usize = 1;
         while (i < order_count) : (i += 1) {
@@ -1759,6 +1895,36 @@ pub const IRCodegen = struct {
             }
 
             var chosen: u8 = NO_REG;
+
+            // A kept wide constant is live over the whole function, so it must
+            // land in a callee-saved register: a caller-saved one is destroyed
+            // by the first call in its range, and the prologue materialisation
+            // writes it once at entry. This has to be decided before the copy
+            // hint and hardware-preference paths below, which can hand out
+            // caller-saved registers. Such a value is never spilled either -
+            // spilling would reintroduce the `movabs` this removes, and a
+            // spilled value would leave the prologue with no register to write.
+            if (self.vreg_keep_const_reg[cur_v]) {
+                for (CALLEE_SAVED_POOL) |r| {
+                    if (reg_owner[r] == 0 and !self.isParkedMagicReg(r)) {
+                        chosen = r;
+                        break;
+                    }
+                }
+                if (chosen == NO_REG) chosen = self.stealCalleeReg(&reg_owner, &used_callee_mask, &next_spill);
+                if (chosen != NO_REG) {
+                    reg_owner[chosen] = cur_v;
+                    self.vreg_reg[cur_v] = chosen;
+                    used_callee_mask |= @as(u16, 1) << @intCast(chosen);
+                } else {
+                    // Unreachable while the kept count is capped by the pool
+                    // size. Give up the register so the defining `const_int`
+                    // falls back to a plain `movabs`, keeping the value defined.
+                    self.vreg_keep_const_reg[cur_v] = false;
+                    self.vreg_reg[cur_v] = NO_REG;
+                }
+                continue;
+            }
 
             // Check copy coalescing / dying two-address reuse hint first
             const hint_v = self.vreg_copy_hint[cur_v];
@@ -1815,6 +1981,7 @@ pub const IRCodegen = struct {
                     if (self.isParkedMagicReg(r)) continue;
                     const own = reg_owner[r];
                     if (own == 0) continue;
+                    if (self.vreg_keep_const_reg[own]) continue;
                     const ow = vreg_weight[own];
                     const oe = self.vreg_end[own];
                     if (ow < best_weight or (ow == best_weight and oe > best_end)) {
@@ -1863,6 +2030,16 @@ pub const IRCodegen = struct {
 
     fn vregPhys(self: *const IRCodegen, vreg: u16) ?u8 {
         if (vreg == 0 or vreg >= MAX_VREGS) return null;
+        // A wide constant that duplicates a kept one is never given a register
+        // of its own: its bits already sit in the register of the vreg it
+        // mirrors, so every read resolves there. This is checked before the
+        // elided test because duplicates are marked elided to keep the
+        // allocator away from them.
+        const dup = self.vreg_keep_const_dup[vreg];
+        if (dup != 0) {
+            const dr = self.vreg_reg[dup];
+            return if (dr == NO_REG) null else dr;
+        }
         if (self.vreg_elided_const[vreg]) return null;
         const r = self.vreg_reg[vreg];
         return if (r == NO_REG) null else r;
