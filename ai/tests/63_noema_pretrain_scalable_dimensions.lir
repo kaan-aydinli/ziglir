@@ -1,0 +1,13 @@
+// State dimensions can exceed the former fixed 1024/128/256 ceilings while
+// still validating allocation arithmetic against the machine address range.
+import "../src/noema_pretrain.lir"
+fn main() -> i64 {
+    let state=noema_pretrain_create_with_memory(1025,129,257,63,1)
+    if state==0 as *f64 { println("0") return 1 }
+    var ok:i64=0
+    if state[NP_C]==1025.0 and state[NP_D]==129.0 and state[NP_N]==257.0 and noema_pretrain_memory_capacity(state)==1 { ok=1 }
+    printInt(ok)
+    println("")
+    noema_pretrain_destroy(state)
+    return if ok==1 { 0 } else { 1 }
+}

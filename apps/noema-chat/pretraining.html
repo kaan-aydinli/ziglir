@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b1020">
+  <meta name="description" content="Kendi TXT veri kümenizle NOEMA-Phi pretraining">
+  <title>NOEMA — Pretraining</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/pretraining.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="rail" aria-label="Uygulama gezinmesi">
+      <a class="brand-mark" href="/" aria-label="NOEMA ana sayfa"><span class="brand-glyph">N</span></a>
+      <a class="rail-button" href="/" title="Chat" aria-label="Chat"><svg viewBox="0 0 24 24"><path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5H5l1.6-3.2A7.5 7.5 0 1 1 20 11.5Z"/><path d="M8 11h.01M12 11h.01M16 11h.01"/></svg></a>
+      <a class="rail-button active" href="/pretraining" title="Pretraining" aria-label="Pretraining"><svg viewBox="0 0 24 24"><path d="M4 19V5m0 14h16M8 15l3-4 3 2 5-7"/><circle cx="19" cy="6" r="1"/></svg></a>
+      <div class="rail-spacer"></div><div class="rail-status" title="LIR runtime"></div>
+    </aside>
+    <main class="workspace">
+      <header class="topbar">
+        <div class="topbar-title"><span class="mobile-brand">N</span><div><div class="eyebrow">NOEMA-PHI · TRAINING</div><h1>Pretraining</h1></div></div>
+        <div class="topbar-right"><nav class="page-tabs" aria-label="Sayfalar"><a href="/">Chat</a><a class="selected" href="/pretraining" aria-current="page">Pretraining</a></nav><span class="engine-pill"><i></i><span id="connection-label">LIR engine</span></span></div>
+      </header>
+
+      <div class="pretraining-main">
+        <section class="pretraining-hero">
+          <div class="welcome-kicker"><span></span> LIR NATIVE · LOCAL TRAINING</div>
+          <h2>Kendi verin.<br><em>Kendi model checkpoint’in.</em></h2>
+          <p>Bir UTF-8 TXT veri kümesi yükle. LIR, konuları yaklaşık 1 MiB’lık akış parçalarına bölerek işler; böylece büyük dosyalarda ilerleme daha sık güncellenir. Gerçek kayıt ilerlemesi, işlenen bayt ve tahmini kalan süre burada gösterilir.</p>
+        </section>
+
+        <section class="training-panel upload-panel" aria-labelledby="upload-heading">
+          <div class="training-heading"><div><div class="section-label">VERİ KÜMESİ</div><h2 id="upload-heading">TXT dosyanı seç</h2></div><span class="training-limit">Boyut sınırı yok · kaynaklara bağlı</span></div>
+          <label class="upload-drop" id="upload-drop" for="training-file">
+            <input id="training-file" type="file" accept=".txt,text/plain">
+            <span class="upload-icon">↑</span>
+            <strong id="training-file-name">TXT dosyasını seçmek için tıkla</strong>
+            <small>UTF-8 düz metin · sabit dosya/satır tavanı yok · toplam boyut sistem kaynaklarına bağlı</small>
+          </label>
+          <div class="dataset-facts" id="dataset-facts" hidden>
+            <div><small>DOSYA BOYUTU</small><strong id="dataset-size">—</strong></div>
+            <div><small>TAHMİNİ KONU SAYISI</small><strong id="dataset-topics">Yüklemede hesaplanacak</strong></div>
+            <div><small>YENİ MODEL SÜRÜMÜ</small><strong>user_pretrain_vNNN.nps</strong></div>
+          </div>
+          <div class="format-guide">
+            <div class="section-label">KONU AYIRMA FORMATI</div>
+            <p>Her konu bloğu eğitim verisi olarak alınır; büyük bloklar yaklaşık 1 MiB’lık kayıtlara bölünür. Ayraç satırda tek başına üç tire olmalı:</p>
+            <pre>Trabzon'un kıyı iklimi ve yağış örüntüleri.
+
+---
+
+Karadeniz bölgesinin coğrafi özellikleri.</pre>
+            <small>Boş bloklar atlanır; uzun konular otomatik olarak yaklaşık 1 MiB eğitim parçalarına bölünür. Boyut sistem kaynaklarıyla sınırlıdır.</small>
+          </div>
+          <div class="training-actions upload-actions"><button id="training-start" type="button" disabled>Pretraining başlat <span>→</span></button><span id="training-hint">Önce bir .txt dosyası seç</span></div>
+          <div class="upload-progress" id="upload-progress" hidden>
+            <div class="training-progress-top"><span id="upload-status">Dosya yükleniyor</span><span id="upload-percent">0%</span></div>
+            <div class="training-track" role="progressbar" aria-label="Dosya yükleme ilerlemesi" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i id="upload-bar"></i></div>
+            <div class="training-progress-bottom"><span id="upload-bytes">0 / 0 bayt</span><span>Dosya LIR için hazırlanıyor</span></div>
+          </div>
+        </section>
+
+        <section class="training-panel live-panel" id="training-panel" aria-labelledby="live-heading" hidden>
+          <div class="training-heading"><div><div class="section-label">CANLI EĞİTİM TELEMETRİSİ</div><h2 id="live-heading">Kayıtlar işleniyor</h2></div><span class="training-status-pill" id="training-state-pill">HAZIRLANIYOR</span></div>
+          <div class="training-progress live-progress">
+            <div class="training-progress-top"><span id="training-status">LIR pretraining bekleniyor</span><strong id="training-percent">0%</strong></div>
+            <div class="training-track large-track" role="progressbar" aria-label="Pretraining ilerlemesi" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i id="training-bar"></i></div>
+            <div class="training-progress-bottom"><span id="training-records">0 / 0 kayıt</span><strong id="training-eta">Kalan süre hesaplanıyor</strong></div>
+          </div>
+          <div class="training-stats-grid">
+            <div><small>İŞLENEN CORPUS BAYTI</small><strong id="training-payload">0 B</strong></div>
+            <div><small>KAYNAK DOSYA</small><strong id="training-source">—</strong></div>
+            <div><small>GEÇEN SÜRE</small><strong id="training-elapsed">0 sn</strong></div>
+            <div><small>TAHMİNİ KALAN</small><strong id="training-remaining">Hesaplanıyor</strong></div>
+          </div>
+          <div class="training-result" id="training-result" hidden><span class="result-check">✓</span><div><strong>Checkpoint hazır</strong><p id="training-checkpoint">ai/noema-training/user_pretrain_vNNN.nps</p></div><a href="/">Chat sayfasında dene →</a></div>
+        </section>
+
+        <section class="training-notes">
+          <div><span class="notes-icon">i</span><div><strong>Şeffaf model notu</strong><p>Bu süreç gerçek LIR eğitimini çalıştırır ve seçilebilir checkpoint kaydeder. Eğitim kayıtlarından sınırlı sayıda satır ve öznitelik çıkarılır; sohbet bunları 5-gram benzerliğiyle arar. Bu, semantik anlayan veya serbest metin üreten bir dil modeli değildir.</p></div></div>
+          <div><span class="notes-icon">↗</span><div><strong>Yükleme ve saklama</strong><p>TXT doğrudan akış halinde sunucuya gönderilir; içerik tarayıcı belleğine bütünüyle alınmaz. İlk eğitim `v001` ile başlar; sonraki eğitimler en son başarılı modeli yükleyip devam ettirerek `v002`, `v003` gibi yeni checkpoint üretir. Önceki sürümler arşivde aynen kalır. Chat en son sürümü kullanır.</p></div></div>
+        </section>
+      </div>
+    </main>
+  </div>
+</body>
+</html>

@@ -1,0 +1,41 @@
+// NOEMA-Phi v3 raw-byte pretraining smoke test; no token/LM path.
+import "../src/noema_pretrain.lir"
+fn main() -> i64 {
+    var checks: i64 = 0
+    var passed: i64 = 0
+    let st = noema_pretrain_create(64, 4, 8, 123)
+    let bytes = @malloc(16) as *u8
+    var i: i64 = 0
+    while i < 16 {
+        @write_u8(@ptr_add(bytes,i), (i * 13 + 31) as u8)
+        i = i + 1
+    }
+    let f = noema_pretrain_document(st,bytes,16,0,1)
+    checks = checks + 1
+    if f == f { passed = passed + 1 }
+    checks = checks + 1
+    if noema_pretrain_documents(st) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if noema_pretrain_active_cavities() == 4 { passed = passed + 1 }
+    checks = checks + 1
+    if noema_pretrain_batch_streams() == 8 { passed = passed + 1 }
+    checks = checks + 1
+    if noema_pretrain_stage(st) == 0 { passed = passed + 1 }
+    // Seven more documents make the 12.5% perturbation row deterministic.
+    i = 0
+    while i < 7 {
+        noema_pretrain_document(st,bytes,16,1,1)
+        i = i + 1
+    }
+    checks = checks + 1
+    if noema_pretrain_do_count(st) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if noema_pretrain_documents(st) == 8 { passed = passed + 1 }
+    noema_pretrain_destroy(st)
+    @free(bytes)
+    printInt(passed)
+    print("/")
+    printInt(checks)
+    println("")
+    return 0
+}

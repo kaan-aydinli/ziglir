@@ -1,0 +1,37 @@
+Kıyı kentlerinde sabah, denizden gelen serinlikle başlar. Balıkçı tekneleri limandan ayrılırken fırınlar yeni ekmeklerini çıkarır. Hava açık olduğunda kıyı çizgisi uzaktan daha belirgin görünür; sisli günlerde ise dağlar bulutların içinde kaybolur. Şehir, günlük yaşamını denizin ritmine göre düzenler.
+
+---
+
+Bir ormanda ağaçlar yalnızca gölge sağlamaz. Kökleri toprağı tutar, yaprakları yağmurun hızını azaltır ve çürüyen bitki parçaları toprağa besin kazandırır. Orman tabanındaki canlı çeşitliliği, suyun ve maddelerin ekosistem içinde dolaşmasına katkıda bulunur. Bir alanın korunması, yalnızca tek bir türü değil, birbirine bağlı yaşam ağını da korumaktır.
+
+---
+
+Bilimsel bir ölçüm, gözlem koşullarıyla birlikte anlam kazanır. Bir araştırmacı ölçüm aracını kalibre eder, yöntemi kaydeder ve belirsizlik payını açıklar. Başka bir ekip aynı yöntemi uygulayabildiğinde sonuçların yeniden üretilip üretilemediği sınanabilir. Tek bir gözlem ilgi çekici olabilir; güçlü bir sonuç ise farklı kanıtlarla desteklenir.
+
+---
+
+Bir yazılım projesinde küçük ve anlaşılır modüller değişiklikleri yönetmeyi kolaylaştırır. Her modülün sorumluluğu açık olduğunda testler de daha hedefli yazılabilir. Sürüm kontrolü, hangi değişikliğin ne zaman yapıldığını gösterir; otomatik testler ise beklenmeyen davranışları erken yakalar. Hata mesajları kısa, eyleme dönük ve ilgili kaynak konumunu belirten biçimde tasarlanmalıdır.
+
+---
+
+Su döngüsünde güneş enerjisi yüzeydeki suyun buharlaşmasını sağlar. Yükselen nemli hava soğuduğunda su damlacıkları bulutlarda yoğunlaşır. Yağış, suyu yeniden toprağa, akarsulara ve göllere taşır. Bir bölgedeki bitki örtüsü, toprağın su tutma kapasitesini ve yüzey akışının hızını etkiler.
+
+---
+
+Bir kütüphanede katalog, kitapların yerini bulmaya yardımcı olur; ancak kataloğun kendisi kitabın içeriğinin yerine geçmez. Başlık, yazar ve konu bilgileri aramayı kolaylaştıran kayıtlardır. Okuyucu kaynağı açıp ilgili bölümü kontrol ederek alıntının bağlamını doğrular. Kaynak gösterirken kullanılan baskı ve sayfa bilgilerini de not etmek gerekir.
+
+---
+
+Trabzon'un kıyı yerleşimleri, yamaçlar ve deniz arasındaki dar alanlarda gelişmiştir. Yağışlı iklim bitki örtüsünü canlı tutar; yüksek kesimlerde hava ve arazi koşulları kısa mesafelerde değişebilir. Yerel ulaşım, kıyı boyunca uzanan yollarla iç bölgelere çıkan güzergâhların birlikte kullanılmasına dayanır. Bir kenti anlamak için coğrafyası kadar gündelik alışkanlıklarına da bakmak gerekir.
+
+---
+
+Enerji tasarrufu tek bir büyük karardan ibaret değildir. Binalarda yalıtım, verimli aydınlatma ve doğru sıcaklık ayarı günlük tüketimi azaltabilir. Elektrik şebekesinde üretim ile talep dengelenirken depolama sistemleri değişken kaynakların kullanımına yardımcı olur. Her çözümün maliyeti, ömrü ve çevresel etkisi birlikte değerlendirilmelidir.
+
+---
+
+Bir ekip çalışmasında kararların gerekçesini yazılı tutmak, daha sonra yapılan incelemeyi kolaylaştırır. Görüş ayrılıkları kişilere değil, varsayımlara ve kanıtlara odaklanmalıdır. Bir deney başarısız olduğunda ölçüm koşulları, kullanılan araçlar ve beklenen sonuç karşılaştırılır. Hatanın kaynağı bulunursa aynı koşulda yeniden ortaya çıkmasını önleyecek bir değişiklik yapılabilir.
+
+---
+
+Dil, insanların deneyimlerini paylaşmasına ve ortak bilgi oluşturmasına yardımcı olur. Aynı sözcük farklı bağlamlarda değişik anlamlar taşıyabilir; bu nedenle dinleyici yalnızca sözcüklere değil, konuşmanın amacına ve çevresindeki bilgilere de dikkat eder. Yazılı anlatımda açık tanımlar ve tutarlı terimler, yanlış anlaşılma olasılığını azaltır.

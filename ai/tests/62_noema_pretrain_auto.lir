@@ -1,0 +1,54 @@
+// Adaptive macro planner and automatic .nbin training telemetry.
+import "../src/noema_pretrain.lir"
+fn main() -> i64 {
+    var checks:i64=0
+    var passed:i64=0
+    let probe=noema_pretrain_create(64,4,8,62)
+    checks=checks+1
+    if NP_MEM_MIN_SCORE>0.219999 and NP_MEM_MIN_SCORE<0.220001 { passed=passed+1 }
+    checks=checks+1
+    if noema_pretrain_auto_macros_suggest(probe,8,4)==1 { passed=passed+1 }
+    checks=checks+1
+    if noema_pretrain_auto_macros_suggest(probe,100000,4)==3 { passed=passed+1 }
+    probe[NP_DOCS]=5.0 probe[NP_LAST_GATE]=0.8 probe[NP_PLATEAU]=0.0
+    checks=checks+1
+    if noema_pretrain_auto_macros_suggest(probe,100000,4)==4 { passed=passed+1 }
+    probe[NP_STAGE]=2.0 probe[NP_LAST_GATE]=0.01 probe[NP_PLATEAU]=3.0
+    checks=checks+1
+    if noema_pretrain_auto_macros_suggest(probe,8,4)==2 { passed=passed+1 }
+    checks=checks+1
+    if noema_pretrain_auto_macros_suggest(probe,0,4)==0 { passed=passed+1 }
+    probe[NP_NUMERIC_FAILURES]=1.0
+    checks=checks+1
+    if noema_pretrain_auto_macros_suggest(probe,128,4)==0 { passed=passed+1 }
+    noema_pretrain_destroy(probe)
+
+    let path="/tmp/noema_phi_auto_training_test.nbin"
+    let fd=@open(path,577,420)
+    let first="Training record one."
+    let second="Training record two."
+    let wrote0=noema_pretrain_nbin_write(fd,first as *u8,first.len as i64,0,0)
+    let wrote1=noema_pretrain_nbin_write(fd,second as *u8,second.len as i64,0,0)
+    @close(fd)
+    let input=@open(path,0,0)
+    let state=noema_pretrain_create(64,4,8,62)
+    let trained=noema_pretrain_nbin_train_auto(state,input,2,128,4)
+    @close(input)
+    checks=checks+1
+    if wrote0==first.len as i64 and wrote1==second.len as i64 and trained==2 and noema_pretrain_documents(state)==2 and noema_pretrain_memory_count(state)==2 { passed=passed+1 }
+    checks=checks+1
+    if noema_pretrain_auto_records(state)==2 and noema_pretrain_auto_macros_last(state)>=1 and noema_pretrain_auto_macros_last(state)<=4 and noema_pretrain_auto_macros_mean(state)>=1.0 and noema_pretrain_auto_macros_mean(state)<=4.0 { passed=passed+1 }
+    let query="Training record two."
+    let answer=@malloc(256) as *u8
+    let answer_len=noema_pretrain_infer(state,query as *u8,query.len as i64,answer,256,4)
+    checks=checks+1
+    var exact=answer_len==second.len as i64 and noema_pretrain_last_match(state)==1.0
+    var k:i64=0
+    while k<answer_len { if @read_u8(@ptr_add(answer,k))!=@read_u8(@ptr_add(second as *u8,k)) { exact=false } k=k+1 }
+    if exact { passed=passed+1 }
+    @free(answer)
+    @unlink(path)
+    noema_pretrain_destroy(state)
+    printInt(passed) print("/") printInt(checks) println("")
+    return if passed==checks { 0 } else { 1 }
+}

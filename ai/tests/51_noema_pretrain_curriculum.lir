@@ -1,0 +1,20 @@
+// Curriculum phase advances after eight records below the 0.5% plateau
+// threshold and remains locked while relative energy changes exceed it.
+import "../src/noema_pretrain.lir"
+fn main() -> i64 {
+    let plateau=noema_pretrain_create(64,4,8,11)
+    let active=noema_pretrain_create(64,4,8,11)
+    var i:i64=0
+    while i<8 {
+        np_commit_document(plateau,1,100.0,99.9,0.5,0)
+        np_commit_document(active,1,100.0,99.0,0.5,0)
+        i=i+1
+    }
+    printInt(noema_pretrain_stage(active))
+    println("")
+    printInt(noema_pretrain_stage(plateau))
+    println("")
+    noema_pretrain_destroy(plateau)
+    noema_pretrain_destroy(active)
+    return 0
+}

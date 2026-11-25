@@ -1,0 +1,30 @@
+// Plain UTF-8 source corpus: standalone --- lines frame topic documents.
+import "../src/noema_pretrain.lir"
+fn main() -> i64 {
+    var checks: i64 = 0
+    var passed: i64 = 0
+    let corpus = "Kıyı kentlerinde sabah denizden gelen serinlikle başlar.\n\n---\n\nBilimsel ölçüm yöntem ve belirsizlik bilgisiyle anlam kazanır.\n---\nKod değişiklikleri küçük modüller ve testlerle yönetilir.\n"
+    let out = @open("/tmp/noema_phi_plaintext_topics.testbin",577,420)
+    let payload_bytes = @malloc(8) as *i64
+    let topics = noema_pretrain_pack_topics(out,corpus as *u8,corpus.len as i64,payload_bytes)
+    @close(out)
+    checks = checks+1
+    if topics == 3 { passed=passed+1 }
+    checks = checks+1
+    if payload_bytes[0] == corpus.len as i64-8 { passed=passed+1 }
+    let fd = @open("/tmp/noema_phi_plaintext_topics.testbin",0,0)
+    let st = noema_pretrain_create(64,4,8,12)
+    let records = noema_pretrain_nbin_train(st,fd,4,512,0)
+    @close(fd)
+    checks = checks+1
+    if records == 3 { passed=passed+1 }
+    checks = checks+1
+    if noema_pretrain_documents(st) == 3 { passed=passed+1 }
+    noema_pretrain_destroy(st)
+    @free(payload_bytes as *u8)
+    printInt(passed)
+    print("/")
+    printInt(checks)
+    println("")
+    return 0
+}

@@ -1,0 +1,62 @@
+// Finite-dimensional, spatially uniform Fourier-mode slice of NOEMA-Φ §5.
+// Implicit-midpoint integration of the damped complex second-order wave mode.
+// For fixed quadratic potential and fixed input this discretization has the
+// exact discrete Lyapunov decrement ΔE = -2*gamma*dt*|Pi_mid|^2.
+import "noema_phi_geometry.lir"
+
+/// `fields` = [psi_re, psi_im, pi_re, pi_im]. `cfg` =
+/// [tau2, gamma, omega_gyro, stiffness, dt, source_re, source_im].
+/// Energy is F + tau2|Pi|², with F=stiffness|psi|²/2-2 Re(conj(psi)source).
+fn noema_phi_wave_energy(fields: *f64, cfg: *f64) -> f64 {
+    var i: i64 = 0
+    while i < 7 { if nphi_finite(cfg[i]) == 0 { return -1.0 } i = i + 1 }
+    i = 0
+    while i < 4 { if nphi_finite(fields[i]) == 0 { return -1.0 } i = i + 1 }
+    if cfg[0] <= 0.0 or cfg[1] < 0.0 or cfg[3] < 0.0 { return -1.0 }
+    let psi2 = fields[0] * fields[0] + fields[1] * fields[1]
+    let pi2 = fields[2] * fields[2] + fields[3] * fields[3]
+    let potential = cfg[3] / 2.0 * psi2 - 2.0 * (fields[0] * cfg[5] + fields[1] * cfg[6])
+    let energy = potential + cfg[0] * pi2
+    return if nphi_finite(energy) == 1 { energy } else { -1.0 }
+}
+
+/// One transactional implicit-midpoint step for
+/// tau2 Pi_dot + gamma Pi = -(k/2)Psi + J + i*omega*Pi, Psi_dot=Pi.
+/// The Hermitian gyro term does no work. Config and fields are caller-owned.
+fn noema_phi_wave_step(fields: *f64, cfg: *f64) -> i64 {
+    var i: i64 = 0
+    while i < 7 { if nphi_finite(cfg[i]) == 0 { return 0 } i = i + 1 }
+    i = 0
+    while i < 4 { if nphi_finite(fields[i]) == 0 { return 0 } i = i + 1 }
+    let tau = cfg[0]
+    let gamma = cfg[1]
+    let omega = cfg[2]
+    let stiffness = cfg[3]
+    let dt = cfg[4]
+    if tau <= 0.0 or gamma < 0.0 or stiffness < 0.0 or dt <= 0.0 { return 0 }
+
+    let psi_re = fields[0]
+    let psi_im = fields[1]
+    let pi_re = fields[2]
+    let pi_im = fields[3]
+    let a_re = tau / dt + gamma / 2.0 + stiffness * dt / 8.0
+    let a_im = 0.0 - omega / 2.0
+    let c_re = tau / dt - gamma / 2.0 - stiffness * dt / 8.0
+    let c_im = omega / 2.0
+    let rhs_re = c_re * pi_re - c_im * pi_im - stiffness / 2.0 * psi_re + cfg[5]
+    let rhs_im = c_re * pi_im + c_im * pi_re - stiffness / 2.0 * psi_im + cfg[6]
+    let denominator = a_re * a_re + a_im * a_im
+    if denominator <= NPHI_EPS or nphi_finite(denominator) == 0 { return 0 }
+    let next_pi_re = (rhs_re * a_re + rhs_im * a_im) / denominator
+    let next_pi_im = (rhs_im * a_re - rhs_re * a_im) / denominator
+    let half_dt = dt / 2.0
+    let next_psi_re = psi_re + half_dt * (pi_re + next_pi_re)
+    let next_psi_im = psi_im + half_dt * (pi_im + next_pi_im)
+    if nphi_finite(next_pi_re) == 0 or nphi_finite(next_pi_im) == 0 or nphi_finite(next_psi_re) == 0 or nphi_finite(next_psi_im) == 0 { return 0 }
+    // Commit only after every coefficient/result is checked.
+    fields[0] = next_psi_re
+    fields[1] = next_psi_im
+    fields[2] = next_pi_re
+    fields[3] = next_pi_im
+    return 1
+}

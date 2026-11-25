@@ -1,0 +1,69 @@
+// Implicit-midpoint NOEMA-Φ §5 scalar-mode Lyapunov checks.
+import "../src/noema_phi_wave.lir"
+fn near_wave(a: f64, b: f64, eps: f64) -> i64 { return if @fabs(a - b) <= eps { 1 } else { 0 } }
+fn main() -> i64 {
+    var checks: i64 = 0
+    var passed: i64 = 0
+    let fields = @malloc(4 * 8) as *f64
+    let saved = @malloc(4 * 8) as *f64
+    let cfg = @malloc(7 * 8) as *f64
+    cfg[0] = 1.0 cfg[1] = 0.4 cfg[2] = 0.7 cfg[3] = 2.0
+    cfg[4] = 0.1 cfg[5] = 0.3 cfg[6] = -0.2
+    fields[0] = 0.7 fields[1] = -0.4 fields[2] = 0.2 fields[3] = 0.8
+    let e0 = noema_phi_wave_energy(fields, cfg)
+    let old_pi_re = fields[2]
+    let old_pi_im = fields[3]
+    checks = checks + 1
+    if noema_phi_wave_step(fields, cfg) == 1 {
+        let e1 = noema_phi_wave_energy(fields, cfg)
+        let mid_re = (old_pi_re + fields[2]) / 2.0
+        let mid_im = (old_pi_im + fields[3]) / 2.0
+        let expected_delta = 0.0 - 2.0 * cfg[1] * cfg[4] * (mid_re * mid_re + mid_im * mid_im)
+        if e1 <= e0 + 1.0e-12 and near_wave(e1 - e0, expected_delta, 1.0e-11) == 1 { passed = passed + 1 }
+    }
+
+    // With zero damping, midpoint preserves this quadratic energy to roundoff,
+    // including the work-free Hermitian gyro term and constant source.
+    cfg[1] = 0.0
+    fields[0] = 0.7 fields[1] = -0.4 fields[2] = 0.2 fields[3] = 0.8
+    let conservative_start = noema_phi_wave_energy(fields, cfg)
+    var i: i64 = 0
+    var conservative_ok = 1
+    while i < 200 {
+        if noema_phi_wave_step(fields, cfg) != 1 { conservative_ok = 0 }
+        if @fabs(noema_phi_wave_energy(fields, cfg) - conservative_start) > 1.0e-10 { conservative_ok = 0 }
+        i = i + 1
+    }
+    checks = checks + 1
+    if conservative_ok == 1 { passed = passed + 1 }
+
+    // Positive damping makes energy nonincreasing over a long fixed-input run.
+    cfg[1] = 0.4
+    fields[0] = 0.7 fields[1] = -0.4 fields[2] = 0.2 fields[3] = 0.8
+    var previous = noema_phi_wave_energy(fields, cfg)
+    var monotone = 1
+    i = 0
+    while i < 200 {
+        if noema_phi_wave_step(fields, cfg) != 1 { monotone = 0 }
+        let current = noema_phi_wave_energy(fields, cfg)
+        if current > previous + 1.0e-12 { monotone = 0 }
+        previous = current
+        i = i + 1
+    }
+    checks = checks + 1
+    if monotone == 1 { passed = passed + 1 }
+
+    fields[0] = 0.2 fields[1] = 0.3 fields[2] = -0.4 fields[3] = 0.1
+    @memcpy(saved as *u8, fields as *u8, 4 * 8)
+    cfg[4] = 0.0
+    checks = checks + 1
+    if noema_phi_wave_step(fields, cfg) == 0 and fields[0] == saved[0] and fields[1] == saved[1] and fields[2] == saved[2] and fields[3] == saved[3] { passed = passed + 1 }
+
+    cfg[4] = 0.1 cfg[0] = 0.0
+    checks = checks + 1
+    if noema_phi_wave_step(fields, cfg) == 0 { passed = passed + 1 }
+
+    printInt(passed) print("/") printInt(checks) println("")
+    @free(fields as *u8) @free(saved as *u8) @free(cfg as *u8)
+    return if passed == checks { 0 } else { 1 }
+}

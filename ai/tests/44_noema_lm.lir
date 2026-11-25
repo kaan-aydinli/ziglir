@@ -1,49 +1,33 @@
-// End-to-end LIR-native causal model forward, masked update and decode.
-import "../src/noema_lm.lir"
+// Architectural replacement for the former Transformer LM test.
+// Verifies the raw-byte NOEMA-Phi pretraining path without token/logit APIs.
+import "../src/noema_pretrain.lir"
 fn main() -> i64 {
     var checks: i64 = 0
     var passed: i64 = 0
-    let m = noema_lm_new(8, 16, 91)
-    let tokens = @malloc(8)
-    @write_u8(tokens, 85) @write_u8(@ptr_add(tokens, 1), 1) @write_u8(@ptr_add(tokens, 2), 2)
-    @write_u8(@ptr_add(tokens, 3), 65) @write_u8(@ptr_add(tokens, 4), 3) @write_u8(@ptr_add(tokens, 5), 4)
-    let mask = @malloc(5)
-    @write_u8(@ptr_add(mask, 0), 0) @write_u8(@ptr_add(mask, 1), 0)
-    @write_u8(@ptr_add(mask, 2), 1) @write_u8(@ptr_add(mask, 3), 1) @write_u8(@ptr_add(mask, 4), 1)
-    let hidden = @malloc(5 * 8 * 8) as *f64
-    let logits = @malloc(5 * NOEMA_LM_VOCAB * 8) as *f64
-    checks += 1
-    if noema_lm_forward(m, tokens, 5, hidden, logits) == 1 { passed += 1 }
-    let loss_before = noema_lm_train_example(m, tokens, 6, mask, 0.05)
-    checks += 1
-    if loss_before >= 0.0 and loss_before < 20.0 { passed += 1 }
+    let state = noema_pretrain_create(64,8,16,91)
+    let bytes = @malloc(16) as *u8
     var i: i64 = 0
-    var loss_after: f64 = 0.0
-    while i < 12 { loss_after = noema_lm_train_example(m, tokens, 6, mask, 0.05) i = i + 1 }
-    checks += 1
-    if loss_after >= 0.0 and loss_after < loss_before { passed += 1 }
-    let next = noema_lm_next_byte(m, tokens, 6)
-    checks += 1
-    if next >= 0 and next < NOEMA_LM_VOCAB { passed += 1 }
-    let output = @malloc(4)
-    checks += 1
-    if noema_lm_generate(m, tokens, 6, output, 4) == 4 { passed += 1 }
-    let checkpoint = "/tmp/noema_lm_roundtrip.testbin"
-    let before_save = noema_lm_next_byte(m, tokens, 6)
-    checks += 1
-    let m2 = noema_lm_new(8, 16, 5)
-    if noema_lm_save(m, checkpoint) == 1 and noema_lm_load(m2, checkpoint) == 1 and noema_lm_next_byte(m2, tokens, 6) == before_save { passed += 1 }
-    let fd = @open(checkpoint, 1, 420)
-    let badbyte = @malloc(1)
-    @write_u8(badbyte, 88)
-    if fd >= 0 { @write(fd, badbyte, 1) @close(fd) }
-    checks += 1
-    if noema_lm_load(m2, checkpoint) == 0 { passed += 1 }
-    @free(badbyte)
-    @unlink(checkpoint)
-    noema_lm_free(m2)
-    @free(tokens) @free(mask) @free(hidden as *u8) @free(logits as *u8) @free(output)
-    noema_lm_free(m)
+    while i < 16 { @write_u8(@ptr_add(bytes,i),(i*7+19) as u8) i=i+1 }
+    checks = checks+1
+    if noema_pretrain_documents(state) == 0 { passed=passed+1 }
+    checks = checks+1
+    if noema_pretrain_active_cavities() == 4 { passed=passed+1 }
+    checks = checks+1
+    if noema_pretrain_batch_streams() == 8 { passed=passed+1 }
+    noema_pretrain_document(state,bytes,16,0,2)
+    checks = checks+1
+    if noema_pretrain_documents(state) == 1 { passed=passed+1 }
+    noema_pretrain_document(state,bytes,16,1,2)
+    checks = checks+1
+    if noema_pretrain_documents(state) == 2 { passed=passed+1 }
+    i = 0
+    while i < 6 { noema_pretrain_document(state,bytes,16,1,1) i=i+1 }
+    checks = checks+1
+    if noema_pretrain_do_count(state) == 1 { passed=passed+1 }
+    checks = checks+1
+    if noema_pretrain_documents(state) == 8 { passed=passed+1 }
+    noema_pretrain_destroy(state)
+    @free(bytes)
     printInt(passed) print("/") printInt(checks) println("")
     return if passed == checks { 0 } else { 1 }
 }

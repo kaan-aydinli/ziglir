@@ -1,0 +1,60 @@
+// Train the streamed user TXT corpus, already packed as length-prefixed topic records.
+// Node writes the .nbin and 16-byte record/byte metadata before starting this run.
+import "src/noema_pretrain.lir"
+fn write_progress(done: i64,total: i64,bytes: i64) {
+    let fd=@open("/tmp/noema-chat-upload-progress.bin",577,420)
+    if fd<0 { return }
+    let frame=@malloc(24) as *u8
+    @write_u64(frame,done as u64)
+    @write_u64(@ptr_add(frame,8),total as u64)
+    @write_u64(@ptr_add(frame,16),bytes as u64)
+    @write(fd,frame,24)
+    @free(frame)
+    @close(fd)
+}
+fn main() -> i64 {
+    let meta_fd=@open("/tmp/noema-chat-upload-meta.bin",0,0)
+    if meta_fd<0 { println("UPLOAD_METADATA_MISSING") return 1 }
+    let meta=@malloc(16) as *u8
+    let meta_len=@read(meta_fd,meta,16)
+    @close(meta_fd)
+    if meta_len!=16 { @free(meta) println("UPLOAD_METADATA_INVALID") return 1 }
+    let total=@read_u64(meta) as i64
+    let payload_bytes=@read_u64(@ptr_add(meta,8)) as i64
+    @free(meta)
+    if total<=0 or payload_bytes<=0 { println("UPLOAD_HAS_NO_TOPICS") return 1 }
+    let input_fd=@open("/tmp/noema-chat-upload.nbin",0,0)
+    if input_fd<0 { println("UPLOAD_NBIN_MISSING") return 1 }
+    var state: *f64 = noema_pretrain_load("ai/noema-training/user_pretrain_latest.nps")
+    if state==0 as *f64 { state=noema_pretrain_create_with_memory(64,8,128,20261124,total) }
+    let needed=noema_pretrain_memory_count(state)+total
+    if noema_pretrain_memory_capacity(state)<needed { state=noema_pretrain_expand_memory(state,needed) }
+    if state==0 as *f64 { @close(input_fd) println("UPLOAD_MEMORY_ALLOCATION_FAILED") return 1 }
+    write_progress(0,total,0)
+    var done: i64=0
+    while done<total {
+        let count=noema_pretrain_nbin_record(state,input_fd,4)
+        if count!=1 {
+            @close(input_fd)
+            noema_pretrain_destroy(state)
+            println("UPLOAD_RECORD_TRAIN_FAILED")
+            return 1
+        }
+        done=done+1
+        write_progress(done,total,noema_pretrain_training_bytes(state))
+    }
+    @close(input_fd)
+    if noema_pretrain_save(state,"/tmp/noema-chat-upload.nps")!=1 {
+        noema_pretrain_destroy(state)
+        println("UPLOAD_CHECKPOINT_SAVE_FAILED")
+        return 1
+    }
+    print("records=") printInt(done)
+    print(" payload_bytes=") printInt(payload_bytes)
+    print(" training_bytes=") printInt(noema_pretrain_training_bytes(state))
+    print(" learned_text_exemplars=") printInt(noema_pretrain_memory_count(state))
+    print(" memory_capacity=") printInt(noema_pretrain_memory_capacity(state))
+    println("")
+    noema_pretrain_destroy(state)
+    return 0
+}

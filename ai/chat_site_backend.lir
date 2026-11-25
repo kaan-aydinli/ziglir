@@ -1,0 +1,124 @@
+// LIR inference adapter for the chat UI and release validator. First stdin line
+// selects trained/uploaded/fresh; candidate is CLI-only and loads a staged
+// checkpoint for promotion tests without swapping the production alias.
+// Following bytes are the raw UTF-8 prompt. Output contains a checkpoint-derived
+// exemplar (or abstention) and measurements from this exact inference run.
+import "src/noema_pretrain.lir"
+fn chat_hex_byte(value: i64) {
+    let digits = "0123456789abcdef"
+    let ptr = digits.ptr as *u8
+    let hi = (value >> 4) & 15
+    let lo = value & 15
+    @write(1,@ptr_add(ptr,hi),1)
+    @write(1,@ptr_add(ptr,lo),1)
+}
+fn main() -> i64 {
+    var input_capacity:i64=4096
+    var input=@malloc(input_capacity) as *u8
+    if input==0 as *u8 { println("NOEMA_RESULT_V2") println("ok=0") println("error=input_allocation_failed") return 1 }
+    var n:i64=0
+    var input_done:i64=0
+    while input_done==0 {
+        if n==input_capacity {
+            if input_capacity>4611686018427387903 { @free(input) println("NOEMA_RESULT_V2") println("ok=0") println("error=input_size_overflow") return 1 }
+            let next_capacity=input_capacity*2
+            let next_input=@malloc(next_capacity) as *u8
+            if next_input==0 as *u8 { @free(input) println("NOEMA_RESULT_V2") println("ok=0") println("error=input_allocation_failed") return 1 }
+            var copied:i64=0
+            while copied<n { @write_u8(@ptr_add(next_input,copied),@read_u8(@ptr_add(input,copied))) copied=copied+1 }
+            @free(input)
+            input=next_input
+            input_capacity=next_capacity
+        }
+        let received=@read(0,@ptr_add(input,n),input_capacity-n)
+        if received<0 { @free(input) println("NOEMA_RESULT_V2") println("ok=0") println("error=input_read_failed") return 1 }
+        if received==0 { input_done=1 } else { n=n+received }
+    }
+    if n <= 0 {
+        @free(input)
+        println("NOEMA_RESULT_V2")
+        println("ok=0")
+        println("error=empty_input")
+        return 1
+    }
+    var split: i64 = 0
+    while split < n and (@read_u8(@ptr_add(input,split)) as i64) != 10 { split=split+1 }
+    if split >= n {
+        @free(input)
+        println("NOEMA_RESULT_V2")
+        println("ok=0")
+        println("error=model_selector_required")
+        return 1
+    }
+    var mode_len=split
+    if mode_len>0 and (@read_u8(@ptr_add(input,mode_len-1)) as i64)==13 { mode_len=mode_len-1 }
+    let trained = mode_len==7 and (@read_u8(input) as i64)==116 and (@read_u8(@ptr_add(input,1)) as i64)==114 and (@read_u8(@ptr_add(input,2)) as i64)==97 and (@read_u8(@ptr_add(input,3)) as i64)==105 and (@read_u8(@ptr_add(input,4)) as i64)==110 and (@read_u8(@ptr_add(input,5)) as i64)==101 and (@read_u8(@ptr_add(input,6)) as i64)==100
+    let fresh = mode_len==5 and (@read_u8(input) as i64)==102 and (@read_u8(@ptr_add(input,1)) as i64)==114 and (@read_u8(@ptr_add(input,2)) as i64)==101 and (@read_u8(@ptr_add(input,3)) as i64)==115 and (@read_u8(@ptr_add(input,4)) as i64)==104
+    let uploaded = mode_len==8 and (@read_u8(input) as i64)==117 and (@read_u8(@ptr_add(input,1)) as i64)==112 and (@read_u8(@ptr_add(input,2)) as i64)==108 and (@read_u8(@ptr_add(input,3)) as i64)==111 and (@read_u8(@ptr_add(input,4)) as i64)==97 and (@read_u8(@ptr_add(input,5)) as i64)==100 and (@read_u8(@ptr_add(input,6)) as i64)==101 and (@read_u8(@ptr_add(input,7)) as i64)==100
+    let candidate = mode_len==9 and (@read_u8(input) as i64)==99 and (@read_u8(@ptr_add(input,1)) as i64)==97 and (@read_u8(@ptr_add(input,2)) as i64)==110 and (@read_u8(@ptr_add(input,3)) as i64)==100 and (@read_u8(@ptr_add(input,4)) as i64)==105 and (@read_u8(@ptr_add(input,5)) as i64)==100 and (@read_u8(@ptr_add(input,6)) as i64)==97 and (@read_u8(@ptr_add(input,7)) as i64)==116 and (@read_u8(@ptr_add(input,8)) as i64)==101
+    if trained==false and fresh==false and uploaded==false and candidate==false {
+        @free(input)
+        println("NOEMA_RESULT_V2")
+        println("ok=0")
+        println("error=unknown_model")
+        return 1
+    }
+    let prompt_start=split+1
+    let prompt_len=n-prompt_start
+    if prompt_len<=0 {
+        @free(input)
+        println("NOEMA_RESULT_V2")
+        println("ok=0")
+        println("error=empty_or_oversized_prompt")
+        return 1
+    }
+    var state: *f64 = 0 as *f64
+    if trained {
+        state=noema_pretrain_load("ai/noema-training/pretrain_large_latest.nps")
+        if state==0 as *f64 { state=noema_pretrain_load("ai/noema-training/pretrain_large.nps") }
+    }
+    else if uploaded { state=noema_pretrain_load("ai/noema-training/user_pretrain_latest.nps") }
+    else if candidate { state=noema_pretrain_load("/tmp/noema_pretrain_candidate.nps") }
+    else { state=noema_pretrain_create(64,8,128,20261124) }
+    if state==0 as *f64 {
+        @free(input)
+        println("NOEMA_RESULT_V2")
+        println("ok=0")
+        println("error=trained_checkpoint_missing_or_invalid")
+        return 1
+    }
+    let output=@malloc(256) as *u8
+    let generated=noema_pretrain_infer(state,@ptr_add(input,prompt_start),prompt_len,output,256,4)
+    if generated<0 {
+        noema_pretrain_destroy(state)
+        @free(output) @free(input)
+        println("NOEMA_RESULT_V2")
+        println("ok=0")
+        println("error=numerical_guard_rejected_inference")
+        return 1
+    }
+    println("NOEMA_RESULT_V2")
+    println("ok=1")
+    print("model_id=")
+    if trained { println("noema_phi_large") } else if uploaded { println("noema_phi_uploaded") } else if candidate { println("noema_phi_candidate") } else { println("noema_phi_fresh") }
+    print("training_records=") printInt(noema_pretrain_documents(state))
+    print("training_bytes=") printInt(noema_pretrain_training_bytes(state))
+    print("training_do_perturbations=") printInt(noema_pretrain_do_count(state))
+    print("spectral_stage=") printInt(noema_pretrain_stage(state))
+    print("input_bytes=") printInt(prompt_len)
+    print("inference_free_energy=") printFloat(noema_pretrain_last_energy(state)) println("")
+    print("inference_surprise_gate=") printFloat(noema_pretrain_last_gate(state)) println("")
+    print("retrieval_similarity=") printFloat(noema_pretrain_last_match(state)) println("")
+    print("stored_exemplars=") printInt(noema_pretrain_memory_count(state))
+    print("memory_capacity=") printInt(noema_pretrain_memory_capacity(state))
+    println("")
+    print("generated_bytes=") printInt(generated)
+    print("generated_hex=")
+    var i: i64=0
+    while i<generated { chat_hex_byte(@read_u8(@ptr_add(output,i)) as i64) i=i+1 }
+    println("")
+    noema_pretrain_destroy(state)
+    @free(output)
+    @free(input)
+    return 0
+}
