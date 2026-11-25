@@ -1,0 +1,120 @@
+// opt: -O1
+// Checkpoint v3 round-trips exemplar state, migrates v1/v2, and rejects corruption.
+import "../src/noema_pretrain.lir"
+fn main() -> i64 {
+    let path="/tmp/noema_phi_pretrain_checkpoint_test.nps"
+    let v1path="/tmp/noema_phi_pretrain_checkpoint_v1_test.nps"
+    let v2path="/tmp/noema_phi_pretrain_checkpoint_v2_test.nps"
+    let v3path="/tmp/noema_phi_pretrain_checkpoint_v3_test.nps"
+    let st=noema_pretrain_create(64,4,8,23)
+    st[NP_DOCS]=9.0
+    st[NP_STAGE]=2.0
+    if noema_pretrain_save(st,path)!=1 { println("SAVE_FAILED") return 1 }
+    let loaded=noema_pretrain_load(path)
+    var roundtrip:i64=1
+    if loaded==0 as *f64 { roundtrip=0 }
+    else {
+        if noema_pretrain_documents(loaded)!=9 { roundtrip=0 }
+        if noema_pretrain_stage(loaded)!=2 { roundtrip=0 }
+    }
+    printInt(roundtrip)
+    println("")
+    if loaded!=0 as *f64 { noema_pretrain_destroy(loaded) }
+
+    let legacy_floats=np_state_floats_legacy(64,4,8)
+    let legacy_payload=legacy_floats*8
+    let current_payload=np_state_floats(64,4,8)*8
+    let image=@malloc(48+current_payload) as *u8
+    var fd=@open(path,0,0)
+    var got=np_read_exact(fd,image,48+current_payload)
+    @close(fd)
+    var v1ok:i64=0
+    var v2ok:i64=0
+    var v3ok:i64=0
+    var corrupt:i64=0
+    if got==48+current_payload {
+        @write_u32(@ptr_add(image,4),1 as u32)
+        @write_u64(@ptr_add(image,32),legacy_floats as u64)
+        let legacy_fd=@open(v1path,577,420)
+        if legacy_fd>=0 {
+            let h=np_write_exact(legacy_fd,image,40)
+            let p=np_write_exact(legacy_fd,@ptr_add(image,48),legacy_payload)
+            @close(legacy_fd)
+            if h==40 and p==legacy_payload {
+                let legacy=noema_pretrain_load(v1path)
+                if legacy!=0 as *f64 and noema_pretrain_documents(legacy)==9 { v1ok=1 }
+                if legacy!=0 as *f64 { noema_pretrain_destroy(legacy) }
+            }
+        }
+
+        fd=@open(path,0,0)
+        got=np_read_exact(fd,image,48+current_payload)
+        @close(fd)
+        if got==48+current_payload {
+            @write_u32(@ptr_add(image,4),2 as u32)
+            @write_u64(@ptr_add(image,32),legacy_floats as u64)
+            @write_u64(@ptr_add(image,40),np_checkpoint_checksum(@ptr_add(image,48),legacy_payload) as u64)
+            let v2fd=@open(v2path,577,420)
+            if v2fd>=0 {
+                let h=np_write_exact(v2fd,image,48)
+                let p=np_write_exact(v2fd,@ptr_add(image,48),legacy_payload)
+                @close(v2fd)
+                if h==48 and p==legacy_payload {
+                    let old=noema_pretrain_load(v2path)
+                    if old!=0 as *f64 and noema_pretrain_documents(old)==9 and noema_pretrain_memory_count(old)==0 { v2ok=1 }
+                    if old!=0 as *f64 { noema_pretrain_destroy(old) }
+                }
+            }
+        }
+
+        fd=@open(path,0,0)
+        got=np_read_exact(fd,image,48+current_payload)
+        @close(fd)
+        if got==48+current_payload {
+            @write_u32(@ptr_add(image,4),3 as u32)
+            let v3fd=@open(v3path,577,420)
+            if v3fd>=0 {
+                let h=np_write_exact(v3fd,image,48)
+                let p=np_write_exact(v3fd,@ptr_add(image,48),current_payload)
+                @close(v3fd)
+                if h==48 and p==current_payload {
+                    let old3=noema_pretrain_load(v3path)
+                    if old3!=0 as *f64 {
+                        let old3docs=noema_pretrain_documents(old3)
+                        let old3cap=noema_pretrain_memory_capacity(old3)
+                        if old3docs==9 and old3cap==NP_MEM_SLOTS { v3ok=1 }
+                        noema_pretrain_destroy(old3)
+                    }
+                }
+            }
+        }
+
+        fd=@open(path,0,0)
+        got=np_read_exact(fd,image,48+current_payload)
+        @close(fd)
+        if got==48+current_payload {
+            @write_u8(@ptr_add(image,48),((@read_u8(@ptr_add(image,48)) as i64)^1) as u8)
+            let out=@open(path,577,420)
+            if out>=0 {
+                let wrote=np_write_exact(out,image,48+current_payload)
+                @close(out)
+                if wrote==48+current_payload {
+                    let rejected=noema_pretrain_load(path)
+                    if rejected==0 as *f64 { corrupt=1 } else { noema_pretrain_destroy(rejected) }
+                }
+            }
+        }
+    }
+    printInt(v1ok)
+    println("")
+    printInt(v2ok)
+    println("")
+    printInt(v3ok)
+    println("")
+    printInt(corrupt)
+    println("")
+    @free(image)
+    noema_pretrain_destroy(st)
+    @unlink(path) @unlink(v1path) @unlink(v2path) @unlink(v3path)
+    return 0
+}

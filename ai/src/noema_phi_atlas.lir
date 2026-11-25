@@ -1,0 +1,148 @@
+// NOEMA-Φ §3.1 hierarchical resonance atlas selector.
+// It builds a binary max-norm bound tree, then performs exact top-K branch-and-
+// bound by query resonance. Search is often sublinear, but worst-case O(C*D); it
+// does not promise the specification's strict O(log C) in adversarial atlases.
+import "noema_phi_geometry.lir"
+const NPHI_ATLAS_MAX_CARDS: i64 = 1048576
+const NPHI_ATLAS_MAX_DIM: i64 = 1024
+const NPHI_ATLAS_MAX_K: i64 = 4
+
+fn nphi_atlas_base_valid(card_count: i64, base: i64) -> i64 {
+    if card_count <= 0 or card_count > NPHI_ATLAS_MAX_CARDS { return 0 }
+    var expected: i64 = 1
+    while expected < card_count { expected = expected * 2 }
+    return if base == expected { 1 } else { 0 }
+}
+
+/// Build squared-norm upper bounds for a complete binary heap tree. `base` is
+/// the smallest power of two >= card_count. norms[1..2*base) is output; each
+/// internal value is max squared signature norm below that node.
+fn noema_phi_atlas_build_bounds(signatures: *f64, card_count: i64, dim: i64, base: i64, norms: *f64) -> i64 {
+    if dim <= 0 or dim > NPHI_ATLAS_MAX_DIM { return 0 }
+    if nphi_atlas_base_valid(card_count, base) == 0 { return 0 }
+    norms[0] = 0.0
+    var node: i64 = 0
+    while node < base {
+        var norm2: f64 = 0.0
+        if node < card_count {
+            var d: i64 = 0
+            while d < dim {
+                let value = signatures[node * dim + d]
+                if nphi_finite(value) == 0 { return 0 }
+                norm2 = norm2 + value * value
+                d = d + 1
+            }
+        }
+        if nphi_finite(norm2) == 0 { return 0 }
+        norms[base + node] = norm2
+        node = node + 1
+    }
+    node = base - 1
+    while node >= 1 {
+        norms[node] = @max(norms[node * 2], norms[node * 2 + 1])
+        node = node - 1
+    }
+    return 1
+}
+
+fn nphi_atlas_dot_score(query: *f64, signatures: *f64, dim: i64, card: i64) -> f64 {
+    var dot: f64 = 0.0
+    var d: i64 = 0
+    while d < dim { dot = dot + query[d] * signatures[card * dim + d] d = d + 1 }
+    return dot * dot
+}
+
+fn nphi_atlas_insert(card: i64, score: f64, k: i64, ids: *f64, scores: *f64, found_in: i64) -> i64 {
+    var found = found_in
+    var pos: i64 = 0
+    while pos < found {
+        if scores[pos] < score { break }
+        if scores[pos] == score and ids[pos] > card as f64 { break }
+        pos = pos + 1
+    }
+    if pos >= k { return found }
+    if found < k { found = found + 1 }
+    var shift = found - 1
+    while shift > pos {
+        ids[shift] = ids[shift - 1]
+        scores[shift] = scores[shift - 1]
+        shift = shift - 1
+    }
+    ids[pos] = card as f64
+    scores[pos] = score
+    return found
+}
+
+fn nphi_atlas_push(node: i64, bound: f64, threshold: f64, stack: *f64, sp_in: i64) -> i64 {
+    if bound >= threshold { stack[sp_in] = node as f64 return sp_in + 1 }
+    return sp_in
+}
+
+/// Exact top-K resonance selection under the stored Cauchy-Schwarz bounds.
+/// meta=[card_count,dim,base,k]. ids/scores each have k cells; stack needs 64
+/// f64 cells. Result scores are |query·Omega_card|²; returns selected count.
+/// Internal-child ordering is best-bound-first, with deterministic id tie-break.
+fn noema_phi_atlas_select(query: *f64, signatures: *f64, norms: *f64, meta: *f64, ids: *f64, scores: *f64, stack: *f64) -> i64 {
+    var mi: i64 = 0
+    while mi < 4 {
+        if nphi_finite(meta[mi]) == 0 { return 0 }
+        if meta[mi] != @floor(meta[mi]) { return 0 }
+        mi = mi + 1
+    }
+    let card_count = meta[0] as i64
+    let dim = meta[1] as i64
+    let base = meta[2] as i64
+    let k = meta[3] as i64
+    if nphi_atlas_base_valid(card_count, base) == 0 { return 0 }
+    if dim <= 0 or dim > NPHI_ATLAS_MAX_DIM { return 0 }
+    if k <= 0 or k > NPHI_ATLAS_MAX_K or k > card_count { return 0 }
+    var query_norm2: f64 = 0.0
+    var d: i64 = 0
+    while d < dim {
+        if nphi_finite(query[d]) == 0 { return 0 }
+        query_norm2 = query_norm2 + query[d] * query[d]
+        d = d + 1
+    }
+    if nphi_finite(query_norm2) == 0 { return 0 }
+    if query_norm2 == 0.0 {
+        var id: i64 = 0
+        while id < k { ids[id] = id as f64 scores[id] = 0.0 id = id + 1 }
+        return k
+    }
+    var found: i64 = 0
+    var sp: i64 = 1
+    stack[0] = 1.0
+    while sp > 0 {
+        sp = sp - 1
+        let node = stack[sp] as i64
+        if nphi_finite(norms[node]) == 0 or norms[node] < 0.0 { return 0 }
+        let node_bound = query_norm2 * norms[node]
+        if nphi_finite(node_bound) == 0 { return 0 }
+        if found == k and node_bound < scores[k - 1] { continue }
+        if node >= base {
+            let card = node - base
+            if card < card_count {
+                let score = nphi_atlas_dot_score(query, signatures, dim, card)
+                if nphi_finite(score) == 0 { return 0 }
+                found = nphi_atlas_insert(card, score, k, ids, scores, found)
+            }
+        } else {
+            let left = node * 2
+            let right = left + 1
+            if nphi_finite(norms[left]) == 0 or norms[left] < 0.0 { return 0 }
+            if nphi_finite(norms[right]) == 0 or norms[right] < 0.0 { return 0 }
+            let left_bound = query_norm2 * norms[left]
+            let right_bound = query_norm2 * norms[right]
+            if nphi_finite(left_bound) == 0 or nphi_finite(right_bound) == 0 { return 0 }
+            let threshold = if found == k { scores[k - 1] } else { 0.0 }
+            if left_bound >= right_bound {
+                sp = nphi_atlas_push(right, right_bound, threshold, stack, sp)
+                sp = nphi_atlas_push(left, left_bound, threshold, stack, sp)
+            } else {
+                sp = nphi_atlas_push(left, left_bound, threshold, stack, sp)
+                sp = nphi_atlas_push(right, right_bound, threshold, stack, sp)
+            }
+        }
+    }
+    return found
+}

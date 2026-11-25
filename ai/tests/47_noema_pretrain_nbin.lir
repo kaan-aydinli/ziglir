@@ -1,0 +1,30 @@
+// Zero-parse .nbin writer/reader and alternating staging-buffer smoke test.
+import "../src/noema_pretrain.lir"
+fn main() -> i64 {
+    var checks: i64 = 0
+    var passed: i64 = 0
+    let raw = @malloc(4) as *u8
+    @write_u8(raw,65) @write_u8(@ptr_add(raw,1),66)
+    @write_u8(@ptr_add(raw,2),67) @write_u8(@ptr_add(raw,3),68)
+    let out = @open("/tmp/noema_phi_pretrain_test.nbin",577,420)
+    let w0 = noema_pretrain_nbin_write(out,raw,4,0,1)
+    let w1 = noema_pretrain_nbin_write(out,raw,4,1,1)
+    @close(out)
+    checks = checks + 1
+    if w0 == 4 and w1 == 4 { passed = passed + 1 }
+    let fd = @open("/tmp/noema_phi_pretrain_test.nbin",0,0)
+    let st = noema_pretrain_create(64,4,8,77)
+    let n = noema_pretrain_nbin_train(st,fd,2,16,0)
+    checks = checks + 1
+    if n == 2 { passed = passed + 1 }
+    checks = checks + 1
+    if noema_pretrain_documents(st) == 2 { passed = passed + 1 }
+    @close(fd)
+    noema_pretrain_destroy(st)
+    @free(raw)
+    printInt(passed)
+    print("/")
+    printInt(checks)
+    println("")
+    return 0
+}

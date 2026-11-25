@@ -1,0 +1,39 @@
+// Deterministic counterfactual phase inversion applies to every alternate
+// branch cell on one in eight documents, not pseudorandom additive noise.
+import "../src/noema_pretrain.lir"
+fn count_changed(st: *f64) -> i64 {
+    var changed:i64=0
+    var slot:i64=0
+    while slot<NP_K {
+        var stream:i64=0
+        while stream<NP_B {
+            var i:i64=0
+            while i<np_n(st) {
+                let at=np_at(slot,stream,i,np_n(st))
+                if st[np_array(st,0)+at]!=st[np_array(st,4)+at] or st[np_array(st,1)+at]!=st[np_array(st,5)+at] { changed=changed+1 }
+                i=i+1
+            }
+            stream=stream+1
+        }
+        slot=slot+1
+    }
+    return changed
+}
+fn main() -> i64 {
+    let st=noema_pretrain_create(64,4,8,9)
+    let bytes=@malloc(8) as *u8
+    var i:i64=0
+    while i<8 { @write_u8(@ptr_add(bytes,i),85) i=i+1 }
+    let sig=@malloc(NP_SIG*8) as *f64
+    let ids=@malloc(NP_K*8) as *f64
+    i=0
+    while i<NP_SIG { sig[i]=0.0 i=i+1 }
+    i=0
+    while i<NP_K { ids[i]=i as f64 i=i+1 }
+    np_inject(st,bytes,8,ids,sig,1,0)
+    printInt(count_changed(st))
+    println("")
+    noema_pretrain_destroy(st)
+    @free(bytes) @free(sig) @free(ids)
+    return 0
+}

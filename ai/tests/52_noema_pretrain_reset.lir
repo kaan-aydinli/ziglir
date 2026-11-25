@@ -1,0 +1,28 @@
+// Partial reset clears working fields but preserves session context; full reset
+// also clears the context ring and increments the reset counter.
+import "../src/noema_pretrain.lir"
+fn main() -> i64 {
+    let st=noema_pretrain_create(64,4,8,19)
+    st[np_array(st,0)]=7.0
+    st[np_orta(st,0)]=11.0
+    st[np_ring(st,0,0)]=22.0
+    noema_pretrain_reset(st,1)
+    var partial_ok:i64=1
+    if st[np_array(st,0)]!=0.0 { partial_ok=0 }
+    if st[np_orta(st,0)]!=11.0 { partial_ok=0 }
+    if st[np_ring(st,0,0)]!=22.0 { partial_ok=0 }
+    printInt(partial_ok)
+    println("")
+
+    st[np_array(st,0)]=9.0
+    noema_pretrain_reset(st,0)
+    var full_ok:i64=1
+    if st[np_array(st,0)]!=0.0 { full_ok=0 }
+    if st[np_orta(st,0)]!=0.0 { full_ok=0 }
+    if st[np_ring(st,0,0)]!=0.0 { full_ok=0 }
+    if st[NP_RESET_COUNT]!=1.0 { full_ok=0 }
+    printInt(full_ok)
+    println("")
+    noema_pretrain_destroy(st)
+    return 0
+}

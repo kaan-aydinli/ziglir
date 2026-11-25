@@ -1,0 +1,79 @@
+// NOEMA-Φ §6.2 analytic ETD propagator for one linear scalar mode.
+// This implements the three damping regimes only; spatial DCT, Strang force
+// splitting, bridge halo exchange and protection propagator are separate work.
+import "noema_phi_geometry.lir"
+
+/// `fields` = [psi_re,psi_im,pi_re,pi_im]. `cfg` = [tau2,gamma,kappa,dt],
+/// where omega^2=kappa/(2*tau2), zeta=gamma/(2*tau2). Source-free linear
+/// mode propagation is analytic and transactional. Returns 0 on invalid range.
+fn noema_phi_etd_step(fields: *f64, cfg: *f64) -> i64 {
+    var i: i64 = 0
+    while i < 4 { if nphi_finite(fields[i]) == 0 { return 0 } i = i + 1 }
+    i = 0
+    while i < 4 { if nphi_finite(cfg[i]) == 0 { return 0 } i = i + 1 }
+    let tau = cfg[0]
+    let gamma = cfg[1]
+    let kappa = cfg[2]
+    let dt = cfg[3]
+    if tau <= 0.0 or gamma < 0.0 or kappa < 0.0 or dt <= 0.0 or dt > 1.0 { return 0 }
+    let zeta = gamma / (2.0 * tau)
+    let omega2 = kappa / (2.0 * tau)
+    let delta = zeta * zeta - omega2
+    var e11: f64 = 0.0
+    var e12: f64 = 0.0
+    var e21: f64 = 0.0
+    var e22: f64 = 0.0
+    if @fabs(delta) <= 1.0e-12 * (1.0 + zeta * zeta + omega2) {
+        let exponent = 0.0 - zeta * dt
+        if @fabs(exponent) > 20.0 { return 0 }
+        let decay = nphi_exp(exponent)
+        e11 = decay * (1.0 + zeta * dt)
+        e12 = dt * decay
+        e21 = 0.0 - zeta * zeta * dt * decay
+        e22 = decay * (1.0 - zeta * dt)
+    } else if delta > 0.0 {
+        let mu = @sqrt(delta)
+        let plus_exp = (0.0 - zeta + mu) * dt
+        let minus_exp = (0.0 - zeta - mu) * dt
+        if @fabs(plus_exp) > 20.0 or @fabs(minus_exp) > 20.0 { return 0 }
+        let ep = nphi_exp(plus_exp)
+        let em = nphi_exp(minus_exp)
+        let ratio = zeta / mu
+        e11 = 0.5 * ((1.0 + ratio) * ep + (1.0 - ratio) * em)
+        e12 = (ep - em) / (2.0 * mu)
+        e21 = 0.0 - omega2 * e12
+        e22 = 0.5 * ((1.0 - ratio) * ep + (1.0 + ratio) * em)
+    } else {
+        let nu = @sqrt(0.0 - delta)
+        let exponent = 0.0 - zeta * dt
+        if @fabs(exponent) > 20.0 { return 0 }
+        let decay = nphi_exp(exponent)
+        let angle = nu * dt
+        let co = @cos(angle)
+        let si = @sin(angle)
+        e11 = decay * (co + zeta / nu * si)
+        e12 = decay * si / nu
+        e21 = 0.0 - omega2 * e12
+        e22 = decay * (co - zeta / nu * si)
+    }
+    let nr = e11 * fields[0] + e12 * fields[2]
+    let ni = e11 * fields[1] + e12 * fields[3]
+    let pr = e21 * fields[0] + e22 * fields[2]
+    let pi = e21 * fields[1] + e22 * fields[3]
+    if nphi_finite(nr) == 0 or nphi_finite(ni) == 0 or nphi_finite(pr) == 0 or nphi_finite(pi) == 0 { return 0 }
+    fields[0] = nr
+    fields[1] = ni
+    fields[2] = pr
+    fields[3] = pi
+    return 1
+}
+
+fn noema_phi_etd_energy(fields: *f64, cfg: *f64) -> f64 {
+    if nphi_finite(cfg[0]) == 0 or nphi_finite(cfg[2]) == 0 or cfg[0] <= 0.0 or cfg[2] < 0.0 { return -1.0 }
+    var i: i64 = 0
+    while i < 4 { if nphi_finite(fields[i]) == 0 { return -1.0 } i = i + 1 }
+    let psi2 = fields[0] * fields[0] + fields[1] * fields[1]
+    let pi2 = fields[2] * fields[2] + fields[3] * fields[3]
+    let energy = cfg[0] * pi2 + cfg[2] / 2.0 * psi2
+    return if nphi_finite(energy) == 1 { energy } else { -1.0 }
+}

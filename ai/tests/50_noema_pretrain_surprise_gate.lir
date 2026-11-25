@@ -1,0 +1,21 @@
+// Consolidation is a no-op at zero surprise and adapts signatures when gated.
+import "../src/noema_pretrain.lir"
+fn main() -> i64 {
+    let st=noema_pretrain_create(64,4,8,9)
+    let sig=@malloc(NP_SIG*8) as *f64
+    let ids=@malloc(NP_K*8) as *f64
+    var i:i64=0
+    while i<NP_SIG { sig[i]=2.0 i=i+1 }
+    i=0
+    while i<NP_K { ids[i]=i as f64 i=i+1 }
+    let before=st[np_sig(st,0,0)]
+    np_consolidate(st,ids,sig,0.0)
+    printInt(if st[np_sig(st,0,0)]==before { 1 } else { 0 })
+    println("")
+    np_consolidate(st,ids,sig,1.0)
+    printInt(if st[np_sig(st,0,0)]!=before { 1 } else { 0 })
+    println("")
+    noema_pretrain_destroy(st)
+    @free(sig) @free(ids)
+    return 0
+}

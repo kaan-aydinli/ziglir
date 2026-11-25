@@ -1,0 +1,63 @@
+// Inference selects exact corpus-derived text by raw-byte trigram resonance;
+// the selected line survives a v3 checkpoint round trip.
+import "../src/noema_pretrain.lir"
+fn main() -> i64 {
+    let st=noema_pretrain_create(64,4,8,41)
+    let a="Cause and effect can be tested with careful measurements.\n"
+    let b="A river carries sediment toward the coast.\n"
+    noema_pretrain_document(st,a as *u8,a.len as i64,0,0)
+    noema_pretrain_document(st,b as *u8,b.len as i64,0,0)
+    var stored:i64=0
+    if noema_pretrain_memory_count(st)==2 { stored=1 }
+    printInt(stored)
+    println("")
+
+    let prompt="River sediment reaches the coast."
+    let output=@malloc(256) as *u8
+    let n=noema_pretrain_infer(st,prompt as *u8,prompt.len as i64,output,256,0)
+    var exact:i64=1
+    if n!=b.len-1 { exact=0 }
+    else {
+        var i:i64=0
+        while i<n { if @read_u8(@ptr_add(output,i))!=@read_u8(@ptr_add(b as *u8,i)) { exact=0 } i=i+1 }
+    }
+    if noema_pretrain_last_match(st)<0.50 { exact=0 }
+    printInt(exact)
+    println("")
+
+    // A lower-confidence, in-domain lexical query should pass the configured
+    // 0.22 threshold with actual whole-token support from the stored line.
+    let weak_prompt="river coast"
+    let weak_n=noema_pretrain_infer(st,weak_prompt as *u8,weak_prompt.len as i64,output,256,0)
+    let weak_score=noema_pretrain_last_match(st)
+    var weak_match=weak_n==b.len-1 and weak_score>=0.22 and weak_score<0.50
+    if weak_match {
+        var j:i64=0
+        while j<weak_n { if @read_u8(@ptr_add(output,j))!=@read_u8(@ptr_add(b as *u8,j)) { weak_match=false } j=j+1 }
+    }
+    if weak_match { printInt(1) } else { printInt(0) }
+    println("")
+
+    let unrelated="completely unrelated quantum gardening hypothesis"
+    let rejected=noema_pretrain_infer(st,unrelated as *u8,unrelated.len as i64,output,256,0)
+    var abstain:i64=0
+    if rejected==0 and noema_pretrain_last_match(st)<0.24 { abstain=1 }
+    printInt(abstain)
+    println("")
+
+    let path="/tmp/noema_phi_learned_excerpt_test.nps"
+    noema_pretrain_save(st,path)
+    let loaded=noema_pretrain_load(path)
+    var persisted:i64=0
+    if loaded!=0 as *f64 {
+        let n2=noema_pretrain_infer(loaded,prompt as *u8,prompt.len as i64,output,128,0)
+        if n2==n and noema_pretrain_memory_count(loaded)==2 and noema_pretrain_last_match(loaded)>0.50 { persisted=1 }
+        noema_pretrain_destroy(loaded)
+    }
+    printInt(persisted)
+    println("")
+    @unlink(path)
+    @free(output)
+    noema_pretrain_destroy(st)
+    return 0
+}

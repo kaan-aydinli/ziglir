@@ -1,0 +1,70 @@
+// Exact damped-mode ETD branch and semigroup tests for NOEMA-Φ §6.2.
+import "../src/noema_phi_etd.lir"
+fn close_etd(a: f64, b: f64, eps: f64) -> i64 { return if @fabs(a - b) <= eps { 1 } else { 0 } }
+fn semigroup_case(gamma: f64) -> i64 {
+    let a = @malloc(4 * 8) as *f64
+    let b = @malloc(4 * 8) as *f64
+    let cfg = @malloc(4 * 8) as *f64
+    a[0] = 0.7 a[1] = -0.4 a[2] = 0.2 a[3] = 0.8
+    @memcpy(b as *u8, a as *u8, 4 * 8)
+    cfg[0] = 1.0 cfg[1] = gamma cfg[2] = 2.0 cfg[3] = 0.1
+    let one_ok = noema_phi_etd_step(a, cfg)
+    cfg[3] = 0.05
+    let half_a = noema_phi_etd_step(b, cfg)
+    let half_b = noema_phi_etd_step(b, cfg)
+    var ok = if one_ok == 1 and half_a == 1 and half_b == 1 { 1 } else { 0 }
+    var i: i64 = 0
+    while i < 4 { if close_etd(a[i], b[i], 1.0e-10) == 0 { ok = 0 } i = i + 1 }
+    @free(a as *u8) @free(b as *u8) @free(cfg as *u8)
+    return ok
+}
+fn main() -> i64 {
+    var checks: i64 = 0
+    var passed: i64 = 0
+    // zeta=2 > omega=1, zeta=omega=1, and zeta=0.1 < omega=1.
+    checks = checks + 1
+    if semigroup_case(4.0) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if semigroup_case(2.0) == 1 { passed = passed + 1 }
+    checks = checks + 1
+    if semigroup_case(0.2) == 1 { passed = passed + 1 }
+
+    let fields = @malloc(4 * 8) as *f64
+    let saved = @malloc(4 * 8) as *f64
+    let cfg = @malloc(4 * 8) as *f64
+    fields[0] = 0.7 fields[1] = -0.4 fields[2] = 0.2 fields[3] = 0.8
+    cfg[0] = 1.0 cfg[1] = 0.0 cfg[2] = 2.0 cfg[3] = 0.02
+    let energy0 = noema_phi_etd_energy(fields, cfg)
+    var i: i64 = 0
+    var conservative = 1
+    while i < 300 {
+        if noema_phi_etd_step(fields, cfg) != 1 { conservative = 0 }
+        if @fabs(noema_phi_etd_energy(fields, cfg) - energy0) > 1.0e-10 { conservative = 0 }
+        i = i + 1
+    }
+    checks = checks + 1
+    if conservative == 1 { passed = passed + 1 }
+
+    fields[0] = 0.7 fields[1] = -0.4 fields[2] = 0.2 fields[3] = 0.8
+    cfg[1] = 0.4 cfg[3] = 0.02
+    var previous = noema_phi_etd_energy(fields, cfg)
+    var monotone = 1
+    i = 0
+    while i < 300 {
+        if noema_phi_etd_step(fields, cfg) != 1 { monotone = 0 }
+        let current = noema_phi_etd_energy(fields, cfg)
+        if current > previous + 1.0e-12 { monotone = 0 }
+        previous = current
+        i = i + 1
+    }
+    checks = checks + 1
+    if monotone == 1 { passed = passed + 1 }
+
+    @memcpy(saved as *u8, fields as *u8, 4 * 8)
+    cfg[3] = 1.1
+    checks = checks + 1
+    if noema_phi_etd_step(fields, cfg) == 0 and fields[0] == saved[0] and fields[1] == saved[1] and fields[2] == saved[2] and fields[3] == saved[3] { passed = passed + 1 }
+    printInt(passed) print("/") printInt(checks) println("")
+    @free(fields as *u8) @free(saved as *u8) @free(cfg as *u8)
+    return if passed == checks { 0 } else { 1 }
+}

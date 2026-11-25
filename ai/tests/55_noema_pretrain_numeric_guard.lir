@@ -1,0 +1,46 @@
+// Numerical guard rejects non-finite trajectories and refuses to replace a
+// valid checkpoint with non-finite state.
+import "../src/noema_pretrain.lir"
+fn main() -> i64 {
+    let bad=1.0e301
+    var finite_check:i64=1
+    if np_finite(3.5)!=1 { finite_check=0 }
+    if np_finite(bad)!=0 { finite_check=0 }
+    printInt(finite_check)
+    println("")
+
+    let st=noema_pretrain_create(64,4,8,31)
+    let bytes=@malloc(8) as *u8
+    var i:i64=0
+    while i<8 { @write_u8(@ptr_add(bytes,i),65) i=i+1 }
+    var card:i64=0
+    while card<64 {
+        i=0
+        while i<4 { st[np_bias(st,card,i)]=1.0e308 i=i+1 }
+        card=card+1
+    }
+    let energy=noema_pretrain_document(st,bytes,8,0,1)
+    var trajectory_check:i64=0
+    if energy<0.0 and noema_pretrain_numeric_failures(st)==1 { trajectory_check=1 }
+    printInt(trajectory_check)
+    println("")
+
+    let path="/tmp/noema_phi_numeric_guard_test.nps"
+    let checkpoint=noema_pretrain_create(64,4,8,31)
+    let saved=noema_pretrain_save(checkpoint,path)
+    checkpoint[NP_DOCS]=bad
+    let rejected=noema_pretrain_save(checkpoint,path)
+    let retained=noema_pretrain_load(path)
+    var checkpoint_check:i64=0
+    if saved==1 and rejected==0 and retained!=0 as *f64 {
+        if noema_pretrain_documents(retained)==0 { checkpoint_check=1 }
+        noema_pretrain_destroy(retained)
+    }
+    printInt(checkpoint_check)
+    println("")
+    @unlink(path)
+    @free(bytes)
+    noema_pretrain_destroy(st)
+    noema_pretrain_destroy(checkpoint)
+    return 0
+}
