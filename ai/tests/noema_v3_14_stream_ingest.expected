@@ -1,0 +1,3 @@
+STREAM_INGEST docs=24 shards=8 bytes=1667
+PEEK_SUM=24 missing_shards=0
+OK=1

@@ -1,0 +1,179 @@
+// NOEMA v3 — bounded-memory streaming multi-shard corpus ingest.
+//
+// WHY THIS EXISTS
+//   The upload trainer historically read the ENTIRE corpus into RAM with a hard
+//   4 MiB cap (`nv3_ut_read_file_cap(in_txt, 4194304, ...)`) and packed it into a
+//   single SoA shard. That caps how much data can be *processed* at 4 MiB and makes
+//   peak memory O(corpus). Petabyte-scale ingest is impossible that way: no machine
+//   holds PB in RAM.
+//
+//   This module removes the ingest capacity ceiling. It streams the corpus through a
+//   fixed-size window (O(chunk) memory, independent of corpus size) and emits a
+//   sequence of standard SoA shards (`shard_0`, `shard_1`, ...), each packed by the
+//   already-tested `nv3_soa_pack_veriayrimi`. The shards are exactly the format that
+//   `nv3_mt_train_multishard_npg` / `nv3_soa_stream_window` already consume, so the
+//   data-parallel training path scales across as many shards as storage allows.
+//
+//   Chunk reads use the new `@pread` positional builtin: O(1) in offset, stateless
+//   and thread-safe, so shards can later be ingested by parallel workers without
+//   racing on a shared file offset.
+//
+// BOUNDARY SAFETY (no silent truncation / no fallback)
+//   * A `<veriayrimi>` document that straddles a chunk boundary is carried to the
+//     next window, never split or dropped.
+//   * A single document larger than the work buffer fails CLOSED with
+//     NV3_STREAM_ERR_DOC_TOO_LARGE rather than being truncated.
+//   * Read/short-read/pack failures propagate as negative error codes; the caller
+//     must not treat a partial ingest as success.
+//
+// MEMORY: peak = work_buf (2 * chunk_bytes) + one shard's in-memory pack arrays
+//         (bounded by chunk_bytes of documents). Independent of total corpus size.
+
+import "noema_v3_soa.lir"
+
+const NV3_STREAM_DELIM_LEN: i64 = 12 // "<veriayrimi>"
+
+// Error codes (returned as negative values).
+const NV3_STREAM_ERR_OPEN: i64 = 1
+const NV3_STREAM_ERR_READ: i64 = 2
+const NV3_STREAM_ERR_DOC_TOO_LARGE: i64 = 3
+const NV3_STREAM_ERR_PACK: i64 = 4
+const NV3_STREAM_ERR_BAD_ARG: i64 = 5
+
+// Returns the start offset of the LAST exact 12-byte "<veriayrimi>" delimiter in
+// buf[0..len), or -1 when none is present.
+fn nv3_stream_last_delim(buf: *u8, len: i64) -> i64 {
+    if len < NV3_STREAM_DELIM_LEN { return -1 }
+    var last: i64 = -1
+    var p: i64 = 0
+    while p <= (len - NV3_STREAM_DELIM_LEN) {
+        if nv3_is_veriayrimi_at(buf, len, p) == 1 { last = p }
+        p = p + 1
+    }
+    return last
+}
+
+// Streams `in_path` and packs every `<veriayrimi>` document into a sequence of SoA
+// shards under `out_root` (shard_0, shard_1, ...). Bounded memory: only a
+// `chunk_bytes` window (plus carry) is ever resident.
+//
+//   in_path        corpus file (`<veriayrimi>` delimited UTF-8)
+//   out_root       directory that will contain shard_0/, shard_1/, ...
+//   chunk_bytes    streaming window size; MUST exceed the largest single document
+//   default_prov   provenance tag (NOEMA_V3_PROV_*) stamped on every byte
+//   out_shards     *i64 receiving the number of shards written
+//   out_bytes      *i64 receiving total payload bytes packed across shards
+//
+// Returns total document count (>= 0) on success, or a negative NV3_STREAM_ERR_*.
+fn nv3_stream_pack_shards(
+    in_path: string,
+    out_root: string,
+    chunk_bytes: i64,
+    default_prov: i64,
+    out_shards: *i64,
+    out_bytes: *i64
+) -> i64 {
+    out_shards[0] = 0
+    out_bytes[0] = 0
+    if chunk_bytes <= 0 or default_prov < 0 or @string_len(out_root) <= 0 {
+        return 0 - NV3_STREAM_ERR_BAD_ARG
+    }
+
+    let fd = @open(in_path, 0, 0)
+    if fd < 0 { return 0 - NV3_STREAM_ERR_OPEN }
+
+    // @mkdir is single-level on the native backend, so create the shard container
+    // first; each shard_N is then one level below it. The caller must ensure
+    // out_root's own parent exists.
+    let _mkroot = @mkdir(out_root, 493)
+
+    // Work buffer holds carry (<= chunk_bytes) + a freshly read chunk (<= chunk_bytes).
+    let buf_cap = chunk_bytes * 2
+    let buf = @malloc(buf_cap)
+    var carry_len: i64 = 0
+    var roff: i64 = 0
+    var total_docs: i64 = 0
+    var total_bytes: i64 = 0
+    var shard_idx: i64 = 0
+    var eof: i64 = 0
+    var err: i64 = 0
+
+    let pay_box = @malloc(8) as *i64
+
+    while eof == 0 and err == 0 {
+        // Bound the read to the free space after the carry so the work buffer can
+        // never overflow. If the buffer is already full and still holds no
+        // delimiter, a single document exceeds it -> fail closed (no truncation).
+        let space = buf_cap - carry_len
+        if space <= 0 {
+            err = NV3_STREAM_ERR_DOC_TOO_LARGE
+        }
+        let want = if space < chunk_bytes { space } else { chunk_bytes }
+        let got = if err == 0 { @pread(fd, @ptr_add(buf, carry_len), want, roff) } else { 0 }
+        if got < 0 {
+            err = NV3_STREAM_ERR_READ
+        } else if err == 0 {
+            roff = roff + got
+            if got < want { eof = 1 }
+            let total_len = carry_len + got
+
+            if eof == 1 {
+                // Final window: pack everything remaining (trailing doc has no
+                // closing delimiter; nv3_soa_pack_veriayrimi emits it).
+                if total_len > 0 {
+                    let sdir = out_root + "/shard_" + @int_to_string(shard_idx)
+                    pay_box[0] = 0
+                    let nd = nv3_soa_pack_veriayrimi(sdir, buf, total_len, default_prov, pay_box)
+                    if nd <= 0 {
+                        // An empty/whitespace-only tail is not an error; a real
+                        // pack failure (nd == 0 with non-ws content) is.
+                        if nv3_segment_has_non_ws(buf, 0, total_len) == 1 { err = NV3_STREAM_ERR_PACK }
+                    } else {
+                        total_docs = total_docs + nd
+                        total_bytes = total_bytes + pay_box[0]
+                        shard_idx = shard_idx + 1
+                    }
+                }
+            } else {
+                let last = nv3_stream_last_delim(buf, total_len)
+                if last < 0 {
+                    // No delimiter in a full work buffer => one document exceeds it.
+                    if total_len >= buf_cap {
+                        err = NV3_STREAM_ERR_DOC_TOO_LARGE
+                    } else {
+                        // Keep accumulating into the carry; read more next round.
+                        carry_len = total_len
+                    }
+                } else {
+                    let cut = last + NV3_STREAM_DELIM_LEN
+                    let sdir = out_root + "/shard_" + @int_to_string(shard_idx)
+                    pay_box[0] = 0
+                    let nd = nv3_soa_pack_veriayrimi(sdir, buf, cut, default_prov, pay_box)
+                    if nd <= 0 {
+                        err = NV3_STREAM_ERR_PACK
+                    } else {
+                        total_docs = total_docs + nd
+                        total_bytes = total_bytes + pay_box[0]
+                        shard_idx = shard_idx + 1
+                        // Carry the partial document after the last delimiter to the
+                        // front of the work buffer for the next window.
+                        let new_carry = total_len - cut
+                        if new_carry > 0 {
+                            @memcpy(buf, @ptr_add(buf, cut), new_carry)
+                        }
+                        carry_len = new_carry
+                    }
+                }
+            }
+        }
+    }
+
+    @free(pay_box as *u8)
+    @free(buf)
+    @close(fd)
+
+    if err != 0 { return 0 - err }
+    out_shards[0] = shard_idx
+    out_bytes[0] = total_bytes
+    return total_docs
+}
