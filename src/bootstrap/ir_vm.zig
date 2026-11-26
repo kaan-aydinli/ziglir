@@ -129,6 +129,13 @@ pub const VMState = struct {
     // Instructions executed so far (deterministic: no wall-clock involved)
     steps: u64 = 0,
 
+    // Per-process CSPRNG key for heap redzone canaries. The cookie alone is a
+    // public compile-time constant, so keying it keeps the stored canary
+    // unpredictable to anything that can guess COOKIE. Not observable through
+    // the guest ISA (canary bytes live past the allocation's checked extent),
+    // so differential-test determinism of visible behaviour is preserved.
+    heap_canary_key: u64 = 0,
+
     // Program arguments
     prog_args: []const []const u8 = &[_][]const u8{},
 
@@ -151,6 +158,7 @@ pub const VMState = struct {
             .module = module,
             .source = source,
             .start_ns = std.time.nanoTimestamp(),
+            .heap_canary_key = util.randomU64(),
         };
         for (module.fns[0..module.fn_count]) |*mf| {
             for (mf.blocks[0..mf.block_count]) |*mb| {
@@ -264,6 +272,8 @@ pub const VMState = struct {
         return null;
     }
 
+    /// Public domain tag; the actual secrecy comes from `heap_canary_key`
+    /// (CSPRNG, per VMState). Canary word = heap_canary_key ^ COOKIE ^ size.
     pub const CANARY_COOKIE: u64 = 0xA55A5AA5C33C3CC3;
 
     pub fn allocHeap(self: *VMState, req_size: i64) VMError!u64 {
@@ -273,7 +283,7 @@ pub const VMState = struct {
         const buf = self.alloc.alloc(u8, total) catch return error.OutOfMemory;
         @memset(buf, 0);
         std.mem.writeInt(u64, buf[0..8], sz, .little);
-        std.mem.writeInt(u64, buf[8 + sz .. 16 + sz][0..8], CANARY_COOKIE ^ @as(u64, sz), .little);
+        std.mem.writeInt(u64, buf[8 + sz .. 16 + sz][0..8], self.heap_canary_key ^ CANARY_COOKIE ^ @as(u64, sz), .little);
         self.mem_lock.lock();
         defer self.mem_lock.unlock();
         if (self.next_heap_addr + @as(u64, total) >= ARRAY_TAG) {
@@ -317,7 +327,7 @@ pub const VMState = struct {
                 const sz: usize = @intCast(std.mem.readInt(u64, ha.data[0..8], .little));
                 if (ha.data.len >= 16 + sz) {
                     const got_canary = std.mem.readInt(u64, ha.data[8 + sz .. 16 + sz][0..8], .little);
-                    if (got_canary != (CANARY_COOKIE ^ @as(u64, sz))) return error.MemoryFault; // heap overflow canary smashed!
+                    if (got_canary != (self.heap_canary_key ^ CANARY_COOKIE ^ @as(u64, sz))) return error.MemoryFault; // heap overflow canary smashed!
                 }
                 @memset(ha.data, 0); // zero-wipe on free
                 ha.freed = true;

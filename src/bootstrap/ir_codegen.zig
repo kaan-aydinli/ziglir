@@ -2203,48 +2203,83 @@ pub const IRCodegen = struct {
         self.emit8(0xE4);
         self.emit8(0xF0); // and rsp, -16
 
-        // Seed per-process cryptographic secrets ([DATA_VADDR+0x70]=heap_secret, [DATA_VADDR+0x78]=stack_canary)
-        // High-entropy instant startup (0 kernel syscalls, 0 latency):
+        // Seed per-process cryptographic secrets ([DATA_VADDR+0x70]=heap_secret,
+        // [DATA_VADDR+0x78]=stack_canary) from the kernel CSPRNG via
+        // getrandom(2), the same source the @random_u64 builtin uses.
+        //
+        // SECURITY (docs/CRITICAL_ISSUES_6.md issue #3): this used to be
+        // rdtsc ^ rsp with a constant 0x0102030405060700 fallback canary —
+        // boot-time TSC values are guessable by any local attacker, which
+        // contradicted the documented "CSPRNG-seeded canaries" guarantee.
+        // There is deliberately no weak fallback: EINTR retries, and any
+        // error, short read, or degenerate zero canary is fail-closed (ud2).
+        self.subRspImm(32); // 16-byte CSPRNG buffer at [rsp]; rsp stays 16-aligned
+        self.emit8(0x48);
+        self.emit8(0x89);
+        self.emit8(0xE7); // mov rdi, rsp
+        self.mov64imm(6, 16); // rsi = 16
+        const gr_loop = self.code_len;
+        self.xorReg(2, 2); // rdx = flags 0
+        self.mov64imm(0, 318); // SYS_getrandom
+        self.syscallInst();
+        self.emitCmpRegImm32(0, -4); // -EINTR
+        _ = self.emitJccReloc(0x4, .code_offset, gr_loop, 0); // je gr_loop (retry)
+        self.emitCmpRegImm32(0, 16); // anything but a full read is fatal
+        const gr_full = self.emitJccReloc(0x4, .code_offset, 0, 0); // je gr_full
         self.emit8(0x0F);
-        self.emit8(0x31); // rdtsc -> edx:eax
-        self.emit8(0x48);
-        self.emit8(0xC1);
-        self.emit8(0xE2);
-        self.emit8(0x20); // shl rdx, 32
-        self.emit8(0x48);
-        self.emit8(0x09);
-        self.emit8(0xD0); // or rax, rdx
-        self.emit8(0x48);
-        self.emit8(0x31);
-        self.emit8(0xE0); // xor rax, rsp
-        self.emit8(0x48);
-        self.emit8(0x83);
-        self.emit8(0xE0);
-        self.emit8(0xF8); // and rax, -8
-        self.mov64imm(1, DATA_VADDR);
-        self.emit8(0x48);
-        self.emit8(0x89);
-        self.emit8(0x41);
-        self.emit8(0x70); // mov [rcx + 0x70], rax
-
-        self.emit8(0x48);
-        self.emit8(0xC1);
-        self.emit8(0xC0);
-        self.emit8(0x11); // rol rax, 17
-        self.emit8(0x48);
-        self.emit8(0xC1);
-        self.emit8(0xE0);
-        self.emit8(0x08); // shl rax, 8 (low byte = 0x00)
-        self.emit8(0x48);
+        self.emit8(0x0B); // ud2 (no CSPRNG, no boot)
+        self.relocs[gr_full].target_id = self.code_len;
+        self.mov64imm(1, DATA_VADDR); // the syscall clobbered rcx
+        self.emit8(0x4C);
+        self.emit8(0x8B);
+        self.emit8(0x04);
+        self.emit8(0x24); // mov r8, [rsp]
+        self.emitAluRegImm32(4, 8, -8); // and r8, -8 — INVARIANT: the low 3 bits of heap_secret
+        // must be zero because slab headers encode the size class in bits 0..2
+        // of (LIVE_SLAB_BASE ^ heap_secret) | class; __lir_free re-derives the
+        // class by XORing the same mask back out. A degenerate all-zero secret
+        // would make every header constant, so fail closed instead.
+        self.emit8(0x4D);
         self.emit8(0x85);
-        self.emit8(0xC0);
-        const can_nz = self.emitJccReloc(0x5, .code_offset, 0, 0);
-        self.mov64imm(0, @bitCast(@as(i64, 0x0102030405060700)));
-        self.relocs[can_nz].target_id = self.code_len;
-        self.emit8(0x48);
+        self.emit8(0xC0); // test r8, r8
+        const sec_nz = self.emitJccReloc(0x5, .code_offset, 0, 0); // jnz sec_ok
+        self.emit8(0x0F);
+        self.emit8(0x0B); // ud2 (fail closed; no weak fallback secret)
+        self.relocs[sec_nz].target_id = self.code_len;
+        self.emit8(0x4C);
         self.emit8(0x89);
         self.emit8(0x41);
-        self.emit8(0x78); // mov [rcx + 0x78], rax
+        self.emit8(0x70); // mov [rcx + 0x70], r8
+        self.emit8(0x4C);
+        self.emit8(0x8B);
+        self.emit8(0x4C);
+        self.emit8(0x24);
+        self.emit8(0x08); // mov r9, [rsp + 8]
+        self.emitAluRegImm32(4, 9, -256); // and r9, ~0xFF — keep a NUL low byte so runaway string writes trip on it (glibc-style canary)
+        self.emit8(0x4D);
+        self.emit8(0x85);
+        self.emit8(0xC9); // test r9, r9
+        const can_nz = self.emitJccReloc(0x5, .code_offset, 0, 0); // jnz can_ok
+        self.emit8(0x0F);
+        self.emit8(0x0B); // ud2 (fail closed; no constant fallback canary)
+        self.relocs[can_nz].target_id = self.code_len;
+        self.emit8(0x4C);
+        self.emit8(0x89);
+        self.emit8(0x49);
+        self.emit8(0x78); // mov [rcx + 0x78], r9
+        // Scrub the CSPRNG buffer off the stack before main() can observe it.
+        self.emit8(0x48);
+        self.emit8(0xC7);
+        self.emit8(0x04);
+        self.emit8(0x24);
+        self.emit32(0); // mov qword [rsp], 0
+        self.emit8(0x48);
+        self.emit8(0xC7);
+        self.emit8(0x44);
+        self.emit8(0x24);
+        self.emit8(0x08);
+        self.emit32(0); // mov qword [rsp + 8], 0
+        self.addRspImm(32);
         // Initialize heap_min ([DATA_VADDR + 0x88]) = -1 and last_user_start ([DATA_VADDR + 0xC0]) = -1
         self.emit8(0x48);
         self.emit8(0xC7);
@@ -2263,6 +2298,8 @@ pub const IRCodegen = struct {
         self.xorReg(3, 3);
         self.xorReg(6, 6);
         self.xorReg(7, 7);
+        self.xorReg(8, 8); // held heap_secret material
+        self.xorReg(9, 9); // held stack canary material
         self.xorReg(12, 12);
 
         if (self.findFn("main")) |main_fi| {
@@ -7296,7 +7333,12 @@ pub const IRCodegen = struct {
         const FREE_COOKIE: u64 = 0x4C49_5246_5245_4500; // "LIRFREE\0"
         const LIVE_SLAB_BASE: u64 = 0x4C49_524C_0000_0000; // "LIRL..." | class
         const LIVE_MMAP_COOKIE: u64 = 0x4C49_524D_0000_0000; // "LIRM\0\0\0\0"
-        const CANARY_SALT: u64 = 0xA5A5_5A5A_1234_5678;
+        // NOTE: the former CANARY_SALT (0xA5A5_5A5A_1234_5678) was removed
+        // (docs/CRITICAL_ISSUES_6.md issue #3): the chunk redzone canary is now
+        // heap_secret ^ req_size, keyed solely by the per-process CSPRNG
+        // secret. A compile-time-public XOR tag contributes no entropy and
+        // only made the scheme look fixed-key; the cookies above remain as
+        // state tags for header word0 (live vs freed), which is not a secret.
         const SLAB_PAYLOAD_END: u32 = 0xFF000; // 1 MiB slab minus 4 KiB chunk-start bitmap page
 
         // ── __lir_add_region(rdi=base, rsi=region_size, rdx=word1) ──
@@ -8131,7 +8173,7 @@ pub const IRCodegen = struct {
         self.emit8(0x42);
         self.emit8(0x10);
         self.emit32(0); // unlock spinlock
-        self.mov64imm(11, CANARY_SALT);
+        self.xorReg(11, 11); // redzone canary = heap_secret ^ req_size (CSPRNG-keyed; the old fixed CANARY_SALT added no entropy)
         self.emit8(0x4D);
         self.emit8(0x31);
         self.emit8(0xC3); // xor r11, r8
@@ -8212,7 +8254,7 @@ pub const IRCodegen = struct {
         self.emit8(0x89);
         self.emit8(0x48);
         self.emit8(0x08); // [rax + 8] = req_size
-        self.mov64imm(11, CANARY_SALT);
+        self.xorReg(11, 11); // redzone canary = heap_secret ^ req_size (CSPRNG-keyed; the old fixed CANARY_SALT added no entropy)
         self.emit8(0x4D);
         self.emit8(0x31);
         self.emit8(0xC3); // xor r11, r8
@@ -8384,7 +8426,7 @@ pub const IRCodegen = struct {
         self.emit8(0x39);
         self.emit8(0xD3); // cmp r11, rdx
         _ = self.emitJccReloc(0x7, .code_offset, f_unlock_trap, 0); // ja unlock_trap
-        self.mov64imm(11, CANARY_SALT);
+        self.xorReg(11, 11); // expected redzone canary = heap_secret ^ req_size (must match the alloc path)
         self.emit8(0x4D);
         self.emit8(0x31);
         self.emit8(0xC3); // xor r11, r8
@@ -8490,7 +8532,7 @@ pub const IRCodegen = struct {
         self.emit8(0x39);
         self.emit8(0xD9); // cmp r9, r11
         const f_mmap_big_trap = self.emitJccReloc(0x7, .code_offset, 0, 0); // ja trap
-        self.mov64imm(11, CANARY_SALT);
+        self.xorReg(11, 11); // expected redzone canary = heap_secret ^ req_size (must match the alloc path)
         self.emit8(0x4D);
         self.emit8(0x31);
         self.emit8(0xC3); // xor r11, r8

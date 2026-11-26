@@ -1389,6 +1389,58 @@ test "security: heap bounds checks cannot be disabled via environment (LIR_TRAP_
     }
 }
 
+test "security: startup seeds canaries via getrandom, never rdtsc or fixed constants" {
+    // Regression for docs/CRITICAL_ISSUES_6.md issue #3. The native startup
+    // used to derive heap_secret and stack_canary from rdtsc ^ rsp with a
+    // constant 0x0102030405060700 fallback canary, and heap redzone canaries
+    // were keyed by the compile-time-public CANARY_SALT 0xA5A55A5A12345678.
+    // All secrets must now come from the kernel CSPRNG (getrandom, SYS 318)
+    // with fail-closed ud2 on error/short read/zero canary: no rdtsc seeding
+    // sequence, no constant fallback canary immediate, and no CANARY_SALT
+    // immediate may appear anywhere in the emitted ELF. Note that the runtime
+    // secret values are deliberately unobservable to the guest program, so
+    // this test pins the seeding mechanism in the emitted code; the existing
+    // stack_canary_smash / heap_slab_overflow_canary trap tests prove the
+    // canary write/check pairs still agree after the salt removal.
+    const source =
+        \\fn main() -> i64 {
+        \\    let buf = @malloc(32)
+        \\    @memset(buf, 7, 32)
+        \\    let v = @read_byte(buf)
+        \\    @free(buf)
+        \\    printInt(v)
+        \\    return 0
+        \\}
+    ;
+    for ([_]main.OptLevel{ .O0, .O2 }) |opt| {
+        const elf = try compileSourceWithOpt(source, opt);
+        defer std.testing.allocator.free(elf);
+
+        // mov eax, 318 (SYS_getrandom); syscall — the startup seeding call.
+        const getrandom_call = [_]u8{ 0xB8, 0x3E, 0x01, 0x00, 0x00, 0x0F, 0x05 };
+        try std.testing.expect(std.mem.indexOf(u8, elf, &getrandom_call) != null);
+
+        // rdtsc; shl rdx, 32 — the removed weak-seed sequence.
+        const rdtsc_seed = [_]u8{ 0x0F, 0x31, 0x48, 0xC1, 0xE2, 0x20 };
+        try std.testing.expect(std.mem.indexOf(u8, elf, &rdtsc_seed) == null);
+
+        // movabs rax, 0x0102030405060700 — the removed constant fallback canary.
+        const fallback_canary = [_]u8{ 0x48, 0xB8, 0x00, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01 };
+        try std.testing.expect(std.mem.indexOf(u8, elf, &fallback_canary) == null);
+
+        // CANARY_SALT as a little-endian 64-bit immediate.
+        const canary_salt = [_]u8{ 0x78, 0x56, 0x34, 0x12, 0x5A, 0x5A, 0xA5, 0xA5 };
+        try std.testing.expect(std.mem.indexOf(u8, elf, &canary_salt) == null);
+
+        // The program must still run correctly: the redzone canary written by
+        // @malloc must still match what @free recomputes (secret ^ size).
+        const run_res = try runElfCapture(std.testing.allocator, elf, "csprng_seed");
+        defer std.testing.allocator.free(run_res.stdout);
+        try std.testing.expectEqual(@as(u8, 0), run_res.exit_code);
+        try std.testing.expectEqualStrings("7\n", run_res.stdout);
+    }
+}
+
 test "ELF execution: dynamic arrays grow past 1024, @array_set zero-fills gaps, and string_split > 1024 tokens" {
     const source =
         \\fn main() -> i64 {
