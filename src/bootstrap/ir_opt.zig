@@ -45,10 +45,11 @@ pub fn optimize(module: *IRModule, level: OptLevel) void {
         optimizeFn(module, fi, level);
     }
 
-    // Bounds-check hoisting runs exactly once, after every function has been
-    // through the whole pipeline. Running it inside optimizeFn meant a second
-    // pass over the same function (inlining is iterative) rewrote instructions
-    // and dropped the marks the first run had set — 8 accesses marked, 5 left.
+    // Bounds-check hoisting is a documented no-op since Issue #2 (see the
+    // BOUNDS-HOIST section): the old heap-range guard could not prove that
+    // loop-varying accesses stayed inside their chunk, so -O2 silently
+    // dropped per-access checks it had not earned. The call stays as the
+    // single place a future span-proof implementation plugs back in.
     if (level == .O2) _ = hoistBoundsChecks(module, null);
 }
 
@@ -4418,219 +4419,41 @@ fn unrollCountedLoops(f: *IRFn) bool {
 
 
 // ════════════════════════════════════════════════════════════════════════════
-// BOUNDS-HOIST — move pointer bounds checks out of counted loops
+// BOUNDS-HOIST — DISABLED (Issue #2 of docs/CRITICAL_ISSUES_6.md): base-in-heap
+// does not prove access-in-chunk.
 //
-// Every @read_*/@write_* in native codegen emits emitPtrTrapN, which is
-// ~22 instructions per access (4 range compares, an 8-byte-end check, and a
-// cold-path branch to the heap validator). Measured on a structural sparse
-// dot product: 10.4 ns/edge in LIR against 0.25 ns/edge in C — a 40x gap that
-// is entirely the check, not the arithmetic.
+// What the pass used to do: in a natural loop whose body had no writes except
+// @read_u64/@write_u64 bulk accesses, it emitted one `bounds_hoist_guard` in
+// the preheader and marked every bulk access in the loop `unchecked_access`,
+// so native codegen skipped the per-access `emitPtrTrapN` chunk check.
 //
-// The check is per-address, but the *buffer* it protects is loop-invariant.
-// This pass hoists one check per buffer to the loop preheader, guarded by the
-// loop trip count, and rewrites the accesses so they run unchecked.
+// Why that is unsound: the emitted guard only tested
+//     heap_min <= base <= heap_max
+// — the whole-heap range. The addresses actually dereferenced inside the loop
+// are `base + i*stride + offset` for a loop-varying index, and nothing proved
+// those stayed inside the base pointer's chunk (or that `i*stride` could not
+// overflow). An access that is inside the heap but outside its chunk passed
+// the guard and then ran with no check at all: a silent out-of-bounds
+// read/write that exists only at -O2. PoC (pinned by the regression test
+// "bounds-hoisting stays disabled"): a 64-byte @malloc chunk read through
+// `@read_u64(@ptr_add(buf, i * 8))` for i in 0..15 trapped with SIGILL at
+// -O0/-O1 but silently summed heap garbage at -O2 (exit 0).
 //
-// SOUNDNESS. The guard test emitted at the preheader is:
-//     (base > 0) && (base >= heap_min) && (limit <= heap_max) && (limit >= base)
-// where limit = base + stride * (trip - 1) + width is the highest address the
-// loop can touch. That is a strict superset of every per-address check the
-// loop body would have done, so if the guard passes no interior access can
-// trap; if it fails we fall through to the original checked body.
+// Re-enabling hoisting (Option A in the report) requires a real access-span
+// proof — loop-invariant base, trip count and stride with overflow-free
+// `span = stride * (trip - 1) + offset + width`, plus a guard that verifies
+// `base .. base+span` lies inside one live chunk at runtime. The fixed-size
+// chunk checks the backends emit (__lir_chk_heap{1,4,8}, lir_chk_ptr_n with a
+// constant n) cannot express a variable span, so no such guard exists today;
+// until it does, every access keeps its own chunk-precise check. That check
+// is cheap on the hot path: two compares against a cached
+// [chunk_start, chunk_end-8] window, with the validator call deferred to a
+// cold path that correct programs never enter.
 //
-// CONSERVATISM. The loop body must not contain any call or store at all
-// (so nothing can realloc or free the buffer), and every access must derive
-// from one base vreg with a proven bound.
+// `BoundsHoistStats` and this entry point keep their old shapes so call sites
+// and `explain` output still compile; the tests pin that nothing is ever
+// rewritten, so a future Option A must consciously update them.
 // ════════════════════════════════════════════════════════════════════════════
-
-/// Result of trying to prove one access site inside a loop.
-const AccessInfo = struct {
-    base: u16, // base pointer vreg (defined outside the loop)
-    stride: i64, // address step per iteration, in bytes
-    width: i64, // access width in bytes
-};
-
-fn isBulkAccess(op: IROp) bool {
-    return switch (op) {
-        .call_read_u64, .call_write_u64 => true,
-        else => false,
-    };
-}
-
-fn accessWidth(op: IROp) i64 {
-    return switch (op) {
-        .call_read_u64, .call_write_u64 => 8,
-        else => 0,
-    };
-}
-
-/// A loop is bulk-safe when it contains no calls and no stores other than the
-/// bulk accesses themselves. Such a loop cannot realloc, free, or alias the
-/// buffer it reads, which is what makes a single preheader check sufficient.
-const MAX_PURE_FNS = 8192;
-
-/// True when the callee cannot write memory, realloc, free, print, or
-/// otherwise touch externally visible state. Such a call is a pure read from
-/// the caller's point of view, so it cannot invalidate a guard that only
-/// protects reads. Computed once per module with a fixpoint over the call
-/// graph: `a` is read-only only if everything `a` calls is read-only too.
-fn computePureFns(module: *IRModule, pure: *[MAX_PURE_FNS]bool) void {
-    const n = @min(module.fn_count, MAX_PURE_FNS);
-
-    // Two linear scans, no full rescans. The first version of this re-walked
-    // every function on every fixpoint round and made compilation 1.5x slower
-    // (b_train.lir 6.9 -> 11.3 ms), which a compile pass may not do.
-    //
-    // Scan 1: pure[i] = "has no impure op of its own and every call target is
-    // in range". Call edges are recorded by mutating callee_fn_idx into the
-    // inverse: we simply remember each impure-from-call function in a work
-    // list and propagate.
-    var deps_on_call: [MAX_PURE_FNS]bool = .{false} ** MAX_PURE_FNS;
-    for (0..n) |i| {
-        pure[i] = true;
-        const f = &module.fns[i];
-        outer: for (0..f.block_count) |bi| {
-            const blk = &f.blocks[bi];
-            for (0..blk.inst_count) |ii| {
-                const inst = &blk.insts[ii];
-                const op = inst.op;
-                if (op == .call) {
-                    const ci = inst.callee_fn_idx;
-                    if (ci < 0 or @as(u32, @intCast(ci)) >= n) {
-                        pure[i] = false;
-                        break :outer;
-                    }
-                    deps_on_call[i] = true;
-                } else if (isImpureOp(op)) {
-                    pure[i] = false;
-                    break :outer;
-                }
-            }
-        }
-    }
-
-    // Scan 2 (only functions that still depend on a call): walk call edges and
-    // propagate impurity. Repeat only while something actually changed, which
-    // for real code is once or twice.
-    var changed = true;
-    var rounds: u32 = 0;
-    while (changed and rounds < 64) : (rounds += 1) {
-        changed = false;
-        for (0..n) |i| {
-            if (!pure[i] or !deps_on_call[i]) continue;
-            const f = &module.fns[i];
-            outer2: for (0..f.block_count) |bi| {
-                const blk = &f.blocks[bi];
-                for (0..blk.inst_count) |ii| {
-                    const inst = &blk.insts[ii];
-                    if (inst.op != .call) continue;
-                    const ci: u32 = @intCast(inst.callee_fn_idx);
-                    if (ci >= n or !pure[ci]) {
-                        pure[i] = false;
-                        changed = true;
-                        break :outer2;
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn isImpureOp(op: IROp) bool {
-    return switch (op) {
-        // A function that writes through any pointer might be writing into the
-        // buffer the caller's loop indexes, so it is not a safe barrier to
-        // hoist across.
-        .field_store,
-        .deref_store,
-        .store_mem,
-        .call_write_u32,
-        .call_write_u64,
-        .call_write_byte,
-        .call_write,
-        .call_memcpy,
-        .call_memset,
-        .call_indirect,
-        .call_malloc,
-        .call_free,
-        .call_syscall,
-        .call_exit,
-        .call_panic,
-        .call_print,
-        .call_println,
-        .call_print_int,
-        .call_println_float,
-        .call_printptr,
-        .call_assert,
-        .call_assert_eq,
-        .call_array_new,
-        .call_array_push,
-        .call_array_set,
-        .call_array_free,
-        .call_array_get,
-        .call_string_new,
-        .call_map_new,
-        .call_map_set,
-        .call_map_del,
-        .call_map_free,
-        .call_chan_new,
-        .call_chan_send,
-        .call_chan_close,
-        => true,
-        else => false,
-    };
-}
-
-fn callIsMemoryPure(f: *const IRFn, inst: *const IRInst, module: *IRModule, pure: *const [MAX_PURE_FNS]bool) bool {
-    _ = f;
-    const ci = inst.callee_fn_idx;
-    if (ci < 0) return false;
-    const idx: u32 = @intCast(ci);
-    if (idx >= module.fn_count or idx >= MAX_PURE_FNS) return false;
-    return pure[idx];
-}
-
-fn loopHasOnlyBulkSideEffects(f: *const IRFn, in_loop: u128, module: *IRModule, pure: *const [MAX_PURE_FNS]bool) bool {
-    var bi: usize = 0;
-    while (bi < f.block_count) : (bi += 1) {
-        if ((in_loop & (@as(u128, 1) << @intCast(bi))) == 0) continue;
-        const blk = &f.blocks[bi];
-        var ii: u16 = 0;
-        while (ii < blk.inst_count) : (ii += 1) {
-            const op = blk.insts[ii].op;
-            // Control flow and slot writes cannot realloc, free, or alias the
-            // buffer being read, so they do not invalidate a preheader guard.
-            if (op == .store_local or op == .jump or op == .cond_jump or op == .nop) continue;
-            // Integer division and remainder are marked as having side effects
-            // because they can trap on a zero divisor. A trap is not a memory
-            // effect: it cannot realloc or free the buffer, so a guard placed
-            // before the loop stays valid. (Treating them as barriers was
-            // costing every arithmetic loop in the benchmark suite.)
-            switch (op) {
-                // Traps are not memory effects.
-                .div, .udiv, .@"mod", .umod => continue,
-                // A struct field load is a read of memory the loop cannot
-                // realloc; it is marked side-effecting only so that it is not
-                // reordered across stores. Stores are already excluded above.
-                .field_access, .deref_load, .load_mem, .call_array_get => continue,
-                else => {},
-            }
-            // A call into memory-pure code is not a barrier either: the callee
-            // cannot realloc or free anything (checked recursively by
-            // computePureFns), and it cannot write into the buffers this loop
-            // indexes because those buffers are never passed to it. This is
-            // what unlocks hoisting on real training loops, where the inner
-            // body is a chain of small helper calls.
-            if (op == .call) {
-                if (callIsMemoryPure(f, &blk.insts[ii], module, pure)) continue;
-                return false;
-            }
-            if (op.hasSideEffects() and !isBulkAccess(op)) {
-                return false;
-            }
-        }
-    }
-    return true;
-}
 
 /// Reported by analyze: 0 = ok, otherwise a reason code (for the explain mode).
 pub const BoundsHoistStats = struct {
@@ -4640,350 +4463,8 @@ pub const BoundsHoistStats = struct {
 };
 
 pub fn hoistBoundsChecks(module: *IRModule, stats: ?*BoundsHoistStats) bool {
-    var pure: [MAX_PURE_FNS]bool = undefined;
-    computePureFns(module, &pure);
-    var changed = false;
-    var fi: u32 = 0;
-    while (fi < module.fn_count) : (fi += 1) {
-        if (hoistBoundsChecksFn(&module.fns[fi], stats, module, &pure)) changed = true;
-    }
-    return changed;
-}
-
-fn hoistBoundsChecksFn(f: *IRFn, stats: ?*BoundsHoistStats, module: *IRModule, pure: *const [MAX_PURE_FNS]bool) bool {
-    if (f.block_count < 2 or f.block_count > 128) return false;
-    var cfg: CFGInfo = undefined;
-    buildCFGInfo(f, &cfg);
-
-    var def_count: [MAX_TRACKED_VREGS]u16 = undefined;
-    isSingleDefVregTable(f, &def_count);
-    var def_blk: [MAX_TRACKED_VREGS]i16 = .{-1} ** MAX_TRACKED_VREGS;
-    for (0..f.block_count) |bi| {
-        for (0..f.blocks[bi].inst_count) |ii| {
-            const inst = f.blocks[bi].insts[ii];
-            const d = inst.dest;
-            if (d > 0 and d < MAX_TRACKED_VREGS and def_count[d] == 1) def_blk[d] = @intCast(bi);
-        }
-    }
-
-    var changed = false;
-    var u_usize: usize = 0;
-    while (u_usize < f.block_count) : (u_usize += 1) {
-        const u: u16 = @intCast(u_usize);
-        var succs: [2]u16 = undefined;
-        const sc = getSuccs(&f.blocks[u], &succs);
-        var si: usize = 0;
-        while (si < sc) : (si += 1) {
-            const h = succs[si];
-            if (h >= f.block_count or !dominates(&cfg, h, u)) continue;
-
-            // Natural loop set (reverse DFS from u, stop at h).
-            var in_loop: u128 = (@as(u128, 1) << @intCast(h)) | (@as(u128, 1) << @intCast(u));
-            var work: [MAX_BLOCKS_PER_FN]u16 = undefined;
-            var wlen: usize = 0;
-            if (u != h) {
-                work[0] = u;
-                wlen = 1;
-            }
-            while (wlen > 0) {
-                wlen -= 1;
-                const cur = work[wlen];
-                for (0..cfg.pred_cnt[cur]) |pi| {
-                    const p = cfg.preds[cur][pi];
-                    if ((in_loop & (@as(u128, 1) << @intCast(p))) == 0) {
-                        in_loop |= (@as(u128, 1) << @intCast(p));
-                        work[wlen] = p;
-                        wlen += 1;
-                    }
-                }
-            }
-
-            if (stats) |s| s.loops_considered += 1;
-
-            // Need a unique preheader that ends in `jump h`.
-            var non_loop_preds: u16 = 0;
-            var preheader: u16 = 0xFFFF;
-            for (0..cfg.pred_cnt[h]) |pi| {
-                const p = cfg.preds[h][pi];
-                if ((in_loop & (@as(u128, 1) << @intCast(p))) == 0) {
-                    non_loop_preds += 1;
-                    preheader = p;
-                }
-            }
-            if (non_loop_preds != 1 or preheader >= f.block_count) continue;
-            const pb = &f.blocks[preheader];
-            if (pb.inst_count == 0) continue;
-            const tail = pb.insts[pb.inst_count - 1];
-            // Two legal shapes: a rotated loop whose preheader ends in
-            // `jump h`, and an unrotated `while` whose preheader ends in
-            // `cond_jump h, exit` (the loop test lives in the preheader, so the
-            // guard must go before that test, which is what we do below).
-            const tail_ok = (tail.op == .jump and tail.target_block == h) or
-                (tail.op == .cond_jump and tail.target_block == h);
-            if (!tail_ok) {
-                continue;
-            }
-            // Guard must be inserted before the terminator, so we need room.
-            const ins_at: u16 = pb.inst_count - 1;
-
-            // Every access must be bulk, derived from one base vreg, with a
-            // single constant stride. Anything else and we leave the loop alone.
-            if (!loopHasOnlyBulkSideEffects(f, in_loop, module, pure)) {
-                continue;
-            }
-
-            // Collect the distinct base pointers the loop reads from. A loop
-            // that touches several buffers (dot products, matrix blocks) needs
-            // one guard per buffer, not one guard total.
-            var bases: [8]u16 = .{0} ** 8;
-            var n_bases: u32 = 0;
-            var ok = true;
-            var n_access: u32 = 0;
-
-            var bi: usize = 0;
-            while (bi < f.block_count and ok) : (bi += 1) {
-                if ((in_loop & (@as(u128, 1) << @intCast(bi))) == 0) continue;
-                const blk = &f.blocks[bi];
-                var ii: u16 = 0;
-                while (ii < blk.inst_count) : (ii += 1) {
-                    const inst2 = blk.insts[ii];
-                    if (!isBulkAccess(inst2.op)) continue;
-                    const ptr_v = inst2.args[0];
-                    if (ptr_v == 0 or ptr_v >= MAX_TRACKED_VREGS) {
-                        ok = false;
-                        break;
-                    }
-                    // The pointer vreg must resolve, through any chain of
-                    // ptr_add's, to a vreg defined outside the loop. Chained
-                    // ones are the normal shape for `@write_u64(@ptr_add(buf,
-                    // k), v)`; following only one level up made the guard give
-                    // up on those loops and left every access inline-checked.
-                    var this_base: u16 = ptr_v;
-                    var depth: u8 = 0;
-                    while (depth < 8) : (depth += 1) {
-                        var def_inst: ?IRInst = null;
-                        var db: usize = 0;
-                        while (db < f.block_count and def_inst == null) : (db += 1) {
-                            var di: u16 = 0;
-                            while (di < f.blocks[db].inst_count) : (di += 1) {
-                                if (f.blocks[db].insts[di].dest == this_base) {
-                                    def_inst = f.blocks[db].insts[di];
-                                    break;
-                                }
-                            }
-                        }
-                        const d = def_inst orelse break;
-                        // Single-def chains only, so the resolved base is the one
-                        // that actually reaches this access.
-                        if (def_count[this_base] != 1) break;
-                        if (this_base >= MAX_TRACKED_VREGS) break;
-                        if (d.op != .call_ptr_add or d.arg_count < 1) break;
-                        if (d.args[0] == 0 or d.args[0] >= MAX_TRACKED_VREGS) break;
-                        if (def_count[d.args[0]] != 1) break;
-                        this_base = d.args[0];
-                        // Stop as soon as the base is defined outside the loop:
-                        // that is the vreg the guard has to test.
-                        const bblk = def_blk[this_base];
-                        if (bblk >= 0 and (in_loop & (@as(u128, 1) << @intCast(@as(usize, @intCast(bblk))))) == 0) break;
-                    }
-                    var seen = false;
-                    var kk: u32 = 0;
-                    while (kk < n_bases) : (kk += 1) {
-                        if (bases[kk] == this_base) seen = true;
-                    }
-                    if (!seen) {
-                        if (n_bases >= bases.len) {
-                            ok = false;
-                            break;
-                        }
-                        bases[n_bases] = this_base;
-                        n_bases += 1;
-                    }
-                    n_access += 1;
-                }
-            }
-            // Cost model: a guard costs roughly the same as one inline check
-            // (it reuses emitPtrTrapN), and it runs once per loop entry. It
-            // only pays when the loop rewrites more accesses than it adds
-            // guards. A one-iteration loop or a loop with a single access is a
-            // net loss, which is exactly what 11_kmeans and 10_isqrt showed.
-            // n_access counts the sites in one pass over the loop; each site
-            // keeps executing every iteration, so the right comparison is
-            // sites-vs-guards, not "does this loop have more than one access".
-            if (ok and n_access < n_bases) {
-                ok = false;
-            }
-            if (!ok or n_bases == 0 or n_access == 0) {
-                continue;
-            }
-
-            // Every base must be defined outside the loop, so the guard can be
-            // evaluated once before any iteration can change it.
-            var base_ok = true;
-            var be: u32 = 0;
-            while (be < n_bases) : (be += 1) {
-                const bblk = def_blk[bases[be]];
-                if (bblk < 0) {
-                    base_ok = false;
-                    break;
-                }
-                if ((in_loop & (@as(u128, 1) << @intCast(@as(usize, @intCast(bblk))))) != 0) {
-                    base_ok = false;
-                    break;
-                }
-            }
-            if (!base_ok) {
-                continue;
-            }
-
-            // We cannot prove a stride or a limit from the CFG alone, so the
-            // guard we emit is the conservative one: the base must sit inside
-            // the heap and the loop must be known non-allocating (checked
-            // above). Accesses are rewritten to unchecked loads/stores but
-            // only after that preheader guard.
-            if (pb.inst_count + n_bases + 1 > MAX_INSTS_PER_BLOCK) continue;
-
-            // Emit the guard into the preheader: recompute the check against
-            // the *base* pointer once. The codegen recognises the marker pair
-            // (a check_base pseudo-op) and emits the same range test it would
-            // have emitted inline, but jumps to the unchecked body on success.
-            // Shift the terminator down and drop one guard per buffer in front.
-            {
-                var mv: u16 = pb.inst_count;
-                const shift: u16 = @intCast(n_bases);
-                while (mv > ins_at) : (mv -= 1) pb.insts[mv + shift - 1] = pb.insts[mv - 1];
-                var gi: u32 = 0;
-                while (gi < n_bases) : (gi += 1) {
-                    var guard: IRInst = .{ .op = .bounds_hoist_guard };
-                    guard.args[0] = bases[gi];
-                    guard.arg_count = 1;
-                    guard.target_block = h;
-                    pb.insts[ins_at + @as(u16, @intCast(gi))] = guard;
-                }
-                pb.inst_count += shift;
-            }
-
-            // Mark the loop's bulk accesses as unchecked.
-            bi = 0;
-            var rewritten: u32 = 0;
-            while (bi < f.block_count) : (bi += 1) {
-                if ((in_loop & (@as(u128, 1) << @intCast(bi))) == 0) continue;
-                const blk = &f.blocks[bi];
-                var ii2: u16 = 0;
-                while (ii2 < blk.inst_count) : (ii2 += 1) {
-                    if (!isBulkAccess(blk.insts[ii2].op)) continue;
-                    blk.insts[ii2].unchecked_access = true;
-                    rewritten += 1;
-                }
-            }
-            if (stats) |s| {
-                s.loops_hoisted += 1;
-                s.accesses_rewritten += rewritten;
-            }
-            changed = true;
-        }
-    }
-    if (changed) _ = dedupeBoundsGuards(f, stats);
-    return changed;
-}
-
-/// Aynı taban işaretçi için birden çok `bounds_hoist_guard` varsa ve
-/// hepsi tek bir baskın bloktan geçiyorsa, yalnızca o blokta bırak.
-///
-/// Neden gerekli: iç içe döngülerde her döngü düzeyi kendi guard'ını
-/// preheader'a koyuyor. Ölçüldü (60x60 matris çarpımı): B4/B5/B6/B7
-/// bloklarında 3+3+3+2 = 11 guard; en sık koşan B7'deki guard her (i,k)
-/// çifti için, yani 3600 kez çalışıyordu. Taban işaretçi döngü boyunca
-/// sabit olduğundan bu kontrollerin hepsi aynı sonucu verir.
-///
-/// Baskınlık koşulu: herhangi bir guard bloğundan fonksiyon çıkışına veya
-/// başka bir guard bloğuna giden her yol, o baskın guard bloğundan geçmeli.
-/// Bunu, aday bloğun diğer tüm guard bloklarını domine etmesiyle sınıyoruz.
-fn dedupeBoundsGuards(f: *IRFn, _: ?*BoundsHoistStats) bool {
-    if (f.block_count < 2) return false;
-
-    // Guard içeren bloklar ve her birindeki guard'ların taban vreg'leri.
-    var guard_blocks: [MAX_BLOCKS_PER_FN]u16 = undefined;
-    var n_guard_blocks: usize = 0;
-    for (0..f.block_count) |bi| {
-        for (0..f.blocks[bi].inst_count) |ii| {
-            if (f.blocks[bi].insts[ii].op == .bounds_hoist_guard) {
-                guard_blocks[n_guard_blocks] = @intCast(bi);
-                n_guard_blocks += 1;
-                break;
-            }
-        }
-    }
-    if (n_guard_blocks < 2) return false;
-
-    var cfg: CFGInfo = undefined;
-    buildCFGInfo(f, &cfg);
-
-    // Her taban için, onu koruyan tüm blokları domine eden bir blok var mı?
-    // Adaylar: guard bloklarının kendisi.
-    // `keep[blk][base]` = bu blok/base kombinasyonu kalsın mı.
-    var keep: [MAX_BLOCKS_PER_FN][8]u16 = undefined;
-    var keep_n: [MAX_BLOCKS_PER_FN]u8 = .{0} ** MAX_BLOCKS_PER_FN;
-    for (0..f.block_count) |bi| keep[bi] = .{0} ** 8;
-
-    var saw_any = false;
-    var b1: usize = 0;
-    while (b1 < n_guard_blocks) : (b1 += 1) {
-        const gb = guard_blocks[b1];
-        var ii: u16 = 0;
-        while (ii < f.blocks[gb].inst_count) : (ii += 1) {
-            const g = f.blocks[gb].insts[ii];
-            if (g.op != .bounds_hoist_guard or g.args[0] == 0) continue;
-            const base = g.args[0];
-            // Bu taban için, gb'yi domine eden tüm guard bloklarını topla.
-            var dominators_of_gb: [MAX_BLOCKS_PER_FN]u16 = undefined;
-            var n_dom: usize = 0;
-            var b2: usize = 0;
-            while (b2 < n_guard_blocks) : (b2 += 1) {
-                const other = guard_blocks[b2];
-                if (other == gb) continue;
-                var has_base = false;
-                for (0..f.blocks[other].inst_count) |oi| {
-                    const og = f.blocks[other].insts[oi];
-                    if (og.op == .bounds_hoist_guard and og.args[0] == base) has_base = true;
-                }
-                if (has_base and dominates(&cfg, other, gb)) {
-                    dominators_of_gb[n_dom] = other;
-                    n_dom += 1;
-                }
-            }
-            if (n_dom > 0) {
-                // gb'deki bu guard gereksiz: onu domine eden başka bir guard var.
-                saw_any = true;
-                continue;
-            }
-            // Bu guard, aynı tabanın tüm diğer guard'larını domine eden tek
-            // blok ise kalsın; aksi hâlde (ne domine eden ne edilen) koru.
-            if (keep_n[gb] < 8) {
-                keep[gb][keep_n[gb]] = base;
-                keep_n[gb] += 1;
-            }
-        }
-    }
-    if (!saw_any) return false;
-
-    // Fazla guard'ları kaldır.
-    for (0..f.block_count) |bi| {
-        var out_i: u16 = 0;
-        var ii: u16 = 0;
-        while (ii < f.blocks[bi].inst_count) : (ii += 1) {
-            const inst = f.blocks[bi].insts[ii];
-            if (inst.op == .bounds_hoist_guard) {
-                var kept = false;
-                for (0..keep_n[bi]) |k| {
-                    if (keep[bi][k] == inst.args[0]) kept = true;
-                }
-                if (!kept) continue;
-            }
-            f.blocks[bi].insts[out_i] = inst;
-            out_i += 1;
-        }
-        f.blocks[bi].inst_count = out_i;
-    }
-    return true;
+    // Deliberate no-op; see the section header above (Issue #2 soundness).
+    _ = module;
+    if (stats) |s| s.* = .{};
+    return false;
 }

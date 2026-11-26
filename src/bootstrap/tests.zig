@@ -4624,65 +4624,30 @@ fn buildHoistLoopModule(module: *ir_mod.IRModule) void {
     module.fn_count = 1;
 }
 
-test "hoisting rewrites bulk accesses in a counted loop" {
+test "bounds-check hoisting stays disabled: no loop shape may produce unchecked accesses" {
+    // Issue #2 pin. The old hoistBoundsChecks marked every @read_u64/
+    // @write_u64 in an eligible loop as `unchecked_access` behind a guard
+    // that only proved `heap_min <= base <= heap_max` — not that the
+    // loop-varying addresses `base + i*stride` stayed inside the base's
+    // chunk. That silently dropped all per-access bounds checking at -O2
+    // for in-heap/out-of-chunk addresses (regression test below). The pass
+    // is a documented no-op until a real access-span proof exists; these
+    // assertions make any re-enable attempt fail here first.
     const module = try std.testing.allocator.create(ir_mod.IRModule);
     defer std.testing.allocator.destroy(module);
     buildHoistLoopModule(module);
 
+    // The permissive shape the old pass loved: single preheader, bulk-only
+    // body, base defined outside the loop, more access sites than bases.
     var stats = ir_opt.BoundsHoistStats{};
-    _ = ir_opt.hoistBoundsChecks(module, &stats);
-
-    try std.testing.expect(stats.accesses_rewritten > 0);
-    try std.testing.expect(module.fns[0].blocks[2].insts[1].unchecked_access);
-}
-
-test "hoisting marks nothing when a loop contains a call that may write" {
-    const module = try std.testing.allocator.create(ir_mod.IRModule);
-    defer std.testing.allocator.destroy(module);
-    buildHoistLoopModule(module);
-
-    // Give the module a callee that stores through a pointer, and call it from
-    // the loop body: the buffer could be reallocated or overwritten, so the
-    // guard must not be hoisted.
-    var g = &module.fns[1];
-    ir_mod.IRModule.initFnSlot(g, 1, 1, 0, 0, 0);
-    g.block_count = 1;
-    g.vreg_count = 4;
-    g.blocks[0].label = 0;
-    g.blocks[0].inst_count = 2;
-    g.blocks[0].insts[0] = .{ .op = .deref_store, .src1 = 1, .src2 = 2 };
-    g.blocks[0].insts[1] = .{ .op = .ret };
-    module.fn_count = 2;
-
-    // Insert the call *before* the loop's back edge: appending it after the
-    // `jump` would leave it as dead code and the test would pass for the
-    // wrong reason.
-    var body = &module.fns[0].blocks[2];
-    body.insts[3] = body.insts[2]; // move the back edge out of the way
-    body.insts[2] = .{ .op = .call, .dest = 0, .callee_fn_idx = 1, .arg_count = 0 };
-    body.inst_count = 4;
-
-    var stats = ir_opt.BoundsHoistStats{};
-    _ = ir_opt.hoistBoundsChecks(module, &stats);
-
+    try std.testing.expectEqual(false, ir_opt.hoistBoundsChecks(module, &stats));
+    try std.testing.expectEqual(@as(u32, 0), stats.loops_hoisted);
     try std.testing.expectEqual(@as(u32, 0), stats.accesses_rewritten);
     try std.testing.expect(!module.fns[0].blocks[2].insts[1].unchecked_access);
-}
 
-test "a read-only callee does not block hoisting" {
-    // (Both fns deliberately keep name_len 1/name_start 0: the pass resolves
-    // callees by callee_fn_idx, not by name, so the names are irrelevant here.)
-    const module = try std.testing.allocator.create(ir_mod.IRModule);
-    defer std.testing.allocator.destroy(module);
-    buildHoistLoopModule(module);
-
-    // Same shape, but the callee only reads: it cannot touch the caller's
-    // buffer, so hoisting must still happen. This is the property that makes
-    // the training loops fast.
+    // Even a memory-pure callee chain in the body (the shape that unlocked
+    // hoisting on the training loops) must not produce unchecked accesses.
     var g = &module.fns[1];
-    // Distinct name range: the synthetic module has one shared (empty) source,
-    // so both functions would otherwise look alike to anything that falls back
-    // to name matching.
     ir_mod.IRModule.initFnSlot(g, 1, 1, 0, 0, 0);
     g.block_count = 1;
     g.vreg_count = 4;
@@ -4691,17 +4656,72 @@ test "a read-only callee does not block hoisting" {
     g.blocks[0].insts[0] = .{ .op = .call_read_u64, .dest = 3, .args = .{ 1, 0, 0, 0, 0, 0, 0, 0 }, .arg_count = 1 };
     g.blocks[0].insts[1] = .{ .op = .ret };
     module.fn_count = 2;
-
-    // Insert the call *before* the loop's back edge: appending it after the
-    // `jump` would leave it as dead code and the test would pass for the
-    // wrong reason.
     var body = &module.fns[0].blocks[2];
     body.insts[3] = body.insts[2]; // move the back edge out of the way
     body.insts[2] = .{ .op = .call, .dest = 0, .callee_fn_idx = 1, .arg_count = 0 };
     body.inst_count = 4;
 
-    var stats = ir_opt.BoundsHoistStats{};
-    _ = ir_opt.hoistBoundsChecks(module, &stats);
+    stats = .{};
+    try std.testing.expectEqual(false, ir_opt.hoistBoundsChecks(module, &stats));
+    try std.testing.expectEqual(@as(u32, 0), stats.accesses_rewritten);
+    try std.testing.expect(!module.fns[0].blocks[2].insts[1].unchecked_access);
+}
 
-    try std.testing.expect(stats.accesses_rewritten > 0);
+test "heap-internal out-of-chunk loop traps identically at -O0, -O1 and -O2" {
+    // Issue #2 PoC, end to end. A 64-byte chunk read through
+    // @read_u64(@ptr_add(buf, i * 8)) for i in 0..15: from i = 8 the address
+    // is past the chunk but still inside the heap arena. Pre-fix, -O2 hoisted
+    // the bounds checks behind a heap-range guard and read garbage silently
+    // (exit 0), while -O0/-O1 trapped with SIGILL — the exact "release-only
+    // memory bug" class. Now every optimization level must trap identically.
+    const oob_src =
+        \\fn main() -> i64 {
+        \\    let buf = @malloc(64)
+        \\    if buf == 0 as *u8 { return 1 }
+        \\    var s: i64 = 0
+        \\    var i: i64 = 0
+        \\    while i < 16 {
+        \\        s += @read_u64(@ptr_add(buf, i * 8))
+        \\        i += 1
+        \\    }
+        \\    printInt(s)
+        \\    @free(buf)
+        \\    return 0
+        \\}
+    ;
+    inline for (.{ .O0, .O1, .O2 }) |lvl| {
+        const elf = try compileSourceWithOpt(oob_src, lvl);
+        defer std.testing.allocator.free(elf);
+        try runElfExpectSigIll(std.testing.allocator, elf, "oob_hoist_" ++ @tagName(lvl));
+    }
+
+    // Control: the same loop shape fully inside the chunk must still compile
+    // and run correctly at -O2 (the fix keeps per-access checks; it must not
+    // break legitimate bulk loops).
+    const ok_src =
+        \\fn main() -> i64 {
+        \\    let buf = @malloc(128)
+        \\    if buf == 0 as *u8 { return 1 }
+        \\    var i: i64 = 0
+        \\    while i < 16 {
+        \\        @write_u64(@ptr_add(buf, i * 8), i + 1)
+        \\        i += 1
+        \\    }
+        \\    var s: i64 = 0
+        \\    var j: i64 = 0
+        \\    while j < 16 {
+        \\        s += @read_u64(@ptr_add(buf, j * 8))
+        \\        j += 1
+        \\    }
+        \\    printInt(s)
+        \\    @free(buf)
+        \\    return 0
+        \\}
+    ;
+    const ok_elf = try compileSourceWithOpt(ok_src, .O2);
+    defer std.testing.allocator.free(ok_elf);
+    const ok_res = try runElfCapture(std.testing.allocator, ok_elf, "inbounds_bulk");
+    defer std.testing.allocator.free(ok_res.stdout);
+    try std.testing.expectEqual(@as(u8, 0), ok_res.exit_code);
+    try std.testing.expectEqualStrings("136\n", ok_res.stdout); // sum(1..16)
 }

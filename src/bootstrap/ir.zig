@@ -148,9 +148,11 @@ pub const IROp = enum {
     call_malloc,
     call_free,
     call_ptr_add,
-    // Bounds-hoist guard: args[0] = base ptr vreg. Emitted in a loop preheader
-    // by hoistBoundsChecks; succeeds only when the whole buffer the loop will
-    // touch provably lies inside the heap. Purely a codegen marker.
+    // Bounds-hoist guard: args[0] = base ptr vreg. INERT since Issue #2
+    // (docs/CRITICAL_ISSUES_6.md): nothing emits it any more, because the
+    // heap-range test it carried cannot prove that loop-varying accesses stay
+    // inside their chunk. Kept so hand-built IR and the backend handlers stay
+    // well-defined; see the BOUNDS-HOIST section in ir_opt.zig.
     bounds_hoist_guard,
     call_read_byte,
     call_write_byte,
@@ -383,7 +385,10 @@ pub const IRInst = struct {
     arg_count: u8 = 0,
     slot: u16 = 0, // stack slot for load_local / store_local / addr_of / alloca
     field_offset: u16 = 0, // for field_access / field_store
-    // Set by hoistBoundsChecks when a bulk access runs under a preheader guard.
+    // When false (always, since Issue #2 disabled bounds-hoisting) the
+    // backends emit the chunk-precise per-access check for bulk reads/writes.
+    // Nothing in the compiler sets this to true any more; the field remains
+    // so the IR layout and backend guards are unchanged. See ir_opt.zig.
     unchecked_access: bool = false,
 };
 
