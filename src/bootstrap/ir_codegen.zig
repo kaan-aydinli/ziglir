@@ -2310,7 +2310,14 @@ pub const IRCodegen = struct {
         self.emit8(0x08);
         self.emit32(0); // mov qword [rsp + 8], 0
         self.addRspImm(32);
-        // Initialize heap_min ([DATA_VADDR + 0x88]) = -1 and last_user_start ([DATA_VADDR + 0xC0]) = -1
+        // Initialize heap_min ([DATA_VADDR + 0x88]) = -1 and the four inline
+        // chunk-cache entries' low bounds ([0xC0], [0xD0], [0xE0], [0xF0]) = -1.
+        // The high bounds ([0xC8], [0xD8], [0xE8], [0xF8]) are already 0 from the
+        // zero-filled data page, so (lo=-1, hi=0) makes every entry invalid: any
+        // pointer is `jb` the -1 low bound, so a fresh cache always misses into
+        // the verifier. The cache was single-entry ([0xC0]); it is now four
+        // entries so loops alternating between up to four live chunks stop
+        // thrashing into the full heap verifier (see emitPtrColdBody).
         self.emit8(0x48);
         self.emit8(0xC7);
         self.emit8(0x81);
@@ -2320,6 +2327,21 @@ pub const IRCodegen = struct {
         self.emit8(0xC7);
         self.emit8(0x81);
         self.emit32(0xC0);
+        self.emit32(0xFFFFFFFF);
+        self.emit8(0x48);
+        self.emit8(0xC7);
+        self.emit8(0x81);
+        self.emit32(0xD0);
+        self.emit32(0xFFFFFFFF);
+        self.emit8(0x48);
+        self.emit8(0xC7);
+        self.emit8(0x81);
+        self.emit32(0xE0);
+        self.emit32(0xFFFFFFFF);
+        self.emit8(0x48);
+        self.emit8(0xC7);
+        self.emit8(0x81);
+        self.emit32(0xF0);
         self.emit32(0xFFFFFFFF);
 
         self.xorReg(0, 0);
@@ -7208,6 +7230,28 @@ pub const IRCodegen = struct {
             8 => .chk_heap8_fn,
             else => .chk_heap1_fn,
         };
+        // 4-entry inline chunk cache scan. The access site already tested entry
+        // e0 ([0xC0..0xC8]) inline; reaching this cold body means e0 missed. Try
+        // e1 ([0xD0]), e2 ([0xE0]), e3 ([0xF0]) before the expensive full
+        // verifier. A hit means `reg` lies within an exactly-verified live chunk
+        // [start, end-8], so the access is safe and we resume it directly -- the
+        // same guarantee the e0 fast path gives, just for three more chunks.
+        // This is what stops loops that alternate between up to four live chunks
+        // (matrix multiply, k-means, n-body) from re-verifying on every access.
+        // All four entries miss -> fall through to the NULL/kernel/heap screen
+        // and the full slab verifier below, which re-installs via FIFO shift.
+        // The jumps use the reloc API (not raw rel8) so the instruction-shrink
+        // pass keeps every distance correct.
+        for ([_]u32{ 0xD0, 0xE0, 0xF0 }) |elo| {
+            self.emitCmpRegAbs(reg, @intCast(DATA_VADDR + elo));
+            const j_next1 = self.emitJccReloc(0x2, .code_offset, 0, self.cur_fn_idx); // jb next
+            self.emitCmpRegAbs(reg, @intCast(DATA_VADDR + elo + 8));
+            const j_next2 = self.emitJccReloc(0x7, .code_offset, 0, self.cur_fn_idx); // ja next
+            _ = self.emitJmpReloc(.code_offset, resume_at, self.cur_fn_idx); // hit -> resume access
+            const next_pos = self.code_len;
+            self.relocs[j_next1].target_id = next_pos;
+            self.relocs[j_next2].target_id = next_pos;
+        }
         self.emitCmpRegImm32(reg, 4096);
         const jb_trap = self.code_len + 1;
         self.emit8(0x72);
@@ -8047,14 +8091,27 @@ pub const IRCodegen = struct {
         self.emit32(0xA0);
         self.emit8(0); // cmp qword [rax + 0xA0], 0 (is_multithreaded)
         const chk_skip_cache = self.emitJccReloc(0x5, .code_offset, 0, 0); // jne
-        self.emit8(0x4C);
-        self.emit8(0x89);
-        self.emit8(0x90);
-        self.emit32(0xC0); // mov [rax + 0xC0], r10
-        self.emit8(0x4C);
-        self.emit8(0x89);
-        self.emit8(0x88);
-        self.emit32(0xC8); // mov [rax + 0xC8], r9
+        // FIFO shift e0->e1->e2->e3, then install the freshly verified chunk in
+        // e0 (rax = DATA_VADDR, r10 = payload_start, r9 = payload_end). This is
+        // the 4-entry inline chunk cache: every entry holds an exactly-verified
+        // live chunk [start, end-8], free invalidates all four, and the install
+        // is still gated on single-threaded mode, so the security guarantee is
+        // identical to the old single-entry cache -- only the hit rate changes.
+        // r11 is dead here: its caller value is restored by the epilogue pops.
+        self.emitMemLoadDisp(11, 0, 0xE0); // e3 = e2
+        self.emitMemStoreDisp(0, 11, 0xF0);
+        self.emitMemLoadDisp(11, 0, 0xE8);
+        self.emitMemStoreDisp(0, 11, 0xF8);
+        self.emitMemLoadDisp(11, 0, 0xD0); // e2 = e1
+        self.emitMemStoreDisp(0, 11, 0xE0);
+        self.emitMemLoadDisp(11, 0, 0xD8);
+        self.emitMemStoreDisp(0, 11, 0xE8);
+        self.emitMemLoadDisp(11, 0, 0xC0); // e1 = e0
+        self.emitMemStoreDisp(0, 11, 0xD0);
+        self.emitMemLoadDisp(11, 0, 0xC8);
+        self.emitMemStoreDisp(0, 11, 0xD8);
+        self.emitMemStoreDisp(0, 10, 0xC0); // e0 = new chunk (start, end-8)
+        self.emitMemStoreDisp(0, 9, 0xC8);
 
         const chk_done_pos = self.code_len;
         self.relocs[chk_done_skip].target_id = chk_done_pos;
@@ -8404,10 +8461,25 @@ pub const IRCodegen = struct {
         self.emit32(0xA0);
         self.emit8(0); // cmp qword [r10 + 0xA0], 0
         const m_skip_cache = self.emitJccReloc(0x5, .code_offset, 0, 0); // jne
-        self.emit8(0x49);
-        self.emit8(0x89);
-        self.emit8(0x82);
-        self.emit32(0xC0); // mov [r10 + 0xC0], rax     (chunk start)
+        // FIFO shift e0->e1->e2->e3 (r10 = DATA_VADDR base, r11 = scratch), then
+        // seed e0 with the freshly allocated block. With four entries a program
+        // that mallocs up to four buffers up-front has them ALL cached before the
+        // hot loops start, so those loops never fall into the full verifier. The
+        // shift only touches r11 and memory; rax (chunk start) and r9 (req_size)
+        // survive it. r11 is malloc's own scratch and is zeroed before return.
+        self.emitMemLoadDisp(11, 10, 0xE0); // e3 = e2
+        self.emitMemStoreDisp(10, 11, 0xF0);
+        self.emitMemLoadDisp(11, 10, 0xE8);
+        self.emitMemStoreDisp(10, 11, 0xF8);
+        self.emitMemLoadDisp(11, 10, 0xD0); // e2 = e1
+        self.emitMemStoreDisp(10, 11, 0xE0);
+        self.emitMemLoadDisp(11, 10, 0xD8);
+        self.emitMemStoreDisp(10, 11, 0xE8);
+        self.emitMemLoadDisp(11, 10, 0xC0); // e1 = e0
+        self.emitMemStoreDisp(10, 11, 0xD0);
+        self.emitMemLoadDisp(11, 10, 0xC8);
+        self.emitMemStoreDisp(10, 11, 0xD8);
+        self.emitMemStoreDisp(10, 0, 0xC0); // e0.lo = chunk start (rax)
         self.emitLeaRegIdxScale(11, 0, 9, 0); // r11 = rax + r9
         // Store the chunk END minus the largest inline-checked access size (8),
         // so the hot path can test `ptr <= [0xC8]` with no lea, no scratch
@@ -8416,10 +8488,7 @@ pub const IRCodegen = struct {
         self.emit8(0x83);
         self.emit8(0xEB);
         self.emit8(0x08); // sub r11, 8
-        self.emit8(0x4D);
-        self.emit8(0x89);
-        self.emit8(0x9A);
-        self.emit32(0xC8); // mov [r10 + 0xC8], r11
+        self.emitMemStoreDisp(10, 11, 0xC8); // e0.hi = end - 8
         self.xorReg(11, 11);
         self.relocs[m_skip_cache].target_id = self.code_len;
         self.emit8(0xC3);
@@ -8430,19 +8499,26 @@ pub const IRCodegen = struct {
         self.emit8(0x85);
         self.emit8(0xFF); // test rdi, rdi
         const f_done0 = self.emitJccReloc(0x4, .code_offset, 0, 0);
-        // Invalidate single-thread last-checked chunk cache immediately
-        self.emit8(0x48);
-        self.emit8(0xC7);
-        self.emit8(0x04);
-        self.emit8(0x25);
-        self.emit32(@intCast(DATA_VADDR + 0xC0));
-        self.emit32(0xFFFFFFFF);
-        self.emit8(0x48);
-        self.emit8(0xC7);
-        self.emit8(0x04);
-        self.emit8(0x25);
-        self.emit32(@intCast(DATA_VADDR + 0xC8));
-        self.emit32(0);
+        // Invalidate ALL FOUR inline chunk-cache entries immediately: a freed
+        // chunk must never stay reachable through a cached fast-path hit. Each
+        // entry becomes (lo = -1, hi = 0); no valid pointer satisfies `ptr >= -1`
+        // (unsigned), so every entry misses into the verifier after a free.
+        {
+            const inv = [_]struct { off: u32, imm: u32 }{
+                .{ .off = 0xC0, .imm = 0xFFFFFFFF }, .{ .off = 0xC8, .imm = 0 },
+                .{ .off = 0xD0, .imm = 0xFFFFFFFF }, .{ .off = 0xD8, .imm = 0 },
+                .{ .off = 0xE0, .imm = 0xFFFFFFFF }, .{ .off = 0xE8, .imm = 0 },
+                .{ .off = 0xF0, .imm = 0xFFFFFFFF }, .{ .off = 0xF8, .imm = 0 },
+            };
+            for (inv) |e| {
+                self.emit8(0x48);
+                self.emit8(0xC7);
+                self.emit8(0x04);
+                self.emit8(0x25);
+                self.emit32(@intCast(DATA_VADDR + e.off));
+                self.emit32(e.imm);
+            }
+        }
         self.emitBasicPtrTrap(7);
         // Reject pointers outside [heap_min, heap_max) (e.g. stack/rodata pointers) without touching [ptr-16]
         self.emit8(0x48);
