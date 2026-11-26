@@ -248,19 +248,36 @@ fn nv3_ut_write_shard_meta(dir: string, num_docs: i64) {
     while k < 5 {
         let name = if k == 0 { n_stream } else if k == 1 { n_prov } else if k == 2 { n_reset } else if k == 3 { n_weight } else { n_docs }
         let path = dir + "/" + name
-        let fb = nv3_ut_read_file_cap(path, 8388608, nb)
+        // SoA files are bounded by this trainer's own 4 MiB corpus cap:
+        // stream.bin/prov.bin <= ~4 MiB, reset.bit <= stream/8,
+        // weight.bin = 4 x stream <= 16 MiB, docs.idx is small. A 32 MiB read
+        // cap therefore covers every file the trainer can emit. The old
+        // 8 MiB cap silently truncated weight.bin for corpora above ~2 MiB
+        // and published a wrong byte_length plus a prefix-only sha256 in
+        // shard_meta.json (found by the 3.95 MB E2E corpus: declared
+        // 8388608 vs actual 15569536).
+        let fb = nv3_ut_read_file_cap(path, 33554432, nb)
         if (fb as i64) != 0 {
-            nv3_ut_put(buf, pos, if k == 0 { "\n    \"" } else { ",\n    \"" })
-            nv3_ut_put(buf, pos, name)
-            nv3_ut_put(buf, pos, "\": {\"byte_length\": ")
-            nv3_ut_put_int(buf, pos, nb[0])
-            nv3_ut_put(buf, pos, ", \"sha256\": \"")
-            let dig = @malloc(32)
-            nv3_sha256(fb, nb[0], dig)
-            nv3_ut_put_hex(buf, pos, dig, 32)
-            @free(dig)
-            nv3_ut_put(buf, pos, "\"}")
-            @free(fb)
+            if nb[0] >= 33554432 {
+                // Fail closed: never publish a digest computed over a prefix.
+                // A file at the cap means the bound above was violated; the
+                // entry is omitted instead of being wrong.
+                println("shard_meta_omitted=" )
+                println(name)
+                @free(fb)
+            } else {
+                nv3_ut_put(buf, pos, if k == 0 { "\n    \"" } else { ",\n    \"" })
+                nv3_ut_put(buf, pos, name)
+                nv3_ut_put(buf, pos, "\": {\"byte_length\": ")
+                nv3_ut_put_int(buf, pos, nb[0])
+                nv3_ut_put(buf, pos, ", \"sha256\": \"")
+                let dig = @malloc(32)
+                nv3_sha256(fb, nb[0], dig)
+                nv3_ut_put_hex(buf, pos, dig, 32)
+                @free(dig)
+                nv3_ut_put(buf, pos, "\"}")
+                @free(fb)
+            }
         }
         k = k + 1
     }

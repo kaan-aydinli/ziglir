@@ -1,3 +1,4 @@
+// max-steps: 2000000000
 import "../src/noema_decoder.lir"
 fn main() -> i64 {
     let weights = @malloc(DECODER_CELLS * 8)

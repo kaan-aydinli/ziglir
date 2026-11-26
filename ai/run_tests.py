@@ -53,10 +53,26 @@ def main():
             if line.startswith("// opt:"):
                 opt = line.split(":", 1)[1].strip()
 
+        # `// max-steps: N` — VM backend'inin fail-closed adım bütçesini bu
+        # test için açıkça yükseltir. Issue #4 VM'e varsayılan 1e9 adım bütçesi
+        # getirdi (sonsuz döngüleri exit=124 ile durdurur). Bazı testler
+        # (ör. 40_noema_decoder: ~25 MB ağırlık memset'i + çoklu train/generate)
+        # meşru şekilde 1e9'dan fazla VM adımı gerektirir; native ve C aynı
+        # kaynağı anında doğru çalıştırır. Bütçe test bazında, yine sonlu ve
+        # açık olarak verilir — sessiz devre dışı bırakma yok, runaway döngüler
+        # hâlâ bu sonlu sınırda yakalanır.
+        max_steps = None
+        for line in head:
+            if line.startswith("// max-steps:"):
+                max_steps = line.split(":", 1)[1].strip()
+
         for b in backends:
+            run_args = [LIR, "run", t, "--backend=" + b]
+            if max_steps is not None and b == "vm":
+                run_args += ["--max-steps=" + max_steps]
             if opt == "-O2":
                 # Varsayılan yol: `run` alt komutu (backend seçilebilir).
-                r = subprocess.run([LIR, "run", t, "--backend=" + b],
+                r = subprocess.run(run_args,
                                    capture_output=True, text=True)
             else:
                 # Özel optimizasyon seviyesi: önce derle, sonra çalıştır.
