@@ -190,6 +190,45 @@ fn main() -> i64 {
     0,
 )
 
+# Positional I/O (@pread/@pwrite/@lseek): the O(1) deep-offset, stateless,
+# thread-safe primitives that PB-scale multi-shard streaming ingest relies on.
+# File I/O is -ENOSYS on bare wasm32-wasi (same as @open/@read), so this runs
+# on the host backends only, mirroring the thread case.
+POSITIONAL_IO_CASE = (
+    "positional_io",
+    """
+fn main() -> i64 {
+    let path = "pos_io.bin"
+    let fdw = @open(path, 577, 420)
+    if fdw < 0 { println("open_w_fail") return 1 }
+    let target = "TARGETOK"
+    let nw = @pwrite(fdw, target.ptr as *u8, 8, 4096)
+    @close(fdw)
+    println("pwrite=" + @int_to_string(nw))
+    let fdr = @open(path, 0, 0)
+    if fdr < 0 { println("open_r_fail") return 1 }
+    let dst = @malloc(8)
+    let nr = @pread(fdr, dst, 8, 4096)
+    var okm = 1
+    var i: i64 = 0
+    while i < 8 { if @read_u8(@ptr_add(dst, i)) != @read_u8(@ptr_add(target.ptr, i)) { okm = 0 } i = i + 1 }
+    println("pread=" + @int_to_string(nr) + " match=" + @int_to_string(okm))
+    let p0 = @lseek(fdr, 0, 1)
+    let _x = @pread(fdr, dst, 8, 16)
+    let p1 = @lseek(fdr, 0, 1)
+    var stateless = 0
+    if p0 == p1 { stateless = 1 }
+    println("stateless=" + @int_to_string(stateless))
+    @free(dst)
+    @close(fdr)
+    let _u = @unlink(path)
+    return 0
+}
+""",
+    "pwrite=8\npread=8 match=1\nstateless=1\n",
+    0,
+)
+
 
 
 class BackendTests(unittest.TestCase):
@@ -213,6 +252,24 @@ class BackendTests(unittest.TestCase):
         """Native/C join must return the child's value, not a wait status."""
         name, source, expected, exit_code = THREAD_CASE
         with tempfile.TemporaryDirectory(prefix="lir-threads-") as temp:
+            cwd = pathlib.Path(temp)
+            path = cwd / (name + ".lir")
+            path.write_text(source)
+            for backend in ("native", "vm", "c"):
+                for level in LEVELS:
+                    with self.subTest(backend=backend, level=level):
+                        result = subprocess.run(
+                            [str(COMPILER), "run", str(path), "--backend=" + backend, level],
+                            cwd=cwd, capture_output=True, text=True, timeout=60)
+                        self.assertEqual(result.returncode, exit_code, result.stderr)
+                        self.assertEqual(result.stdout, expected, result.stderr)
+
+    def test_positional_io_pread_pwrite_lseek(self):
+        """@pwrite/@pread/@lseek: correct deep-offset I/O, and @pread is
+        stateless (must not move the shared file offset). Host backends only;
+        bare wasm32-wasi returns -ENOSYS for all file I/O like @open/@read."""
+        name, source, expected, exit_code = POSITIONAL_IO_CASE
+        with tempfile.TemporaryDirectory(prefix="lir-posio-") as temp:
             cwd = pathlib.Path(temp)
             path = cwd / (name + ".lir")
             path.write_text(source)

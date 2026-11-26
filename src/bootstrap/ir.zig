@@ -175,6 +175,9 @@ pub const IROp = enum {
     call_open,
     call_read,
     call_write,
+    call_pread, // positional read: pread(fd, buf, count, offset) -> bytes read (stateless, thread-safe)
+    call_pwrite, // positional write: pwrite(fd, buf, count, offset) -> bytes written
+    call_lseek, // reposition: lseek(fd, offset, whence) -> new offset
     call_close,
     call_unlink,
     call_mkdir,
@@ -287,6 +290,9 @@ pub const IROp = enum {
             .call_open,
             .call_read,
             .call_write,
+            .call_pread,
+            .call_pwrite,
+            .call_lseek,
             .call_close,
             .call_unlink,
             .call_mkdir,

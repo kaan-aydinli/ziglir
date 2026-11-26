@@ -1501,6 +1501,84 @@ pub const VMState = struct {
                     vregs[inst.dest] = @bitCast(@as(i64, -9));
                 }
             },
+            .call_pread => {
+                const fd_i: i64 = @bitCast(vregs[inst.args[0]]);
+                const n_i: i64 = @bitCast(vregs[inst.args[2]]);
+                const off_i: i64 = @bitCast(vregs[inst.args[3]]);
+                if (n_i < 0 or off_i < 0) return error.Trap;
+                if (fd_i < 0 or @as(usize, @intCast(fd_i)) >= self.files.items.len or self.files.items[@intCast(fd_i)] == null) {
+                    vregs[inst.dest] = @bitCast(@as(i64, -9)); // -EBADF (fd 0/1/2 are non-seekable pipes)
+                    return;
+                }
+                if (n_i == 0) {
+                    vregs[inst.dest] = 0;
+                    return;
+                }
+                const dst = try self.resolveSlice(vregs[inst.args[1]], @intCast(n_i), true);
+                const f = self.files.items[@intCast(fd_i)].?;
+                const n = f.pread(dst, @intCast(off_i)) catch {
+                    vregs[inst.dest] = @bitCast(@as(i64, -5)); // -EIO
+                    return;
+                };
+                vregs[inst.dest] = @intCast(n);
+            },
+            .call_pwrite => {
+                const fd_i: i64 = @bitCast(vregs[inst.args[0]]);
+                const n_i: i64 = @bitCast(vregs[inst.args[2]]);
+                const off_i: i64 = @bitCast(vregs[inst.args[3]]);
+                if (n_i < 0 or off_i < 0) return error.Trap;
+                if (fd_i < 0 or @as(usize, @intCast(fd_i)) >= self.files.items.len or self.files.items[@intCast(fd_i)] == null) {
+                    vregs[inst.dest] = @bitCast(@as(i64, -9));
+                    return;
+                }
+                if (n_i == 0) {
+                    vregs[inst.dest] = 0;
+                    return;
+                }
+                const src = try self.resolveSlice(vregs[inst.args[1]], @intCast(n_i), false);
+                const f = self.files.items[@intCast(fd_i)].?;
+                const n = f.pwrite(src, @intCast(off_i)) catch {
+                    vregs[inst.dest] = @bitCast(@as(i64, -5));
+                    return;
+                };
+                vregs[inst.dest] = @intCast(n);
+            },
+            .call_lseek => {
+                const fd_i: i64 = @bitCast(vregs[inst.args[0]]);
+                const off_i: i64 = @bitCast(vregs[inst.args[1]]);
+                const whence_i: i64 = @bitCast(vregs[inst.args[2]]);
+                if (fd_i < 0 or @as(usize, @intCast(fd_i)) >= self.files.items.len or self.files.items[@intCast(fd_i)] == null) {
+                    vregs[inst.dest] = @bitCast(@as(i64, -9));
+                    return;
+                }
+                const f = self.files.items[@intCast(fd_i)].?;
+                if (whence_i == 0) { // SEEK_SET
+                    if (off_i < 0) return error.Trap;
+                    f.seekTo(@intCast(off_i)) catch {
+                        vregs[inst.dest] = @bitCast(@as(i64, -22));
+                        return;
+                    };
+                } else if (whence_i == 1) { // SEEK_CUR
+                    f.seekBy(off_i) catch {
+                        vregs[inst.dest] = @bitCast(@as(i64, -22));
+                        return;
+                    };
+                } else if (whence_i == 2) { // SEEK_END (off = distance before end, Zig semantics)
+                    if (off_i < 0) return error.Trap;
+                    f.seekFromEnd(@intCast(off_i)) catch {
+                        vregs[inst.dest] = @bitCast(@as(i64, -22));
+                        return;
+                    };
+                } else {
+                    vregs[inst.dest] = @bitCast(@as(i64, -22)); // -EINVAL
+                    return;
+                }
+                const pos = f.getPos() catch {
+                    vregs[inst.dest] = @bitCast(@as(i64, -22));
+                    return;
+                };
+                vregs[inst.dest] = @intCast(pos);
+            },
             .call_close => {
                 const fd_i: i64 = @bitCast(vregs[inst.args[0]]);
                 if (fd_i >= 3 and @as(usize, @intCast(fd_i)) < self.files.items.len) {

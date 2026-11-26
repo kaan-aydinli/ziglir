@@ -5266,6 +5266,79 @@ pub const IRCodegen = struct {
                 self.syscallInst();
                 if (inst.dest != 0) self.storeRegToVreg(0, inst.dest);
             },
+            // Positional read: pread(fd, buf, count, offset) -> bytes read.
+            // Stateless (does not mutate the shared file offset) and therefore
+            // safe to call concurrently from multiple OS threads on one fd —
+            // the primitive PB-scale multi-shard streaming ingest relies on.
+            // Args map to the Linux syscall ABI: rdi=fd, rsi=buf, rdx=count,
+            // r10=offset, rax=17 (SYS_pread64). Mirrors call_read's fail-closed
+            // negative-count trap and pointer/length bounds check.
+            .call_pread => {
+                self.loadVregToReg(inst.args[0], 0);
+                self.pushReg(0); // fd
+                self.loadVregToReg(inst.args[1], 0);
+                self.pushReg(0); // buf
+                self.loadVregToReg(inst.args[3], 0);
+                self.pushReg(0); // offset
+                self.loadVregToReg(inst.args[2], 2); // count -> rdx
+                self.popReg(10); // offset -> r10
+                self.popReg(6); // buf -> rsi
+                self.popReg(7); // fd -> rdi
+                self.emit8(0x48);
+                self.emit8(0x85);
+                self.emit8(0xD2); // test rdx, rdx
+                const prd_nonneg = self.emitJccReloc(0x9, .code_offset, 0, fi); // jns
+                self.emit8(0x0F);
+                self.emit8(0x0B); // ud2
+                self.relocs[prd_nonneg].target_id = self.code_len;
+                const prd_zero = self.emitJccReloc(0x4, .code_offset, 0, fi); // jz
+                self.emitCheckPtrLenRegs(6, 2);
+                self.relocs[prd_zero].target_id = self.code_len;
+                self.mov64imm(0, 17); // SYS_pread64
+                self.syscallInst();
+                if (inst.dest != 0) self.storeRegToVreg(0, inst.dest);
+            },
+            // Positional write: pwrite(fd, buf, count, offset) -> bytes written.
+            // rdi=fd, rsi=buf, rdx=count, r10=offset, rax=18 (SYS_pwrite64).
+            .call_pwrite => {
+                self.loadVregToReg(inst.args[0], 0);
+                self.pushReg(0); // fd
+                self.loadVregToReg(inst.args[1], 0);
+                self.pushReg(0); // buf
+                self.loadVregToReg(inst.args[3], 0);
+                self.pushReg(0); // offset
+                self.loadVregToReg(inst.args[2], 2); // count -> rdx
+                self.popReg(10); // offset -> r10
+                self.popReg(6); // buf -> rsi
+                self.popReg(7); // fd -> rdi
+                self.emit8(0x48);
+                self.emit8(0x85);
+                self.emit8(0xD2); // test rdx, rdx
+                const pwr_nonneg = self.emitJccReloc(0x9, .code_offset, 0, fi); // jns
+                self.emit8(0x0F);
+                self.emit8(0x0B); // ud2
+                self.relocs[pwr_nonneg].target_id = self.code_len;
+                const pwr_zero = self.emitJccReloc(0x4, .code_offset, 0, fi); // jz
+                self.emitCheckPtrLenRegs(6, 2);
+                self.relocs[pwr_zero].target_id = self.code_len;
+                self.mov64imm(0, 18); // SYS_pwrite64
+                self.syscallInst();
+                if (inst.dest != 0) self.storeRegToVreg(0, inst.dest);
+            },
+            // Reposition file offset: lseek(fd, offset, whence) -> new offset.
+            // rdi=fd, rsi=offset, rdx=whence, rax=8 (SYS_lseek).
+            .call_lseek => {
+                self.loadVregToReg(inst.args[0], 0);
+                self.pushReg(0); // fd
+                self.loadVregToReg(inst.args[1], 0);
+                self.pushReg(0); // offset
+                self.loadVregToReg(inst.args[2], 2); // whence -> rdx
+                self.popReg(6); // offset -> rsi
+                self.popReg(7); // fd -> rdi
+                self.mov64imm(0, 8); // SYS_lseek
+                self.syscallInst();
+                if (inst.dest != 0) self.storeRegToVreg(0, inst.dest);
+            },
             .call_close => {
                 self.loadVregToReg(inst.args[0], 7);
                 self.mov64imm(0, 3);

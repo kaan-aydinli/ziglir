@@ -908,6 +908,36 @@ pub fn emitC(alloc: std.mem.Allocator, module: *const IRModule, source: []const 
         \\    return (int64_t)close((int)fd);
         \\#endif
         \\}
+        \\// Positional read: stateless (does not move the shared file offset), so it
+        \\// is safe to call concurrently from multiple threads on one fd. This is the
+        \\// O(1) deep-offset primitive that PB-scale multi-shard streaming relies on.
+        \\static int64_t lir_pread_fd(int64_t fd, uint64_t buf, int64_t n, int64_t off) {
+        \\    if (n < 0 || off < 0) lir_trap();
+        \\    if (n > 0) lir_chk_ptr_n(buf, (size_t)n);
+        \\#ifdef _WIN32
+        \\    if (_lseeki64((int)fd, (int64_t)off, SEEK_SET) < 0) return (int64_t)-1;
+        \\    return (int64_t)_read((int)fd, (void *)(uintptr_t)buf, (unsigned int)n);
+        \\#else
+        \\    return (int64_t)pread((int)fd, (void *)(uintptr_t)buf, (size_t)n, (off_t)off);
+        \\#endif
+        \\}
+        \\static int64_t lir_pwrite_fd(int64_t fd, uint64_t buf, int64_t n, int64_t off) {
+        \\    if (n < 0 || off < 0) lir_trap();
+        \\    if (n > 0) lir_chk_ptr_n(buf, (size_t)n);
+        \\#ifdef _WIN32
+        \\    if (_lseeki64((int)fd, (int64_t)off, SEEK_SET) < 0) return (int64_t)-1;
+        \\    return (int64_t)_write((int)fd, (const void *)(uintptr_t)buf, (unsigned int)n);
+        \\#else
+        \\    return (int64_t)pwrite((int)fd, (const void *)(uintptr_t)buf, (size_t)n, (off_t)off);
+        \\#endif
+        \\}
+        \\static int64_t lir_lseek_fd(int64_t fd, int64_t off, int64_t whence) {
+        \\#ifdef _WIN32
+        \\    return (int64_t)_lseeki64((int)fd, (int64_t)off, (int)whence);
+        \\#else
+        \\    return (int64_t)lseek((int)fd, (off_t)off, (int)whence);
+        \\#endif
+        \\}
         \\static int64_t lir_unlink_p(uint64_t path) {
         \\    (void)lir_chk_cstr(path);
         \\#ifdef _WIN32
@@ -1446,6 +1476,9 @@ pub fn emitC(alloc: std.mem.Allocator, module: *const IRModule, source: []const 
                     .call_open => try w.print("    v{d} = (uint64_t)lir_open(v{d}, (int64_t)v{d}, (int64_t)v{d});\n", .{ inst.dest, inst.args[0], inst.args[1], if (inst.arg_count >= 3) inst.args[2] else 0 }),
                     .call_read => try w.print("    v{d} = (uint64_t)lir_read_fd((int64_t)v{d}, v{d}, (int64_t)v{d});\n", .{ inst.dest, inst.args[0], inst.args[1], inst.args[2] }),
                     .call_write => try w.print("    v{d} = (uint64_t)lir_write_fd((int64_t)v{d}, v{d}, (int64_t)v{d});\n", .{ inst.dest, inst.args[0], inst.args[1], inst.args[2] }),
+                    .call_pread => try w.print("    v{d} = (uint64_t)lir_pread_fd((int64_t)v{d}, v{d}, (int64_t)v{d}, (int64_t)v{d});\n", .{ inst.dest, inst.args[0], inst.args[1], inst.args[2], inst.args[3] }),
+                    .call_pwrite => try w.print("    v{d} = (uint64_t)lir_pwrite_fd((int64_t)v{d}, v{d}, (int64_t)v{d}, (int64_t)v{d});\n", .{ inst.dest, inst.args[0], inst.args[1], inst.args[2], inst.args[3] }),
+                    .call_lseek => try w.print("    v{d} = (uint64_t)lir_lseek_fd((int64_t)v{d}, (int64_t)v{d}, (int64_t)v{d});\n", .{ inst.dest, inst.args[0], inst.args[1], inst.args[2] }),
                     .call_close => try w.print("    v{d} = (uint64_t)lir_close_fd((int64_t)v{d});\n", .{ inst.dest, inst.args[0] }),
                     .call_unlink => try w.print("    v{d} = (uint64_t)lir_unlink_p(v{d});\n", .{ inst.dest, inst.args[0] }),
                     .call_mkdir => try w.print("    v{d} = (uint64_t)lir_mkdir_p(v{d}, (int64_t)v{d});\n", .{ inst.dest, inst.args[0], inst.args[1] }),

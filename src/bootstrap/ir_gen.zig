@@ -3521,6 +3521,12 @@ pub const IRGen = struct {
                 .call_read
             else if (eql(name, "@write"))
                 .call_write
+            else if (eql(name, "@pread"))
+                .call_pread
+            else if (eql(name, "@pwrite"))
+                .call_pwrite
+            else if (eql(name, "@lseek"))
+                .call_lseek
             else if (eql(name, "@close"))
                 .call_close
             else if (eql(name, "@unlink"))
