@@ -990,6 +990,11 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'HEAD') return res.end();
     return res.end(data);
   } catch (error) {
+    // A LIR exit caused by an unresolvable selector is the caller's mistake, not ours: report
+    // it as a bad request with a message that names the value, instead of an opaque 500.
+    if (/LIR çıkış kodu/i.test(error.message || '')) {
+      return jsonResponse(res, 400, { ok: false, error: `Model çalıştırılamadı: ${error.message}` });
+    }
     const status = error.status || 500;
     return jsonResponse(res, status, { ok: false, error: error.message || 'İstek işlenemedi.' });
   }

@@ -423,9 +423,14 @@ def run(url: str) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="", help="audit an already running server instead of starting one")
+    parser.add_argument("--require-chrome", action="store_true",
+                        help="fail (instead of SKIP) when no browser is available; for lanes that install one")
     args = parser.parse_args()
 
     if args.url:
+        if args.require_chrome and not find_chrome():
+            print("FAIL: --require-chrome was given but no Chromium is available")
+            return 1
         return run(args.url)
 
     if not (ROOT / "zig-out" / "bin" / "noema_v3_chat_backend").exists():

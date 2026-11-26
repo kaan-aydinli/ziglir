@@ -443,16 +443,25 @@ function populateModels(models) {
   for (const model of models) {
     if (model.legacy) continue; // the primary experience is v3 only
     const option = el('option', null, `${model.id} · ${fmtBytes(model.checkpointBytes)}`);
-    option.value = model.id;
+    // Post the selector, not the short id: that is what the backend resolves. Using the id here
+    // made every model except the default fail with an opaque LIR exit code.
+    option.value = model.selector || model.id;
+    option.dataset.modelId = model.id;
     option.disabled = !model.available;
     select.append(option);
   }
   // `?model=` lets the training page hand off directly to the model it just produced, so the
-  // user does not have to find it in a dropdown.
+  // user does not have to find it in a dropdown. Accept either the selector or the short id.
   const requested = new URLSearchParams(location.search).get('model');
-  const wanted = requested ? Array.from(select.options).find(o => !o.disabled && (o.value === requested || o.value.endsWith(requested))) : null;
+  const wanted = requested
+    ? Array.from(select.options).find(o => !o.disabled && (
+        o.value === requested || o.dataset.modelId === requested ||
+        requested.endsWith(`:${o.dataset.modelId}`) || requested.endsWith(o.value)
+      ))
+    : null;
   const firstAvailable = wanted || Array.from(select.options).find(option => !option.disabled);
   if (firstAvailable) select.value = firstAvailable.value;
+  if (wanted) select.dataset.pendingDeepLink = '1';
 }
 
 function renderWelcomeFacts(artifacts) {
