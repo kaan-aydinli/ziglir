@@ -86,12 +86,17 @@ pub fn emitBinary(
     }
 }
 
+pub const VMExecOptions = ir_vm_mod.ExecOptions;
+pub const DEFAULT_VM_MAX_STEPS = ir_vm_mod.DEFAULT_MAX_STEPS;
+pub const DEFAULT_VM_MAX_WALL_MS = ir_vm_mod.DEFAULT_MAX_WALL_MS;
+
 pub fn executeVM(
     alloc: std.mem.Allocator,
     module: *const ir.IRModule,
     source: []const u8,
     prog_args: []const []const u8,
     capture_io: bool,
+    opts: VMExecOptions,
 ) !VMResult {
-    return try ir_vm_mod.execute(alloc, module, source, prog_args, capture_io);
+    return try ir_vm_mod.execute(alloc, module, source, prog_args, capture_io, opts);
 }

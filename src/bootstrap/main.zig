@@ -810,6 +810,27 @@ fn executeCompiledArtifact(
             printErr("\n");
             sysExit(1);
         };
+        if (res.trapped) {
+            // Never exit silently on a trapped run: name the budget or fault
+            // that stopped the guest (Issue #4 — a bare exit code 124 with no
+            // message is indistinguishable from an external timeout).
+            switch (res.trap_kind) {
+                .step_limit => printErr("VM stopped: instruction budget exhausted after " ),
+                .wall_time => printErr("VM stopped: wall-clock budget exhausted after "),
+                .trap => printErr("VM trapped: "),
+                .memory_fault => printErr("VM memory fault: "),
+                .stack_overflow => printErr("VM stack overflow: "),
+                else => printErr("VM execution stopped: "),
+            }
+            var num_buf: [24]u8 = undefined;
+            const steps_str = std.fmt.bufPrint(&num_buf, "{d}", .{res.steps}) catch "?";
+            printErr(steps_str);
+            switch (res.trap_kind) {
+                .step_limit => printErr(" steps (raise with --max-steps=N)\n"),
+                .wall_time => printErr(" steps (raise with --timeout-ms=M)\n"),
+                else => printErr(" steps\n"),
+            }
+        }
         if (res.exit_code != 0) sysExit(@bitCast(res.exit_code));
         return;
     }
@@ -918,6 +939,11 @@ fn cmdRun(args: []const []const u8) void {
     var target = Target.host();
     var backend_kind: BackendKind = .auto;
     var prog_args_start: usize = args.len;
+    // VM resource budgets (--backend=vm). Must be > 0: the limits exist so a
+    // runaway guest program cannot pin the host, and a flag that disables
+    // them would reintroduce exactly that (Issue #4).
+    var vm_max_steps: u64 = backend_mod.DEFAULT_VM_MAX_STEPS;
+    var vm_max_wall_ms: u64 = backend_mod.DEFAULT_VM_MAX_WALL_MS;
 
     var idx: usize = 0;
     while (idx < args.len) : (idx += 1) {
@@ -929,6 +955,10 @@ fn cmdRun(args: []const []const u8) void {
             target = parseTargetOrDie(spec);
         } else if (parseFlagValue(args, &idx, "--backend=", "--backend")) |spec| {
             backend_kind = parseBackendOrDie(spec);
+        } else if (parseFlagValue(args, &idx, "--max-steps=", "--max-steps")) |spec| {
+            vm_max_steps = parseBudgetOrDie(spec, "--max-steps");
+        } else if (parseFlagValue(args, &idx, "--timeout-ms=", "--timeout-ms")) |spec| {
+            vm_max_wall_ms = parseBudgetOrDie(spec, "--timeout-ms");
         } else if (parseOptFlag(arg)) |ol| {
             opt_level = ol;
         } else if (arg.len > 0 and arg[0] == '-' and input_file == null) {
@@ -956,8 +986,28 @@ fn cmdRun(args: []const []const u8) void {
     defer alloc.free(source_buf);
 
     var compiler = Compiler.initForTarget(source_buf, in_path, opt_level, target, backend_kind);
+    compiler.vm_max_steps = vm_max_steps;
+    compiler.vm_max_wall_ms = vm_max_wall_ms;
     const prog_args = if (prog_args_start < args.len) args[prog_args_start..] else &[_][]const u8{};
     executeCompiledArtifact(alloc, &compiler, prog_args);
+}
+
+fn parseBudgetOrDie(spec: []const u8, flag: []const u8) u64 {
+    const parsed = std.fmt.parseInt(u64, spec, 10) catch {
+        printErr("Error: ");
+        printErr(flag);
+        printErr(" expects a positive integer, got '");
+        printErr(spec);
+        printErr("'\n");
+        sysExit(1);
+    };
+    if (parsed == 0) {
+        printErr("Error: ");
+        printErr(flag);
+        printErr(" must be > 0; the VM resource budget cannot be disabled\n");
+        sysExit(1);
+    }
+    return parsed;
 }
 
 fn cmdInit(name: []const u8, for_agents: bool) void {

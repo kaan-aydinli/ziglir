@@ -1,16 +1,35 @@
 import http from 'node:http';
 import { spawn } from 'node:child_process';
-import { readFileSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { constants as fsConstants, readFileSync, rmSync } from 'node:fs';
+import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { once } from 'node:events';
-import { open, readFile, readdir, rm, stat, statfs, unlink, writeFile } from 'node:fs/promises';
-import { cpus, freemem, loadavg, totalmem } from 'node:os';
+import { mkdtemp, open, readFile, readdir, rm, stat, statfs, unlink, writeFile } from 'node:fs/promises';
+import { cpus, freemem, loadavg, tmpdir, totalmem } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '../..');
 const port = Number(process.env.PORT || 4173);
+
+/// Positive-integer env reader. Fail-closed: a malformed or non-positive value
+/// aborts startup instead of silently falling back to "no limit" — the pre-fix
+/// `TRAIN_TIMEOUT_MS || 0` default meant an unbounded trainer subprocess.
+function intEnv(name, fallback, { allowZero = false } = {}) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 0 || (value === 0 && !allowZero)) {
+    throw new Error(`${name} must be a positive safe integer (got '${raw}')`);
+  }
+  return value;
+}
+
+// Bind loopback by default. The pre-fix server listened on 0.0.0.0 with no
+// auth and no rate limit: one request from anywhere on the network could pin
+// the host CPU with an unbounded VM/trainer subprocess (Issue #4). Exposing
+// the service now requires an explicit NOEMA_CHAT_HOST=0.0.0.0.
+const HOST = process.env.NOEMA_CHAT_HOST || '127.0.0.1';
 const lir = process.env.LIR_BIN || path.join(root, 'zig-out/bin/lir');
 const BACKEND_NATIVE = process.env.NOEMA_V3_BACKEND_BIN || path.join(root, 'zig-out/bin/noema_v3_chat_backend');
 const BACKEND_LIR = path.join(root, 'ai/noema_v3_chat_backend.lir');
@@ -28,11 +47,105 @@ const userShardDir = path.join(root, 'ai/noema_v3/corpus_user');
 
 const maxCorpusRun = 4;
 const diskReserveBytes = 256 * 1024 * 1024;
-const uploadTmp = '/tmp/noema-chat-v3-upload.tr.txt';
-const progressFile = '/tmp/noema-chat-v3-progress.bin';
-const requestTimeoutMs = Number(process.env.CHAT_TIMEOUT_MS || 30000);
-const trainingTimeoutMs = Number(process.env.TRAIN_TIMEOUT_MS || 0);
-if (!Number.isSafeInteger(trainingTimeoutMs) || trainingTimeoutMs < 0) throw new Error('TRAIN_TIMEOUT_MS must be zero or a positive safe integer');
+
+// Private per-process work directory (mkdtemp => mode 0700, unique name)
+// instead of the old fixed, world-writable /tmp paths. Fixed paths let any
+// local user pre-create a directory/symlink at the name (permanent EISDIR
+// DoS, or a TOCTOU race between the unlink and the create), and made the
+// uploaded corpus readable to every local user while a job ran.
+const workDir = await mkdtemp(path.join(tmpdir(), 'noema-chat-'));
+const uploadTmp = path.join(workDir, 'upload.tr.txt');
+const progressFile = path.join(workDir, 'progress.bin');
+// O_EXCL: refuse to open a pre-existing file (no silent reuse); O_NOFOLLOW:
+// refuse symlinks even inside our own directory.
+const EXCL_NOFOLLOW = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW;
+function cleanupWorkDir() {
+  try { rmSync(workDir, { recursive: true, force: true, maxRetries: 2 }); } catch { /* best effort */ }
+}
+process.on('exit', cleanupWorkDir);
+for (const [sig, code] of [['SIGINT', 130], ['SIGTERM', 143]]) {
+  process.on(sig, () => { cleanupWorkDir(); process.exit(code); });
+}
+
+const requestTimeoutMs = intEnv('CHAT_TIMEOUT_MS', 30000);
+// Training timeout: 10 minutes by default, never 0. "unlimited" is accepted
+// only as an explicit, spelled-out opt-in — a numeric 0 aborts startup.
+const trainingTimeoutMs = (() => {
+  const raw = process.env.TRAIN_TIMEOUT_MS;
+  if (raw === undefined || raw === '') return 600_000;
+  if (raw === 'unlimited') return 0; // explicit opt-out; spawnCapture then runs without a timer
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`TRAIN_TIMEOUT_MS must be a positive safe integer or the literal 'unlimited' (got '${raw}')`);
+  }
+  return value;
+})();
+
+// Basic abuse limits (Issue #4). All have sane defaults; all are enforced.
+const rateWindowMs = 60_000;
+const rateChatPerWindow = intEnv('NOEMA_RATE_CHAT', 30);
+const rateTrainPerWindow = intEnv('NOEMA_RATE_TRAIN', 5);
+const rateApiPerWindow = intEnv('NOEMA_RATE_API', 240);
+const maxConcurrentRuns = intEnv('NOEMA_MAX_CONCURRENT_RUNS', 2);
+const maxUploadBytes = intEnv('NOEMA_MAX_UPLOAD_BYTES', 64 * 1024 * 1024);
+
+const rateBuckets = new Map(); // key -> { count, resetAt }
+function rateAllow(key, limit) {
+  const now = Date.now();
+  let bucket = rateBuckets.get(key);
+  if (!bucket || now >= bucket.resetAt) {
+    bucket = { count: 0, resetAt: now + rateWindowMs };
+    rateBuckets.set(key, bucket);
+    if (rateBuckets.size > 8192) {
+      for (const [k, v] of rateBuckets) if (now >= v.resetAt) rateBuckets.delete(k);
+    }
+  }
+  bucket.count += 1;
+  return bucket.count <= limit;
+}
+
+// Default-on auth for the endpoints that spawn subprocesses. Browsers get an
+// HttpOnly SameSite=Strict session cookie when they load the UI, so the
+// existing frontend keeps working with zero changes; anything that is not a
+// same-site browser (curl, another host, a CSRF form post) must present the
+// cookie or a NOEMA_CHAT_TOKEN bearer token. NOEMA_CHAT_AUTH=off is the only
+// way to disable it, and it is explicit.
+const authEnabled = (process.env.NOEMA_CHAT_AUTH || '').toLowerCase() !== 'off';
+const bearerToken = typeof process.env.NOEMA_CHAT_TOKEN === 'string' && process.env.NOEMA_CHAT_TOKEN.length >= 16
+  ? process.env.NOEMA_CHAT_TOKEN
+  : null;
+const sessions = new Map(); // token -> issuedAt
+const SESSION_LIMIT = 1024;
+function issueSession() {
+  const token = randomBytes(32).toString('base64url');
+  if (sessions.size >= SESSION_LIMIT) sessions.delete(sessions.keys().next().value); // evict oldest
+  sessions.set(token, Date.now());
+  return token;
+}
+function parseCookies(req) {
+  const out = {};
+  const header = req.headers.cookie;
+  if (typeof header !== 'string') return out;
+  for (const part of header.split(';')) {
+    const at = part.indexOf('=');
+    if (at > 0) out[part.slice(0, at).trim()] = part.slice(at + 1).trim();
+  }
+  return out;
+}
+function sessionToken(req) {
+  const token = parseCookies(req)['noema_session'];
+  return typeof token === 'string' && token.length === 43 && sessions.has(token) ? token : null;
+}
+function isAuthorized(req) {
+  if (!authEnabled) return true;
+  const auth = req.headers.authorization;
+  if (typeof auth === 'string' && auth.startsWith('Bearer ') && bearerToken) {
+    const given = Buffer.from(auth.slice(7));
+    const want = Buffer.from(bearerToken);
+    if (given.length === want.length && timingSafeEqual(given, want)) return true;
+  }
+  return sessionToken(req) !== null;
+}
 
 let trainingJob = null;
 let trainingReserved = false;
@@ -471,7 +584,7 @@ async function writeChunk(stream, chunk) {
  */
 async function prepareUploadedCorpus(req) {
   const { createWriteStream } = await import('node:fs');
-  const output = createWriteStream(uploadTmp, { flags: 'w' });
+  const output = createWriteStream(uploadTmp, { flags: EXCL_NOFOLLOW, mode: 0o600 });
   const decoder = new TextDecoder('utf-8', { fatal: true });
   let sourceBytes = 0;
   let payloadBytes = 0;
@@ -484,7 +597,7 @@ async function prepareUploadedCorpus(req) {
   const maxTopicBytes = 64 * 1024;
 
   const ensureDisk = async () => {
-    const info = await statfs('/tmp');
+    const info = await statfs(workDir);
     const free = BigInt(info.bavail) * BigInt(info.bsize);
     if (free < BigInt(diskReserveBytes)) throw new UploadError('Yükleme için yeterli disk alanı kalmadı.', 507);
   };
@@ -539,6 +652,7 @@ async function prepareUploadedCorpus(req) {
     await ensureDisk();
     for await (const chunk of req) {
       sourceBytes += chunk.length;
+      if (sourceBytes > maxUploadBytes) throw new UploadError(`Yükleme ${maxUploadBytes} bayt sınırını aşıyor.`, 413);
       if (sourceBytes - lastDiskCheck >= 64 * 1024 * 1024) {
         await ensureDisk();
         lastDiskCheck = sourceBytes;
@@ -662,6 +776,11 @@ async function startTraining(req, fileName, res) {
     return jsonResponse(res, 400, { ok: false, error: 'Yalnızca .txt dosyası yükleyin.' });
   }
   const safeFileName = path.basename(fileName);
+  const declaredLength = Number(req.headers['content-length']);
+  if (Number.isFinite(declaredLength) && declaredLength > maxUploadBytes) {
+    req.resume();
+    return jsonResponse(res, 413, { ok: false, error: `Yükleme ${maxUploadBytes} bayt sınırını aşıyor.` });
+  }
   trainingReserved = true;
   await Promise.all([uploadTmp, progressFile].map(file => unlink(file).catch(() => {})));
   let corpus;
@@ -673,7 +792,7 @@ async function startTraining(req, fileName, res) {
   }
 
   const version = await nextUserVersion();
-  await writeFile(progressFile, Buffer.alloc(24));
+  await writeFile(progressFile, Buffer.alloc(24), { flag: EXCL_NOFOLLOW, mode: 0o600 });
   const job = {
     id: randomUUID(),
     fileName: safeFileName,
@@ -913,6 +1032,29 @@ async function healthPayload() {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || '/', 'http://localhost');
   try {
+    // ── Abuse gates (Issue #4) ─────────────────────────────────────────────
+    // Per-IP fixed-window rate limit on every /api route; the CPU-spawning
+    // endpoints (chat/train) additionally require a session cookie or the
+    // bearer token. Pre-fix, 40 back-to-back unauthenticated POSTs all
+    // returned 200 and each spawned an unbounded inference subprocess.
+    const ip = req.socket.remoteAddress || 'unknown';
+    const isApi = url.pathname.startsWith('/api/');
+    const isTrainApi = url.pathname === '/api/train' || url.pathname === '/api/train/status';
+    const isChatApi = url.pathname === '/api/chat';
+    if (isApi) {
+      const routeClass = isTrainApi ? 'train' : isChatApi ? 'chat' : 'api';
+      const limit = isTrainApi ? rateTrainPerWindow : isChatApi ? rateChatPerWindow : rateApiPerWindow;
+      if (!rateAllow(`${ip} ${routeClass}`, limit)) {
+        if (req.method === 'POST' || req.method === 'PUT') req.resume();
+        res.setHeader('retry-after', String(Math.ceil(rateWindowMs / 1000)));
+        return jsonResponse(res, 429, { ok: false, error: 'Çok fazla istek; bir dakika sonra tekrar deneyin.' });
+      }
+    }
+    if ((isChatApi || isTrainApi) && !isAuthorized(req)) {
+      if (req.method === 'POST' || req.method === 'PUT') req.resume();
+      res.setHeader('www-authenticate', 'Bearer');
+      return jsonResponse(res, 401, { ok: false, error: 'Yetkilendirme gerekli: UI üzerinden tarayıcı oturumu veya NOEMA_CHAT_TOKEN ile Bearer token.' });
+    }
     if (req.method === 'GET' && url.pathname === '/api/health') {
       return jsonResponse(res, 200, await healthPayload());
     }
@@ -931,6 +1073,13 @@ const server = http.createServer(async (req, res) => {
       if (!message.trim()) return jsonResponse(res, 400, { ok: false, error: 'Bir mesaj yazın.' });
       if (Buffer.byteLength(message, 'utf8') > 2048) return jsonResponse(res, 413, { ok: false, error: 'Mesaj 2048 bayt sınırını aşıyor.' });
       const selector = typeof body.selector === 'string' ? body.selector : (typeof body.modelId === 'string' ? body.modelId : 'noema_v3');
+      // activeRuns was already tracked for telemetry; it now also caps
+      // concurrency so a burst of clients cannot fan out into unbounded
+      // subprocess spawns.
+      if (activeRuns >= maxConcurrentRuns) {
+        res.setHeader('retry-after', '5');
+        return jsonResponse(res, 429, { ok: false, error: 'Sunucu meşgul: eşzamanlı çalıştırma sınırı aşıldı.' });
+      }
       const started = Date.now();
       let run;
       try {
@@ -975,7 +1124,7 @@ const server = http.createServer(async (req, res) => {
     const safe = path.resolve(here, `.${route}`);
     if (!safe.startsWith(`${here}${path.sep}`)) return send(res, 404, 'Not found', 'text/plain; charset=utf-8');
     const data = await readFile(safe);
-    res.writeHead(200, {
+    const staticHeaders = {
       'content-type': mime[path.extname(safe)] || 'application/octet-stream',
       'cache-control': 'no-cache',
       'x-content-type-options': 'nosniff',
@@ -986,7 +1135,15 @@ const server = http.createServer(async (req, res) => {
       // which this policy permits. Keep it that way — loosening to 'unsafe-inline' would let any
       // injected attribute through.
       'content-security-policy': "default-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'self'; frame-ancestors 'self'",
-    });
+    };
+    // Hand the browser its session cookie when it loads the UI, so the
+    // existing frontend satisfies the auth gate with zero client changes.
+    // HttpOnly: no script can read it; SameSite=Strict: never sent on
+    // cross-site requests (CSRF).
+    if (authEnabled && req.method === 'GET' && !sessionToken(req)) {
+      staticHeaders['set-cookie'] = `noema_session=${issueSession()}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400`;
+    }
+    res.writeHead(200, staticHeaders);
     if (req.method === 'HEAD') return res.end();
     return res.end(data);
   } catch (error) {
@@ -1000,8 +1157,14 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(port, '0.0.0.0', () => {
-  console.log(`NOEMA Chat listening on 0.0.0.0:${port}`);
+server.listen(port, HOST, () => {
+  console.log(`NOEMA Chat listening on ${HOST}:${port}`);
+  if (!['127.0.0.1', 'localhost', '::1'].includes(HOST)) {
+    console.warn(`WARNING: NOEMA_CHAT_HOST=${HOST} exposes the service beyond loopback; rate limits and auth are the only protection.`);
+  }
   console.log(`NOEMA v3 backend: ${BACKEND_NATIVE} (fallback LIR: ${BACKEND_LIR})`);
   console.log(`NOEMA v3 trainer: ${TRAINER_NATIVE} (fallback LIR: ${TRAINER_LIR})`);
+  console.log(`auth: ${authEnabled ? (bearerToken ? 'session cookie + bearer token' : 'session cookie (UI); set NOEMA_CHAT_TOKEN for non-browser API clients') : 'DISABLED via NOEMA_CHAT_AUTH=off'}`);
+  console.log(`limits: chat ${rateChatPerWindow}/min, train ${rateTrainPerWindow}/min, api ${rateApiPerWindow}/min, concurrent runs ${maxConcurrentRuns}, upload cap ${maxUploadBytes} bytes, train timeout ${trainingTimeoutMs === 0 ? 'unlimited (explicit)' : `${trainingTimeoutMs}ms`}`);
+  console.log(`private work dir: ${workDir} (mode 0700, removed on exit)`);
 });

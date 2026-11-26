@@ -894,7 +894,7 @@ test "IR verifier rejects uses whose definition does not dominate them" {
     // gate that must stop it), the undefined path executes as a silent wrong
     // answer instead of failing — this is the 2026-11 wrong-answer bug class.
     const ir_vm_mod = @import("ir_vm.zig");
-    const res = try ir_vm_mod.execute(std.testing.allocator, module, "main", &[_][]const u8{}, false);
+    const res = try ir_vm_mod.execute(std.testing.allocator, module, "main", &[_][]const u8{}, false, .{});
     try std.testing.expect(!res.trapped);
     try std.testing.expectEqual(@as(i64, 0), res.exit_code); // silently 0, not an error
 }
@@ -960,7 +960,7 @@ test "IR verifier accepts well-formed SSA, post-SSA redefinition and dead code" 
         f.blocks[3].insts[1] = .{ .op = .ret, .src1 = 4 };
         try ir_verify.verify(module, "main");
         const ir_vm_mod = @import("ir_vm.zig");
-        const res = try ir_vm_mod.execute(std.testing.allocator, module, "main", &[_][]const u8{}, false);
+        const res = try ir_vm_mod.execute(std.testing.allocator, module, "main", &[_][]const u8{}, false, .{});
         try std.testing.expect(!res.trapped);
         try std.testing.expectEqual(@as(i64, 20), res.exit_code);
     }
@@ -1039,6 +1039,81 @@ test "Optimizer regression: if-conversion must not move branch bodies above the 
     defer std.testing.allocator.free(res0.stdout);
     try std.testing.expectEqual(@as(u8, 0), res0.exit_code);
     try std.testing.expectEqualStrings("204\n55\n", res0.stdout);
+}
+
+test "VM enforces a non-zero step limit: while true {} fails with StepLimitExceeded" {
+    // Issue #4 PoC shape: `fn main() -> i64 { while true {} }` lowers to a
+    // single block that jumps to itself. The VM counted `steps` but never
+    // compared them to a limit, so this loop ran forever — a deterministic
+    // host DoS for anything that interprets untrusted programs. Before the
+    // fix this test does not fail, it hangs (verified with timeout(1)).
+    const ir_vm_mod = @import("ir_vm.zig");
+
+    // The default budget must be non-zero: 0 silently meant "unlimited".
+    try std.testing.expect(ir_vm_mod.DEFAULT_MAX_STEPS > 0);
+
+    // Infinite-loop module: B0 = [jump B0].
+    const loop_mod = try std.testing.allocator.create(ir_mod.IRModule);
+    defer std.testing.allocator.destroy(loop_mod);
+    loop_mod.init();
+    loop_mod.fn_count = 1;
+    ir_mod.IRModule.initFnSlot(&loop_mod.fns[0], 0, 4, 0, 0, 0);
+    loop_mod.fns[0].vreg_count = 1;
+    loop_mod.fns[0].block_count = 1;
+    loop_mod.fns[0].blocks[0].inst_count = 1;
+    loop_mod.fns[0].blocks[0].insts[0] = .{ .op = .jump, .target_block = 0 };
+
+    // A small explicit budget fires deterministically and immediately.
+    {
+        const vm = try ir_vm_mod.VMState.init(std.testing.allocator, loop_mod, "main");
+        defer vm.deinit();
+        vm.max_steps = 1_000;
+        try std.testing.expectError(ir_vm_mod.VMError.StepLimitExceeded, vm.run());
+        try std.testing.expect(vm.steps >= 1_000);
+    }
+
+    // execute() maps the budget exhaustion to the conventional timeout code.
+    {
+        const res = try ir_vm_mod.execute(std.testing.allocator, loop_mod, "main", &[_][]const u8{}, false, .{ .max_steps = 1_000 });
+        try std.testing.expect(res.trapped);
+        try std.testing.expectEqual(@as(i64, 124), res.exit_code);
+        try std.testing.expect(res.steps >= 1_000);
+    }
+
+    // Wall-clock budget: a guest loop that never stops is also cut at
+    // max_wall_ms even when the step budget is effectively unbounded.
+    {
+        const vm = try ir_vm_mod.VMState.init(std.testing.allocator, loop_mod, "main");
+        defer vm.deinit();
+        vm.max_steps = std.math.maxInt(u64);
+        vm.max_wall_ms = 1;
+        try std.testing.expectError(ir_vm_mod.VMError.WallTimeExceeded, vm.run());
+    }
+
+    // max_steps = 0 must not disable the guard: run() normalizes it back to
+    // the default (same for max_wall_ms). Pinned on a program that exits
+    // immediately (spinning the full 1e9-step default would be too slow for
+    // a unit test).
+    {
+        const ok_mod = try std.testing.allocator.create(ir_mod.IRModule);
+        defer std.testing.allocator.destroy(ok_mod);
+        ok_mod.init();
+        ok_mod.fn_count = 1;
+        ir_mod.IRModule.initFnSlot(&ok_mod.fns[0], 0, 4, 0, 0, 0);
+        ok_mod.fns[0].vreg_count = 1;
+        ok_mod.fns[0].block_count = 1;
+        ok_mod.fns[0].blocks[0].inst_count = 1;
+        ok_mod.fns[0].blocks[0].insts[0] = .{ .op = .ret, .src1 = 0 };
+
+        const vm = try ir_vm_mod.VMState.init(std.testing.allocator, ok_mod, "main");
+        defer vm.deinit();
+        vm.max_steps = 0; // the pre-fix "unlimited" value
+        vm.max_wall_ms = 0;
+        const code = try vm.run();
+        try std.testing.expectEqual(@as(i64, 0), code);
+        try std.testing.expectEqual(ir_vm_mod.DEFAULT_MAX_STEPS, vm.max_steps);
+        try std.testing.expectEqual(ir_vm_mod.DEFAULT_MAX_WALL_MS, vm.max_wall_ms);
+    }
 }
 
 

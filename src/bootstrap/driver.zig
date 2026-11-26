@@ -72,6 +72,10 @@ pub const Compiler = struct {
     quiet: bool = false,
     diag_format: diag_mod.Format = .human,
     test_mode: bool = false,
+    /// VM-only budgets (`lir run --backend=vm --max-steps=N --timeout-ms=M`).
+    /// Non-zero defaults; the VM normalizes 0 back to the default at run time.
+    vm_max_steps: u64 = backend_mod.DEFAULT_VM_MAX_STEPS,
+    vm_max_wall_ms: u64 = backend_mod.DEFAULT_VM_MAX_WALL_MS,
     last_diag_count: u32 = 0,
     last_diag_source_id: u32 = 0,
     last_diag_line: u32 = 0,
@@ -436,7 +440,10 @@ pub const Compiler = struct {
         if (self.emit_ir) {
             ir_module.dumpModule(self.source);
         }
-        return try backend_mod.executeVM(alloc, ir_module, self.source, prog_args, capture_io);
+        return try backend_mod.executeVM(alloc, ir_module, self.source, prog_args, capture_io, .{
+            .max_steps = self.vm_max_steps,
+            .max_wall_ms = self.vm_max_wall_ms,
+        });
     }
 
     pub fn compile(self: *Compiler) ![]const u8 {

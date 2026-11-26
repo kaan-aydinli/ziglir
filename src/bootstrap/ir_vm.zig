@@ -26,6 +26,29 @@ const FN_TAG: u64 = 0xC000_0000;
 
 const MAX_CALL_DEPTH: u32 = 2048;
 
+/// Deterministic instruction budget for one VM run. Non-zero by design: a VM
+/// without a step limit runs `while true {}` forever (host DoS), and the old
+/// `max_steps = 0` default silently meant "no limit" because the (missing)
+/// check compared against zero. Callers may lower it; raising it to 0 is
+/// normalized back to the default in `run()` so the limit can never be
+/// disabled by accident.
+pub const DEFAULT_MAX_STEPS: u64 = 1_000_000_000;
+
+/// Wall-clock budget for one VM run. The step limit catches tight guest
+/// loops; this catches a run that stalls in blocking syscalls or guest
+/// thread waits without executing instructions. Checked every 4096 steps
+/// so the clock read is amortized to noise. 0 is normalized to the default
+/// in `run()` — the budget cannot be disabled.
+pub const DEFAULT_MAX_WALL_MS: u64 = 300_000;
+
+/// Per-run VM budgets. Both defaults are non-zero; passing 0 for either is
+/// normalized back to the default inside `run()` (a zero budget must never
+/// silently mean "unlimited").
+pub const ExecOptions = struct {
+    max_steps: u64 = DEFAULT_MAX_STEPS,
+    max_wall_ms: u64 = DEFAULT_MAX_WALL_MS,
+};
+
 pub const VMError = error{
     MissingMain,
     InvalidFunction,
@@ -33,10 +56,24 @@ pub const VMError = error{
     StackOverflow,
     MemoryFault,
     OutOfMemory,
+    StepLimitExceeded,
+    WallTimeExceeded,
     Exit,
 };
 
 pub const VMResult = struct {
+    /// Why a run was cut short, so callers (CLI, REPL, differential tests)
+    /// can name the failure instead of showing a bare exit code.
+    pub const TrapKind = enum {
+        none,
+        trap,
+        memory_fault,
+        stack_overflow,
+        step_limit,
+        wall_time,
+        other,
+    };
+
     exit_code: i64 = 0,
     /// Instructions actually executed. The only cost number this compiler
     /// reports, because it is the only one it can measure.
@@ -44,6 +81,7 @@ pub const VMResult = struct {
     stdout: []u8 = &[_]u8{},
     stderr: []u8 = &[_]u8{},
     trapped: bool = false,
+    trap_kind: TrapKind = .none,
 
     pub fn deinit(self: *VMResult, alloc: std.mem.Allocator) void {
         if (self.stdout.len > 0) alloc.free(self.stdout);
@@ -128,6 +166,12 @@ pub const VMState = struct {
 
     // Instructions executed so far (deterministic: no wall-clock involved)
     steps: u64 = 0,
+
+    // Instruction budget; see DEFAULT_MAX_STEPS. Never 0 while running.
+    max_steps: u64 = DEFAULT_MAX_STEPS,
+
+    // Wall-clock budget; see DEFAULT_MAX_WALL_MS. Never 0 while running.
+    max_wall_ms: u64 = DEFAULT_MAX_WALL_MS,
 
     // Per-process CSPRNG key for heap redzone canaries. The cookie alone is a
     // public compile-time constant, so keying it keeps the stored canary
@@ -469,6 +513,9 @@ pub const VMState = struct {
     }
 
     pub fn run(self: *VMState) VMError!i64 {
+        // 0 would disable the guards; the limits are not optional.
+        if (self.max_steps == 0) self.max_steps = DEFAULT_MAX_STEPS;
+        if (self.max_wall_ms == 0) self.max_wall_ms = DEFAULT_MAX_WALL_MS;
         const main_fi = self.findFn("main") orelse return error.MissingMain;
         const res = self.callFn(main_fi, &[_]u64{}, 0) catch |err| {
             if (err == error.Exit) return self.exit_code;
@@ -562,6 +609,12 @@ pub const VMState = struct {
             while (ii < blk.inst_count) : (ii += 1) {
                 const inst = blk.insts[ii];
                 self.steps += 1;
+                if (self.steps >= self.max_steps) return error.StepLimitExceeded;
+                if (self.steps & 0xFFF == 0) {
+                    const elapsed_ns = std.time.nanoTimestamp() - self.start_ns;
+                    const elapsed_ms: u64 = if (elapsed_ns <= 0) 0 else @intCast(@min(@divTrunc(elapsed_ns, std.time.ns_per_ms), std.math.maxInt(u64)));
+                    if (elapsed_ms >= self.max_wall_ms) return error.WallTimeExceeded;
+                }
                 switch (inst.op) {
                     .nop, .struct_decl, .module_import, .phi => {},
                     .const_int => vregs[inst.dest] = @bitCast(inst.imm),
@@ -1582,11 +1635,14 @@ pub fn execute(
     source: []const u8,
     prog_args: []const []const u8,
     capture_io: bool,
+    opts: ExecOptions,
 ) !VMResult {
     const vm = try VMState.init(alloc, module, source);
     defer vm.deinit();
     vm.prog_args = prog_args;
     vm.capture_io = capture_io;
+    vm.max_steps = opts.max_steps;
+    vm.max_wall_ms = opts.max_wall_ms;
     var result = VMResult{};
     if (vm.run()) |code| {
         result.exit_code = code;
@@ -1594,7 +1650,17 @@ pub fn execute(
         result.trapped = true;
         result.exit_code = switch (err) {
             error.Trap, error.MemoryFault, error.StackOverflow => 132,
+            // 124: the conventional "timed out" exit code (cf. timeout(1)).
+            error.StepLimitExceeded, error.WallTimeExceeded => 124,
             else => 1,
+        };
+        result.trap_kind = switch (err) {
+            error.Trap => .trap,
+            error.MemoryFault => .memory_fault,
+            error.StackOverflow => .stack_overflow,
+            error.StepLimitExceeded => .step_limit,
+            error.WallTimeExceeded => .wall_time,
+            else => .other,
         };
     }
     result.steps = vm.steps;
