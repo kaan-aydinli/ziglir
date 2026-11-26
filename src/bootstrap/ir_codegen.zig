@@ -282,9 +282,6 @@ pub const IRCodegen = struct {
     deferred_div64: [256]DeferredDiv64 = undefined,
     deferred_div64_count: usize = 0,
 
-    // null = not probed yet; cached because the probe is a getenv per access
-    opt_trap_ceil: ?bool = null,
-
     deferred_ptr_cold: [4096]DeferredPtrCold = undefined,
     deferred_ptr_cold_count: usize = 0,
 
@@ -299,7 +296,6 @@ pub const IRCodegen = struct {
         // cleared explicitly or the loops index the arrays out of bounds.
         self.deferred_ptr_cold_count = 0;
         self.deferred_div64_count = 0;
-        self.opt_trap_ceil = null;
         self.code_len = 0;
         self.overflowed = false;
         self.invalid_reference = false;
@@ -6981,29 +6977,22 @@ pub const IRCodegen = struct {
         self.emit8(0x0B); // ud2
     }
 
-    /// Measurement-only switch: LIR_TRAP_CEIL=1 compiles away the heap-range
-    /// screen and the verifier call, i.e. an unsound but maximally fast build.
-    /// Used to quantify how much headroom the check machinery still costs.
-    fn trapCeil(self: *IRCodegen) bool {
-        return self.opt_trap_ceil orelse blk: {
-            const v = std.posix.getenv("LIR_TRAP_CEIL") != null;
-            self.opt_trap_ceil = v;
-            break :blk v;
-        };
-    }
-
     /// Pointer check for the hottest access opcodes: the hot path stays inline,
     /// the cold half is parked after the function's last block.
+    ///
+    /// SECURITY: the heap-range screen and the __lir_chk_heap{1,4,8} verifier
+    /// call below are load-bearing runtime bounds checks for every hot memory
+    /// access. There used to be an environment-variable switch here
+    /// (LIR_TRAP_CEIL) that compiled them away for "measurement-only" builds.
+    /// It was removed on purpose: an env var that silently strips memory
+    /// safety from produced binaries leaves no trace in the artifact and is
+    /// indistinguishable from an attack. Nothing in this file may downgrade
+    /// the emitted checks based on ambient configuration; if a future change
+    /// needs an unsafe fast path it must be an explicit opt-in CLI flag that
+    /// (a) refuses ReleaseSafe-like modes, (b) prints a loud warning, and
+    /// (c) embeds a permanent marker in the output binary.
     fn emitPtrTrapN(self: *IRCodegen, reg: u8, access_bytes: u8) void {
         std.debug.assert(reg != 4);
-        if (self.trapCeil() and access_bytes <= 8) {
-            self.emitCmpRegImm32(reg, 4096);
-            self.emit8(0x73);
-            self.emit8(0x02);
-            self.emit8(0x0F);
-            self.emit8(0x0B);
-            return;
-        }
         if (self.deferred_ptr_cold_count >= self.deferred_ptr_cold.len) {
             self.emitPtrTrapNInline(reg, access_bytes);
             return;

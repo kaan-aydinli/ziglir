@@ -1337,6 +1337,58 @@ test "ELF execution: runtime safety traps on OOB, div0, MIN_INT/-1, double-free,
     }
 }
 
+test "security: heap bounds checks cannot be disabled via environment (LIR_TRAP_CEIL removed)" {
+    // Regression for docs/CRITICAL_ISSUES_6.md issue #1. An out-of-bounds heap
+    // read (4096 bytes past a 16-byte chunk, still inside the heap arena) must
+    // trap with SIGILL regardless of ambient environment configuration, and
+    // the emitted ELF must be byte-identical with and without the legacy
+    // LIR_TRAP_CEIL measurement switch set to "1" or "0". Before the fix, any
+    // value of that variable (including "0") stripped the heap-range screen
+    // and the __lir_chk_heap{1,4,8} verifier call from the hottest access
+    // paths, turning the OOB read into a silent success.
+    const source =
+        \\fn rt_val(x: i64) -> i64 { if @argc() > 999999 { return 0 } return x }
+        \\fn main() -> i64 {
+        \\    let buf = @malloc(16)
+        \\    @memset(buf, 65, 16)
+        \\    let v = @read_byte(@ptr_add(buf, rt_val(4096)))
+        \\    printInt(v)
+        \\    return 0
+        \\}
+    ;
+    for ([_]main.OptLevel{ .O0, .O1, .O2 }) |opt| {
+        const baseline = try compileSourceWithOpt(source, opt);
+        defer std.testing.allocator.free(baseline);
+        try runElfExpectSigIll(std.testing.allocator, baseline, "trap_ceil_base");
+
+        for ([_][]const u8{ "1", "0" }) |value| {
+            // Zig 0.13 has no setenv in std; append to the environ slice the
+            // same way std.posix.getenv reads it, then restore.
+            const saved_environ = std.os.environ;
+            var entry_buf: [32]u8 = undefined;
+            const entry_z = try std.testing.allocator.dupeZ(u8, try std.fmt.bufPrint(&entry_buf, "LIR_TRAP_CEIL={s}", .{value}));
+            defer std.testing.allocator.free(entry_z);
+            const extended = try std.testing.allocator.alloc([*:0]u8, saved_environ.len + 1);
+            defer std.testing.allocator.free(extended);
+            @memcpy(extended[0..saved_environ.len], saved_environ);
+            extended[saved_environ.len] = entry_z.ptr;
+            std.os.environ = extended;
+            errdefer std.os.environ = saved_environ;
+            // The variable must be visible to std.posix.getenv before we rely
+            // on codegen ignoring it.
+            try std.testing.expect(std.posix.getenv("LIR_TRAP_CEIL") != null);
+
+            const with_env = try compileSourceWithOpt(source, opt);
+            std.os.environ = saved_environ;
+            defer std.testing.allocator.free(with_env);
+            // The emitted machine code must not depend on the environment.
+            try std.testing.expectEqualSlices(u8, baseline, with_env);
+            // And the OOB read must still trap.
+            try runElfExpectSigIll(std.testing.allocator, with_env, "trap_ceil_env");
+        }
+    }
+}
+
 test "ELF execution: dynamic arrays grow past 1024, @array_set zero-fills gaps, and string_split > 1024 tokens" {
     const source =
         \\fn main() -> i64 {
