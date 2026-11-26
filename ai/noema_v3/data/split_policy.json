@@ -1,0 +1,26 @@
+{
+  "version": "0.1.0-phase0",
+  "policy": "leakage_free_source_family_and_near_duplicate",
+  "rules": [
+    "Splits are assigned by source_family and near_duplicate_cluster_id, never by individual row/example.",
+    "All records sharing source_family OR near_duplicate_cluster_id MUST be in the same split.",
+    "Test split is locked before autonomous hyperparameter search; it must never enter search/tuning loops.",
+    "Dev split may be used for calibration/threshold locking only after integrity checks pass.",
+    "Train split may include verified self-play examples only when deterministically verified by independent LIR kernels.",
+    "Every ingestion run must log: read == accepted + rejected, manifest checksum verification, and split assignment audit.",
+    "Document-length weighting must be applied during training so long documents do not dominate loss."
+  ],
+  "split_targets": {
+    "train": 0.98,
+    "dev": 0.01,
+    "test": 0.01
+  },
+  "integrity_checks": [
+    "manifest_checksum_verified",
+    "no_source_family_overlap",
+    "no_near_duplicate_cluster_overlap",
+    "license_allowlist_passed",
+    "provenance_tag_present",
+    "byte_length_matches_content"
+  ]
+}

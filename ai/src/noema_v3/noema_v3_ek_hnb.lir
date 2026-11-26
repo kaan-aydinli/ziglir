@@ -1,0 +1,1080 @@
+// NOEMA v3 Phase 2: EK-HNB (Entropy-Folded Hierarchical Causal Memory)
+// + Exact-Causality Reverse-Prompt Analysis Head.
+
+import "noema_v3_contract.lir"
+import "noema_v3_kernels.lir"
+import "noema_v3_seg_ckpt.lir"
+
+const NV3_VOCAB_UTF8: i64 = 256
+const NV3_NUM_PROV: i64 = 5
+const NV3_LN256: f64 = 5.5451774444795623
+
+const NV3_SL_EMB_BYTE: i64 = 0
+const NV3_SL_EMB_PROV: i64 = 1
+const NV3_SL_CONV_W: i64 = 2
+const NV3_SL_CONV_B: i64 = 3
+const NV3_SL_RMS0_G: i64 = 4
+const NV3_SL_L0_WK: i64 = 5
+const NV3_SL_L0_WV: i64 = 6
+const NV3_SL_L0_WQ: i64 = 7
+const NV3_SL_L1_WK: i64 = 8
+const NV3_SL_L1_WV: i64 = 9
+const NV3_SL_L1_WQ: i64 = 10
+const NV3_SL_L2_WK: i64 = 11
+const NV3_SL_L2_WV: i64 = 12
+const NV3_SL_L2_WQ: i64 = 13
+const NV3_SL_ROUTER_SC: i64 = 14
+const NV3_SL_ROUTER_U1: i64 = 15
+const NV3_SL_ROUTER_U2: i64 = 16
+const NV3_SL_REV_WK: i64 = 17
+const NV3_SL_REV_WV: i64 = 18
+const NV3_SL_REV_WQ: i64 = 19
+const NV3_SL_REV_WOUT: i64 = 20
+const NV3_SL_RMS1_G: i64 = 21
+const NV3_SL_SW_WG: i64 = 22
+const NV3_SL_SW_BG: i64 = 23
+const NV3_SL_SW_WU: i64 = 24
+const NV3_SL_SW_BU: i64 = 25
+const NV3_SL_SW_WO: i64 = 26
+const NV3_SL_SW_BO: i64 = 27
+const NV3_SL_HEAD_W: i64 = 28
+const NV3_SL_HEAD_B: i64 = 29
+const NV3_NUM_SLICES: i64 = 30
+
+struct Nv3EkHnbConfig {
+    d_model: i64
+    d_k: i64
+    d_h: i64
+    conv_k: i64
+    coarse_ckpt: i64
+    fine_ckpt: i64
+    use_fp32_ckpt: i64
+}
+
+struct Nv3EkHnbModel {
+    cfg: Nv3EkHnbConfig
+    total_params: i64
+    step_count: i64
+    params: *f64
+    grads: *f64
+    offs: *i64
+}
+
+struct Nv3FoldStats {
+    ok: i64
+    byte_steps: i64
+    patch_folds: i64
+    event_folds: i64
+    mean_surprise: f64
+    loss_nats: f64
+    bpb: f64
+}
+
+struct Nv3ResetConvDims {
+    t_len: i64
+    channels: i64
+    kernel: i64
+}
+
+struct Nv3ResetConvGrad {
+    dx: *f64
+    dw: *f64
+    db: *f64
+}
+
+struct Nv3EkHnbBatch {
+    t_len: i64
+    prompt_len: i64
+    in_bytes: *i64
+    prov_seq: *i64
+    reset_seq: *i64
+    tgt_bytes: *i64
+    loss_weights: *f64
+    logits_out: *f64
+}
+
+fn nv3_ek_hnb_arch_hash(cfg: Nv3EkHnbConfig) -> i64 {
+    var h: i64 = -3750763034362895579
+    h = @wrapping_mul(h ^ NOEMA_V3_SCHEMA_VERSION, 1099511628211)
+    h = @wrapping_mul(h ^ NV3_VOCAB_UTF8, 1099511628211)
+    h = @wrapping_mul(h ^ cfg.d_model, 1099511628211)
+    h = @wrapping_mul(h ^ cfg.d_k, 1099511628211)
+    h = @wrapping_mul(h ^ cfg.d_h, 1099511628211)
+    h = @wrapping_mul(h ^ cfg.conv_k, 1099511628211)
+    return h
+}
+
+fn nv3_provenance_tag_valid(tag: i64) -> i64 {
+    if tag >= NOEMA_V3_PROV_SYSTEM_POLICY and tag <= NOEMA_V3_PROV_HYPOTHESIS { return 1 }
+    return 0
+}
+
+fn nv3_provenance_can_grant_authority(source_tag: i64, target_authority: i64, kernel_verified: i64) -> i64 {
+    if nv3_provenance_tag_valid(source_tag) == 0 or nv3_provenance_tag_valid(target_authority) == 0 {
+        return 0
+    }
+    if target_authority == NOEMA_V3_PROV_SYSTEM_POLICY {
+        return if source_tag == NOEMA_V3_PROV_SYSTEM_POLICY { 1 } else { 0 }
+    }
+    if target_authority == NOEMA_V3_PROV_VERIFIED_KHG {
+        if source_tag == NOEMA_V3_PROV_VERIFIED_KHG { return 1 }
+        return if kernel_verified == 1 { 1 } else { 0 }
+    }
+    return 1
+}
+
+fn nv3_sl_p(m: Nv3EkHnbModel, sl: i64) -> *f64 {
+    return @ptr_add(m.params as *u8, m.offs[sl] * 8) as *f64
+}
+
+fn nv3_sl_g(m: Nv3EkHnbModel, sl: i64) -> *f64 {
+    return @ptr_add(m.grads as *u8, m.offs[sl] * 8) as *f64
+}
+
+fn nv3_ek_hnb_create(cfg: Nv3EkHnbConfig, seed: i64) -> Nv3EkHnbModel {
+    let d = cfg.d_model
+    let dk = cfg.d_k
+    let dh = cfg.d_h
+    let ck = cfg.conv_k
+    let offs = @malloc((NV3_NUM_SLICES + 1) * 8) as *i64
+
+    var cur: i64 = 0
+    offs[NV3_SL_EMB_BYTE] = cur   cur = cur + NV3_VOCAB_UTF8 * d
+    offs[NV3_SL_EMB_PROV] = cur   cur = cur + NV3_NUM_PROV * d
+    offs[NV3_SL_CONV_W] = cur     cur = cur + d * ck
+    offs[NV3_SL_CONV_B] = cur     cur = cur + d
+    offs[NV3_SL_RMS0_G] = cur     cur = cur + d
+    offs[NV3_SL_L0_WK] = cur      cur = cur + d * dk
+    offs[NV3_SL_L0_WV] = cur      cur = cur + d * d
+    offs[NV3_SL_L0_WQ] = cur      cur = cur + d * dk
+    offs[NV3_SL_L1_WK] = cur      cur = cur + d * dk
+    offs[NV3_SL_L1_WV] = cur      cur = cur + d * d
+    offs[NV3_SL_L1_WQ] = cur      cur = cur + d * dk
+    offs[NV3_SL_L2_WK] = cur      cur = cur + d * dk
+    offs[NV3_SL_L2_WV] = cur      cur = cur + d * d
+    offs[NV3_SL_L2_WQ] = cur      cur = cur + d * dk
+    offs[NV3_SL_ROUTER_SC] = cur  cur = cur + 12
+    offs[NV3_SL_ROUTER_U1] = cur  cur = cur + d
+    offs[NV3_SL_ROUTER_U2] = cur  cur = cur + d
+    offs[NV3_SL_REV_WK] = cur     cur = cur + d * dk
+    offs[NV3_SL_REV_WV] = cur     cur = cur + d * d
+    offs[NV3_SL_REV_WQ] = cur     cur = cur + d * dk
+    offs[NV3_SL_REV_WOUT] = cur   cur = cur + d * d
+    offs[NV3_SL_RMS1_G] = cur     cur = cur + d
+    offs[NV3_SL_SW_WG] = cur      cur = cur + d * dh
+    offs[NV3_SL_SW_BG] = cur      cur = cur + dh
+    offs[NV3_SL_SW_WU] = cur      cur = cur + d * dh
+    offs[NV3_SL_SW_BU] = cur      cur = cur + dh
+    offs[NV3_SL_SW_WO] = cur      cur = cur + dh * d
+    offs[NV3_SL_SW_BO] = cur      cur = cur + d
+    offs[NV3_SL_HEAD_W] = cur     cur = cur + d * NV3_VOCAB_UTF8
+    offs[NV3_SL_HEAD_B] = cur     cur = cur + NV3_VOCAB_UTF8
+    offs[NV3_NUM_SLICES] = cur
+
+    let total_params = cur
+    let params = @malloc(total_params * 8) as *f64
+    let grads = @malloc(total_params * 8) as *f64
+    nv3_zero(params, total_params)
+    nv3_zero(grads, total_params)
+
+    var rng: i64 = (seed ^ 73856093) | 1
+    var i: i64 = 0
+    while i < total_params {
+        rng = @wrapping_mul(rng, 6364136223846793005) + 1442695040888963407
+        let bucket = ((rng >> 33) & 2047) - 1024
+        params[i] = (bucket as f64) * 0.00004
+        i = i + 1
+    }
+
+    let m = Nv3EkHnbModel { cfg: cfg, total_params: total_params, step_count: 0, params: params, grads: grads, offs: offs }
+    let rms0 = nv3_sl_p(m, NV3_SL_RMS0_G)
+    let rms1 = nv3_sl_p(m, NV3_SL_RMS1_G)
+    let cb = nv3_sl_p(m, NV3_SL_CONV_B)
+    let cw = nv3_sl_p(m, NV3_SL_CONV_W)
+    i = 0
+    while i < d {
+        rms0[i] = 1.0
+        rms1[i] = 1.0
+        cb[i] = 0.0
+        cw[i * ck + (ck - 1)] = 0.5
+        i = i + 1
+    }
+    nv3_zero(nv3_sl_p(m, NV3_SL_SW_BG), dh)
+    nv3_zero(nv3_sl_p(m, NV3_SL_SW_BU), dh)
+    nv3_zero(nv3_sl_p(m, NV3_SL_SW_BO), d)
+    nv3_zero(nv3_sl_p(m, NV3_SL_HEAD_B), NV3_VOCAB_UTF8)
+
+    let rs = nv3_sl_p(m, NV3_SL_ROUTER_SC)
+    rs[0] = 1.5   rs[1] = 0.4
+    rs[2] = 2.4   rs[3] = 0.2
+    rs[4] = 3.5   rs[5] = 0.0
+    rs[6] = 4.0   rs[7] = 0.45  rs[8] = 0.0
+    rs[9] = 4.0   rs[10] = 0.62 rs[11] = -0.2
+    return m
+}
+
+fn nv3_ek_hnb_free(m: Nv3EkHnbModel) {
+    @free(m.params as *u8)
+    @free(m.grads as *u8)
+    @free(m.offs as *u8)
+}
+
+fn nv3_reset_conv1d_forward(x: *f64, w: *f64, b: *f64, reset_seq: *i64, y: *f64, d: Nv3ResetConvDims) {
+    var doc_start: i64 = 0
+    var t: i64 = 0
+    while t < d.t_len {
+        if reset_seq[t] != 0 { doc_start = t }
+        var c: i64 = 0
+        while c < d.channels {
+            var acc = b[c]
+            var k: i64 = 0
+            while k < d.kernel {
+                let src_t = t - (d.kernel - 1 - k)
+                if src_t >= doc_start {
+                    acc = acc + w[c * d.kernel + k] * x[src_t * d.channels + c]
+                }
+                k = k + 1
+            }
+            y[t * d.channels + c] = acc
+            c = c + 1
+        }
+        t = t + 1
+    }
+}
+
+fn nv3_reset_conv1d_backward(dy: *f64, x: *f64, w: *f64, reset_seq: *i64, g_in: Nv3ResetConvGrad, d: Nv3ResetConvDims) {
+    var g = g_in
+    nv3_zero(g.dx, d.t_len * d.channels)
+    nv3_zero(g.dw, d.channels * d.kernel)
+    nv3_zero(g.db, d.channels)
+    var doc_start: i64 = 0
+    var t: i64 = 0
+    while t < d.t_len {
+        if reset_seq[t] != 0 { doc_start = t }
+        var c: i64 = 0
+        while c < d.channels {
+            let gout = dy[t * d.channels + c]
+            g.db[c] = g.db[c] + gout
+            var k: i64 = 0
+            while k < d.kernel {
+                let src_t = t - (d.kernel - 1 - k)
+                if src_t >= doc_start {
+                    let x_idx = src_t * d.channels + c
+                    let w_idx = c * d.kernel + k
+                    g.dw[w_idx] = g.dw[w_idx] + gout * x[x_idx]
+                    g.dx[x_idx] = g.dx[x_idx] + gout * w[w_idx]
+                }
+                k = k + 1
+            }
+            c = c + 1
+        }
+        t = t + 1
+    }
+}
+
+fn nv3_compute_causal_surprise(in_bytes: *i64, reset_seq: *i64, t_len: i64, surprise_out: *f64) {
+    let excess = @malloc(NV3_VOCAB_UTF8 * 8) as *f64
+    let stamp = @malloc(NV3_VOCAB_UTF8 * 8) as *i64
+    var c: i64 = 0
+    while c < NV3_VOCAB_UTF8 { stamp[c] = 0 excess[c] = 0.0 c = c + 1 }
+
+    var epoch: i64 = 1
+    var decay_scale: f64 = 1.0
+    var excess_total: f64 = 0.0
+    var t: i64 = 0
+    while t < t_len {
+        if reset_seq[t] != 0 {
+            epoch = epoch + 1
+            decay_scale = 1.0
+            excess_total = 0.0
+        }
+        let b = in_bytes[t] & 255
+        if stamp[b] != epoch {
+            stamp[b] = epoch
+            excess[b] = 0.0
+        }
+        let cnt_b = 1.0 + excess[b] * decay_scale
+        let tot_m = 256.0 + excess_total * decay_scale
+        let prob = cnt_b / tot_m
+        var surp = (0.0 - nv3_log(prob)) / NV3_LN256
+        if surp < 0.0 { surp = 0.0 }
+        if surp > 1.25 { surp = 1.25 }
+        surprise_out[t] = surp
+
+        decay_scale = decay_scale * 0.96
+        let add_u = 3.0 / decay_scale
+        excess[b] = excess[b] + add_u
+        excess_total = excess_total + add_u
+        if decay_scale < 0.000001 {
+            c = 0
+            while c < NV3_VOCAB_UTF8 {
+                if stamp[c] == epoch { excess[c] = excess[c] * decay_scale }
+                c = c + 1
+            }
+            excess_total = excess_total * decay_scale
+            decay_scale = 1.0
+        }
+        t = t + 1
+    }
+    @free(excess as *u8)
+    @free(stamp as *u8)
+}
+
+struct Nv3ProjKvq {
+    wk: *f64
+    wv: *f64
+    wq: *f64
+    k_raw: *f64
+    k_norm: *f64
+    v_seq: *f64
+    q_seq: *f64
+}
+
+struct Nv3ProjKvqGrad {
+    dx_seq: *f64
+    dwk: *f64
+    dwv: *f64
+    dwq: *f64
+    dk_norm: *f64
+    dv_seq: *f64
+    dq_seq: *f64
+}
+
+fn nv3_max_i64(a: i64, b: i64) -> i64 {
+    return if a > b { a } else { b }
+}
+
+fn nv3_proj_kvq_forward(x_seq: *f64, p_in: Nv3ProjKvq, t_len: i64, d: i64, dk: i64) {
+    var p = p_in
+    let mdim = nv3_max_i64(d, dk)
+    let zero_b = @malloc(mdim * 8) as *f64
+    nv3_zero(zero_b, mdim)
+    var t: i64 = 0
+    while t < t_len {
+        let xt = @ptr_add(x_seq as *u8, t * d * 8) as *f64
+        let krt = @ptr_add(p.k_raw as *u8, t * dk * 8) as *f64
+        let knt = @ptr_add(p.k_norm as *u8, t * dk * 8) as *f64
+        let vt = @ptr_add(p.v_seq as *u8, t * d * 8) as *f64
+        let qt = @ptr_add(p.q_seq as *u8, t * dk * 8) as *f64
+        nv3_linear_forward(xt, p.wk, zero_b, krt, d, dk)
+        nv3_l2norm_forward(krt, knt, dk, 0.00001)
+        nv3_linear_forward(xt, p.wv, zero_b, vt, d, d)
+        nv3_linear_forward(xt, p.wq, zero_b, qt, d, dk)
+        t = t + 1
+    }
+    @free(zero_b as *u8)
+}
+
+fn nv3_proj_kvq_backward(x_seq: *f64, p: Nv3ProjKvq, g_in: Nv3ProjKvqGrad, t_len: i64, d: i64, dk: i64) {
+    var g = g_in
+    let mdim = nv3_max_i64(d, dk)
+    let tmp_dx = @malloc(d * 8) as *f64
+    let tmp_dkr = @malloc(dk * 8) as *f64
+    let dummy_b = @malloc(mdim * 8) as *f64
+    var t: i64 = 0
+    while t < t_len {
+        let xt = @ptr_add(x_seq as *u8, t * d * 8) as *f64
+        let dxt = @ptr_add(g.dx_seq as *u8, t * d * 8) as *f64
+        let krt = @ptr_add(p.k_raw as *u8, t * dk * 8) as *f64
+        let dknt = @ptr_add(g.dk_norm as *u8, t * dk * 8) as *f64
+        let dvt = @ptr_add(g.dv_seq as *u8, t * d * 8) as *f64
+        let dqt = @ptr_add(g.dq_seq as *u8, t * dk * 8) as *f64
+
+        nv3_l2norm_backward(dknt, krt, tmp_dkr, dk, 0.00001)
+        let gk = Nv3LinearGrad { dx: tmp_dx, dw: g.dwk, db: dummy_b }
+        nv3_linear_backward(tmp_dkr, xt, p.wk, gk, d, dk)
+        nv3_axpy(dxt, 1.0, tmp_dx, d)
+
+        let gv = Nv3LinearGrad { dx: tmp_dx, dw: g.dwv, db: dummy_b }
+        nv3_linear_backward(dvt, xt, p.wv, gv, d, d)
+        nv3_axpy(dxt, 1.0, tmp_dx, d)
+
+        let gq = Nv3LinearGrad { dx: tmp_dx, dw: g.dwq, db: dummy_b }
+        nv3_linear_backward(dqt, xt, p.wq, gq, d, dk)
+        nv3_axpy(dxt, 1.0, tmp_dx, d)
+        t = t + 1
+    }
+    @free(tmp_dx as *u8)
+    @free(tmp_dkr as *u8)
+    @free(dummy_b as *u8)
+}
+
+// One HAIB level wrapper: projects x_seq -> (k_hat, v, q), runs 2-level segment-checkpointed HAIB.
+// If dr_in != 0 as *f64, also computes backward into dx_acc, dgamma_out, deta_out, and slice grads.
+struct Nv3LevelSpec {
+    sl_wk: i64
+    sl_wv: i64
+    sl_wq: i64
+    gam_seq: *f64
+    eta_seq: *f64
+    reset_seq: *i64
+    r_out: *f64
+}
+
+struct Nv3LevelGradSpec {
+    dr_seq: *f64
+    dx_acc: *f64
+    dgam_out: *f64
+    deta_out: *f64
+}
+
+fn nv3_ek_hnb_level_run(m: Nv3EkHnbModel, x_seq: *f64, t_len: i64, sp_in: Nv3LevelSpec,
+                        gs_in: Nv3LevelGradSpec, do_bwd: i64) {
+    var sp = sp_in
+    var gs = gs_in
+    let d = m.cfg.d_model
+    let dk = m.cfg.d_k
+    let mn = d * dk
+
+    let m0 = @malloc(mn * 8) as *f64
+    nv3_zero(m0, mn)
+    let k_raw = @malloc(t_len * dk * 8) as *f64
+    let k_hat = @malloc(t_len * dk * 8) as *f64
+    let v_seq = @malloc(t_len * d * 8) as *f64
+    let q_seq = @malloc(t_len * dk * 8) as *f64
+
+    let pj = Nv3ProjKvq {
+        wk: nv3_sl_p(m, sp.sl_wk), wv: nv3_sl_p(m, sp.sl_wv), wq: nv3_sl_p(m, sp.sl_wq),
+        k_raw: k_raw, k_norm: k_hat, v_seq: v_seq, q_seq: q_seq
+    }
+    nv3_proj_kvq_forward(x_seq, pj, t_len, d, dk)
+
+    let dm0 = @malloc(mn * 8) as *f64
+    let dk_s = @malloc(t_len * dk * 8) as *f64
+    let dv_s = @malloc(t_len * d * 8) as *f64
+    let dq_s = @malloc(t_len * dk * 8) as *f64
+    let dr_use = @malloc(t_len * d * 8) as *f64
+    if do_bwd != 0 {
+        nv3_copy(dr_use, gs.dr_seq, t_len * d)
+    } else {
+        nv3_zero(dr_use, t_len * d)
+    }
+    let hg = Nv3HaibSeqGrad {
+        dm0: dm0, dk_seq: dk_s, dv_seq: dv_s, dq_seq: dq_s,
+        dgamma_seq: gs.dgam_out, deta_seq: gs.deta_out
+    }
+    let seq = Nv3HaibSeq {
+        t_len: t_len, d_v: d, d_k: dk, m0: m0,
+        k_seq: k_hat, v_seq: v_seq, q_seq: q_seq,
+        gamma_seq: sp.gam_seq, eta_seq: sp.eta_seq, reset_seq: sp.reset_seq, r_out: sp.r_out
+    }
+    nv3_haib_seq_two_level_fwd_bwd(seq, dr_use, hg, m.cfg.coarse_ckpt, m.cfg.fine_ckpt, m.cfg.use_fp32_ckpt)
+
+    if do_bwd != 0 {
+        let pg = Nv3ProjKvqGrad {
+            dx_seq: gs.dx_acc,
+            dwk: nv3_sl_g(m, sp.sl_wk), dwv: nv3_sl_g(m, sp.sl_wv), dwq: nv3_sl_g(m, sp.sl_wq),
+            dk_norm: dk_s, dv_seq: dv_s, dq_seq: dq_s
+        }
+        nv3_proj_kvq_backward(x_seq, pj, pg, t_len, d, dk)
+    }
+
+    @free(m0 as *u8) @free(k_raw as *u8) @free(k_hat as *u8) @free(v_seq as *u8) @free(q_seq as *u8)
+    @free(dm0 as *u8) @free(dk_s as *u8) @free(dv_s as *u8) @free(dq_s as *u8) @free(dr_use as *u8)
+}
+
+fn nv3_ek_hnb_embed_conv_fwd(m: Nv3EkHnbModel, batch: Nv3EkHnbBatch,
+                             x_seq: *f64, conv_out: *f64, h0_seq: *f64) {
+    let d = m.cfg.d_model
+    let t_len = batch.t_len
+    let emb_b = nv3_sl_p(m, NV3_SL_EMB_BYTE)
+    let emb_p = nv3_sl_p(m, NV3_SL_EMB_PROV)
+    var t: i64 = 0
+    while t < t_len {
+        let bid = batch.in_bytes[t] & 255
+        let ptag = batch.prov_seq[t]
+        var c: i64 = 0
+        while c < d {
+            x_seq[t * d + c] = emb_b[bid * d + c] + emb_p[ptag * d + c]
+            c = c + 1
+        }
+        t = t + 1
+    }
+    let cdims = Nv3ResetConvDims { t_len: t_len, channels: d, kernel: m.cfg.conv_k }
+    nv3_reset_conv1d_forward(x_seq, nv3_sl_p(m, NV3_SL_CONV_W), nv3_sl_p(m, NV3_SL_CONV_B), batch.reset_seq, conv_out, cdims)
+    nv3_rmsnorm_forward(conv_out, nv3_sl_p(m, NV3_SL_RMS0_G), h0_seq, t_len, d, 0.00001)
+}
+
+fn nv3_ek_hnb_embed_conv_bwd(m: Nv3EkHnbModel, batch: Nv3EkHnbBatch,
+                             x_seq: *f64, conv_out: *f64, dh0_seq: *f64) {
+    let d = m.cfg.d_model
+    let t_len = batch.t_len
+    let dconv_out = @malloc(t_len * d * 8) as *f64
+    let dx_seq = @malloc(t_len * d * 8) as *f64
+
+    let rms0_grad = Nv3RmsnormGrad { dx: dconv_out, dgamma: nv3_sl_g(m, NV3_SL_RMS0_G) }
+    nv3_rmsnorm_backward(dh0_seq, conv_out, nv3_sl_p(m, NV3_SL_RMS0_G), rms0_grad, t_len, d, 0.00001)
+
+    let cdims = Nv3ResetConvDims { t_len: t_len, channels: d, kernel: m.cfg.conv_k }
+    let conv_grad = Nv3ResetConvGrad {
+        dx: dx_seq, dw: nv3_sl_g(m, NV3_SL_CONV_W), db: nv3_sl_g(m, NV3_SL_CONV_B)
+    }
+    nv3_reset_conv1d_backward(dconv_out, x_seq, nv3_sl_p(m, NV3_SL_CONV_W), batch.reset_seq, conv_grad, cdims)
+
+    let g_emb_b = nv3_sl_g(m, NV3_SL_EMB_BYTE)
+    let g_emb_p = nv3_sl_g(m, NV3_SL_EMB_PROV)
+    var t: i64 = 0
+    while t < t_len {
+        let bid = batch.in_bytes[t] & 255
+        let ptag = batch.prov_seq[t]
+        var c: i64 = 0
+        while c < d {
+            let gxc = dx_seq[t * d + c]
+            g_emb_b[bid * d + c] = g_emb_b[bid * d + c] + gxc
+            g_emb_p[ptag * d + c] = g_emb_p[ptag * d + c] + gxc
+            c = c + 1
+        }
+        t = t + 1
+    }
+    @free(dconv_out as *u8)
+    @free(dx_seq as *u8)
+}
+
+// Top fusion RMSNorm + SwiGLU + raw UTF-8 byte decoder forward + optional backward into dfuse_out.
+fn nv3_ek_hnb_top_fwd_bwd(m: Nv3EkHnbModel, batch: Nv3EkHnbBatch,
+                          fuse_seq: *f64, dfuse_out: *f64, do_bwd: i64) -> f64 {
+    let t_len = batch.t_len
+    let d = m.cfg.d_model
+    let dh = m.cfg.d_h
+
+    let norm1_seq = @malloc(t_len * d * 8) as *f64
+    let gate_sw = @malloc(t_len * dh * 8) as *f64
+    let up_sw = @malloc(t_len * dh * 8) as *f64
+    let hid_sw = @malloc(t_len * dh * 8) as *f64
+    let top_seq = @malloc(t_len * d * 8) as *f64
+
+    nv3_rmsnorm_forward(fuse_seq, nv3_sl_p(m, NV3_SL_RMS1_G), norm1_seq, t_len, d, 0.00001)
+    let sw_params = Nv3SwiGluParams {
+        wg: nv3_sl_p(m, NV3_SL_SW_WG), bg: nv3_sl_p(m, NV3_SL_SW_BG),
+        wu: nv3_sl_p(m, NV3_SL_SW_WU), bu: nv3_sl_p(m, NV3_SL_SW_BU),
+        wo: nv3_sl_p(m, NV3_SL_SW_WO), bo: nv3_sl_p(m, NV3_SL_SW_BO)
+    }
+    let sw_dims = Nv3SwiGluDims { in_dim: d, h_dim: dh, out_dim: d }
+    let head_w = nv3_sl_p(m, NV3_SL_HEAD_W)
+    let head_b = nv3_sl_p(m, NV3_SL_HEAD_B)
+
+    var t: i64 = 0
+    while t < t_len {
+        let nin = @ptr_add(norm1_seq as *u8, t * d * 8) as *f64
+        let gt = @ptr_add(gate_sw as *u8, t * dh * 8) as *f64
+        let ut = @ptr_add(up_sw as *u8, t * dh * 8) as *f64
+        let ht = @ptr_add(hid_sw as *u8, t * dh * 8) as *f64
+        let tout = @ptr_add(top_seq as *u8, t * d * 8) as *f64
+        let sbuf = Nv3SwiGluBuf { gate: gt, up: ut, hidden: ht }
+        nv3_swiglu_forward(nin, sw_params, sbuf, tout, sw_dims)
+        var c: i64 = 0
+        while c < d { tout[c] = tout[c] + fuse_seq[t * d + c] c = c + 1 }
+        let lout = @ptr_add(batch.logits_out as *u8, t * NV3_VOCAB_UTF8 * 8) as *f64
+        nv3_linear_forward(tout, head_w, head_b, lout, d, NV3_VOCAB_UTF8)
+        t = t + 1
+    }
+
+    let loss_nats = nv3_softmax_ce_forward(batch.logits_out, batch.tgt_bytes, batch.loss_weights, t_len, NV3_VOCAB_UTF8)
+
+    if do_bwd != 0 {
+        let dlogits = @malloc(t_len * NV3_VOCAB_UTF8 * 8) as *f64
+        let dtop_seq = @malloc(t_len * d * 8) as *f64
+        let dnorm1_seq = @malloc(t_len * d * 8) as *f64
+        nv3_softmax_ce_backward(1.0, batch.logits_out, batch.tgt_bytes, batch.loss_weights, dlogits, t_len, NV3_VOCAB_UTF8)
+
+        let s_dx = @malloc(d * 8) as *f64
+        let s_dwg = @malloc(d * dh * 8) as *f64
+        let s_dbg = @malloc(dh * 8) as *f64
+        let s_dwu = @malloc(d * dh * 8) as *f64
+        let s_dbu = @malloc(dh * 8) as *f64
+        let s_dwo = @malloc(dh * d * 8) as *f64
+        let s_dbo = @malloc(d * 8) as *f64
+
+        t = 0
+        while t < t_len {
+            let dl_t = @ptr_add(dlogits as *u8, t * NV3_VOCAB_UTF8 * 8) as *f64
+            let tout = @ptr_add(top_seq as *u8, t * d * 8) as *f64
+            let dtop = @ptr_add(dtop_seq as *u8, t * d * 8) as *f64
+            let hgrad = Nv3LinearGrad { dx: dtop, dw: nv3_sl_g(m, NV3_SL_HEAD_W), db: nv3_sl_g(m, NV3_SL_HEAD_B) }
+            nv3_linear_backward(dl_t, tout, head_w, hgrad, d, NV3_VOCAB_UTF8)
+
+            let nin = @ptr_add(norm1_seq as *u8, t * d * 8) as *f64
+            let gt = @ptr_add(gate_sw as *u8, t * dh * 8) as *f64
+            let ut = @ptr_add(up_sw as *u8, t * dh * 8) as *f64
+            let ht = @ptr_add(hid_sw as *u8, t * dh * 8) as *f64
+            let sbuf = Nv3SwiGluBuf { gate: gt, up: ut, hidden: ht }
+            let sgrad = Nv3SwiGluGrad { dx: s_dx, dwg: s_dwg, dbg: s_dbg, dwu: s_dwu, dbu: s_dbu, dwo: s_dwo, dbo: s_dbo }
+            nv3_swiglu_backward(dtop, nin, sw_params, sbuf, sgrad, sw_dims)
+
+            let dn1 = @ptr_add(dnorm1_seq as *u8, t * d * 8) as *f64
+            nv3_copy(dn1, s_dx, d)
+            nv3_axpy(nv3_sl_g(m, NV3_SL_SW_WG), 1.0, s_dwg, d * dh)
+            nv3_axpy(nv3_sl_g(m, NV3_SL_SW_BG), 1.0, s_dbg, dh)
+            nv3_axpy(nv3_sl_g(m, NV3_SL_SW_WU), 1.0, s_dwu, d * dh)
+            nv3_axpy(nv3_sl_g(m, NV3_SL_SW_BU), 1.0, s_dbu, dh)
+            nv3_axpy(nv3_sl_g(m, NV3_SL_SW_WO), 1.0, s_dwo, dh * d)
+            nv3_axpy(nv3_sl_g(m, NV3_SL_SW_BO), 1.0, s_dbo, d)
+            t = t + 1
+        }
+        let rms1_grad = Nv3RmsnormGrad { dx: dfuse_out, dgamma: nv3_sl_g(m, NV3_SL_RMS1_G) }
+        nv3_rmsnorm_backward(dnorm1_seq, fuse_seq, nv3_sl_p(m, NV3_SL_RMS1_G), rms1_grad, t_len, d, 0.00001)
+        nv3_axpy(dfuse_out, 1.0, dtop_seq, t_len * d)
+
+        @free(s_dx as *u8) @free(s_dwg as *u8) @free(s_dbg as *u8) @free(s_dwu as *u8)
+        @free(s_dbu as *u8) @free(s_dwo as *u8) @free(s_dbo as *u8)
+        @free(dlogits as *u8) @free(dtop_seq as *u8) @free(dnorm1_seq as *u8)
+    }
+
+    @free(norm1_seq as *u8) @free(gate_sw as *u8) @free(up_sw as *u8)
+    @free(hid_sw as *u8) @free(top_seq as *u8)
+    return loss_nats
+}
+
+struct Nv3HierBwdCtx {
+    x_seq: *f64
+    conv_out: *f64
+    h0_seq: *f64
+    s_seq: *f64
+    r1_seq: *f64
+    surprise: *f64
+    gate1: *f64
+    sig2_seq: *f64
+    gate2: *f64
+    gam0_seq: *f64
+    eta0_seq: *f64
+    gam1_seq: *f64
+    eta1_seq: *f64
+    ds_seq: *f64
+    dr1_seq: *f64
+    dgam2: *f64
+    deta2: *f64
+}
+
+// Exact reverse topological order: Router2 -> Level1 -> Router1 -> Level0 -> Router0 -> Embed/Conv0
+fn nv3_ek_hnb_hier_bwd(m: Nv3EkHnbModel, batch: Nv3EkHnbBatch, ctx_in: Nv3HierBwdCtx) {
+    var ctx = ctx_in
+    let t_len = batch.t_len
+    let d = m.cfg.d_model
+    let rs = nv3_sl_p(m, NV3_SL_ROUTER_SC)
+    let grs = nv3_sl_g(m, NV3_SL_ROUTER_SC)
+    let u1 = nv3_sl_p(m, NV3_SL_ROUTER_U1)
+    let u2 = nv3_sl_p(m, NV3_SL_ROUTER_U2)
+    let gu1 = nv3_sl_g(m, NV3_SL_ROUTER_U1)
+    let gu2 = nv3_sl_g(m, NV3_SL_ROUTER_U2)
+
+    let g0_base = nv3_sigmoid(rs[0])
+    let g1_base = nv3_sigmoid(rs[2])
+    let e1_base = nv3_sigmoid(rs[3]) * 1.5
+    let g2_base = nv3_sigmoid(rs[4])
+    let e2_base = nv3_sigmoid(rs[5]) * 1.5
+
+    let dgate1 = @malloc(t_len * 8) as *f64
+    nv3_zero(dgate1, t_len)
+
+    // 1) Router 2 backward (accumulates into ctx.dr1_seq BEFORE Level 1 HAIB backward)
+    var dg2_acc: f64 = 0.0
+    var de2_acc: f64 = 0.0
+    var t: i64 = 0
+    while t < t_len {
+        let g2_t = ctx.gate2[t]
+        let sig2_t = ctx.sig2_seq[t]
+        let g1_t = ctx.gate1[t]
+        dg2_acc = dg2_acc + ctx.dgam2[t] * g2_t
+        de2_acc = de2_acc + ctx.deta2[t] * g2_t
+        let dg2_t = ctx.dgam2[t] * (g2_base - 1.0) + ctx.deta2[t] * e2_base
+        dgate1[t] = dgate1[t] + dg2_t * sig2_t
+        let da2 = (dg2_t * g1_t) * sig2_t * (1.0 - sig2_t)
+        grs[9] = grs[9] + da2 * (ctx.surprise[t] - rs[10])
+        grs[10] = grs[10] - da2 * rs[9]
+        grs[11] = grs[11] + da2
+        var c: i64 = 0
+        while c < d {
+            gu2[c] = gu2[c] + da2 * ctx.r1_seq[t * d + c]
+            ctx.dr1_seq[t * d + c] = ctx.dr1_seq[t * d + c] + da2 * u2[c]
+            c = c + 1
+        }
+        t = t + 1
+    }
+    grs[4] = grs[4] + dg2_acc * g2_base * (1.0 - g2_base)
+    let sig_e2 = nv3_sigmoid(rs[5])
+    grs[5] = grs[5] + de2_acc * 1.5 * sig_e2 * (1.0 - sig_e2)
+
+    // 2) Level 1 HAIB backward -> accumulates into ctx.ds_seq
+    let dummy_r = @malloc(t_len * d * 8) as *f64
+    let dgam1 = @malloc(t_len * 8) as *f64
+    let deta1 = @malloc(t_len * 8) as *f64
+    let sp1 = Nv3LevelSpec { sl_wk: NV3_SL_L1_WK, sl_wv: NV3_SL_L1_WV, sl_wq: NV3_SL_L1_WQ, gam_seq: ctx.gam1_seq, eta_seq: ctx.eta1_seq, reset_seq: batch.reset_seq, r_out: dummy_r }
+    let gs1 = Nv3LevelGradSpec { dr_seq: ctx.dr1_seq, dx_acc: ctx.ds_seq, dgam_out: dgam1, deta_out: deta1 }
+    nv3_ek_hnb_level_run(m, ctx.s_seq, t_len, sp1, gs1, 1)
+
+    // 3) Router 1 backward -> accumulates into ctx.ds_seq
+    var dg1_acc: f64 = 0.0
+    var de1_acc: f64 = 0.0
+    t = 0
+    while t < t_len {
+        let g1_t = ctx.gate1[t]
+        dg1_acc = dg1_acc + dgam1[t] * g1_t
+        de1_acc = de1_acc + deta1[t] * g1_t
+        let dg1_tot = dgate1[t] + dgam1[t] * (g1_base - 1.0) + deta1[t] * e1_base
+        let da1 = dg1_tot * g1_t * (1.0 - g1_t)
+        grs[6] = grs[6] + da1 * (ctx.surprise[t] - rs[7])
+        grs[7] = grs[7] - da1 * rs[6]
+        grs[8] = grs[8] + da1
+        var c: i64 = 0
+        while c < d {
+            gu1[c] = gu1[c] + da1 * ctx.s_seq[t * d + c]
+            ctx.ds_seq[t * d + c] = ctx.ds_seq[t * d + c] + da1 * u1[c]
+            c = c + 1
+        }
+        t = t + 1
+    }
+    grs[2] = grs[2] + dg1_acc * g1_base * (1.0 - g1_base)
+    let sig_e1 = nv3_sigmoid(rs[3])
+    grs[3] = grs[3] + de1_acc * 1.5 * sig_e1 * (1.0 - sig_e1)
+
+    // 4) Level 0 HAIB + Router 0 backward -> accumulates into dh0_seq
+    let dh0_seq = @malloc(t_len * d * 8) as *f64
+    let dr0_seq = @malloc(t_len * d * 8) as *f64
+    let dgam0 = @malloc(t_len * 8) as *f64
+    let deta0 = @malloc(t_len * 8) as *f64
+    nv3_copy(dh0_seq, ctx.ds_seq, t_len * d)
+    nv3_copy(dr0_seq, ctx.ds_seq, t_len * d)
+
+    let sp0 = Nv3LevelSpec { sl_wk: NV3_SL_L0_WK, sl_wv: NV3_SL_L0_WV, sl_wq: NV3_SL_L0_WQ, gam_seq: ctx.gam0_seq, eta_seq: ctx.eta0_seq, reset_seq: batch.reset_seq, r_out: dummy_r }
+    let gs0 = Nv3LevelGradSpec { dr_seq: dr0_seq, dx_acc: dh0_seq, dgam_out: dgam0, deta_out: deta0 }
+    nv3_ek_hnb_level_run(m, ctx.h0_seq, t_len, sp0, gs0, 1)
+
+    var dg0_acc: f64 = 0.0
+    var de0_acc: f64 = 0.0
+    t = 0
+    while t < t_len { dg0_acc = dg0_acc + dgam0[t] de0_acc = de0_acc + deta0[t] t = t + 1 }
+    grs[0] = grs[0] + dg0_acc * g0_base * (1.0 - g0_base)
+    let sig_e0 = nv3_sigmoid(rs[1])
+    grs[1] = grs[1] + de0_acc * 1.5 * sig_e0 * (1.0 - sig_e0)
+
+    // 5) RMSNorm0 + Reset-Aware Conv1D + Byte/Provenance Embeddings backward
+    nv3_ek_hnb_embed_conv_bwd(m, batch, ctx.x_seq, ctx.conv_out, dh0_seq)
+
+    @free(dgate1 as *u8) @free(dummy_r as *u8) @free(dgam1 as *u8) @free(deta1 as *u8)
+    @free(dh0_seq as *u8) @free(dr0_seq as *u8) @free(dgam0 as *u8) @free(deta0 as *u8)
+}
+
+fn nv3_ek_hnb_fwd_bwd(m: Nv3EkHnbModel, batch: Nv3EkHnbBatch, do_backward: i64) -> Nv3FoldStats {
+    let t_len = batch.t_len
+    let d = m.cfg.d_model
+    if t_len <= 0 or batch.prompt_len < 0 or batch.prompt_len > t_len {
+        return Nv3FoldStats { ok: 0, byte_steps: 0, patch_folds: 0, event_folds: 0, mean_surprise: 0.0, loss_nats: 0.0, bpb: 0.0 }
+    }
+    var t: i64 = 0
+    while t < t_len {
+        if nv3_provenance_tag_valid(batch.prov_seq[t]) == 0 {
+            return Nv3FoldStats { ok: 0, byte_steps: 0, patch_folds: 0, event_folds: 0, mean_surprise: 0.0, loss_nats: 0.0, bpb: 0.0 }
+        }
+        t = t + 1
+    }
+
+    let rev_summary = @malloc(d * 8) as *f64
+    let rev_cond = @malloc(d * 8) as *f64
+    nv3_zero(rev_summary, d)
+    nv3_zero(rev_cond, d)
+    if batch.prompt_len > 0 {
+        let zero_d = @malloc(d * 8) as *f64
+        nv3_zero(zero_d, d)
+        nv3_ek_hnb_rev_seq_fwd_bwd(m, batch, rev_summary, zero_d, 0)
+        nv3_linear_forward(rev_summary, nv3_sl_p(m, NV3_SL_REV_WOUT), zero_d, rev_cond, d, d)
+        @free(zero_d as *u8)
+    }
+
+    let x_seq = @malloc(t_len * d * 8) as *f64
+    let conv_out = @malloc(t_len * d * 8) as *f64
+    let h0_seq = @malloc(t_len * d * 8) as *f64
+    let surprise = @malloc(t_len * 8) as *f64
+    nv3_ek_hnb_embed_conv_fwd(m, batch, x_seq, conv_out, h0_seq)
+    nv3_compute_causal_surprise(batch.in_bytes, batch.reset_seq, t_len, surprise)
+
+    let rs = nv3_sl_p(m, NV3_SL_ROUTER_SC)
+    let g0_base = nv3_sigmoid(rs[0])
+    let e0_base = nv3_sigmoid(rs[1]) * 1.5
+    let g1_base = nv3_sigmoid(rs[2])
+    let e1_base = nv3_sigmoid(rs[3]) * 1.5
+    let g2_base = nv3_sigmoid(rs[4])
+    let e2_base = nv3_sigmoid(rs[5]) * 1.5
+    let u1 = nv3_sl_p(m, NV3_SL_ROUTER_U1)
+    let u2 = nv3_sl_p(m, NV3_SL_ROUTER_U2)
+
+    let gam0_seq = @malloc(t_len * 8) as *f64
+    let eta0_seq = @malloc(t_len * 8) as *f64
+    let r0_seq = @malloc(t_len * d * 8) as *f64
+    let dummy_f = @malloc(t_len * d * 8) as *f64
+    let dummy_s = @malloc(t_len * 8) as *f64
+    t = 0
+    while t < t_len { gam0_seq[t] = g0_base eta0_seq[t] = e0_base t = t + 1 }
+
+    let sp0 = Nv3LevelSpec { sl_wk: NV3_SL_L0_WK, sl_wv: NV3_SL_L0_WV, sl_wq: NV3_SL_L0_WQ, gam_seq: gam0_seq, eta_seq: eta0_seq, reset_seq: batch.reset_seq, r_out: r0_seq }
+    let gs_noop = Nv3LevelGradSpec { dr_seq: dummy_f, dx_acc: dummy_f, dgam_out: dummy_s, deta_out: dummy_s }
+    nv3_ek_hnb_level_run(m, h0_seq, t_len, sp0, gs_noop, 0)
+
+    let s_seq = @malloc(t_len * d * 8) as *f64
+    let gate1 = @malloc(t_len * 8) as *f64
+    let gam1_seq = @malloc(t_len * 8) as *f64
+    let eta1_seq = @malloc(t_len * 8) as *f64
+    let r1_seq = @malloc(t_len * d * 8) as *f64
+    var patch_folds: i64 = 0
+    var surp_sum: f64 = 0.0
+    t = 0
+    while t < t_len {
+        var dot_u1: f64 = 0.0
+        var c: i64 = 0
+        while c < d {
+            let sv = h0_seq[t * d + c] + r0_seq[t * d + c]
+            s_seq[t * d + c] = sv
+            dot_u1 = dot_u1 + u1[c] * sv
+            c = c + 1
+        }
+        surp_sum = surp_sum + surprise[t]
+        let g1 = nv3_sigmoid(rs[6] * (surprise[t] - rs[7]) + dot_u1 + rs[8])
+        gate1[t] = g1
+        gam1_seq[t] = 1.0 - (1.0 - g1_base) * g1
+        eta1_seq[t] = e1_base * g1
+        if batch.reset_seq[t] != 0 or g1 >= 0.5 { patch_folds = patch_folds + 1 }
+        t = t + 1
+    }
+    let sp1 = Nv3LevelSpec { sl_wk: NV3_SL_L1_WK, sl_wv: NV3_SL_L1_WV, sl_wq: NV3_SL_L1_WQ, gam_seq: gam1_seq, eta_seq: eta1_seq, reset_seq: batch.reset_seq, r_out: r1_seq }
+    nv3_ek_hnb_level_run(m, s_seq, t_len, sp1, gs_noop, 0)
+
+    let sig2_seq = @malloc(t_len * 8) as *f64
+    let gate2 = @malloc(t_len * 8) as *f64
+    let gam2_seq = @malloc(t_len * 8) as *f64
+    let eta2_seq = @malloc(t_len * 8) as *f64
+    let r2_seq = @malloc(t_len * d * 8) as *f64
+    var event_folds: i64 = 0
+    t = 0
+    while t < t_len {
+        var dot_u2: f64 = 0.0
+        var c: i64 = 0
+        while c < d { dot_u2 = dot_u2 + u2[c] * r1_seq[t * d + c] c = c + 1 }
+        let sig2 = nv3_sigmoid(rs[9] * (surprise[t] - rs[10]) + dot_u2 + rs[11])
+        let g2 = gate1[t] * sig2
+        sig2_seq[t] = sig2
+        gate2[t] = g2
+        gam2_seq[t] = 1.0 - (1.0 - g2_base) * g2
+        eta2_seq[t] = e2_base * g2
+        if (batch.reset_seq[t] != 0 or gate1[t] >= 0.5) and g2 >= 0.5 { event_folds = event_folds + 1 }
+        t = t + 1
+    }
+    let sp2 = Nv3LevelSpec { sl_wk: NV3_SL_L2_WK, sl_wv: NV3_SL_L2_WV, sl_wq: NV3_SL_L2_WQ, gam_seq: gam2_seq, eta_seq: eta2_seq, reset_seq: batch.reset_seq, r_out: r2_seq }
+    nv3_ek_hnb_level_run(m, r1_seq, t_len, sp2, gs_noop, 0)
+
+    let fuse_seq = @malloc(t_len * d * 8) as *f64
+    let dfuse_seq = @malloc(t_len * d * 8) as *f64
+    let rev_active = @malloc(t_len * 8) as *i64
+    var seen_post_reset: i64 = 0
+    t = 0
+    while t < t_len {
+        if batch.prompt_len > 0 and t >= batch.prompt_len and batch.reset_seq[t] != 0 { seen_post_reset = 1 }
+        var use_rev: i64 = 0
+        if batch.prompt_len > 0 and t >= (batch.prompt_len - 1) and seen_post_reset == 0 { use_rev = 1 }
+        rev_active[t] = use_rev
+        var c: i64 = 0
+        while c < d {
+            var fv = s_seq[t * d + c] + r1_seq[t * d + c] + r2_seq[t * d + c]
+            if use_rev == 1 { fv = fv + rev_cond[c] }
+            fuse_seq[t * d + c] = fv
+            c = c + 1
+        }
+        t = t + 1
+    }
+
+    if do_backward != 0 { nv3_zero(m.grads, m.total_params) }
+    let loss_nats = nv3_ek_hnb_top_fwd_bwd(m, batch, fuse_seq, dfuse_seq, do_backward)
+    let bpb = nv3_bpb_from_nats(loss_nats, batch.loss_weights, t_len)
+
+    if do_backward != 0 {
+        if batch.prompt_len > 0 {
+            let drev_cond = @malloc(d * 8) as *f64
+            let drev_sum = @malloc(d * 8) as *f64
+            let dummy_rb = @malloc(d * 8) as *f64
+            nv3_zero(drev_cond, d)
+            t = 0
+            while t < t_len {
+                if rev_active[t] == 1 {
+                    let df_t = @ptr_add(dfuse_seq as *u8, t * d * 8) as *f64
+                    nv3_axpy(drev_cond, 1.0, df_t, d)
+                }
+                t = t + 1
+            }
+            let rg = Nv3LinearGrad { dx: drev_sum, dw: nv3_sl_g(m, NV3_SL_REV_WOUT), db: dummy_rb }
+            nv3_linear_backward(drev_cond, rev_summary, nv3_sl_p(m, NV3_SL_REV_WOUT), rg, d, d)
+            nv3_ek_hnb_rev_seq_fwd_bwd(m, batch, dummy_rb, drev_sum, 1)
+            @free(drev_cond as *u8) @free(drev_sum as *u8) @free(dummy_rb as *u8)
+        }
+
+        let ds_seq = @malloc(t_len * d * 8) as *f64
+        let dr1_seq = @malloc(t_len * d * 8) as *f64
+        let dr2_seq = @malloc(t_len * d * 8) as *f64
+        nv3_copy(ds_seq, dfuse_seq, t_len * d)
+        nv3_copy(dr1_seq, dfuse_seq, t_len * d)
+        nv3_copy(dr2_seq, dfuse_seq, t_len * d)
+
+        let dgam2 = @malloc(t_len * 8) as *f64
+        let deta2 = @malloc(t_len * 8) as *f64
+
+        let gs2 = Nv3LevelGradSpec { dr_seq: dr2_seq, dx_acc: dr1_seq, dgam_out: dgam2, deta_out: deta2 }
+        nv3_ek_hnb_level_run(m, r1_seq, t_len, sp2, gs2, 1)
+
+        let hctx = Nv3HierBwdCtx {
+            x_seq: x_seq, conv_out: conv_out, h0_seq: h0_seq, s_seq: s_seq, r1_seq: r1_seq,
+            surprise: surprise, gate1: gate1, sig2_seq: sig2_seq, gate2: gate2,
+            gam0_seq: gam0_seq, eta0_seq: eta0_seq, gam1_seq: gam1_seq, eta1_seq: eta1_seq,
+            ds_seq: ds_seq, dr1_seq: dr1_seq, dgam2: dgam2, deta2: deta2
+        }
+        nv3_ek_hnb_hier_bwd(m, batch, hctx)
+
+        @free(ds_seq as *u8) @free(dr1_seq as *u8) @free(dr2_seq as *u8)
+        @free(dgam2 as *u8) @free(deta2 as *u8)
+    }
+
+    @free(rev_summary as *u8) @free(rev_cond as *u8) @free(x_seq as *u8) @free(conv_out as *u8)
+    @free(h0_seq as *u8) @free(surprise as *u8) @free(gam0_seq as *u8) @free(eta0_seq as *u8)
+    @free(r0_seq as *u8) @free(dummy_f as *u8) @free(dummy_s as *u8) @free(s_seq as *u8)
+    @free(gate1 as *u8) @free(gam1_seq as *u8) @free(eta1_seq as *u8) @free(r1_seq as *u8)
+    @free(sig2_seq as *u8) @free(gate2 as *u8) @free(gam2_seq as *u8) @free(eta2_seq as *u8)
+    @free(r2_seq as *u8) @free(fuse_seq as *u8) @free(dfuse_seq as *u8) @free(rev_active as *u8)
+
+    return Nv3FoldStats {
+        ok: 1,
+        byte_steps: t_len,
+        patch_folds: patch_folds,
+        event_folds: event_folds,
+        mean_surprise: surp_sum / (t_len as f64),
+        loss_nats: loss_nats,
+        bpb: bpb
+    }
+}
+
+// Standalone Reverse-Prompt Analysis Head (EXACT CAUSALITY RULE):
+// Scans ONLY prompt_bytes[0 .. prompt_len - 1] once; response bytes >= prompt_len are unreachable.
+fn nv3_ek_hnb_reverse_prompt_forward(m: Nv3EkHnbModel, prompt_bytes: *u8, prompt_provs: *i64,
+                                     prompt_len: i64, rev_summary_out: *f64) -> i64 {
+    let d = m.cfg.d_model
+    nv3_zero(rev_summary_out, d)
+    if prompt_len < 0 { return 0 }
+    if prompt_len == 0 { return 1 }
+
+    let in_b = @malloc(prompt_len * 8) as *i64
+    var p: i64 = 0
+    while p < prompt_len {
+        if nv3_provenance_tag_valid(prompt_provs[p]) == 0 {
+            @free(in_b as *u8)
+            return 0
+        }
+        in_b[p] = (@read_u8(@ptr_add(prompt_bytes, p)) as i64) & 255
+        p = p + 1
+    }
+    let dummy_f = @malloc(8) as *f64
+    let dummy_i = @malloc(8) as *i64
+    let batch = Nv3EkHnbBatch {
+        t_len: prompt_len, prompt_len: prompt_len,
+        in_bytes: in_b, prov_seq: prompt_provs, reset_seq: dummy_i,
+        tgt_bytes: dummy_i, loss_weights: dummy_f, logits_out: dummy_f
+    }
+    let r_last = @malloc(d * 8) as *f64
+    let zero_d = @malloc(d * 8) as *f64
+    nv3_zero(zero_d, d)
+    nv3_ek_hnb_rev_seq_fwd_bwd(m, batch, r_last, zero_d, 0)
+    nv3_linear_forward(r_last, nv3_sl_p(m, NV3_SL_REV_WOUT), zero_d, rev_summary_out, d, d)
+
+    @free(in_b as *u8) @free(dummy_f as *u8) @free(dummy_i as *u8)
+    @free(r_last as *u8) @free(zero_d as *u8)
+    return 1
+}
+
+fn nv3_ek_hnb_rev_seq_fwd_bwd(m: Nv3EkHnbModel, batch: Nv3EkHnbBatch,
+                              r_last_out: *f64, dr_last_in: *f64, do_bwd: i64) {
+    let p_len = batch.prompt_len
+    let d = m.cfg.d_model
+    nv3_zero(r_last_out, d)
+    if p_len <= 0 { return }
+
+    let rx_seq = @malloc(p_len * d * 8) as *f64
+    let rr_seq = @malloc(p_len * d * 8) as *f64
+    let rgam = @malloc(p_len * 8) as *f64
+    let reta = @malloc(p_len * 8) as *f64
+    let rrst = @malloc(p_len * 8) as *i64
+
+    let emb_b = nv3_sl_p(m, NV3_SL_EMB_BYTE)
+    let emb_p = nv3_sl_p(m, NV3_SL_EMB_PROV)
+    var idx: i64 = 0
+    while idx < p_len {
+        let src_p = (p_len - 1) - idx
+        let bid = batch.in_bytes[src_p] & 255
+        let ptag = batch.prov_seq[src_p]
+        var c: i64 = 0
+        while c < d {
+            rx_seq[idx * d + c] = emb_b[bid * d + c] + emb_p[ptag * d + c]
+            c = c + 1
+        }
+        rgam[idx] = 0.92
+        reta[idx] = 0.85
+        rrst[idx] = 0
+        idx = idx + 1
+    }
+
+    let drr_seq = @malloc(p_len * d * 8) as *f64
+    let drx_seq = @malloc(p_len * d * 8) as *f64
+    let rdg = @malloc(p_len * 8) as *f64
+    let rde = @malloc(p_len * 8) as *f64
+    nv3_zero(drr_seq, p_len * d)
+    nv3_zero(drx_seq, p_len * d)
+    if do_bwd != 0 {
+        let last_dr = @ptr_add(drr_seq as *u8, (p_len - 1) * d * 8) as *f64
+        nv3_copy(last_dr, dr_last_in, d)
+    }
+
+    let rsp = Nv3LevelSpec { sl_wk: NV3_SL_REV_WK, sl_wv: NV3_SL_REV_WV, sl_wq: NV3_SL_REV_WQ, gam_seq: rgam, eta_seq: reta, reset_seq: rrst, r_out: rr_seq }
+    let rgs = Nv3LevelGradSpec { dr_seq: drr_seq, dx_acc: drx_seq, dgam_out: rdg, deta_out: rde }
+    nv3_ek_hnb_level_run(m, rx_seq, p_len, rsp, rgs, do_bwd)
+
+    let last_r = @ptr_add(rr_seq as *u8, (p_len - 1) * d * 8) as *f64
+    nv3_copy(r_last_out, last_r, d)
+
+    if do_bwd != 0 {
+        let g_emb_b = nv3_sl_g(m, NV3_SL_EMB_BYTE)
+        let g_emb_p = nv3_sl_g(m, NV3_SL_EMB_PROV)
+        idx = 0
+        while idx < p_len {
+            let src_p = (p_len - 1) - idx
+            let bid = batch.in_bytes[src_p] & 255
+            let ptag = batch.prov_seq[src_p]
+            var c: i64 = 0
+            while c < d {
+                let gxc = drx_seq[idx * d + c]
+                g_emb_b[bid * d + c] = g_emb_b[bid * d + c] + gxc
+                g_emb_p[ptag * d + c] = g_emb_p[ptag * d + c] + gxc
+                c = c + 1
+            }
+            idx = idx + 1
+        }
+    }
+
+    @free(rx_seq as *u8) @free(rr_seq as *u8) @free(rgam as *u8) @free(reta as *u8)
+    @free(rrst as *u8) @free(drr_seq as *u8) @free(drx_seq as *u8) @free(rdg as *u8) @free(rde as *u8)
+}
+
+fn nv3_ek_hnb_fd_worst(m: Nv3EkHnbModel, batch: Nv3EkHnbBatch, ana_grads: *f64,
+                       start_idx: i64, count: i64, stride: i64, eps: f64) -> f64 {
+    let p = m.params
+    var worst: f64 = 0.0
+    var k: i64 = 0
+    while k < count {
+        let idx = start_idx + k * stride
+        let orig = p[idx]
+        p[idx] = orig + eps
+        let st_p = nv3_ek_hnb_fwd_bwd(m, batch, 0)
+        p[idx] = orig - eps
+        let st_m = nv3_ek_hnb_fwd_bwd(m, batch, 0)
+        p[idx] = orig
+        let num_g = (st_p.loss_nats - st_m.loss_nats) / (2.0 * eps)
+        let diff = nv3_abs(ana_grads[idx] - num_g)
+        let denom = nv3_max(1.0, nv3_max(nv3_abs(ana_grads[idx]), nv3_abs(num_g)))
+        let err = diff / denom
+        if err > worst { worst = err }
+        k = k + 1
+    }
+    return worst
+}

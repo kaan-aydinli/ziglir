@@ -1,0 +1,6 @@
+İlke: Kuvvet kütle ile ivmenin çarpımına eşittir (F = m * a). Kanıt: 6 kg * 3 m/s^2 = 18 N [DOĞRULANDI]
+İlke: Kesir toplamı ortak payda ve EBOB ile indirgenir. Kanıt: (1/4) + (1/4) = 1/2 [DOĞRULANDI]
+İlke: A => B ve A öncülleri doğruysa B zorunlu olarak doğrudur; !B ile çelişki oluşur [DOĞRULANDI]
+İlke: Kanıt grafiğinde doğrulanmış dayanak yoksa model iddia üretmez ve dürüstçe çekinir [ABSTAIN]
+Principle: Mechanical work per unit time defines power in SI units. Proof: 20 J / 4 s = 5 W [VERIFIED]
+Principle: Causal byte generation observes prompt bytes only and never accesses future response bytes [VERIFIED]

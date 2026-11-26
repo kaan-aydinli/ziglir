@@ -1,0 +1,33 @@
+{
+  "version": "0.1.0-phase0",
+  "name": "future_byte_leakage_negative",
+  "description": "Reverse head / bidirectional components may analyze only fully observed prompt bytes during inference. Future response bytes must be inaccessible.",
+  "rule": "KESIN NEDENSELLIK: Uretim (inference) sirasinda ters baslik yalnizca kullanicidan eksiksiz alinmis prompt'u bir kez analiz edebilir; uretilecek yanitin gelecekteki hicbir baytina erisemez.",
+  "cases": [
+    {
+      "id": "leak_001",
+      "mode": "inference",
+      "prompt_utf8": "Soru: 2+2=? Cevap:",
+      "forbidden_access": "response_bytes_after_prompt",
+      "expected": { "leak_detected": false, "reverse_head_scope": "prompt_only" }
+    },
+    {
+      "id": "leak_002",
+      "mode": "inference",
+      "prompt_utf8": "def foo():\n    return 1\n# explain:",
+      "forbidden_access": "future_generated_tokens_or_bytes",
+      "expected": { "leak_detected": false, "reverse_head_scope": "prompt_only" }
+    },
+    {
+      "id": "leak_003",
+      "mode": "training",
+      "sequence_utf8": "abcde",
+      "allowed_access": "future_bytes_for_reverse_loss_only",
+      "expected": { "training_reverse_loss_allowed": true, "inference_future_access_allowed": false }
+    }
+  ],
+  "gate": {
+    "must_pass_before_training_run": true,
+    "failure_action": "BLOCK_TRAINING"
+  }
+}

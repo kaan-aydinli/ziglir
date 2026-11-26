@@ -1,0 +1,358 @@
+// NOEMA v3 Phase 1: fp32 Householder-Delta HAIB, Two-Level Segment Checkpointing,
+// Document Reset Isolation, and Causal Future-Leakage Negative Tests.
+
+import "../src/noema_v3/noema_v3_kernels.lir"
+import "../src/noema_v3/noema_v3_seg_ckpt.lir"
+
+fn max_abs_diff(a: *f64, b: *f64, n: i64) -> f64 {
+    var mx: f64 = 0.0
+    var i: i64 = 0
+    while i < n {
+        let d = nv3_abs(a[i] - b[i])
+        if d > mx { mx = d }
+        i = i + 1
+    }
+    return mx
+}
+
+fn max_abs_val(a: *f64, n: i64) -> f64 {
+    var mx: f64 = 0.0
+    var i: i64 = 0
+    while i < n {
+        let v = nv3_abs(a[i])
+        if v > mx { mx = v }
+        i = i + 1
+    }
+    return mx
+}
+
+fn check_gate(name: string, cond: i64) -> i64 {
+    print("SEG_HAIB_CHECK test=")
+    print(name)
+    if cond != 0 {
+        println(" pass=1")
+        return 1
+    }
+    println(" pass=0")
+    return 0
+}
+
+// 1) Verify fp32 Householder-Delta associative recall, exact overwrite, and reset_flag.
+fn test_haib_orthogonal_overwrite_f32() -> i64 {
+    let d_v: i64 = 3
+    let d_k: i64 = 4
+    let mn = d_v * d_k
+    let dims = Nv3HaibDims { d_v: d_v, d_k: d_k }
+
+    let m0 = @malloc(mn * 4)
+    let m1 = @malloc(mn * 4)
+    let m2 = @malloc(mn * 4)
+    let m3 = @malloc(mn * 4)
+    let m4 = @malloc(mn * 4)
+    nv3_zero_f32_packed(m0, mn)
+
+    // Orthogonal normalized keys k1 = (0.6, 0.8, 0, 0), k2 = (0, 0, 0.8, -0.6)
+    let k1 = @malloc(d_k * 8) as *f64
+    let k2 = @malloc(d_k * 8) as *f64
+    k1[0]=0.6 k1[1]=0.8 k1[2]=0.0 k1[3]=0.0
+    k2[0]=0.0 k2[1]=0.0 k2[2]=0.8 k2[3]=-0.6
+
+    let v1 = @malloc(d_v * 8) as *f64
+    let v2 = @malloc(d_v * 8) as *f64
+    let v1_new = @malloc(d_v * 8) as *f64
+    let r_out = @malloc(d_v * 8) as *f64
+    v1[0]=1.5 v1[1]=-0.75 v1[2]=2.25
+    v2[0]=-1.0 v2[1]=3.0 v2[2]=0.5
+    v1_new[0]=-2.5 v1_new[1]=1.25 v1_new[2]=0.75
+
+    // Write (k1, v1) then (k2, v2) with gamma=1, eta=1
+    let s1 = Nv3HaibF32StepBuf { m_prev: m0, k: k1, v: v1, q: k1, m_next: m1, r_out: r_out }
+    nv3_haib_write_f32_state(s1, 1.0, 1.0, 0, dims)
+    let s2 = Nv3HaibF32StepBuf { m_prev: m1, k: k2, v: v2, q: k2, m_next: m2, r_out: r_out }
+    nv3_haib_write_f32_state(s2, 1.0, 1.0, 0, dims)
+
+    nv3_haib_read_f32_state(m2, k1, r_out, d_v, d_k)
+    let err_k1 = max_abs_diff(r_out, v1, d_v)
+    nv3_haib_read_f32_state(m2, k2, r_out, d_v, d_k)
+    let err_k2 = max_abs_diff(r_out, v2, d_v)
+
+    // Overwrite (k1, v1_new): k1 must update to v1_new while orthogonal k2 remains v2
+    let s3 = Nv3HaibF32StepBuf { m_prev: m2, k: k1, v: v1_new, q: k1, m_next: m3, r_out: r_out }
+    nv3_haib_write_f32_state(s3, 1.0, 1.0, 0, dims)
+    let err_k1_over = max_abs_diff(r_out, v1_new, d_v)
+    nv3_haib_read_f32_state(m3, k2, r_out, d_v, d_k)
+    let err_k2_keep = max_abs_diff(r_out, v2, d_v)
+
+    // Hard reset (reset_flag = 1) when writing k2: k1 must now read 0
+    let s4 = Nv3HaibF32StepBuf { m_prev: m3, k: k2, v: v2, q: k1, m_next: m4, r_out: r_out }
+    nv3_haib_write_f32_state(s4, 1.0, 1.0, 1, dims)
+    let err_k1_reset = max_abs_val(r_out, d_v)
+
+    @free(m0) @free(m1) @free(m2) @free(m3) @free(m4)
+    @free(k1 as *u8) @free(k2 as *u8) @free(v1 as *u8) @free(v2 as *u8) @free(v1_new as *u8) @free(r_out as *u8)
+
+    var ok: i64 = 0
+    if err_k1 < 0.000001 and err_k2 < 0.000001 and err_k1_over < 0.000001 and err_k2_keep < 0.000001 and err_k1_reset < 0.000001 {
+        ok = 1
+    }
+    return check_gate("fp32_haib_orthogonal_overwrite_and_reset", ok)
+}
+
+fn fill_deterministic_seq(t_len: i64, m0: *f64, k_seq: *f64, v_seq: *f64, q_seq: *f64,
+                          gamma_seq: *f64, eta_seq: *f64) {
+    let d_v: i64 = 3
+    let d_k: i64 = 4
+    let mn = d_v * d_k
+    var i: i64 = 0
+    while i < mn {
+        m0[i] = (((i * 7 + 3) % 11) as f64 - 5.0) * 0.05
+        i = i + 1
+    }
+    var t: i64 = 0
+    while t < t_len {
+        var ss: f64 = 0.0
+        var j: i64 = 0
+        while j < d_k {
+            let kv = (((t * 13 + j * 5 + 2) % 17) as f64 - 8.0) * 0.1
+            k_seq[t * d_k + j] = kv
+            ss = ss + kv * kv
+            q_seq[t * d_k + j] = (((t * 9 + j * 3 + 1) % 13) as f64 - 6.0) * 0.1
+            j = j + 1
+        }
+        let inv = 1.0 / @sqrt(ss + 0.000001)
+        j = 0
+        while j < d_k {
+            k_seq[t * d_k + j] = k_seq[t * d_k + j] * inv
+            j = j + 1
+        }
+        j = 0
+        while j < d_v {
+            v_seq[t * d_v + j] = (((t * 11 + j * 7 + 4) % 19) as f64 - 9.0) * 0.08
+            j = j + 1
+        }
+        gamma_seq[t] = 0.85 + (((t * 3) % 10) as f64) * 0.01
+        eta_seq[t] = 0.6 + (((t * 5) % 8) as f64) * 0.05
+        t = t + 1
+    }
+}
+
+// 2) Verify two-level segment checkpointing slot budget + exact equivalence + fp32 drift bound.
+fn test_two_level_segment_checkpointing() -> i64 {
+    let budget_512 = nv3_seg_ckpt_slot_budget(512, 64, 8)
+    // 8 coarse + 8 fine + 9 micro = 25 state matrices (vs 513 uncheckpointed)
+    let ok_budget = check_gate("slot_budget_512_is_25", if budget_512 == 25 { 1 } else { 0 })
+
+    let t_len: i64 = 19
+    let d_v: i64 = 3
+    let d_k: i64 = 4
+    let mn = d_v * d_k
+    let m0 = @malloc(mn * 8) as *f64
+    let k_seq = @malloc(t_len * d_k * 8) as *f64
+    let v_seq = @malloc(t_len * d_v * 8) as *f64
+    let q_seq = @malloc(t_len * d_k * 8) as *f64
+    let gamma_seq = @malloc(t_len * 8) as *f64
+    let eta_seq = @malloc(t_len * 8) as *f64
+    let reset_seq = @malloc(t_len * 8) as *i64
+    let dr_seq = @malloc(t_len * d_v * 8) as *f64
+
+    fill_deterministic_seq(t_len, m0, k_seq, v_seq, q_seq, gamma_seq, eta_seq)
+    var t: i64 = 0
+    while t < t_len { reset_seq[t] = 0 t = t + 1 }
+    reset_seq[11] = 1
+    var i: i64 = 0
+    while i < t_len * d_v {
+        dr_seq[i] = (((i * 7 + 1) % 13) as f64 - 6.0) * 0.07
+        i = i + 1
+    }
+
+    let r_ref = @malloc(t_len * d_v * 8) as *f64
+    let dm0_ref = @malloc(mn * 8) as *f64
+    let dk_ref = @malloc(t_len * d_k * 8) as *f64
+    let dv_ref = @malloc(t_len * d_v * 8) as *f64
+    let dq_ref = @malloc(t_len * d_k * 8) as *f64
+    let dg_ref = @malloc(t_len * 8) as *f64
+    let de_ref = @malloc(t_len * 8) as *f64
+
+    let seq_ref = Nv3HaibSeq {
+        t_len: t_len, d_v: d_v, d_k: d_k, m0: m0,
+        k_seq: k_seq, v_seq: v_seq, q_seq: q_seq,
+        gamma_seq: gamma_seq, eta_seq: eta_seq, reset_seq: reset_seq, r_out: r_ref
+    }
+    let g_ref = Nv3HaibSeqGrad {
+        dm0: dm0_ref, dk_seq: dk_ref, dv_seq: dv_ref, dq_seq: dq_ref, dgamma_seq: dg_ref, deta_seq: de_ref
+    }
+    nv3_haib_seq_full_fwd_bwd(seq_ref, dr_seq, g_ref)
+
+    let r_seg = @malloc(t_len * d_v * 8) as *f64
+    let dm0_seg = @malloc(mn * 8) as *f64
+    let dk_seg = @malloc(t_len * d_k * 8) as *f64
+    let dv_seg = @malloc(t_len * d_v * 8) as *f64
+    let dq_seg = @malloc(t_len * d_k * 8) as *f64
+    let dg_seg = @malloc(t_len * 8) as *f64
+    let de_seg = @malloc(t_len * 8) as *f64
+
+    let seq_seg = Nv3HaibSeq {
+        t_len: t_len, d_v: d_v, d_k: d_k, m0: m0,
+        k_seq: k_seq, v_seq: v_seq, q_seq: q_seq,
+        gamma_seq: gamma_seq, eta_seq: eta_seq, reset_seq: reset_seq, r_out: r_seg
+    }
+    let g_seg = Nv3HaibSeqGrad {
+        dm0: dm0_seg, dk_seq: dk_seg, dv_seq: dv_seg, dq_seq: dq_seg, dgamma_seq: dg_seg, deta_seq: de_seg
+    }
+
+    // Mode 0: f64 two-level checkpointing (coarse=6, fine=2 on non-divisible T=19)
+    nv3_haib_seq_two_level_fwd_bwd(seq_seg, dr_seq, g_seg, 6, 2, 0)
+    var max_f64_diff = max_abs_diff(r_ref, r_seg, t_len * d_v)
+    max_f64_diff = nv3_max(max_f64_diff, max_abs_diff(dm0_ref, dm0_seg, mn))
+    max_f64_diff = nv3_max(max_f64_diff, max_abs_diff(dk_ref, dk_seg, t_len * d_k))
+    max_f64_diff = nv3_max(max_f64_diff, max_abs_diff(dv_ref, dv_seg, t_len * d_v))
+    max_f64_diff = nv3_max(max_f64_diff, max_abs_diff(dq_ref, dq_seg, t_len * d_k))
+    max_f64_diff = nv3_max(max_f64_diff, max_abs_diff(dg_ref, dg_seg, t_len))
+    max_f64_diff = nv3_max(max_f64_diff, max_abs_diff(de_ref, de_seg, t_len))
+    let ok_exact = check_gate("two_level_f64_matches_full_bwd", if max_f64_diff < 1.0e-13 { 1 } else { 0 })
+
+    // Mode 1: fp32-state two-level checkpointing (4-byte *f32 checkpoint pools)
+    nv3_haib_seq_two_level_fwd_bwd(seq_seg, dr_seq, g_seg, 6, 2, 1)
+    var max_f32_diff = max_abs_diff(r_ref, r_seg, t_len * d_v)
+    max_f32_diff = nv3_max(max_f32_diff, max_abs_diff(dm0_ref, dm0_seg, mn))
+    max_f32_diff = nv3_max(max_f32_diff, max_abs_diff(dk_ref, dk_seg, t_len * d_k))
+    max_f32_diff = nv3_max(max_f32_diff, max_abs_diff(dv_ref, dv_seg, t_len * d_v))
+    max_f32_diff = nv3_max(max_f32_diff, max_abs_diff(dq_ref, dq_seg, t_len * d_k))
+    max_f32_diff = nv3_max(max_f32_diff, max_abs_diff(dg_ref, dg_seg, t_len))
+    max_f32_diff = nv3_max(max_f32_diff, max_abs_diff(de_ref, de_seg, t_len))
+    let ok_fp32 = check_gate("two_level_fp32_drift_within_1e5", if max_f32_diff < 0.00001 { 1 } else { 0 })
+
+    @free(m0 as *u8) @free(k_seq as *u8) @free(v_seq as *u8) @free(q_seq as *u8)
+    @free(gamma_seq as *u8) @free(eta_seq as *u8) @free(reset_seq as *u8) @free(dr_seq as *u8)
+    @free(r_ref as *u8) @free(dm0_ref as *u8) @free(dk_ref as *u8) @free(dv_ref as *u8)
+    @free(dq_ref as *u8) @free(dg_ref as *u8) @free(de_ref as *u8)
+    @free(r_seg as *u8) @free(dm0_seg as *u8) @free(dk_seg as *u8) @free(dv_seg as *u8)
+    @free(dq_seg as *u8) @free(dg_seg as *u8) @free(de_seg as *u8)
+
+    if ok_budget == 1 and ok_exact == 1 and ok_fp32 == 1 { return 1 }
+    return 0
+}
+
+// 3) Negative tests for future leakage & cross-document reset boundary leakage.
+fn test_causality_and_reset_isolation() -> i64 {
+    let t_len: i64 = 16
+    let d_v: i64 = 3
+    let d_k: i64 = 4
+    let mn = d_v * d_k
+    let split_t: i64 = 9
+
+    let m0 = @malloc(mn * 8) as *f64
+    let k_seq = @malloc(t_len * d_k * 8) as *f64
+    let v_seq = @malloc(t_len * d_v * 8) as *f64
+    let q_seq = @malloc(t_len * d_k * 8) as *f64
+    let gamma_seq = @malloc(t_len * 8) as *f64
+    let eta_seq = @malloc(t_len * 8) as *f64
+    let reset_seq = @malloc(t_len * 8) as *i64
+    let dr_seq = @malloc(t_len * d_v * 8) as *f64
+    let r_a = @malloc(t_len * d_v * 8) as *f64
+    let r_b = @malloc(t_len * d_v * 8) as *f64
+    let dm0 = @malloc(mn * 8) as *f64
+    let dk = @malloc(t_len * d_k * 8) as *f64
+    let dv = @malloc(t_len * d_v * 8) as *f64
+    let dq = @malloc(t_len * d_k * 8) as *f64
+    let dg = @malloc(t_len * 8) as *f64
+    let de = @malloc(t_len * 8) as *f64
+
+    fill_deterministic_seq(t_len, m0, k_seq, v_seq, q_seq, gamma_seq, eta_seq)
+    var t: i64 = 0
+    while t < t_len { reset_seq[t] = 0 t = t + 1 }
+    nv3_zero(dr_seq, t_len * d_v)
+
+    let seq_a = Nv3HaibSeq {
+        t_len: t_len, d_v: d_v, d_k: d_k, m0: m0,
+        k_seq: k_seq, v_seq: v_seq, q_seq: q_seq,
+        gamma_seq: gamma_seq, eta_seq: eta_seq, reset_seq: reset_seq, r_out: r_a
+    }
+    let g = Nv3HaibSeqGrad { dm0: dm0, dk_seq: dk, dv_seq: dv, dq_seq: dq, dgamma_seq: dg, deta_seq: de }
+    nv3_haib_seq_two_level_fwd_bwd(seq_a, dr_seq, g, 5, 2, 1)
+
+    // Mutate all future positions t >= split_t drastically; prefix r[0..split_t-1] MUST be bit-identical
+    t = split_t
+    while t < t_len {
+        var j: i64 = 0
+        while j < d_k {
+            k_seq[t * d_k + j] = 0.5
+            q_seq[t * d_k + j] = -99.0
+            j = j + 1
+        }
+        j = 0
+        while j < d_v {
+            v_seq[t * d_v + j] = 777.0
+            j = j + 1
+        }
+        gamma_seq[t] = 0.1
+        eta_seq[t] = 2.0
+        t = t + 1
+    }
+    let seq_b = Nv3HaibSeq {
+        t_len: t_len, d_v: d_v, d_k: d_k, m0: m0,
+        k_seq: k_seq, v_seq: v_seq, q_seq: q_seq,
+        gamma_seq: gamma_seq, eta_seq: eta_seq, reset_seq: reset_seq, r_out: r_b
+    }
+    nv3_haib_seq_two_level_fwd_bwd(seq_b, dr_seq, g, 5, 2, 1)
+    let leak_haib = max_abs_diff(r_a, r_b, split_t * d_v)
+    let ok_causal_haib = check_gate("no_future_leakage_haib_seq", if leak_haib == 0.0 { 1 } else { 0 })
+
+    // Also verify CausalDepthwiseConv1D has zero future leakage when t >= split_t is mutated
+    let conv_dims = Nv3ConvDims { t_len: t_len, channels: d_v, kernel: 4 }
+    let cw = @malloc(d_v * 4 * 8) as *f64
+    let cb = @malloc(d_v * 8) as *f64
+    var ci: i64 = 0
+    while ci < d_v * 4 { cw[ci] = 0.25 ci = ci + 1 }
+    ci = 0
+    while ci < d_v { cb[ci] = 0.1 ci = ci + 1 }
+    nv3_causal_depthwise_conv1d_forward(v_seq, cw, cb, r_a, conv_dims)
+    t = split_t
+    while t < t_len {
+        var j: i64 = 0
+        while j < d_v { v_seq[t * d_v + j] = -12345.0 j = j + 1 }
+        t = t + 1
+    }
+    nv3_causal_depthwise_conv1d_forward(v_seq, cw, cb, r_b, conv_dims)
+    let leak_conv = max_abs_diff(r_a, r_b, split_t * d_v)
+    let ok_causal_conv = check_gate("no_future_leakage_causal_conv1d", if leak_conv == 0.0 { 1 } else { 0 })
+
+    // Document reset isolation: reset_seq[split_t] = 1, upstream loss ONLY in [split_t .. t_len-1]
+    reset_seq[split_t] = 1
+    nv3_zero(dr_seq, t_len * d_v)
+    t = split_t
+    while t < t_len {
+        var j: i64 = 0
+        while j < d_v { dr_seq[t * d_v + j] = 1.0 j = j + 1 }
+        t = t + 1
+    }
+    nv3_haib_seq_two_level_fwd_bwd(seq_b, dr_seq, g, 5, 2, 1)
+    var pre_reset_grad = max_abs_val(dm0, mn)
+    pre_reset_grad = nv3_max(pre_reset_grad, max_abs_val(dk, split_t * d_k))
+    pre_reset_grad = nv3_max(pre_reset_grad, max_abs_val(dv, split_t * d_v))
+    pre_reset_grad = nv3_max(pre_reset_grad, max_abs_val(dq, split_t * d_k))
+    pre_reset_grad = nv3_max(pre_reset_grad, max_abs_val(dg, split_t))
+    pre_reset_grad = nv3_max(pre_reset_grad, max_abs_val(de, split_t))
+    let ok_reset_bwd = check_gate("reset_boundary_blocks_grad_leakage", if pre_reset_grad == 0.0 { 1 } else { 0 })
+
+    @free(cw as *u8) @free(cb as *u8)
+    @free(m0 as *u8) @free(k_seq as *u8) @free(v_seq as *u8) @free(q_seq as *u8)
+    @free(gamma_seq as *u8) @free(eta_seq as *u8) @free(reset_seq as *u8) @free(dr_seq as *u8)
+    @free(r_a as *u8) @free(r_b as *u8) @free(dm0 as *u8) @free(dk as *u8) @free(dv as *u8)
+    @free(dq as *u8) @free(dg as *u8) @free(de as *u8)
+
+    if ok_causal_haib == 1 and ok_causal_conv == 1 and ok_reset_bwd == 1 { return 1 }
+    return 0
+}
+
+fn main() -> i64 {
+    let ok1 = test_haib_orthogonal_overwrite_f32()
+    let ok2 = test_two_level_segment_checkpointing()
+    let ok3 = test_causality_and_reset_isolation()
+    if ok1 == 1 and ok2 == 1 and ok3 == 1 {
+        println("ALL_PASS")
+        return 0
+    }
+    println("SOME_FAIL")
+    return 1
+}

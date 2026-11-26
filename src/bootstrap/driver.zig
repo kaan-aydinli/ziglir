@@ -130,12 +130,12 @@ pub const Compiler = struct {
             .diag = diag,
         };
         parser_inst.parse();
-        if (parser_inst.invalid_syntax) return error.InvalidSyntax;
-        if (parser_inst.unsupported_float_literal) return error.UnsupportedFloatLiteral;
         if (ast.overflowed) {
             diag.addCodedAt(.limit_ast_capacity, .err, source_id, 1, 1, 1, "AST or metadata capacity exceeded");
             return error.TooManyASTNodes;
         }
+        if (parser_inst.invalid_syntax) return error.InvalidSyntax;
+        if (parser_inst.unsupported_float_literal) return error.UnsupportedFloatLiteral;
         if (parser_inst.invalid_integer_literal) {
             diag.addCodedAt(.lex_integer_literal, .err, source_id, parser_inst.invalid_integer_line, parser_inst.invalid_integer_col, parser_inst.invalid_integer_len, "malformed or out-of-range i64 integer literal");
             return error.InvalidIntegerLiteral;

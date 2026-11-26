@@ -1,0 +1,33 @@
+{
+  "schema": "noema_v3_blind_key_v1",
+  "items": [
+    {
+      "item_id": "blind_item_01",
+      "salt_prefix": "c74eca0d7c5a1e9c",
+      "option_A_model": "noema_v3_unscaled_single_shard",
+      "option_B_model": "noema_v3_scaled_multishard",
+      "assignment_commitment_sha256": "d6ccfe5976ca6976b3fb395c60cfb50e6e1e4f5a4dd27bf80f9336f87079211e"
+    },
+    {
+      "item_id": "blind_item_02",
+      "salt_prefix": "ddf090f499cf4739",
+      "option_A_model": "noema_v3_unscaled_single_shard",
+      "option_B_model": "noema_v3_scaled_multishard",
+      "assignment_commitment_sha256": "22311ee61f1ed9debb95012ed9d23ba431246c891416de8c4dff532c90db88bb"
+    },
+    {
+      "item_id": "blind_item_03",
+      "salt_prefix": "db197bb22e3aabd3",
+      "option_A_model": "noema_v3_unscaled_single_shard",
+      "option_B_model": "noema_v3_scaled_multishard",
+      "assignment_commitment_sha256": "7a81d41c2e156b9a7fc784d4565d4aae80f123c3dd261de8614e16da2021a5e3"
+    },
+    {
+      "item_id": "blind_item_04",
+      "salt_prefix": "018a51083ae710f7",
+      "option_A_model": "noema_v3_unscaled_single_shard",
+      "option_B_model": "noema_v3_scaled_multishard",
+      "assignment_commitment_sha256": "a957dcca4381e290b25b1b4863c0dc7248b3f32b9fd8c5cac1bbe31b583ad6b6"
+    }
+  ]
+}

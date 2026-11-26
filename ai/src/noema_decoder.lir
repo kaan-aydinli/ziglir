@@ -129,6 +129,9 @@ fn noema_decoder_load(weights: *u8, path: string) -> i64 {
     return 1
 }
 
+// LEGACY / ISOLATED (NOEMA v3 Phase 0): fixed decoder, not NOEMA v3 weight-generation.
+// New work belongs under ai/src/noema_v3/.
+
 /// Greedy conditional decoding; each output position scores weights for the
 /// active prompt feature bins. Generation depends on both the input and weights.
 fn noema_decoder_generate(weights: *u8, class_id: i64, input_features: *u8, input_dim: i64, output: *u8, capacity: i64) -> i64 {

@@ -1,0 +1,545 @@
+// NOEMA v3 Phase 2: Pure-LIR SoA Shard Reader, Validator, and Writer.
+// Binary SoA contract (zero-parse, fail-closed, provenance-isolated):
+//   stream.bin : u8[N] raw UTF-8 byte stream (zero tokenizer)
+//   prov.bin   : u8[N] provenance tags in 0..4 (NOEMA_V3_PROV_*)
+//   reset.bit  : u8[(N+7)/8] MSB-first document/segment reset bitset
+//   weight.bin : binary32[N] little-endian IEEE-754 float32 loss weights (>= 0, finite)
+//   docs.idx   : 16-byte header ("NV3D", version=3, num_docs=D) + D * 32-byte records:
+//                [byte_offset:u64, byte_length:u64, manifest_hash64:u64, fnv1a64:u64]
+
+import "noema_v3_contract.lir"
+import "noema_v3_math.lir"
+
+const NV3_DOCS_MAGIC_LE: i64 = 1144215118
+const NV3_FNV1A_OFFSET_I64: i64 = -3750763034362895579
+const NV3_FNV1A_PRIME_I64: i64 = 1099511628211
+
+struct Nv3SoaShard {
+    ok: i64
+    error_code: i64
+    num_bytes: i64
+    num_docs: i64
+    read_docs: i64
+    accepted_docs: i64
+    rejected_docs: i64
+    stream: *u8
+    prov: *i64
+    reset: *i64
+    weights: *f64
+    doc_offsets: *i64
+    doc_lengths: *i64
+    doc_manifest_hashes: *i64
+}
+
+fn nv3_fnv1a64(buf: *u8, len: i64) -> i64 {
+    var h: i64 = NV3_FNV1A_OFFSET_I64
+    var i: i64 = 0
+    while i < len {
+        let b = (@read_u8(@ptr_add(buf, i)) as i64) & 255
+        h = @wrapping_mul(h ^ b, NV3_FNV1A_PRIME_I64)
+        i = i + 1
+    }
+    return h
+}
+
+fn nv3_write_all_file(path: string, buf: *u8, len: i64) -> i64 {
+    if len < 0 { return 0 }
+    let fd = @open(path, 577, 420)
+    if fd < 0 { return 0 }
+    var off: i64 = 0
+    while off < len {
+        let n = @write(fd, @ptr_add(buf, off), len - off)
+        if n <= 0 {
+            let _c = @close(fd)
+            return 0
+        }
+        off = off + n
+    }
+    let _c = @close(fd)
+    return 1
+}
+
+// Reads an entire file up to max_bytes. Writes actual byte length into out_len[0].
+// Returns null (0 as *u8) if missing, empty when disallowed, or exceeds max_bytes.
+fn nv3_read_entire_file(path: string, max_bytes: i64, out_len: *i64) -> *u8 {
+    out_len[0] = -1
+    let fd = @open(path, 0, 0)
+    if fd < 0 { return 0 as *u8 }
+    let cap = max_bytes + 1
+    let tmp = @malloc(cap)
+    var total: i64 = 0
+    var reading: i64 = 1
+    while reading == 1 and total < cap {
+        let n = @read(fd, @ptr_add(tmp, total), cap - total)
+        if n < 0 {
+            let _c = @close(fd)
+            @free(tmp)
+            return 0 as *u8
+        }
+        if n == 0 {
+            reading = 0
+        } else {
+            total = total + n
+        }
+    }
+    let _c = @close(fd)
+    if total > max_bytes {
+        @free(tmp)
+        return 0 as *u8
+    }
+    let alloc_sz = if total > 0 { total } else { 1 }
+    let exact = @malloc(alloc_sz)
+    if total > 0 {
+        @memcpy(exact, tmp, total)
+    }
+    @free(tmp)
+    out_len[0] = total
+    return exact
+}
+
+fn nv3_soa_empty_fail(err_code: i64, r_docs: i64, acc_docs: i64, rej_docs: i64) -> Nv3SoaShard {
+    let dummy1 = @malloc(8)
+    let dummy2 = @malloc(8) as *i64
+    let dummy3 = @malloc(8) as *i64
+    let dummy4 = @malloc(8) as *f64
+    let dummy5 = @malloc(8) as *i64
+    let dummy6 = @malloc(8) as *i64
+    let dummy7 = @malloc(8) as *i64
+    return Nv3SoaShard {
+        ok: 0,
+        error_code: err_code,
+        num_bytes: 0,
+        num_docs: 0,
+        read_docs: r_docs,
+        accepted_docs: acc_docs,
+        rejected_docs: rej_docs,
+        stream: dummy1,
+        prov: dummy2,
+        reset: dummy3,
+        weights: dummy4,
+        doc_offsets: dummy5,
+        doc_lengths: dummy6,
+        doc_manifest_hashes: dummy7
+    }
+}
+
+fn nv3_soa_free(shard: Nv3SoaShard) {
+    @free(shard.stream)
+    @free(shard.prov as *u8)
+    @free(shard.reset as *u8)
+    @free(shard.weights as *u8)
+    @free(shard.doc_offsets as *u8)
+    @free(shard.doc_lengths as *u8)
+    @free(shard.doc_manifest_hashes as *u8)
+}
+
+// Load and fail-closed validate a SoA shard directory in pure LIR.
+fn nv3_soa_load(dir_path: string, max_bytes: i64) -> Nv3SoaShard {
+    let len_box = @malloc(8) as *i64
+
+    let stream_buf = nv3_read_entire_file(dir_path + "/stream.bin", max_bytes, len_box)
+    let n_bytes = len_box[0]
+    if stream_buf == (0 as *u8) or n_bytes <= 0 {
+        if stream_buf != (0 as *u8) { @free(stream_buf) }
+        @free(len_box as *u8)
+        return nv3_soa_empty_fail(1, 0, 0, 0)
+    }
+
+    let prov_raw = nv3_read_entire_file(dir_path + "/prov.bin", max_bytes, len_box)
+    let prov_len = len_box[0]
+    if prov_raw == (0 as *u8) or prov_len != n_bytes {
+        if prov_raw != (0 as *u8) { @free(prov_raw) }
+        @free(stream_buf)
+        @free(len_box as *u8)
+        return nv3_soa_empty_fail(2, 0, 0, 0)
+    }
+
+    let expected_reset_bytes = (n_bytes + 7) / 8
+    let reset_raw = nv3_read_entire_file(dir_path + "/reset.bit", expected_reset_bytes + 16, len_box)
+    let reset_len = len_box[0]
+    if reset_raw == (0 as *u8) or reset_len != expected_reset_bytes {
+        if reset_raw != (0 as *u8) { @free(reset_raw) }
+        @free(prov_raw)
+        @free(stream_buf)
+        @free(len_box as *u8)
+        return nv3_soa_empty_fail(3, 0, 0, 0)
+    }
+
+    let expected_weight_bytes = n_bytes * 4
+    let weight_raw = nv3_read_entire_file(dir_path + "/weight.bin", expected_weight_bytes + 16, len_box)
+    let weight_len = len_box[0]
+    if weight_raw == (0 as *u8) or weight_len != expected_weight_bytes {
+        if weight_raw != (0 as *u8) { @free(weight_raw) }
+        @free(reset_raw)
+        @free(prov_raw)
+        @free(stream_buf)
+        @free(len_box as *u8)
+        return nv3_soa_empty_fail(4, 0, 0, 0)
+    }
+
+    let docs_raw = nv3_read_entire_file(dir_path + "/docs.idx", max_bytes * 32 + 64, len_box)
+    let docs_len = len_box[0]
+    @free(len_box as *u8)
+    if docs_raw == (0 as *u8) or docs_len < 48 {
+        if docs_raw != (0 as *u8) { @free(docs_raw) }
+        @free(weight_raw) @free(reset_raw) @free(prov_raw) @free(stream_buf)
+        return nv3_soa_empty_fail(5, 0, 0, 0)
+    }
+
+    // Validate docs.idx header: magic "NV3D", version 3, exact size 16 + D*32
+    let magic = (@read_u32(docs_raw) as i64) & 4294967295
+    let ver = (@read_u32(@ptr_add(docs_raw, 4)) as i64) & 4294967295
+    let n_docs = @read_u64(@ptr_add(docs_raw, 8))
+    if magic != NV3_DOCS_MAGIC_LE or ver != NOEMA_V3_SCHEMA_VERSION or n_docs <= 0 or docs_len != (16 + n_docs * 32) {
+        @free(docs_raw) @free(weight_raw) @free(reset_raw) @free(prov_raw) @free(stream_buf)
+        return nv3_soa_empty_fail(6, 0, 0, 0)
+    }
+
+    // Unpack prov, reset, weights and validate per-byte invariants
+    let prov_arr = @malloc(n_bytes * 8) as *i64
+    let reset_arr = @malloc(n_bytes * 8) as *i64
+    let weights_arr = @malloc(n_bytes * 8) as *f64
+    nv3_f32_to_f64_buf(weights_arr, weight_raw, n_bytes)
+
+    var byte_ok: i64 = 1
+    var t: i64 = 0
+    while t < n_bytes {
+        let ptag = (@read_u8(@ptr_add(prov_raw, t)) as i64) & 255
+        if ptag < 0 or ptag > NOEMA_V3_PROV_HYPOTHESIS {
+            byte_ok = 0
+        }
+        prov_arr[t] = ptag
+        let rbyte = (@read_u8(@ptr_add(reset_raw, t / 8)) as i64) & 255
+        let rbit = (rbyte >> (7 - (t % 8))) & 1
+        reset_arr[t] = rbit
+        if nv3_is_finite(weights_arr[t]) == 0 or weights_arr[t] < 0.0 {
+            byte_ok = 0
+        }
+        t = t + 1
+    }
+
+    @free(prov_raw)
+    @free(reset_raw)
+    @free(weight_raw)
+
+    if byte_ok == 0 {
+        @free(docs_raw) @free(stream_buf)
+        @free(prov_arr as *u8) @free(reset_arr as *u8) @free(weights_arr as *u8)
+        return nv3_soa_empty_fail(7, n_docs, 0, n_docs)
+    }
+
+    // Validate every document descriptor & FNV-1a checksum; enforce read == accepted + rejected
+    let doc_offsets = @malloc(n_docs * 8) as *i64
+    let doc_lengths = @malloc(n_docs * 8) as *i64
+    let doc_mhashes = @malloc(n_docs * 8) as *i64
+
+    var expected_off: i64 = 0
+    var accepted: i64 = 0
+    var rejected: i64 = 0
+    var d: i64 = 0
+    while d < n_docs {
+        let rec = @ptr_add(docs_raw, 16 + d * 32)
+        let d_off = @read_u64(rec)
+        let d_len = @read_u64(@ptr_add(rec, 8))
+        let d_mh = @read_u64(@ptr_add(rec, 16))
+        let d_ck = @read_u64(@ptr_add(rec, 24))
+
+        doc_offsets[d] = d_off
+        doc_lengths[d] = d_len
+        doc_mhashes[d] = d_mh
+
+        var doc_valid: i64 = 1
+        if d_off != expected_off or d_len <= 0 or (d_off + d_len) > n_bytes {
+            doc_valid = 0
+        } else {
+            // Document start MUST carry reset bit == 1 to prevent cross-document leakage
+            if reset_arr[d_off] != 1 {
+                doc_valid = 0
+            }
+            let actual_ck = nv3_fnv1a64(@ptr_add(stream_buf, d_off), d_len)
+            if actual_ck != d_ck {
+                doc_valid = 0
+            }
+            expected_off = d_off + d_len
+        }
+        if doc_valid == 1 {
+            accepted = accepted + 1
+        } else {
+            rejected = rejected + 1
+        }
+        d = d + 1
+    }
+    @free(docs_raw)
+
+    if rejected > 0 or expected_off != n_bytes or (accepted + rejected) != n_docs {
+        @free(stream_buf)
+        @free(prov_arr as *u8) @free(reset_arr as *u8) @free(weights_arr as *u8)
+        @free(doc_offsets as *u8) @free(doc_lengths as *u8) @free(doc_mhashes as *u8)
+        return nv3_soa_empty_fail(8, n_docs, accepted, rejected)
+    }
+
+    return Nv3SoaShard {
+        ok: 1,
+        error_code: 0,
+        num_bytes: n_bytes,
+        num_docs: n_docs,
+        read_docs: n_docs,
+        accepted_docs: accepted,
+        rejected_docs: 0,
+        stream: stream_buf,
+        prov: prov_arr,
+        reset: reset_arr,
+        weights: weights_arr,
+        doc_offsets: doc_offsets,
+        doc_lengths: doc_lengths,
+        doc_manifest_hashes: doc_mhashes
+    }
+}
+
+struct Nv3SoaWriteSpec {
+    num_bytes: i64
+    num_docs: i64
+    stream: *u8
+    prov: *i64
+    reset: *i64
+    weights: *f64
+    doc_offsets: *i64
+    doc_lengths: *i64
+    doc_manifest_hashes: *i64
+}
+
+// Write binary SoA files (stream.bin, prov.bin, reset.bit, weight.bin, docs.idx) in pure LIR.
+fn nv3_soa_write(dir_path: string, spec: Nv3SoaWriteSpec) -> i64 {
+    let n = spec.num_bytes
+    let d_cnt = spec.num_docs
+    if n <= 0 or d_cnt <= 0 { return 0 }
+    let _mk = @mkdir(dir_path, 493)
+
+    let prov_raw = @malloc(n)
+    let reset_bytes = (n + 7) / 8
+    let reset_raw = @malloc(reset_bytes)
+    @memset(reset_raw, 0, reset_bytes)
+    let weight_raw = @malloc(n * 4)
+    nv3_f64_to_f32_buf(weight_raw, spec.weights, n)
+
+    var t: i64 = 0
+    while t < n {
+        @write_u8(@ptr_add(prov_raw, t), (spec.prov[t] & 255) as u8)
+        if spec.reset[t] != 0 {
+            let b_idx = t / 8
+            let cur = (@read_u8(@ptr_add(reset_raw, b_idx)) as i64) & 255
+            let next_b = cur | (1 << (7 - (t % 8)))
+            @write_u8(@ptr_add(reset_raw, b_idx), next_b as u8)
+        }
+        t = t + 1
+    }
+
+    let docs_bytes = 16 + d_cnt * 32
+    let docs_raw = @malloc(docs_bytes)
+    @write_u32(docs_raw, NV3_DOCS_MAGIC_LE as u32)
+    @write_u32(@ptr_add(docs_raw, 4), NOEMA_V3_SCHEMA_VERSION as u32)
+    @write_u64(@ptr_add(docs_raw, 8), d_cnt)
+
+    var d: i64 = 0
+    while d < d_cnt {
+        let rec = @ptr_add(docs_raw, 16 + d * 32)
+        let off = spec.doc_offsets[d]
+        let ln = spec.doc_lengths[d]
+        let ck = nv3_fnv1a64(@ptr_add(spec.stream, off), ln)
+        @write_u64(rec, off)
+        @write_u64(@ptr_add(rec, 8), ln)
+        @write_u64(@ptr_add(rec, 16), spec.doc_manifest_hashes[d])
+        @write_u64(@ptr_add(rec, 24), ck)
+        d = d + 1
+    }
+
+    let ok1 = nv3_write_all_file(dir_path + "/stream.bin", spec.stream, n)
+    let ok2 = nv3_write_all_file(dir_path + "/prov.bin", prov_raw, n)
+    let ok3 = nv3_write_all_file(dir_path + "/reset.bit", reset_raw, reset_bytes)
+    let ok4 = nv3_write_all_file(dir_path + "/weight.bin", weight_raw, n * 4)
+    let ok5 = nv3_write_all_file(dir_path + "/docs.idx", docs_raw, docs_bytes)
+
+    @free(prov_raw)
+    @free(reset_raw)
+    @free(weight_raw)
+    @free(docs_raw)
+
+    if ok1 == 1 and ok2 == 1 and ok3 == 1 and ok4 == 1 and ok5 == 1 { return 1 }
+    return 0
+}
+
+// Matches exact 12-byte "<veriayrimi>" delimiter at `pos` in `buf[0..len)`.
+fn nv3_is_veriayrimi_at(buf: *u8, len: i64, pos: i64) -> i64 {
+    if pos < 0 or (pos + 12) > len { return 0 }
+    if ((@read_u8(@ptr_add(buf, pos)) as i64) & 255) != 60 { return 0 }
+    if ((@read_u8(@ptr_add(buf, pos + 1)) as i64) & 255) != 118 { return 0 }
+    if ((@read_u8(@ptr_add(buf, pos + 2)) as i64) & 255) != 101 { return 0 }
+    if ((@read_u8(@ptr_add(buf, pos + 3)) as i64) & 255) != 114 { return 0 }
+    if ((@read_u8(@ptr_add(buf, pos + 4)) as i64) & 255) != 105 { return 0 }
+    if ((@read_u8(@ptr_add(buf, pos + 5)) as i64) & 255) != 97 { return 0 }
+    if ((@read_u8(@ptr_add(buf, pos + 6)) as i64) & 255) != 121 { return 0 }
+    if ((@read_u8(@ptr_add(buf, pos + 7)) as i64) & 255) != 114 { return 0 }
+    if ((@read_u8(@ptr_add(buf, pos + 8)) as i64) & 255) != 105 { return 0 }
+    if ((@read_u8(@ptr_add(buf, pos + 9)) as i64) & 255) != 109 { return 0 }
+    if ((@read_u8(@ptr_add(buf, pos + 10)) as i64) & 255) != 105 { return 0 }
+    if ((@read_u8(@ptr_add(buf, pos + 11)) as i64) & 255) != 62 { return 0 }
+    return 1
+}
+
+fn nv3_segment_has_non_ws(buf: *u8, a: i64, b: i64) -> i64 {
+    var k = a
+    while k < b {
+        let ch = (@read_u8(@ptr_add(buf, k)) as i64) & 255
+        if ch != 9 and ch != 10 and ch != 13 and ch != 32 { return 1 }
+        k = k + 1
+    }
+    return 0
+}
+
+// Splits a raw UTF-8 corpus buffer on `<veriayrimi>` (supporting both standalone `<veriayrimi>` lines
+// and inline `<veriayrimi>` tags), strips `<veriayrimi>` framing bytes, sets `reset = 1` at each
+// document start, and writes an NV3D v3 binary SoA shard to `dir_path`.
+// Returns number of packed documents (> 0) on success, 0 on failure.
+fn nv3_soa_pack_veriayrimi(
+    dir_path: string,
+    src_buf: *u8,
+    src_len: i64,
+    default_prov: i64,
+    out_payload_bytes: *i64
+) -> i64 {
+    out_payload_bytes[0] = 0
+    if src_len <= 0 or default_prov < 0 or default_prov > NOEMA_V3_PROV_HYPOTHESIS { return 0 }
+
+    let max_docs = (src_len / 2) + 8
+    let seg_starts = @malloc(max_docs * 8) as *i64
+    let seg_ends = @malloc(max_docs * 8) as *i64
+    var n_docs: i64 = 0
+
+    var cur_start: i64 = 0
+    var pos: i64 = 0
+    while pos < src_len {
+        if nv3_is_veriayrimi_at(src_buf, src_len, pos) == 1 {
+            // Check if `<veriayrimi>` stands alone on its physical line
+            var cut_end = pos
+            if pos == 0 or ((@read_u8(@ptr_add(src_buf, pos - 1)) as i64) & 255) == 10 {
+                let after = pos + 12
+                if after == src_len {
+                    if nv3_segment_has_non_ws(src_buf, cur_start, cut_end) == 1 {
+                        seg_starts[n_docs] = cur_start
+                        seg_ends[n_docs] = cut_end
+                        n_docs = n_docs + 1
+                    }
+                    cur_start = src_len
+                    pos = src_len
+                } else {
+                    let b_next = (@read_u8(@ptr_add(src_buf, after)) as i64) & 255
+                    if b_next == 10 {
+                        if nv3_segment_has_non_ws(src_buf, cur_start, cut_end) == 1 {
+                            seg_starts[n_docs] = cur_start
+                            seg_ends[n_docs] = cut_end
+                            n_docs = n_docs + 1
+                        }
+                        cur_start = after + 1
+                        pos = after + 1
+                    } else if b_next == 13 and (after + 1) < src_len and ((@read_u8(@ptr_add(src_buf, after + 1)) as i64) & 255) == 10 {
+                        if nv3_segment_has_non_ws(src_buf, cur_start, cut_end) == 1 {
+                            seg_starts[n_docs] = cur_start
+                            seg_ends[n_docs] = cut_end
+                            n_docs = n_docs + 1
+                        }
+                        cur_start = after + 2
+                        pos = after + 2
+                    } else {
+                        if nv3_segment_has_non_ws(src_buf, cur_start, cut_end) == 1 {
+                            seg_starts[n_docs] = cur_start
+                            seg_ends[n_docs] = cut_end
+                            n_docs = n_docs + 1
+                        }
+                        cur_start = after
+                        pos = after
+                    }
+                }
+            } else {
+                // Inline `<veriayrimi>` delimiter
+                if nv3_segment_has_non_ws(src_buf, cur_start, cut_end) == 1 {
+                    seg_starts[n_docs] = cur_start
+                    seg_ends[n_docs] = cut_end
+                    n_docs = n_docs + 1
+                }
+                cur_start = pos + 12
+                pos = pos + 12
+            }
+        } else {
+            pos = pos + 1
+        }
+    }
+    if cur_start < src_len and nv3_segment_has_non_ws(src_buf, cur_start, src_len) == 1 {
+        seg_starts[n_docs] = cur_start
+        seg_ends[n_docs] = src_len
+        n_docs = n_docs + 1
+    }
+
+    if n_docs <= 0 {
+        @free(seg_starts as *u8)
+        @free(seg_ends as *u8)
+        return 0
+    }
+
+    var total_bytes: i64 = 0
+    var d: i64 = 0
+    while d < n_docs {
+        total_bytes = total_bytes + (seg_ends[d] - seg_starts[d])
+        d = d + 1
+    }
+
+    let stream = @malloc(total_bytes)
+    let prov = @malloc(total_bytes * 8) as *i64
+    let rst = @malloc(total_bytes * 8) as *i64
+    let wts = @malloc(total_bytes * 8) as *f64
+    let doff = @malloc(n_docs * 8) as *i64
+    let dlen = @malloc(n_docs * 8) as *i64
+    let dmh = @malloc(n_docs * 8) as *i64
+
+    var out_off: i64 = 0
+    d = 0
+    while d < n_docs {
+        let sa = seg_starts[d]
+        let sb = seg_ends[d]
+        let ln = sb - sa
+        doff[d] = out_off
+        dlen[d] = ln
+        var k: i64 = 0
+        while k < ln {
+            let b = @read_u8(@ptr_add(src_buf, sa + k))
+            @write_u8(@ptr_add(stream, out_off + k), b)
+            prov[out_off + k] = default_prov
+            rst[out_off + k] = if k == 0 { 1 } else { 0 }
+            wts[out_off + k] = 1.0
+            k = k + 1
+        }
+        dmh[d] = nv3_fnv1a64(@ptr_add(stream, out_off), ln)
+        out_off = out_off + ln
+        d = d + 1
+    }
+
+    let wok = nv3_soa_write(dir_path, Nv3SoaWriteSpec {
+        num_bytes: total_bytes,
+        num_docs: n_docs,
+        stream: stream,
+        prov: prov,
+        reset: rst,
+        weights: wts,
+        doc_offsets: doff,
+        doc_lengths: dlen,
+        doc_manifest_hashes: dmh
+    })
+
+    @free(stream) @free(prov as *u8) @free(rst as *u8) @free(wts as *u8)
+    @free(doff as *u8) @free(dlen as *u8) @free(dmh as *u8)
+    @free(seg_starts as *u8) @free(seg_ends as *u8)
+
+    if wok != 1 { return 0 }
+    out_payload_bytes[0] = total_bytes
+    return n_docs
+}
+

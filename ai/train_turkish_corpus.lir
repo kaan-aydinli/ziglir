@@ -1,4 +1,4 @@
-// Read a plain-text corpus and split topics only on standalone '---' lines.
+// Read a plain-text corpus and split topics on '<veriayrimi>' delimiters.
 // Every topic is passed unchanged as raw UTF-8 to a distinct pretraining record.
 // Run from repository root: ./zig-out/bin/lir run ai/train_turkish_corpus.lir --backend=native
 import "src/noema_pretrain.lir"

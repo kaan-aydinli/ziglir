@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "NOEMA v3 Data Manifest Entry",
+  "version": "0.1.0-phase0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "source_id",
+    "source_family",
+    "license",
+    "language",
+    "acquired_date",
+    "content_sha256",
+    "content_blake3",
+    "near_duplicate_cluster_id",
+    "byte_length",
+    "split_eligibility"
+  ],
+  "properties": {
+    "source_id": { "type": "string", "minLength": 1, "description": "Stable unique source identifier." },
+    "source_family": { "type": "string", "minLength": 1, "description": "Family/group used for leakage-free split; all near-duplicates and same-family variants stay in same split." },
+    "license": { "type": "string", "minLength": 1, "description": "License identifier or reviewed policy label; must be allowlisted before training." },
+    "language": { "type": "string", "pattern": "^[a-zA-Z]{2,3}(-[a-zA-Z0-9]+)*$", "description": "BCP-47 language tag." },
+    "acquired_date": { "type": "string", "format": "date", "description": "Source acquisition date (YYYY-MM-DD)." },
+    "content_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "content_blake3": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "near_duplicate_cluster_id": { "type": "string", "minLength": 1, "description": "MinHash/SimHash cluster id; cluster must not cross splits." },
+    "byte_length": { "type": "integer", "minimum": 0 },
+    "split_eligibility": { "type": "string", "enum": ["train", "dev", "test", "excluded"] },
+    "provenance": { "type": "string", "enum": ["SYSTEM_POLICY", "USER_INPUT", "UNTRUSTED_SOURCE", "VERIFIED_KHG", "HYPOTHESIS"] },
+    "notes": { "type": "string" }
+  }
+}

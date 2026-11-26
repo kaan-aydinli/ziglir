@@ -2348,7 +2348,7 @@ fn ensureBlockConst(
 fn localConstantFoldAndLVN(f: *IRFn) bool {
     var changed = false;
 
-    var const_known: [MAX_TRACKED_VREGS]bool = undefined;
+    var const_known: [MAX_TRACKED_VREGS]bool = .{false} ** MAX_TRACKED_VREGS;
     var const_val: [MAX_TRACKED_VREGS]i64 = undefined;
     // `def_inst` is stamped with the owning block instead of being cleared to
     // null: only the current block's definitions are observable (the consumers
@@ -2357,7 +2357,7 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
     // generation stamp keeps the "cleared every block" semantics while touching
     // only the entries this block defined.
     var def_inst: [MAX_TRACKED_VREGS]u16 = undefined;
-    var def_gen: [MAX_TRACKED_VREGS]u16 = undefined;
+    var def_gen: [MAX_TRACKED_VREGS]u16 = .{0xFFFF} ** MAX_TRACKED_VREGS;
     var expr_table: [128]ExprKey = undefined;
     // Vregs whose `const_known` entry is currently true, so the next block can
     // clear them without scanning the whole table.
@@ -3224,11 +3224,16 @@ fn deadCodeElimination(f: *IRFn, level: OptLevel) bool {
     // `gen` is bumped once per call; a slot is live exactly when it was stamped.
     const live_gen = struct {
         var counter: u32 = 0;
+        var inst_live: [MAX_BLOCKS_PER_FN][MAX_INSTS_PER_BLOCK]u32 =
+            .{.{0} ** MAX_INSTS_PER_BLOCK} ** MAX_BLOCKS_PER_FN;
     };
     live_gen.counter +%= 1;
-    if (live_gen.counter == 0) live_gen.counter = 1; // 0 means "never stamped"
+    if (live_gen.counter == 0) {
+        @memset(std.mem.asBytes(&live_gen.inst_live), 0);
+        live_gen.counter = 1; // 0 means "never stamped"
+    }
     const cur_gen: u32 = live_gen.counter;
-    var inst_live: [MAX_BLOCKS_PER_FN][MAX_INSTS_PER_BLOCK]u32 = undefined;
+    const inst_live = &live_gen.inst_live;
 
     const markInputs = struct {
         fn call(inst: IRInst, vlive: *[MAX_TRACKED_VREGS]bool) bool {

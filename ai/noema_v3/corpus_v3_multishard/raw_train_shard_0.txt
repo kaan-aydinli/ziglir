@@ -1,0 +1,22 @@
+Karadeniz kiyi kusaginda nemli ruzgarlar dag yamaclarina carparak yil boyu duzenli orografik yagis uretir.
+
+<veriayrimi>
+Trabzon ve Rize vadilerinde sis tabakasi toprağin su dengesini korur ve mevsimsel sicaklik farkini azaltir.
+
+<veriayrimi>
+Bilimsel olcum belirsizlik sinirlari aciklandiginda dogrulanabilir bilgiye donusur; kanitsiz iddia elenir.
+
+<veriayrimi>
+Epistemik durustluk, yetersiz kanit durumunda uydurma yanit yerine acik cekimserlik uretmeyi gerektirir.
+
+<veriayrimi>
+Moduler yazilim mimarisinde her bilesen acik giris cikis sozlesmesi ve deterministik birim testleriyle korunur.
+
+<veriayrimi>
+Sifir ayristirmali ikili veri akislari gereksiz metin donusumlerini kaldirarak bellek bant genisligini korur.
+
+<veriayrimi>
+Exact rational verification: 1/3 + 1/6 = 1/2; 3/4 - 1/4 = 1/2.
+
+<veriayrimi>
+Formal deductive chain: A=>B, B=>C, A |- C; 2024-02-29 < 2024-03-01.

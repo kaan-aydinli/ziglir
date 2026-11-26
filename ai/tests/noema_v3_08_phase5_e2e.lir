@@ -1,0 +1,137 @@
+// NOEMA v3 Phase 5 Differential Test:
+// Locked NPG-v3 Checkpoint Evaluation, Empirical SoA ECE, and Valid-UTF-8 Weight Generation
+// across native, vm, and c backends.
+
+import "../src/noema_v3/noema_v3_selfplay_gate.lir"
+
+fn utf8_buffer_is_valid(buf: *u8, n: i64) -> i64 {
+    var i: i64 = 0
+    while i < n {
+        let b0 = (@read_u8(@ptr_add(buf, i)) as i64) & 255
+        if b0 < 128 {
+            i = i + 1
+        } else if b0 >= 194 and b0 <= 223 {
+            if i + 1 >= n { return 0 }
+            let b1 = (@read_u8(@ptr_add(buf, i + 1)) as i64) & 255
+            if b1 < 128 or b1 > 191 { return 0 }
+            i = i + 2
+        } else if b0 >= 224 and b0 <= 239 {
+            if i + 2 >= n { return 0 }
+            let b1 = (@read_u8(@ptr_add(buf, i + 1)) as i64) & 255
+            let b2 = (@read_u8(@ptr_add(buf, i + 2)) as i64) & 255
+            if b0 == 224 and b1 < 160 { return 0 }
+            if b0 == 237 and b1 > 159 { return 0 }
+            if b1 < 128 or b1 > 191 or b2 < 128 or b2 > 191 { return 0 }
+            i = i + 3
+        } else if b0 >= 240 and b0 <= 244 {
+            if i + 3 >= n { return 0 }
+            let b1 = (@read_u8(@ptr_add(buf, i + 1)) as i64) & 255
+            let b2 = (@read_u8(@ptr_add(buf, i + 2)) as i64) & 255
+            let b3 = (@read_u8(@ptr_add(buf, i + 3)) as i64) & 255
+            if b0 == 240 and b1 < 144 { return 0 }
+            if b0 == 244 and b1 > 143 { return 0 }
+            if b1 < 128 or b1 > 191 or b2 < 128 or b2 > 191 or b3 < 128 or b3 > 191 { return 0 }
+            i = i + 4
+        } else {
+            return 0
+        }
+    }
+    return 1
+}
+
+fn main() -> i64 {
+    let tr = nv3_trainer_create(Nv3TrainerCfg {
+        d_model: 12,
+        d_k: 8,
+        d_h: 20,
+        conv_k: 3,
+        coarse_ckpt: 16,
+        fine_ckpt: 4,
+        use_fp32_ckpt: 1,
+        seed: 20261125
+    })
+
+    let loaded = nv3_trainer_load_npg(tr, "ai/noema_v3/checkpoints/noema_v3_locked.npg3")
+    let ckpt_ok = if loaded == 1 and tr.total_params == 8828 and tr.step_box[0] == 36 { 1 } else { 0 }
+    print("NV3_P5_CKPT_LOADED_OK: ") printInt(ckpt_ok)
+
+    // Evaluate locked disjoint test_soa bpb & empirical ECE in one streaming pass
+    let bpb_box = @malloc(8) as *f64
+    let test_ece = nv3_trainer_eval_soa_ece(tr, "ai/noema_v3/corpus_locked/test_soa", 10, bpb_box)
+    let test_bpb = bpb_box[0]
+    @free(bpb_box as *u8)
+    let bpb_ok = if test_bpb > 4.0 and test_bpb < 6.5 { 1 } else { 0 }
+    let ece_ok = if test_ece >= 0.0 and test_ece < 0.30 { 1 } else { 0 }
+    print("NV3_P5_TEST_BPB_OK: ") printInt(bpb_ok)
+    print("NV3_P5_TEST_ECE_OK: ") printInt(ece_ok)
+
+    // Valid-UTF-8 raw-byte weight generation + neural telemetry
+    let prompt = "İlke: Kuvvet"
+    let plen = @string_len(prompt)
+    let provs = @malloc(plen * 8) as *i64
+    var pi: i64 = 0
+    while pi < plen {
+        provs[pi] = NOEMA_V3_PROV_USER_INPUT
+        pi = pi + 1
+    }
+    let out_buf = @malloc(24)
+    let metrics = @malloc(24) as *f64
+    let gen_n = nv3_trainer_generate_utf8_valid(tr, prompt.ptr as *u8, provs, plen, 24, out_buf, metrics)
+    let utf8_ok = if gen_n == 24 and utf8_buffer_is_valid(out_buf, gen_n) == 1 { 1 } else { 0 }
+    let metrics_ok = if metrics[0] > 1.0 and metrics[0] < 5.2 and metrics[1] > 0.1 and metrics[1] <= 1.0 and metrics[2] > 0.015 { 1 } else { 0 }
+    print("NV3_P5_UTF8_VALID_GEN_OK: ") printInt(utf8_ok)
+    print("NV3_P5_NEURAL_TELEMETRY_OK: ") printInt(metrics_ok)
+
+    // Future-leakage causality invariant on trained locked checkpoint
+    let mcfg = Nv3EkHnbConfig {
+        d_model: 12, d_k: 8, d_h: 20, conv_k: 3, coarse_ckpt: 16, fine_ckpt: 4, use_fp32_ckpt: 1
+    }
+    let m = Nv3EkHnbModel {
+        cfg: mcfg, total_params: tr.total_params, step_count: tr.step_box[0],
+        params: tr.params, grads: tr.grads, offs: tr.offs
+    }
+    let seq_a = @malloc(48) as *i64
+    let seq_b = @malloc(48) as *i64
+    let pv_ab = @malloc(48) as *i64
+    let rs_ab = @malloc(48) as *i64
+    let tg_ab = @malloc(48) as *i64
+    let lw_ab = @malloc(48) as *f64
+    let lga = @malloc(6 * 256 * 8) as *f64
+    let lgb = @malloc(6 * 256 * 8) as *f64
+    var k: i64 = 0
+    while k < 6 {
+        seq_a[k] = 65 + k
+        seq_b[k] = if k < 4 { 65 + k } else { 200 + k }
+        pv_ab[k] = NOEMA_V3_PROV_USER_INPUT
+        rs_ab[k] = if k == 0 { 1 } else { 0 }
+        tg_ab[k] = 66 + k
+        lw_ab[k] = 1.0
+        k = k + 1
+    }
+    let _sa = nv3_ek_hnb_fwd_bwd(m, Nv3EkHnbBatch {
+        t_len: 6, prompt_len: 4, in_bytes: seq_a, prov_seq: pv_ab, reset_seq: rs_ab,
+        tgt_bytes: tg_ab, loss_weights: lw_ab, logits_out: lga
+    }, 0)
+    let _sb = nv3_ek_hnb_fwd_bwd(m, Nv3EkHnbBatch {
+        t_len: 6, prompt_len: 4, in_bytes: seq_b, prov_seq: pv_ab, reset_seq: rs_ab,
+        tgt_bytes: tg_ab, loss_weights: lw_ab, logits_out: lgb
+    }, 0)
+    var leak: f64 = 0.0
+    var li: i64 = 0
+    while li < 4 * 256 {
+        let df = nv3_abs(lga[li] - lgb[li])
+        if df > leak { leak = df }
+        li = li + 1
+    }
+    @free(tg_ab as *u8) @free(lw_ab as *u8) @free(lga as *u8) @free(lgb as *u8)
+    let leak_ok = if leak == 0.0 { 1 } else { 0 }
+    print("NV3_P5_ZERO_FUTURE_LEAK_OK: ") printInt(leak_ok)
+
+    let all_pass = if ckpt_ok == 1 and bpb_ok == 1 and ece_ok == 1 and utf8_ok == 1 and metrics_ok == 1 and leak_ok == 1 { 1 } else { 0 }
+    print("NOEMA_V3_PHASE5_E2E_ALL_PASS: ") printInt(all_pass)
+
+    @free(seq_a as *u8) @free(seq_b as *u8) @free(pv_ab as *u8) @free(rs_ab as *u8)
+    @free(provs as *u8) @free(out_buf) @free(metrics as *u8)
+    nv3_trainer_free(tr)
+    return if all_pass == 1 { 0 } else { 1 }
+}

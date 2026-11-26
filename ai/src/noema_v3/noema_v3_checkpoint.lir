@@ -1,0 +1,185 @@
+// NOEMA v3 Phase 2: Pure-LIR NPG-v3 Binary Checkpoint Serializer & Validator.
+//
+// Binary layout (88-byte header + contiguous parameter payload):
+//   [0..4]   u32 magic0 = 0x7647504E ("NPGv")
+//   [4..8]   u32 magic1 = 0x00030033 ("3\0\3\0")
+//   [8..16]  u64 schema_version = 3 (NOEMA_V3_SCHEMA_VERSION)
+//   [16..24] u64 arch_hash      = nv3_ek_hnb_arch_hash(cfg)
+//   [24..32] u64 dtype_code     = 1 (IEEE-754 f64) or 2 (IEEE-754 binary32)
+//   [32..40] u64 d_model
+//   [40..48] u64 d_k
+//   [48..56] u64 d_h
+//   [56..64] u64 conv_k
+//   [64..72] u64 step_count
+//   [72..80] u64 total_params
+//   [80..88] u64 payload_fnv1a64
+//   [88..]   payload bytes (total_params * 8 for f64, total_params * 4 for binary32)
+//
+// Legacy flat .nps files are rejected fail-closed before touching model memory.
+
+import "noema_v3_soa.lir"
+import "noema_v3_ek_hnb.lir"
+
+const NV3_NPG_MAGIC0_LE: i64 = 1984385102
+const NV3_NPG_MAGIC1_LE: i64 = 196659
+const NV3_NPG_HEADER_BYTES: i64 = 88
+const NV3_NPG_DTYPE_F64: i64 = 1
+const NV3_NPG_DTYPE_F32: i64 = 2
+
+struct Nv3NpgModelView {
+    d_model: i64
+    d_k: i64
+    d_h: i64
+    conv_k: i64
+    total_params: i64
+    params: *f64
+}
+
+struct Nv3CheckpointLoadResult {
+    ok: i64
+    error_code: i64
+    schema_version: i64
+    dtype_code: i64
+    step_count: i64
+    total_params: i64
+}
+
+fn nv3_npg_v3_save(path: string, mv: Nv3NpgModelView, step_count: i64, dtype_code: i64) -> i64 {
+    if dtype_code != NV3_NPG_DTYPE_F64 and dtype_code != NV3_NPG_DTYPE_F32 {
+        return 0
+    }
+    if mv.total_params <= 0 or nv3_all_finite(mv.params, mv.total_params) == 0 {
+        return 0
+    }
+
+    let elem_bytes = if dtype_code == NV3_NPG_DTYPE_F64 { 8 } else { 4 }
+    let payload_bytes = mv.total_params * elem_bytes
+    let total_bytes = NV3_NPG_HEADER_BYTES + payload_bytes
+    let buf = @malloc(total_bytes)
+    let payload_ptr = @ptr_add(buf, NV3_NPG_HEADER_BYTES)
+
+    if dtype_code == NV3_NPG_DTYPE_F64 {
+        @memcpy(payload_ptr, mv.params as *u8, payload_bytes)
+    } else {
+        nv3_f64_to_f32_buf(payload_ptr, mv.params, mv.total_params)
+    }
+
+    let cksum = nv3_fnv1a64(payload_ptr, payload_bytes)
+    let cfg = Nv3EkHnbConfig { d_model: mv.d_model, d_k: mv.d_k, d_h: mv.d_h, conv_k: mv.conv_k, coarse_ckpt: 8, fine_ckpt: 2, use_fp32_ckpt: 1 }
+    let arch_h = nv3_ek_hnb_arch_hash(cfg)
+
+    @write_u32(buf, NV3_NPG_MAGIC0_LE as u32)
+    @write_u32(@ptr_add(buf, 4), NV3_NPG_MAGIC1_LE as u32)
+    @write_u64(@ptr_add(buf, 8), NOEMA_V3_SCHEMA_VERSION)
+    @write_u64(@ptr_add(buf, 16), arch_h)
+    @write_u64(@ptr_add(buf, 24), dtype_code)
+    @write_u64(@ptr_add(buf, 32), mv.d_model)
+    @write_u64(@ptr_add(buf, 40), mv.d_k)
+    @write_u64(@ptr_add(buf, 48), mv.d_h)
+    @write_u64(@ptr_add(buf, 56), mv.conv_k)
+    @write_u64(@ptr_add(buf, 64), step_count)
+    @write_u64(@ptr_add(buf, 72), mv.total_params)
+    @write_u64(@ptr_add(buf, 80), cksum)
+
+    let ok = nv3_write_all_file(path, buf, total_bytes)
+    @free(buf)
+    return ok
+}
+
+fn nv3_npg_fail(code: i64) -> Nv3CheckpointLoadResult {
+    return Nv3CheckpointLoadResult {
+        ok: 0, error_code: code, schema_version: 0, dtype_code: 0, step_count: 0, total_params: 0
+    }
+}
+
+fn nv3_npg_v3_load_into(path: string, mv: Nv3NpgModelView) -> Nv3CheckpointLoadResult {
+    // Hard path guard against legacy .nps artifacts
+    let plen = @string_len(path)
+    if plen >= 4 {
+        if @string_sub(path, plen - 4, 4) == ".nps" {
+            return nv3_npg_fail(10)
+        }
+    }
+
+    let max_sz = NV3_NPG_HEADER_BYTES + mv.total_params * 8 + 64
+    let len_box = @malloc(8) as *i64
+    let raw = nv3_read_entire_file(path, max_sz, len_box)
+    let n_read = len_box[0]
+    @free(len_box as *u8)
+
+    if raw == (0 as *u8) or n_read < NV3_NPG_HEADER_BYTES {
+        if raw != (0 as *u8) { @free(raw) }
+        return nv3_npg_fail(1)
+    }
+
+    let mg0 = (@read_u32(raw) as i64) & 4294967295
+    let mg1 = (@read_u32(@ptr_add(raw, 4)) as i64) & 4294967295
+    if mg0 != NV3_NPG_MAGIC0_LE or mg1 != NV3_NPG_MAGIC1_LE {
+        @free(raw)
+        return nv3_npg_fail(2)
+    }
+
+    let schema_v = @read_u64(@ptr_add(raw, 8))
+    let arch_h = @read_u64(@ptr_add(raw, 16))
+    let dtype_c = @read_u64(@ptr_add(raw, 24))
+    let dm = @read_u64(@ptr_add(raw, 32))
+    let dk = @read_u64(@ptr_add(raw, 40))
+    let dh = @read_u64(@ptr_add(raw, 48))
+    let ck = @read_u64(@ptr_add(raw, 56))
+    let step_c = @read_u64(@ptr_add(raw, 64))
+    let n_params = @read_u64(@ptr_add(raw, 72))
+    let expected_cksum = @read_u64(@ptr_add(raw, 80))
+
+    let cfg = Nv3EkHnbConfig { d_model: mv.d_model, d_k: mv.d_k, d_h: mv.d_h, conv_k: mv.conv_k, coarse_ckpt: 8, fine_ckpt: 2, use_fp32_ckpt: 1 }
+    if schema_v != NOEMA_V3_SCHEMA_VERSION {
+        @free(raw)
+        return nv3_npg_fail(3)
+    }
+    if arch_h != nv3_ek_hnb_arch_hash(cfg) or dm != mv.d_model or dk != mv.d_k or dh != mv.d_h or ck != mv.conv_k or n_params != mv.total_params {
+        @free(raw)
+        return nv3_npg_fail(4)
+    }
+    if dtype_c != NV3_NPG_DTYPE_F64 and dtype_c != NV3_NPG_DTYPE_F32 {
+        @free(raw)
+        return nv3_npg_fail(5)
+    }
+
+    let elem_bytes = if dtype_c == NV3_NPG_DTYPE_F64 { 8 } else { 4 }
+    let payload_bytes = n_params * elem_bytes
+    if n_read != (NV3_NPG_HEADER_BYTES + payload_bytes) {
+        @free(raw)
+        return nv3_npg_fail(6)
+    }
+
+    let payload_ptr = @ptr_add(raw, NV3_NPG_HEADER_BYTES)
+    let actual_cksum = nv3_fnv1a64(payload_ptr, payload_bytes)
+    if actual_cksum != expected_cksum {
+        @free(raw)
+        return nv3_npg_fail(7)
+    }
+
+    let staged = @malloc(n_params * 8) as *f64
+    if dtype_c == NV3_NPG_DTYPE_F64 {
+        @memcpy(staged as *u8, payload_ptr, payload_bytes)
+    } else {
+        nv3_f32_to_f64_buf(staged, payload_ptr, n_params)
+    }
+    @free(raw)
+
+    if nv3_all_finite(staged, n_params) == 0 {
+        @free(staged as *u8)
+        return nv3_npg_fail(8)
+    }
+
+    nv3_copy(mv.params, staged, n_params)
+    @free(staged as *u8)
+
+    return Nv3CheckpointLoadResult {
+        ok: 1,
+        error_code: 0,
+        schema_version: schema_v,
+        dtype_code: dtype_c,
+        step_count: step_c,
+        total_params: n_params
+    }
+}

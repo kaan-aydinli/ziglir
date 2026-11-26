@@ -1,0 +1,975 @@
+// NOEMA v3 Production `NV3G1` Generative Graph & Anti-Verbatim Index (`noema_v3_nv3g.lir`)
+// 100% Pure LIR · Zero External Dependencies · Zero Stored Exemplar Sentences
+
+const NV3_SYN_MAX_ATOMS: i64 = 24576
+const NV3_SYN_MAX_ARENA: i64 = 393216
+const NV3_SYN_MAX_TOKS: i64 = 131072
+const NV3_SYN_MAX_TOPICS: i64 = 1024
+const NV3_SYN_TOPIC_SIG_K: i64 = 20
+
+const NV3_SYN_FLAG_PUNCT: i64 = 1
+const NV3_SYN_FLAG_SENT_END: i64 = 2
+const NV3_SYN_FLAG_UPPER_START: i64 = 4
+const NV3_SYN_FLAG_STOPWORD: i64 = 8
+
+// Prompt-intent floor for greeting starters: atoms below this are never chosen as the opening
+// atom, so greetings surface only when the prompt itself greets.
+const NV3_SYN_GREET_BOOST_FLOOR: f64 = 4.2
+
+// Anti-verbatim acceptance gate: no synthesized candidate may reproduce more than this many
+// consecutive corpus atoms. `NV3_SYN_SEARCH_ROUNDS` bounds the escalating regeneration loop.
+const NV3_SYN_MAX_CORPUS_RUN: i64 = 4
+const NV3_SYN_SEARCH_ROUNDS: i64 = 4
+const NV3_SYN_SLOTS_PER_ROUND: i64 = 4
+const NV3_SYN_MAX_SEQ: i64 = 80
+const NV3_SYN_BASE_PRESSURE: i64 = 4500
+
+fn nv3_syn_fnv1a_bytes(ptr: *u8, len: i64) -> i64 {
+    var h: i64 = 1469598103934665603
+    var i: i64 = 0
+    while i < len {
+        var lb = (@read_u8(@ptr_add(ptr, i)) as i64) & 255
+        if lb >= 65 and lb <= 90 { lb = lb + 32 }
+        h = (h ^ lb) * 1099511628211
+        i = i + 1
+    }
+    if h < 0 { h = 0 - h }
+    if h == 0 { h = 1 }
+    return h
+}
+
+fn nv3_syn_exact_hash(ptr: *u8, len: i64) -> i64 {
+    var h: i64 = 1469598103934665603
+    var i: i64 = 0
+    while i < len {
+        let b = (@read_u8(@ptr_add(ptr, i)) as i64) & 255
+        h = (h ^ b) * 1099511628211
+        i = i + 1
+    }
+    if h < 0 { h = 0 - h }
+    if h == 0 { h = 1 }
+    return h
+}
+
+fn nv3_syn_hash4(a0: i64, a1: i64, a2: i64, a3: i64) -> i64 {
+    var h: i64 = 1469598103934665603
+    h = (h ^ (a0 + 17)) * 1099511628211
+    h = (h ^ (a1 + 31)) * 1099511628211
+    h = (h ^ (a2 + 47)) * 1099511628211
+    h = (h ^ (a3 + 73)) * 1099511628211
+    if h < 0 { h = 0 - h }
+    if h == 0 { h = 1 }
+    return h
+}
+
+fn nv3_syn_sort_i64(arr: *i64, n: i64) {
+    if n <= 1 { return }
+    var start = (n - 2) / 2
+    while start >= 0 {
+        var root = start
+        while (root * 2 + 1) < n {
+            let child = root * 2 + 1
+            var sw = root
+            if arr[sw] < arr[child] { sw = child }
+            if (child + 1) < n and arr[sw] < arr[child + 1] { sw = child + 1 }
+            if sw == root { break }
+            let tmp = arr[root] arr[root] = arr[sw] arr[sw] = tmp
+            root = sw
+        }
+        start = start - 1
+    }
+    var end = n - 1
+    while end > 0 {
+        let tmp2 = arr[end] arr[end] = arr[0] arr[0] = tmp2
+        end = end - 1
+        var root2: i64 = 0
+        while (root2 * 2 + 1) <= end {
+            let child2 = root2 * 2 + 1
+            var sw2 = root2
+            if arr[sw2] < arr[child2] { sw2 = child2 }
+            if (child2 + 1) <= end and arr[sw2] < arr[child2 + 1] { sw2 = child2 + 1 }
+            if sw2 == root2 { break }
+            let tmp3 = arr[root2] arr[root2] = arr[sw2] arr[sw2] = tmp3
+            root2 = sw2
+        }
+    }
+}
+
+fn nv3_syn_sort_kv(keys: *i64, vals: *i64, n: i64) {
+    if n <= 1 { return }
+    var start = (n - 2) / 2
+    while start >= 0 {
+        var root = start
+        while (root * 2 + 1) < n {
+            let child = root * 2 + 1
+            var sw = root
+            if keys[sw] < keys[child] or (keys[sw] == keys[child] and vals[sw] < vals[child]) { sw = child }
+            if (child + 1) < n {
+                let c1 = child + 1
+                if keys[sw] < keys[c1] or (keys[sw] == keys[c1] and vals[sw] < vals[c1]) { sw = c1 }
+            }
+            if sw == root { break }
+            let tk = keys[root] keys[root] = keys[sw] keys[sw] = tk
+            let tv = vals[root] vals[root] = vals[sw] vals[sw] = tv
+            root = sw
+        }
+        start = start - 1
+    }
+    var end = n - 1
+    while end > 0 {
+        let tk2 = keys[end] keys[end] = keys[0] keys[0] = tk2
+        let tv2 = vals[end] vals[end] = vals[0] vals[0] = tv2
+        end = end - 1
+        var root2: i64 = 0
+        while (root2 * 2 + 1) <= end {
+            let child2 = root2 * 2 + 1
+            var sw2 = root2
+            if keys[sw2] < keys[child2] or (keys[sw2] == keys[child2] and vals[sw2] < vals[child2]) { sw2 = child2 }
+            if (child2 + 1) <= end {
+                let c2 = child2 + 1
+                if keys[sw2] < keys[c2] or (keys[sw2] == keys[c2] and vals[sw2] < vals[c2]) { sw2 = c2 }
+            }
+            if sw2 == root2 { break }
+            let tk3 = keys[root2] keys[root2] = keys[sw2] keys[sw2] = tk3
+            let tv3 = vals[root2] vals[root2] = vals[sw2] vals[sw2] = tv3
+            root2 = sw2
+        }
+    }
+}
+
+fn nv3_syn_dedup_sorted_i64(arr: *i64, n: i64) -> i64 {
+    if n <= 0 { return 0 }
+    var out: i64 = 1
+    var i: i64 = 1
+    while i < n {
+        if arr[i] != arr[out - 1] {
+            arr[out] = arr[i]
+            out = out + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn nv3_syn_bsearch_has(arr: *i64, n: i64, target: i64) -> i64 {
+    var lo: i64 = 0
+    var hi = n - 1
+    while lo <= hi {
+        let mid = (lo + hi) / 2
+        let v = arr[mid]
+        if v == target { return 1 }
+        if v < target { lo = mid + 1 }
+        else { hi = mid - 1 }
+    }
+    return 0
+}
+
+fn nv3_syn_lower_bound(arr: *i64, n: i64, target: i64) -> i64 {
+    var lo: i64 = 0
+    var hi = n
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        if arr[mid] < target { lo = mid + 1 }
+        else { hi = mid }
+    }
+    return lo
+}
+
+fn nv3_syn_is_ws(b: i64) -> i64 {
+    if b == 32 or b == 9 or b == 10 or b == 13 { return 1 }
+    return 0
+}
+
+fn nv3_syn_is_punct_delim(b: i64) -> i64 {
+    if b == 46 or b == 44 or b == 59 or b == 58 or b == 33 or b == 63 { return 1 }
+    if b == 40 or b == 41 or b == 91 or b == 93 or b == 34 { return 1 }
+    return 0
+}
+
+fn nv3_syn_utf8_valid(buf: *u8, len: i64) -> i64 {
+    var i: i64 = 0
+    while i < len {
+        let b0 = (@read_u8(@ptr_add(buf, i)) as i64) & 255
+        if b0 == 0 { return 0 }
+        var step: i64 = 0
+        if b0 < 128 {
+            step = 1
+        } else if b0 >= 194 and b0 <= 223 and (i + 1) < len {
+            let b1 = (@read_u8(@ptr_add(buf, i + 1)) as i64) & 255
+            if b1 >= 128 and b1 <= 191 { step = 2 }
+        } else if b0 >= 224 and b0 <= 239 and (i + 2) < len {
+            let b1 = (@read_u8(@ptr_add(buf, i + 1)) as i64) & 255
+            let b2 = (@read_u8(@ptr_add(buf, i + 2)) as i64) & 255
+            if b1 >= 128 and b1 <= 191 and b2 >= 128 and b2 <= 191 {
+                if !((b0 == 224 and b1 < 160) or (b0 == 237 and b1 > 159)) { step = 3 }
+            }
+        } else if b0 >= 240 and b0 <= 244 and (i + 3) < len {
+            let b1 = (@read_u8(@ptr_add(buf, i + 1)) as i64) & 255
+            let b2 = (@read_u8(@ptr_add(buf, i + 2)) as i64) & 255
+            let b3 = (@read_u8(@ptr_add(buf, i + 3)) as i64) & 255
+            if b1 >= 128 and b1 <= 191 and b2 >= 128 and b2 <= 191 and b3 >= 128 and b3 <= 191 {
+                if !((b0 == 240 and b1 < 144) or (b0 == 244 and b1 > 143)) { step = 4 }
+            }
+        }
+        if step == 0 { return 0 }
+        i = i + step
+    }
+    return 1
+}
+
+fn nv3_syn_is_upper_utf8_start(ptr: *u8, len: i64) -> i64 {
+    if len <= 0 { return 0 }
+    let b0 = (@read_u8(ptr) as i64) & 255
+    if b0 >= 65 and b0 <= 90 { return 1 }
+    if len >= 2 {
+        let b1 = (@read_u8(@ptr_add(ptr, 1)) as i64) & 255
+        if b0 == 195 and (b1 == 135 or b1 == 150 or b1 == 156 or b1 == 130) { return 1 }
+        if b0 == 196 and (b1 == 158 or b1 == 176) { return 1 }
+        if b0 == 197 and b1 == 158 { return 1 }
+    }
+    return 0
+}
+
+fn nv3_syn_bytes_eq(a: *u8, alen: i64, b: *u8, blen: i64) -> i64 {
+    if alen != blen { return 0 }
+    var i: i64 = 0
+    while i < alen {
+        let x = (@read_u8(@ptr_add(a, i)) as i64) & 255
+        let y = (@read_u8(@ptr_add(b, i)) as i64) & 255
+        if x != y { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn nv3_syn_slice_str(buf: *u8, start: i64, slen: i64) -> string {
+    if slen <= 0 { return "" }
+    let tmp = @malloc(slen + 1)
+    var i: i64 = 0
+    while i < slen {
+        @write_u8(@ptr_add(tmp, i), @read_u8(@ptr_add(buf, start + i)))
+        i = i + 1
+    }
+    let s = @string_new(tmp, slen)
+    @free(tmp)
+    return s
+}
+
+fn nv3_syn_eq_lit(ptr: *u8, len: i64, lit: string) -> i64 {
+    if len != @string_len(lit) { return 0 }
+    return nv3_syn_bytes_eq(ptr, len, lit.ptr as *u8, len)
+}
+
+fn nv3_syn_is_common_func_word(ptr: *u8, len: i64) -> i64 {
+    if len <= 2 { return 1 }
+    if nv3_syn_eq_lit(ptr, len, "bir") == 1 or nv3_syn_eq_lit(ptr, len, "için") == 1 or nv3_syn_eq_lit(ptr, len, "ile") == 1 { return 1 }
+    if nv3_syn_eq_lit(ptr, len, "olarak") == 1 or nv3_syn_eq_lit(ptr, len, "olan") == 1 or nv3_syn_eq_lit(ptr, len, "daha") == 1 { return 1 }
+    if nv3_syn_eq_lit(ptr, len, "ancak") == 1 or nv3_syn_eq_lit(ptr, len, "gibi") == 1 or nv3_syn_eq_lit(ptr, len, "kadar") == 1 { return 1 }
+    if nv3_syn_eq_lit(ptr, len, "hem") == 1 or nv3_syn_eq_lit(ptr, len, "ise") == 1 or nv3_syn_eq_lit(ptr, len, "veya") == 1 { return 1 }
+    if nv3_syn_eq_lit(ptr, len, "her") == 1 or nv3_syn_eq_lit(ptr, len, "çok") == 1 or nv3_syn_eq_lit(ptr, len, "aynı") == 1 { return 1 }
+    if nv3_syn_eq_lit(ptr, len, "Bir") == 1 or nv3_syn_eq_lit(ptr, len, "Ancak") == 1 or nv3_syn_eq_lit(ptr, len, "Ayrıca") == 1 { return 1 }
+    if nv3_syn_eq_lit(ptr, len, "İlke") == 1 or nv3_syn_eq_lit(ptr, len, "Soru") == 1 or nv3_syn_eq_lit(ptr, len, "nasıl") == 1 { return 1 }
+    if nv3_syn_eq_lit(ptr, len, "nedir") == 1 or nv3_syn_eq_lit(ptr, len, "neden") == 1 or nv3_syn_eq_lit(ptr, len, "kaçtır") == 1 { return 1 }
+    // Interrogatives and calendar fillers. They appear in almost every question but carry no topic:
+    // leaving them as content stems lets `Napolyon hangi yılda doğdu?` ground on `hangi`/`yıl` and
+    // synthesize an answer from an unrelated corpus topic.
+    if nv3_syn_eq_lit(ptr, len, "hangi") == 1 or nv3_syn_eq_lit(ptr, len, "hangisi") == 1 { return 1 }
+    if nv3_syn_eq_lit(ptr, len, "kaç") == 1 or nv3_syn_eq_lit(ptr, len, "kim") == 1 or nv3_syn_eq_lit(ptr, len, "nerede") == 1 { return 1 }
+    if nv3_syn_eq_lit(ptr, len, "yıl") == 1 or nv3_syn_eq_lit(ptr, len, "yılda") == 1 or nv3_syn_eq_lit(ptr, len, "zaman") == 1 { return 1 }
+    if nv3_syn_eq_lit(ptr, len, "niçin") == 1 or nv3_syn_eq_lit(ptr, len, "nereye") == 1 or nv3_syn_eq_lit(ptr, len, "kimin") == 1 { return 1 }
+    if nv3_syn_eq_lit(ptr, len, "arasında") == 1 or nv3_syn_eq_lit(ptr, len, "arasındaki") == 1 { return 1 }
+    return 0
+}
+
+fn nv3_syn_slice_eq(a: *u8, a_off: i64, b: *u8, b_off: i64, len: i64) -> i64 {
+    var i: i64 = 0
+    while i < len {
+        let x = (@read_u8(@ptr_add(a, a_off + i)) as i64) & 255
+        let y = (@read_u8(@ptr_add(b, b_off + i)) as i64) & 255
+        if x != y { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn nv3_syn_copy_word(buf: *u8, off: i64, len: i64) -> *u8 {
+    let tmp = @malloc(len + 8)
+    var i: i64 = 0
+    while i < len {
+        @write_u8(@ptr_add(tmp, i), @read_u8(@ptr_add(buf, off + i)))
+        i = i + 1
+    }
+    return tmp
+}
+
+// Decodes one letter at `i` into its ASCII-folded lowercase code and the number of bytes consumed.
+// Turkish letters keep a single canonical code each (`ı/İ/i` -> 105, `ş` -> 115, `ç` -> 99,
+// `ö` -> 111, `ü` -> 117, `ğ/g` -> 103), so text typed on a non-Turkish keyboard (`yagis`,
+// `kiyi`) folds onto exactly the same codes as the corpus text (`yağış`, `kıyı`).
+fn nv3_syn_fold_char(ptr: *u8, i: i64, len: i64, out_code: *i64, out_step: *i64) {
+    let b0 = (@read_u8(@ptr_add(ptr, i)) as i64) & 255
+    if b0 < 128 {
+        var lb = b0
+        if lb >= 65 and lb <= 90 { lb = lb + 32 }
+        if b0 == 221 or b0 == 208 { lb = 105 }
+        out_code[0] = lb
+        out_step[0] = 1
+        return
+    }
+    if (i + 1) < len and b0 >= 192 and b0 < 224 {
+        let u1 = (@read_u8(@ptr_add(ptr, i + 1)) as i64) & 255
+        var code = (b0 + u1) & 255
+        if b0 == 196 and u1 == 177 { code = 105 }
+        else if b0 == 196 and u1 == 176 { code = 105 }
+        else if b0 == 197 and u1 == 159 { code = 115 }
+        else if b0 == 197 and u1 == 158 { code = 115 }
+        else if b0 == 195 and u1 == 167 { code = 99 }
+        else if b0 == 195 and u1 == 135 { code = 99 }
+        else if b0 == 195 and u1 == 182 { code = 111 }
+        else if b0 == 195 and u1 == 150 { code = 111 }
+        else if b0 == 195 and u1 == 188 { code = 117 }
+        else if b0 == 195 and u1 == 156 { code = 117 }
+        else if b0 == 196 and u1 == 159 { code = 103 }
+        else if b0 == 196 and u1 == 158 { code = 103 }
+        out_code[0] = code
+        out_step[0] = 2
+        return
+    }
+    out_code[0] = b0 & 255
+    out_step[0] = 1
+}
+
+// Packed 6-bit mirror of the first nine folded letters. `nv3_syn_stem_hash` truncates at five
+// letters, which collides `yapısı`/`yapısal`; the mirror is the full-word view the grounding gate
+// needs to prove that two words really are morphological forms of one another.
+fn nv3_syn_shadow(ptr: *u8, len: i64) -> i64 {
+    let code_box = @malloc(8) as *i64
+    let step_box = @malloc(8) as *i64
+    var i: i64 = 0
+    var chars: i64 = 0
+    var acc: i64 = 0
+    while i < len and chars < 9 {
+        nv3_syn_fold_char(ptr, i, len, code_box, step_box)
+        acc = acc | (((code_box[0] & 63) << (6 * chars)))
+        i = i + step_box[0]
+        chars = chars + 1
+    }
+    @free(code_box as *u8) @free(step_box as *u8)
+    return acc
+}
+
+fn nv3_syn_stem_hash(ptr: *u8, len: i64) -> i64 {
+    if len < 3 { return 0 }
+    let code_box = @malloc(8) as *i64
+    let step_box = @malloc(8) as *i64
+    var i: i64 = 0
+    var h: i64 = 1469598103934665603
+    var chars: i64 = 0
+    while i < len and chars < 5 {
+        nv3_syn_fold_char(ptr, i, len, code_box, step_box)
+        h = (h ^ code_box[0]) * 1099511628211
+        i = i + step_box[0]
+        chars = chars + 1
+    }
+    @free(code_box as *u8) @free(step_box as *u8)
+    if chars < 3 { return 0 }
+    if h < 0 { h = 0 - h }
+    if h == 0 { h = 1 }
+    return h
+}
+
+// Curated Turkish predicate/participle stoplist. Grounding on a generic verb form ("edilir",
+// "gerekir", "yapılır") lets any prompt synthesise topical drift, because those words appear in
+// almost every document signature; nominal plurals such as "kesirler" deliberately do not appear
+// here. Generic suffix matching was tried and rejected: it also hits nominals and breaks the
+// `kesirler`-type grounding that the phase-10 test relies on, so the list stays explicit.
+fn nv3_syn_is_predicate_form(ptr: *u8, len: i64) -> i64 {
+    if len < 4 { return 0 }
+    if nv3_syn_eq_lit(ptr, len, "edilir") == 1 or nv3_syn_eq_lit(ptr, len, "yapılır") == 1 { return 1 }
+    if nv3_syn_eq_lit(ptr, len, "olur") == 1 or nv3_syn_eq_lit(ptr, len, "gerekir") == 1 { return 1 }
+    if nv3_syn_eq_lit(ptr, len, "işe") == 1 or nv3_syn_eq_lit(ptr, len, "yarar") == 1 { return 1 }
+    if nv3_syn_eq_lit(ptr, len, "sadeleştirilerek") == 1 or nv3_syn_eq_lit(ptr, len, "incelenerek") == 1 { return 1 }
+    if nv3_syn_eq_lit(ptr, len, "yapılarak") == 1 or nv3_syn_eq_lit(ptr, len, "kullanılır") == 1 { return 1 }
+    if nv3_syn_eq_lit(ptr, len, "sağlanır") == 1 or nv3_syn_eq_lit(ptr, len, "belirlenir") == 1 { return 1 }
+    if nv3_syn_eq_lit(ptr, len, "oluşur") == 1 or nv3_syn_eq_lit(ptr, len, "verilir") == 1 { return 1 }
+    if nv3_syn_eq_lit(ptr, len, "görülür") == 1 or nv3_syn_eq_lit(ptr, len, "bilinir") == 1 { return 1 }
+    if nv3_syn_eq_lit(ptr, len, "denir") == 1 or nv3_syn_eq_lit(ptr, len, "olması") == 1 { return 1 }
+    return 0
+}
+
+fn nv3_syn_classify_atom(ptr: *u8, len: i64) -> i64 {
+    if len <= 0 { return 0 }
+    let b0 = (@read_u8(ptr) as i64) & 255
+    if len == 1 {
+        if b0 == 46 or b0 == 33 or b0 == 63 { return NV3_SYN_FLAG_PUNCT | NV3_SYN_FLAG_SENT_END }
+        if b0 == 44 or b0 == 59 or b0 == 58 { return NV3_SYN_FLAG_PUNCT }
+    }
+    var flags: i64 = 0
+    if nv3_syn_is_upper_utf8_start(ptr, len) == 1 { flags = flags | NV3_SYN_FLAG_UPPER_START }
+    if nv3_syn_is_common_func_word(ptr, len) == 1 { flags = flags | NV3_SYN_FLAG_STOPWORD }
+    return flags
+}
+
+// `gh` (`*i64`, 25 slots):
+//   [0]=ok, [1]=num_atoms, [2]=arena_len, [3]=num_bi, [4]=num_tri, [5]=num_topics,
+//   [6]=num_f4, [7]=num_fs, [8]=total_fert,
+//   [9]=atom_off, [10]=atom_len, [11]=atom_flags, [12]=atom_cnt, [13]=atom_fert, [14]=atom_hash,
+//   [15]=arena, [16]=bi_head, [17]=bi_dst, [18]=bi_cnt, [19]=tri_key, [20]=tri_dst, [21]=tri_cnt,
+//   [22]=topic_sig, [23]=f4_keys, [24]=fs_keys
+fn nv3_syn_graph_free(gh: *i64) {
+    if (gh as i64) == 0 { return }
+    var i: i64 = 9
+    while i <= 25 {
+        if gh[i] != 0 { @free(gh[i] as *u8) }
+        i = i + 1
+    }
+    @free(gh as *u8)
+}
+
+fn nv3_syn_empty_graph() -> *i64 {
+    let gh = @malloc(26 * 8) as *i64
+    var i: i64 = 0
+    while i < 26 { gh[i] = 0 i = i + 1 }
+    return gh
+}
+
+fn nv3_syn_write_all(fd: i64, ptr: *u8, total: i64) -> i64 {
+    var done: i64 = 0
+    while done < total {
+        let w = @write(fd, @ptr_add(ptr, done), total - done)
+        if w <= 0 { return 0 }
+        done = done + w
+    }
+    return 1
+}
+
+fn nv3_syn_read_all(fd: i64, ptr: *u8, total: i64) -> i64 {
+    var done: i64 = 0
+    while done < total {
+        let r = @read(fd, @ptr_add(ptr, done), total - done)
+        if r <= 0 { return 0 }
+        done = done + r
+    }
+    return 1
+}
+
+fn nv3_syn_save_nv3g(gh: *i64, path: string) -> i64 {
+    if gh[0] != 1 or gh[1] <= 0 { return 0 }
+    let fd = @open(path, 577, 420)
+    if fd < 0 { return 0 }
+    let hdr = @malloc(80) as *i64
+    hdr[0] = 3550861174880973654
+    hdr[1] = 1
+    hdr[2] = gh[1] hdr[3] = gh[2] hdr[4] = gh[3] hdr[5] = gh[4]
+    hdr[6] = gh[5] hdr[7] = gh[6] hdr[8] = gh[7] hdr[9] = gh[8]
+
+    var ok: i64 = nv3_syn_write_all(fd, hdr as *u8, 80)
+    @free(hdr as *u8)
+    let na = gh[1]
+    ok = ok & nv3_syn_write_all(fd, gh[9] as *u8, na * 8)
+    ok = ok & nv3_syn_write_all(fd, gh[10] as *u8, na * 8)
+    ok = ok & nv3_syn_write_all(fd, gh[11] as *u8, na * 8)
+    ok = ok & nv3_syn_write_all(fd, gh[12] as *u8, na * 8)
+    ok = ok & nv3_syn_write_all(fd, gh[13] as *u8, na * 8)
+    ok = ok & nv3_syn_write_all(fd, gh[14] as *u8, na * 8)
+    if gh[2] > 0 { ok = ok & nv3_syn_write_all(fd, gh[15] as *u8, gh[2]) }
+    ok = ok & nv3_syn_write_all(fd, gh[16] as *u8, (na + 1) * 8)
+    if gh[3] > 0 {
+        ok = ok & nv3_syn_write_all(fd, gh[17] as *u8, gh[3] * 8)
+        ok = ok & nv3_syn_write_all(fd, gh[18] as *u8, gh[3] * 8)
+    }
+    if gh[4] > 0 {
+        ok = ok & nv3_syn_write_all(fd, gh[19] as *u8, gh[4] * 8)
+        ok = ok & nv3_syn_write_all(fd, gh[20] as *u8, gh[4] * 8)
+        ok = ok & nv3_syn_write_all(fd, gh[21] as *u8, gh[4] * 8)
+    }
+    if gh[5] > 0 { ok = ok & nv3_syn_write_all(fd, gh[22] as *u8, gh[5] * NV3_SYN_TOPIC_SIG_K * 8) }
+    if gh[6] > 0 { ok = ok & nv3_syn_write_all(fd, gh[23] as *u8, gh[6] * 8) }
+    if gh[7] > 0 { ok = ok & nv3_syn_write_all(fd, gh[24] as *u8, gh[7] * 8) }
+    // v1.1 trailer: exact per-atom document frequencies. Older readers stop after `fs_keys` and
+    // treat this block as trailing bytes they never address.
+    if gh[25] != 0 { ok = ok & nv3_syn_write_all(fd, gh[25] as *u8, na * 8) }
+    @close(fd)
+    return ok
+}
+
+fn nv3_syn_load_nv3g(path: string) -> *i64 {
+    let fd = @open(path, 0, 0)
+    if fd < 0 { return nv3_syn_empty_graph() }
+    let hdr = @malloc(80) as *i64
+    if nv3_syn_read_all(fd, hdr as *u8, 80) != 1 {
+        @free(hdr as *u8) @close(fd)
+        return nv3_syn_empty_graph()
+    }
+    let magic = hdr[0] let ver = hdr[1]
+    let na = hdr[2] let alen = hdr[3] let nbi = hdr[4] let ntri = hdr[5]
+    let ntop = hdr[6] let nf4 = hdr[7] let nfs = hdr[8] let tfert = hdr[9]
+    @free(hdr as *u8)
+
+    if magic != 3550861174880973654 or ver != 1 or na <= 0 or na > NV3_SYN_MAX_ATOMS or alen <= 0 or alen > 2097152 {
+        @close(fd)
+        return nv3_syn_empty_graph()
+    }
+
+    let gh = nv3_syn_empty_graph()
+    gh[0] = 1 gh[1] = na gh[2] = alen gh[3] = nbi gh[4] = ntri
+    gh[5] = ntop gh[6] = nf4 gh[7] = nfs gh[8] = tfert
+    gh[9] = @malloc(na * 8) as i64
+    gh[10] = @malloc(na * 8) as i64
+    gh[11] = @malloc(na * 8) as i64
+    gh[12] = @malloc(na * 8) as i64
+    gh[13] = @malloc(na * 8) as i64
+    gh[14] = @malloc(na * 8) as i64
+    gh[15] = @malloc(alen) as i64
+    gh[16] = @malloc((na + 1) * 8) as i64
+    gh[17] = @malloc((if nbi > 0 { nbi } else { 1 }) * 8) as i64
+    gh[18] = @malloc((if nbi > 0 { nbi } else { 1 }) * 8) as i64
+    gh[19] = @malloc((if ntri > 0 { ntri } else { 1 }) * 8) as i64
+    gh[20] = @malloc((if ntri > 0 { ntri } else { 1 }) * 8) as i64
+    gh[21] = @malloc((if ntri > 0 { ntri } else { 1 }) * 8) as i64
+    gh[22] = @malloc((if ntop > 0 { ntop * NV3_SYN_TOPIC_SIG_K } else { 1 }) * 8) as i64
+    gh[23] = @malloc((if nf4 > 0 { nf4 } else { 1 }) * 8) as i64
+    gh[24] = @malloc((if nfs > 0 { nfs } else { 1 }) * 8) as i64
+
+    var ok: i64 = 1
+    ok = ok & nv3_syn_read_all(fd, gh[9] as *u8, na * 8)
+    ok = ok & nv3_syn_read_all(fd, gh[10] as *u8, na * 8)
+    ok = ok & nv3_syn_read_all(fd, gh[11] as *u8, na * 8)
+    ok = ok & nv3_syn_read_all(fd, gh[12] as *u8, na * 8)
+    ok = ok & nv3_syn_read_all(fd, gh[13] as *u8, na * 8)
+    ok = ok & nv3_syn_read_all(fd, gh[14] as *u8, na * 8)
+    ok = ok & nv3_syn_read_all(fd, gh[15] as *u8, alen)
+    ok = ok & nv3_syn_read_all(fd, gh[16] as *u8, (na + 1) * 8)
+    if nbi > 0 {
+        ok = ok & nv3_syn_read_all(fd, gh[17] as *u8, nbi * 8)
+        ok = ok & nv3_syn_read_all(fd, gh[18] as *u8, nbi * 8)
+    }
+    if ntri > 0 {
+        ok = ok & nv3_syn_read_all(fd, gh[19] as *u8, ntri * 8)
+        ok = ok & nv3_syn_read_all(fd, gh[20] as *u8, ntri * 8)
+        ok = ok & nv3_syn_read_all(fd, gh[21] as *u8, ntri * 8)
+    }
+    if ntop > 0 { ok = ok & nv3_syn_read_all(fd, gh[22] as *u8, ntop * NV3_SYN_TOPIC_SIG_K * 8) }
+    if nf4 > 0 { ok = ok & nv3_syn_read_all(fd, gh[23] as *u8, nf4 * 8) }
+    if nfs > 0 { ok = ok & nv3_syn_read_all(fd, gh[24] as *u8, nfs * 8) }
+    let df_tbl = @malloc(na * 8) as *i64
+    if nv3_syn_read_all(fd, df_tbl as *u8, na * 8) != 1 {
+        // Pre-v1.1 artifact: approximate the table from the sampled topic signatures so that the
+        // graph stays usable; the compiled gate only needs `>= 1`.
+        var dz2: i64 = 0
+        while dz2 < na { df_tbl[dz2] = 0 dz2 = dz2 + 1 }
+        let sig_tbl = gh[22] as *i64
+        var dt: i64 = 0
+        while dt < ntop {
+            var dj: i64 = 0
+            while dj < NV3_SYN_TOPIC_SIG_K {
+                let dw = sig_tbl[dt * NV3_SYN_TOPIC_SIG_K + dj]
+                if dw >= 0 and dw < na { df_tbl[dw] = df_tbl[dw] + 1 }
+                dj = dj + 1
+            }
+            dt = dt + 1
+        }
+    }
+    gh[25] = df_tbl as i64
+    @close(fd)
+    if ok != 1 { nv3_syn_graph_free(gh) return nv3_syn_empty_graph() }
+    return gh
+}
+
+fn cb_eq_punct(b: i64) -> i64 {
+    if b == 33 or b == 63 { return 1 }
+    return 0
+}
+
+fn nv3_syn_match_delim(buf: *u8, pos: i64, end_pos: i64) -> i64 {
+    if (pos + 12) > end_pos { return 0 }
+    let pat = "<veriayrimi>"
+    return nv3_syn_slice_eq(buf, pos, pat.ptr as *u8, 0, 12)
+}
+
+fn nv3_syn_intern_atom(ht_slots: *i64, ht_mask: i64, ctx: *i64, ptr: *u8, len: i64) -> i64 {
+    if len <= 0 or len > 48 { return -1 }
+    let h = nv3_syn_exact_hash(ptr, len)
+    let a_off = ctx[2] as *i64
+    let a_len = ctx[3] as *i64
+    let a_flg = ctx[4] as *i64
+    let a_cnt = ctx[5] as *i64
+    let a_hsh = ctx[6] as *i64
+    let arena = ctx[7] as *u8
+
+    var slot = h & ht_mask
+    var probes: i64 = 0
+    while probes <= ht_mask {
+        let aid = ht_slots[slot]
+        if aid < 0 {
+            let cur_n = ctx[0]
+            let cur_ar = ctx[1]
+            if cur_n >= NV3_SYN_MAX_ATOMS or (cur_ar + len) > NV3_SYN_MAX_ARENA { return -1 }
+            var k: i64 = 0
+            while k < len {
+                @write_u8(@ptr_add(arena, cur_ar + k), @read_u8(@ptr_add(ptr, k)))
+                k = k + 1
+            }
+            a_off[cur_n] = cur_ar
+            a_len[cur_n] = len
+            a_flg[cur_n] = nv3_syn_classify_atom(ptr, len)
+            a_cnt[cur_n] = 1
+            a_hsh[cur_n] = nv3_syn_stem_hash(ptr, len)
+            ht_slots[slot] = cur_n
+            ctx[0] = cur_n + 1
+            ctx[1] = cur_ar + len
+            return cur_n
+        }
+        if a_len[aid] == len and nv3_syn_slice_eq(arena, a_off[aid], ptr, 0, len) == 1 {
+            a_cnt[aid] = a_cnt[aid] + 1
+            return aid
+        }
+        slot = (slot + 1) & ht_mask
+        probes = probes + 1
+    }
+    return -1
+}
+
+fn nv3_syn_scan_word_end(buf: *u8, start: i64, seg_b: i64) -> i64 {
+    var pos = start
+    while pos < seg_b and (pos - start) < 46 {
+        let cb = (@read_u8(@ptr_add(buf, pos)) as i64) & 255
+        if nv3_syn_is_ws(cb) == 1 or cb == 40 or cb == 41 or cb == 91 or cb == 93 or cb == 34 { break }
+        if cb == 46 or cb == 44 or cb == 59 or cb == 58 or cb == 33 or cb == 63 {
+            var num_dot: i64 = 0
+            if (cb == 44 or cb == 46) and pos > start and (pos + 1) < seg_b {
+                let pb = (@read_u8(@ptr_add(buf, pos - 1)) as i64) & 255
+                let nb = (@read_u8(@ptr_add(buf, pos + 1)) as i64) & 255
+                if pb >= 48 and pb <= 57 and nb >= 48 and nb <= 57 { num_dot = 1 }
+            }
+            if num_dot == 0 { break }
+            pos = pos + 1
+        } else if cb >= 240 and (pos + 4) <= seg_b { pos = pos + 4 }
+        else if cb >= 224 and (pos + 3) <= seg_b { pos = pos + 3 }
+        else if cb >= 192 and (pos + 2) <= seg_b { pos = pos + 2 }
+        else { pos = pos + 1 }
+    }
+    return pos
+}
+
+fn nv3_syn_tokenize_segment(
+    buf: *u8,
+    seg_a: i64,
+    seg_b: i64,
+    ht_slots: *i64,
+    ctx: *i64,
+    tok_stream: *i64
+) -> i64 {
+    let ht_mask = ctx[8]
+    let base_off = ctx[9]
+    let max_toks = NV3_SYN_MAX_TOKS - base_off
+    var pos = seg_a
+    var n_out: i64 = 0
+    while pos < seg_b and n_out < max_toks {
+        let b = (@read_u8(@ptr_add(buf, pos)) as i64) & 255
+        if nv3_syn_is_ws(b) == 1 or b == 40 or b == 41 or b == 91 or b == 93 or b == 34 {
+            pos = pos + 1
+        } else if b == 46 or b == 44 or b == 59 or b == 58 or cb_eq_punct(b) == 1 {
+            let wtmp_p = nv3_syn_copy_word(buf, pos, 1)
+            let pid = nv3_syn_intern_atom(ht_slots, ht_mask, ctx, wtmp_p, 1)
+            @free(wtmp_p)
+            if pid >= 0 {
+                if n_out == 0 or tok_stream[base_off + n_out - 1] != pid {
+                    tok_stream[base_off + n_out] = pid
+                    n_out = n_out + 1
+                }
+            }
+            pos = pos + 1
+        } else {
+            let start = pos
+            pos = nv3_syn_scan_word_end(buf, start, seg_b)
+            let wlen = pos - start
+            if wlen > 0 and wlen <= 48 {
+                let wtmp = nv3_syn_copy_word(buf, start, wlen)
+                let wid = nv3_syn_intern_atom(ht_slots, ht_mask, ctx, wtmp, wlen)
+                @free(wtmp)
+                if wid >= 0 { tok_stream[base_off + n_out] = wid n_out = n_out + 1 }
+            } else if wlen == 0 {
+                pos = pos + 1
+            }
+        }
+    }
+    return n_out
+}
+
+fn nv3_syn_pack_csr_edges(
+    gh: *i64,
+    raw_bi_k: *i64,
+    n_raw_bi: i64,
+    raw_tri_k: *i64,
+    raw_tri_v: *i64,
+    n_raw_tri: i64
+) {
+    let na = gh[1]
+    nv3_syn_sort_i64(raw_bi_k, n_raw_bi)
+    let bi_dst = @malloc((if n_raw_bi > 0 { n_raw_bi } else { 1 }) * 8) as *i64
+    let bi_cnt = @malloc((if n_raw_bi > 0 { n_raw_bi } else { 1 }) * 8) as *i64
+    let bi_head = @malloc((na + 1) * 8) as *i64
+    let a_fert = @malloc(na * 8) as *i64
+    var zf: i64 = 0
+    while zf < na { a_fert[zf] = 0 zf = zf + 1 }
+    zf = 0
+    while zf <= na { bi_head[zf] = 0 zf = zf + 1 }
+
+    var u_bi: i64 = 0 var total_fert: i64 = 0 var bi_i: i64 = 0
+    while bi_i < n_raw_bi {
+        let key = raw_bi_k[bi_i]
+        var cnt: i64 = 1
+        while (bi_i + 1) < n_raw_bi and raw_bi_k[bi_i + 1] == key { cnt = cnt + 1 bi_i = bi_i + 1 }
+        let src = key >> 20
+        let dst = key & 1048575
+        if src >= 0 and src < na and dst >= 0 and dst < na {
+            bi_dst[u_bi] = dst bi_cnt[u_bi] = cnt
+            bi_head[src + 1] = bi_head[src + 1] + 1
+            a_fert[dst] = a_fert[dst] + 1
+            total_fert = total_fert + 1 u_bi = u_bi + 1
+        }
+        bi_i = bi_i + 1
+    }
+    var bh: i64 = 1
+    while bh <= na { bi_head[bh] = bi_head[bh] + bi_head[bh - 1] bh = bh + 1 }
+
+    nv3_syn_sort_kv(raw_tri_k, raw_tri_v, n_raw_tri)
+    let tri_key = @malloc((if n_raw_tri > 0 { n_raw_tri } else { 1 }) * 8) as *i64
+    let tri_dst = @malloc((if n_raw_tri > 0 { n_raw_tri } else { 1 }) * 8) as *i64
+    let tri_cnt = @malloc((if n_raw_tri > 0 { n_raw_tri } else { 1 }) * 8) as *i64
+    var u_tri: i64 = 0 var tri_i: i64 = 0
+    while tri_i < n_raw_tri {
+        let tk = raw_tri_k[tri_i] let td = raw_tri_v[tri_i]
+        var tcnt: i64 = 1
+        while (tri_i + 1) < n_raw_tri and raw_tri_k[tri_i + 1] == tk and raw_tri_v[tri_i + 1] == td {
+            tcnt = tcnt + 1 tri_i = tri_i + 1
+        }
+        tri_key[u_tri] = tk tri_dst[u_tri] = td tri_cnt[u_tri] = tcnt u_tri = u_tri + 1
+        tri_i = tri_i + 1
+    }
+
+    gh[3] = u_bi
+    gh[4] = u_tri
+    gh[8] = if total_fert > 0 { total_fert } else { 1 }
+    gh[13] = a_fert as i64
+    gh[16] = bi_head as i64
+    gh[17] = bi_dst as i64
+    gh[18] = bi_cnt as i64
+    gh[19] = tri_key as i64
+    gh[20] = tri_dst as i64
+    gh[21] = tri_cnt as i64
+}
+
+// Fills one topic signature (`NV3_SYN_TOPIC_SIG_K` slots, `-1` padded) from a document's token
+// span. The signature samples the whole document rather than its first 20 content words: a 45-word
+// topic would otherwise never contribute the defining terms that appear later ("... entropi
+// artar."). Slots 0..K-2 come from an even stride over the tail of the document and the last slot
+// takes the final content word, which is where definitions usually land.
+fn nv3_syn_fill_topic_sig(topic_sig: *i64, vd: i64, tok_stream: *i64, a_flg: *i64, a_len: *i64, ta: i64, tb: i64) {
+    var sig_k: i64 = 0
+    var sig_from = ta
+    if (tb - ta) > 76 { sig_from = tb - 76 }
+    var span = tb - sig_from
+    var stride: i64 = 1
+    if span > NV3_SYN_TOPIC_SIG_K { stride = (span + NV3_SYN_TOPIC_SIG_K - 1) / NV3_SYN_TOPIC_SIG_K }
+    var last_cw: i64 = -1
+    var scan_t = sig_from
+    var base = vd * NV3_SYN_TOPIC_SIG_K
+    while scan_t < tb and sig_k < NV3_SYN_TOPIC_SIG_K {
+        let cw = tok_stream[scan_t]
+        if (a_flg[cw] & (NV3_SYN_FLAG_PUNCT | NV3_SYN_FLAG_STOPWORD)) == 0 and a_len[cw] >= 4 {
+            last_cw = cw
+            if sig_k < (NV3_SYN_TOPIC_SIG_K - 1) {
+                var dup: i64 = 0
+                var sk: i64 = 0
+                while sk < sig_k {
+                    if topic_sig[base + sk] == cw { dup = 1 break }
+                    sk = sk + 1
+                }
+                if dup == 0 { topic_sig[base + sig_k] = cw sig_k = sig_k + 1 }
+            }
+        }
+        scan_t = scan_t + stride
+    }
+    if last_cw >= 0 and sig_k < NV3_SYN_TOPIC_SIG_K {
+        var dup_l: i64 = 0
+        var skl: i64 = 0
+        while skl < sig_k {
+            if topic_sig[base + skl] == last_cw { dup_l = 1 break }
+            skl = skl + 1
+        }
+        if dup_l == 0 { topic_sig[base + sig_k] = last_cw sig_k = sig_k + 1 }
+    }
+    while sig_k < NV3_SYN_TOPIC_SIG_K { topic_sig[base + sig_k] = -1 sig_k = sig_k + 1 }
+}
+
+fn nv3_syn_build_from_utf8(buf: *u8, len: i64) -> *i64 {
+    if len <= 0 { return nv3_syn_empty_graph() }
+
+    let ht_cap: i64 = 65536
+    let ht_mask = ht_cap - 1
+    let ht_slots = @malloc(ht_cap * 8) as *i64
+    var hi: i64 = 0
+    while hi < ht_cap { ht_slots[hi] = -1 hi = hi + 1 }
+
+    let a_off = @malloc(NV3_SYN_MAX_ATOMS * 8) as *i64
+    let a_len = @malloc(NV3_SYN_MAX_ATOMS * 8) as *i64
+    let a_flg = @malloc(NV3_SYN_MAX_ATOMS * 8) as *i64
+    let a_cnt = @malloc(NV3_SYN_MAX_ATOMS * 8) as *i64
+    let a_hsh = @malloc(NV3_SYN_MAX_ATOMS * 8) as *i64
+    let arena = @malloc(NV3_SYN_MAX_ARENA)
+
+    let ctx = @malloc(96) as *i64
+    ctx[0] = 0 ctx[1] = 0
+    ctx[2] = a_off as i64 ctx[3] = a_len as i64 ctx[4] = a_flg as i64
+    ctx[5] = a_cnt as i64 ctx[6] = a_hsh as i64 ctx[7] = arena as i64
+    ctx[8] = ht_mask ctx[9] = 0
+
+    let dot_str = "."
+    let _dot_id = nv3_syn_intern_atom(ht_slots, ht_mask, ctx, dot_str.ptr as *u8, 1)
+
+    let doc_starts = @malloc(NV3_SYN_MAX_TOPICS * 8) as *i64
+    let doc_ends = @malloc(NV3_SYN_MAX_TOPICS * 8) as *i64
+    var n_docs: i64 = 0
+    var seg_start: i64 = 0
+    var scan: i64 = 0
+    while scan < len {
+        if nv3_syn_match_delim(buf, scan, len) == 1 {
+            if scan > seg_start and n_docs < NV3_SYN_MAX_TOPICS {
+                doc_starts[n_docs] = seg_start doc_ends[n_docs] = scan n_docs = n_docs + 1
+            }
+            scan = scan + 12
+            seg_start = scan
+        } else {
+            scan = scan + 1
+        }
+    }
+    if len > seg_start and n_docs < NV3_SYN_MAX_TOPICS {
+        doc_starts[n_docs] = seg_start doc_ends[n_docs] = len n_docs = n_docs + 1
+    }
+
+    let tok_stream = @malloc(NV3_SYN_MAX_TOKS * 8) as *i64
+    let doc_tok_off = @malloc((NV3_SYN_MAX_TOPICS + 1) * 8) as *i64
+    var total_toks: i64 = 0
+    var valid_docs: i64 = 0
+    var d: i64 = 0
+    while d < n_docs and total_toks < (NV3_SYN_MAX_TOKS - 64) {
+        ctx[9] = total_toks
+        let added = nv3_syn_tokenize_segment(buf, doc_starts[d], doc_ends[d], ht_slots, ctx, tok_stream)
+        if added >= 4 {
+            doc_tok_off[valid_docs] = total_toks
+            total_toks = total_toks + added
+            valid_docs = valid_docs + 1
+            doc_tok_off[valid_docs] = total_toks
+        }
+        d = d + 1
+    }
+    @free(doc_starts as *u8) @free(doc_ends as *u8) @free(ht_slots as *u8)
+
+    let na = ctx[0]
+    let alen = ctx[1]
+    @free(ctx as *u8)
+
+    if na <= 1 or total_toks < 4 {
+        @free(a_off as *u8) @free(a_len as *u8) @free(a_flg as *u8)
+        @free(a_cnt as *u8) @free(a_hsh as *u8) @free(arena)
+        @free(tok_stream as *u8) @free(doc_tok_off as *u8)
+        return nv3_syn_empty_graph()
+    }
+
+    let raw_bi_k = @malloc(total_toks * 8) as *i64
+    let raw_tri_k = @malloc(total_toks * 8) as *i64
+    let raw_tri_v = @malloc(total_toks * 8) as *i64
+    let raw_f4 = @malloc(total_toks * 8) as *i64
+    let raw_fs = @malloc((total_toks / 3 + 16) * 8) as *i64
+
+    var n_raw_bi: i64 = 0 var n_raw_tri: i64 = 0 var n_raw_f4: i64 = 0 var n_raw_fs: i64 = 0
+    // Real document frequency per atom: the number of topic documents that contain the atom at
+    // least once. This is the quantity the grounding gate needs; counting hits inside the sampled
+    // topic signature (20 of a document's ~45 content words) systematically under-reports and would
+    // reject atoms that every document of a topic actually uses.
+    let a_df = @malloc(na * 8) as *i64
+    let a_doc_seen = @malloc(na * 8) as *i64
+    var dz: i64 = 0
+    while dz < na { a_df[dz] = 0 a_doc_seen[dz] = -1 dz = dz + 1 }
+    let topic_sig = @malloc((if valid_docs > 0 { valid_docs * NV3_SYN_TOPIC_SIG_K } else { 1 }) * 8) as *i64
+    var vd: i64 = 0
+    while vd < valid_docs {
+        let ta = doc_tok_off[vd]
+        let tb = doc_tok_off[vd + 1]
+        var sent_h: i64 = 1469598103934665603
+        var sent_words: i64 = 0
+        var ti = ta
+        while ti < tb {
+            let w = tok_stream[ti]
+            let flg = a_flg[w]
+            // First occurrence inside this document only; `a_doc_seen` stamps the document id.
+            if a_doc_seen[w] != (vd + 1) { a_doc_seen[w] = vd + 1 a_df[w] = a_df[w] + 1 }
+            if (flg & NV3_SYN_FLAG_PUNCT) == 0 {
+                sent_h = (sent_h ^ (w + 97)) * 1099511628211
+                sent_words = sent_words + 1
+            } else if (flg & NV3_SYN_FLAG_SENT_END) != 0 {
+                if sent_words >= 4 {
+                    var sh_f = sent_h
+                    if sh_f < 0 { sh_f = 0 - sh_f }
+                    if sh_f == 0 { sh_f = 1 }
+                    raw_fs[n_raw_fs] = sh_f n_raw_fs = n_raw_fs + 1
+                }
+                sent_h = 1469598103934665603 sent_words = 0
+            }
+            if (ti + 1) < tb {
+                raw_bi_k[n_raw_bi] = (w << 20) | tok_stream[ti + 1]
+                n_raw_bi = n_raw_bi + 1
+            }
+            if (ti + 2) < tb {
+                raw_tri_k[n_raw_tri] = (w << 20) | tok_stream[ti + 1]
+                raw_tri_v[n_raw_tri] = tok_stream[ti + 2]
+                n_raw_tri = n_raw_tri + 1
+            }
+            if (ti + 3) < tb {
+                raw_f4[n_raw_f4] = nv3_syn_hash4(w, tok_stream[ti + 1], tok_stream[ti + 2], tok_stream[ti + 3])
+                n_raw_f4 = n_raw_f4 + 1
+            }
+            ti = ti + 1
+        }
+        if sent_words >= 4 {
+            var sh_l = sent_h
+            if sh_l < 0 { sh_l = 0 - sh_l }
+            if sh_l == 0 { sh_l = 1 }
+            raw_fs[n_raw_fs] = sh_l n_raw_fs = n_raw_fs + 1
+        }
+        nv3_syn_fill_topic_sig(topic_sig, vd, tok_stream, a_flg, a_len, ta, tb)
+        vd = vd + 1
+    }
+    @free(tok_stream as *u8) @free(doc_tok_off as *u8)
+
+    nv3_syn_sort_i64(raw_f4, n_raw_f4)
+    let u_f4 = nv3_syn_dedup_sorted_i64(raw_f4, n_raw_f4)
+    nv3_syn_sort_i64(raw_fs, n_raw_fs)
+    let u_fs = nv3_syn_dedup_sorted_i64(raw_fs, n_raw_fs)
+
+    let f4_keys = @malloc((if u_f4 > 0 { u_f4 } else { 1 }) * 8) as *i64
+    var c4: i64 = 0
+    while c4 < u_f4 { f4_keys[c4] = raw_f4[c4] c4 = c4 + 1 }
+    @free(raw_f4 as *u8)
+
+    let fs_keys = @malloc((if u_fs > 0 { u_fs } else { 1 }) * 8) as *i64
+    var cs: i64 = 0
+    while cs < u_fs { fs_keys[cs] = raw_fs[cs] cs = cs + 1 }
+    @free(raw_fs as *u8)
+
+    let gh = nv3_syn_empty_graph()
+    gh[0] = 1 gh[1] = na gh[2] = alen
+    gh[5] = valid_docs gh[6] = u_f4 gh[7] = u_fs
+    gh[9] = a_off as i64 gh[10] = a_len as i64 gh[11] = a_flg as i64
+    gh[12] = a_cnt as i64 gh[14] = a_hsh as i64
+    gh[15] = arena as i64
+    gh[22] = topic_sig as i64 gh[23] = f4_keys as i64 gh[24] = fs_keys as i64
+    gh[25] = a_df as i64
+    @free(a_doc_seen as *u8)
+
+    nv3_syn_pack_csr_edges(gh, raw_bi_k, n_raw_bi, raw_tri_k, raw_tri_v, n_raw_tri)
+    @free(raw_bi_k as *u8) @free(raw_tri_k as *u8) @free(raw_tri_v as *u8)
+    return gh
+}

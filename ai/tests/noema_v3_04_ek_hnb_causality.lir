@@ -1,0 +1,415 @@
+// NOEMA v3 Phase 2 Test 04:
+//   1) Central finite-difference verification across all 30 EK-HNB + Reverse-Prompt slices (tol <= 1e-5)
+//   2) 3-level entropy-folding timescale hierarchy + fp32 two-level segment checkpointing drift check
+//   3) Exact future_leakage_negative.json tests:
+//        - leak_001: prompt-only reverse head invariance to response bytes
+//        - leak_002: strict causal response prefix invariance to future bytes
+//        - leak_003: hard cross-document reset isolation (forward logits + backward gradients)
+//   4) Provenance isolation & out-of-range fail-closed enforcement
+
+import "../src/noema_v3/noema_v3_ek_hnb.lir"
+
+// Check 1: Full-architecture central finite-difference test across all 30 parameter slices
+fn test_ek_hnb_full_fd() -> i64 {
+    let cfg = Nv3EkHnbConfig {
+        d_model: 4, d_k: 3, d_h: 5, conv_k: 3,
+        coarse_ckpt: 4, fine_ckpt: 2, use_fp32_ckpt: 0
+    }
+    let m = nv3_ek_hnb_create(cfg, 20261125)
+    // Amplify initial weights slightly so every nonlinear path has well-conditioned curvature
+    let mp = m.params
+    var i: i64 = 0
+    while i < m.total_params {
+        if i < m.offs[NV3_SL_ROUTER_SC] or i >= m.offs[NV3_SL_ROUTER_U1] {
+            let s = (((i * 73 + 19) % 23) - 11) as f64
+            mp[i] = mp[i] + s * 0.03
+        }
+        i = i + 1
+    }
+
+    let t_len: i64 = 6
+    let in_b = @malloc(t_len * 8) as *i64
+    let prov = @malloc(t_len * 8) as *i64
+    let rst = @malloc(t_len * 8) as *i64
+    let tgt = @malloc(t_len * 8) as *i64
+    let lw = @malloc(t_len * 8) as *f64
+    let logits = @malloc(t_len * 256 * 8) as *f64
+
+    // Multi-byte UTF-8 sequence ("şı:a" + reset + "b") with prompt_len = 2
+    in_b[0] = 197 prov[0] = NOEMA_V3_PROV_USER_INPUT   rst[0] = 1 tgt[0] = 159 lw[0] = 0.0
+    in_b[1] = 159 prov[1] = NOEMA_V3_PROV_USER_INPUT   rst[1] = 0 tgt[1] = 196 lw[1] = 1.0
+    in_b[2] = 196 prov[2] = NOEMA_V3_PROV_HYPOTHESIS   rst[2] = 0 tgt[2] = 177 lw[2] = 1.0
+    in_b[3] = 177 prov[3] = NOEMA_V3_PROV_HYPOTHESIS   rst[3] = 0 tgt[3] = 58  lw[3] = 0.7
+    in_b[4] = 58  prov[4] = NOEMA_V3_PROV_VERIFIED_KHG rst[4] = 1 tgt[4] = 97  lw[4] = 1.0
+    in_b[5] = 97  prov[5] = NOEMA_V3_PROV_VERIFIED_KHG rst[5] = 0 tgt[5] = 10  lw[5] = 0.5
+
+    let batch = Nv3EkHnbBatch {
+        t_len: t_len, prompt_len: 2,
+        in_bytes: in_b, prov_seq: prov, reset_seq: rst,
+        tgt_bytes: tgt, loss_weights: lw, logits_out: logits
+    }
+
+    let st0 = nv3_ek_hnb_fwd_bwd(m, batch, 1)
+    if st0.ok != 1 { return 0 }
+
+    let ana = @malloc(m.total_params * 8) as *f64
+    nv3_copy(ana, m.grads, m.total_params)
+
+    let eps: f64 = 0.0001
+    var worst: f64 = 0.0
+
+    // Check active + inactive byte embeddings (slice 0)
+    let e0 = nv3_ek_hnb_fd_worst(m, batch, ana, m.offs[NV3_SL_EMB_BYTE] + 197 * 4, 1, 1, eps)
+    let e1 = nv3_ek_hnb_fd_worst(m, batch, ana, m.offs[NV3_SL_EMB_BYTE] + 58 * 4, 1, 1, eps)
+    let e2 = nv3_ek_hnb_fd_worst(m, batch, ana, m.offs[NV3_SL_EMB_BYTE] + 13 * 4, 1, 1, eps)
+    if e0 > worst { worst = e0 }
+    if e1 > worst { worst = e1 }
+    if e2 > worst { worst = e2 }
+
+    // Check EVERY slice 1..27 (router scalars across all 3 levels + every weight/norm/conv/rev/swiglu slice)
+    var sl: i64 = 1
+    while sl <= NV3_SL_SW_BO {
+        let sl_start = m.offs[sl]
+        let sl_len = m.offs[sl + 1] - sl_start
+        var esl: f64 = 0.0
+        if sl == NV3_SL_ROUTER_SC {
+            esl = nv3_ek_hnb_fd_worst(m, batch, ana, sl_start, 6, 2, eps)
+            let esl2 = nv3_ek_hnb_fd_worst(m, batch, ana, sl_start + 1, 6, 2, eps)
+            if esl2 > esl { esl = esl2 }
+        } else {
+            let mid_idx = sl_start + (sl_len / 2)
+            esl = nv3_ek_hnb_fd_worst(m, batch, ana, mid_idx, 1, 1, eps)
+        }
+        if esl > worst { worst = esl }
+        sl = sl + 1
+    }
+
+    // Check active target + non-target columns in HEAD_W and HEAD_B (slices 28..29)
+    let eh_w = nv3_ek_hnb_fd_worst(m, batch, ana, m.offs[NV3_SL_HEAD_W] + 159, 2, 256, eps)
+    let eh_b1 = nv3_ek_hnb_fd_worst(m, batch, ana, m.offs[NV3_SL_HEAD_B] + 159, 1, 1, eps)
+    let eh_b2 = nv3_ek_hnb_fd_worst(m, batch, ana, m.offs[NV3_SL_HEAD_B] + 97, 1, 1, eps)
+    if eh_w > worst { worst = eh_w }
+    if eh_b1 > worst { worst = eh_b1 }
+    if eh_b2 > worst { worst = eh_b2 }
+
+    @free(ana as *u8) @free(in_b as *u8) @free(prov as *u8)
+    @free(rst as *u8) @free(tgt as *u8) @free(lw as *u8) @free(logits as *u8)
+    nv3_ek_hnb_free(m)
+
+    if worst <= 0.00001 { return 1 }
+    return 0
+}
+
+// Check 2: Entropy-folding 3-timescale invariant & fp32 two-level checkpointing consistency
+fn test_hierarchy_and_fp32_ckpt() -> i64 {
+    let cfg_f64 = Nv3EkHnbConfig { d_model: 4, d_k: 3, d_h: 5, conv_k: 3, coarse_ckpt: 4, fine_ckpt: 2, use_fp32_ckpt: 0 }
+    let cfg_f32 = Nv3EkHnbConfig { d_model: 4, d_k: 3, d_h: 5, conv_k: 3, coarse_ckpt: 4, fine_ckpt: 2, use_fp32_ckpt: 1 }
+    let m64 = nv3_ek_hnb_create(cfg_f64, 777)
+    let m32 = nv3_ek_hnb_create(cfg_f32, 777)
+
+    let s = "Tanım: aaaa bbbb!\n"
+    let t_len = @string_len(s) - 1
+    let in_b = @malloc(t_len * 8) as *i64
+    let prov = @malloc(t_len * 8) as *i64
+    let rst = @malloc(t_len * 8) as *i64
+    let tgt = @malloc(t_len * 8) as *i64
+    let lw = @malloc(t_len * 8) as *f64
+    let logits64 = @malloc(t_len * 256 * 8) as *f64
+    let logits32 = @malloc(t_len * 256 * 8) as *f64
+
+    var t: i64 = 0
+    while t < t_len {
+        in_b[t] = @string_char_at(s, t) & 255
+        tgt[t] = @string_char_at(s, t + 1) & 255
+        prov[t] = NOEMA_V3_PROV_VERIFIED_KHG
+        rst[t] = if t == 0 { 1 } else { 0 }
+        lw[t] = 1.0
+        t = t + 1
+    }
+
+    let b64 = Nv3EkHnbBatch { t_len: t_len, prompt_len: 0, in_bytes: in_b, prov_seq: prov, reset_seq: rst, tgt_bytes: tgt, loss_weights: lw, logits_out: logits64 }
+    let b32 = Nv3EkHnbBatch { t_len: t_len, prompt_len: 0, in_bytes: in_b, prov_seq: prov, reset_seq: rst, tgt_bytes: tgt, loss_weights: lw, logits_out: logits32 }
+    let st64 = nv3_ek_hnb_fwd_bwd(m64, b64, 1)
+    let st32 = nv3_ek_hnb_fwd_bwd(m32, b32, 1)
+
+    var ok: i64 = 1
+    if st64.ok != 1 or st32.ok != 1 { ok = 0 }
+    // Hierarchical timescale invariant: byte_steps >= patch_folds >= event_folds >= 1
+    if st32.byte_steps < st32.patch_folds or st32.patch_folds < st32.event_folds or st32.event_folds < 1 {
+        ok = 0
+    }
+    if nv3_abs(st64.bpb - st32.bpb) > 0.00001 {
+        ok = 0
+    }
+
+    @free(in_b as *u8) @free(prov as *u8) @free(rst as *u8) @free(tgt as *u8)
+    @free(lw as *u8) @free(logits64 as *u8) @free(logits32 as *u8)
+    nv3_ek_hnb_free(m64)
+    nv3_ek_hnb_free(m32)
+    return ok
+}
+
+fn fill_from_string(s: string, out_i64: *i64, out_u8: *u8) -> i64 {
+    let n = @string_len(s)
+    var i: i64 = 0
+    while i < n {
+        let b = @string_char_at(s, i) & 255
+        out_i64[i] = b
+        @write_u8(@ptr_add(out_u8, i), b as u8)
+        i = i + 1
+    }
+    return n
+}
+
+// Check 3: future_leakage_negative.json case leak_001 (reverse prompt head invariance to response)
+fn test_leak_001_prompt_only_reverse() -> i64 {
+    let cfg = Nv3EkHnbConfig { d_model: 4, d_k: 3, d_h: 5, conv_k: 3, coarse_ckpt: 4, fine_ckpt: 2, use_fp32_ckpt: 1 }
+    let m = nv3_ek_hnb_create(cfg, 1001)
+
+    let prompt_s = "Soru: 17 * 23 kaçtır?\nYanıt: "
+    let full_a = prompt_s + "391"
+    let full_b = prompt_s + "999"
+    let p_len = @string_len(prompt_s)
+    let t_len = @string_len(full_a)
+
+    let in_a = @malloc(t_len * 8) as *i64
+    let in_b = @malloc(t_len * 8) as *i64
+    let u8_a = @malloc(t_len)
+    let u8_b = @malloc(t_len)
+    let _na = fill_from_string(full_a, in_a, u8_a)
+    let _nb = fill_from_string(full_b, in_b, u8_b)
+
+    let prov = @malloc(t_len * 8) as *i64
+    let rst = @malloc(t_len * 8) as *i64
+    let lw = @malloc(t_len * 8) as *f64
+    let log_a = @malloc(t_len * 256 * 8) as *f64
+    let log_b = @malloc(t_len * 256 * 8) as *f64
+    var t: i64 = 0
+    while t < t_len {
+        prov[t] = if t < p_len { NOEMA_V3_PROV_USER_INPUT } else { NOEMA_V3_PROV_HYPOTHESIS }
+        rst[t] = if t == 0 { 1 } else { 0 }
+        lw[t] = 0.0
+        t = t + 1
+    }
+
+    let rev_a = @malloc(4 * 8) as *f64
+    let rev_b = @malloc(4 * 8) as *f64
+    let ok_ra = nv3_ek_hnb_reverse_prompt_forward(m, u8_a, prov, p_len, rev_a)
+    let ok_rb = nv3_ek_hnb_reverse_prompt_forward(m, u8_b, prov, p_len, rev_b)
+
+    let ba = Nv3EkHnbBatch { t_len: t_len, prompt_len: p_len, in_bytes: in_a, prov_seq: prov, reset_seq: rst, tgt_bytes: in_a, loss_weights: lw, logits_out: log_a }
+    let bb = Nv3EkHnbBatch { t_len: t_len, prompt_len: p_len, in_bytes: in_b, prov_seq: prov, reset_seq: rst, tgt_bytes: in_b, loss_weights: lw, logits_out: log_b }
+    let _sa = nv3_ek_hnb_fwd_bwd(m, ba, 0)
+    let _sb = nv3_ek_hnb_fwd_bwd(m, bb, 0)
+
+    var max_diff: f64 = 0.0
+    var c: i64 = 0
+    while c < 4 {
+        let df = nv3_abs(rev_a[c] - rev_b[c])
+        if df > max_diff { max_diff = df }
+        c = c + 1
+    }
+    // Every position t in 0..p_len-1 (including predicting first response byte at p_len-1) MUST have 0.0 diff!
+    t = 0
+    while t < p_len {
+        c = 0
+        while c < 256 {
+            let df = nv3_abs(log_a[t * 256 + c] - log_b[t * 256 + c])
+            if df > max_diff { max_diff = df }
+            c = c + 1
+        }
+        t = t + 1
+    }
+
+    @free(in_a as *u8) @free(in_b as *u8) @free(u8_a) @free(u8_b)
+    @free(prov as *u8) @free(rst as *u8) @free(lw as *u8)
+    @free(log_a as *u8) @free(log_b as *u8) @free(rev_a as *u8) @free(rev_b as *u8)
+    nv3_ek_hnb_free(m)
+    if ok_ra == 1 and ok_rb == 1 and max_diff == 0.0 { return 1 }
+    return 0
+}
+
+// Check 4: future_leakage_negative.json case leak_002 (response prefix causal invariance)
+fn test_leak_002_future_response_mask() -> i64 {
+    let cfg = Nv3EkHnbConfig { d_model: 4, d_k: 3, d_h: 5, conv_k: 3, coarse_ckpt: 4, fine_ckpt: 2, use_fp32_ckpt: 1 }
+    let m = nv3_ek_hnb_create(cfg, 1002)
+
+    let resp_a = "Kanıt: A -> B ve B -> C ise A -> C."
+    let resp_b = "Kanıt: XXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+    let t_len = @string_len(resp_a)
+    let prefix_k = @string_len("Kanıt: ")
+
+    let in_a = @malloc(t_len * 8) as *i64
+    let in_b = @malloc(t_len * 8) as *i64
+    let u8_tmp = @malloc(t_len)
+    let _na = fill_from_string(resp_a, in_a, u8_tmp)
+    let _nb = fill_from_string(resp_b, in_b, u8_tmp)
+    @free(u8_tmp)
+
+    let prov = @malloc(t_len * 8) as *i64
+    let rst = @malloc(t_len * 8) as *i64
+    let lw = @malloc(t_len * 8) as *f64
+    let log_a = @malloc(t_len * 256 * 8) as *f64
+    let log_b = @malloc(t_len * 256 * 8) as *f64
+    var t: i64 = 0
+    while t < t_len {
+        prov[t] = NOEMA_V3_PROV_HYPOTHESIS
+        rst[t] = if t == 0 { 1 } else { 0 }
+        lw[t] = 0.0
+        t = t + 1
+    }
+
+    let ba = Nv3EkHnbBatch { t_len: t_len, prompt_len: 0, in_bytes: in_a, prov_seq: prov, reset_seq: rst, tgt_bytes: in_a, loss_weights: lw, logits_out: log_a }
+    let bb = Nv3EkHnbBatch { t_len: t_len, prompt_len: 0, in_bytes: in_b, prov_seq: prov, reset_seq: rst, tgt_bytes: in_b, loss_weights: lw, logits_out: log_b }
+    let _sa = nv3_ek_hnb_fwd_bwd(m, ba, 0)
+    let _sb = nv3_ek_hnb_fwd_bwd(m, bb, 0)
+
+    var max_diff: f64 = 0.0
+    t = 0
+    while t < prefix_k {
+        var c: i64 = 0
+        while c < 256 {
+            let df = nv3_abs(log_a[t * 256 + c] - log_b[t * 256 + c])
+            if df > max_diff { max_diff = df }
+            c = c + 1
+        }
+        t = t + 1
+    }
+
+    @free(in_a as *u8) @free(in_b as *u8) @free(prov as *u8) @free(rst as *u8)
+    @free(lw as *u8) @free(log_a as *u8) @free(log_b as *u8)
+    nv3_ek_hnb_free(m)
+    return if max_diff == 0.0 { 1 } else { 0 }
+}
+
+// Check 5: future_leakage_negative.json case leak_003 (cross-document reset isolation: forward + grad)
+fn test_leak_003_cross_document_reset() -> i64 {
+    let cfg = Nv3EkHnbConfig { d_model: 4, d_k: 3, d_h: 5, conv_k: 3, coarse_ckpt: 4, fine_ckpt: 2, use_fp32_ckpt: 1 }
+    let m = nv3_ek_hnb_create(cfg, 1003)
+
+    let doc1_a = "Belge 1 gizli anahtar: 847291."
+    let doc1_b = "Belge 1 gizli anahtar: 000000."
+    let doc2 = "Belge 2: Bağımsız metin."
+    let d1_len = @string_len(doc1_a)
+    let full_a = doc1_a + doc2
+    let full_b = doc1_b + doc2
+    let t_len = @string_len(full_a)
+
+    let in_a = @malloc(t_len * 8) as *i64
+    let in_b = @malloc(t_len * 8) as *i64
+    let u8_tmp = @malloc(t_len)
+    let _na = fill_from_string(full_a, in_a, u8_tmp)
+    let _nb = fill_from_string(full_b, in_b, u8_tmp)
+    @free(u8_tmp)
+
+    let prov = @malloc(t_len * 8) as *i64
+    let rst = @malloc(t_len * 8) as *i64
+    let lw = @malloc(t_len * 8) as *f64
+    let log_a = @malloc(t_len * 256 * 8) as *f64
+    let log_b = @malloc(t_len * 256 * 8) as *f64
+    var t: i64 = 0
+    while t < t_len {
+        prov[t] = NOEMA_V3_PROV_UNTRUSTED_SOURCE
+        rst[t] = if t == 0 or t == d1_len { 1 } else { 0 }
+        // Supervise ONLY doc2 so backward gradients must also be 100% invariant to doc1!
+        lw[t] = if t >= d1_len { 1.0 } else { 0.0 }
+        t = t + 1
+    }
+
+    let ba = Nv3EkHnbBatch { t_len: t_len, prompt_len: 0, in_bytes: in_a, prov_seq: prov, reset_seq: rst, tgt_bytes: in_a, loss_weights: lw, logits_out: log_a }
+    let bb = Nv3EkHnbBatch { t_len: t_len, prompt_len: 0, in_bytes: in_b, prov_seq: prov, reset_seq: rst, tgt_bytes: in_b, loss_weights: lw, logits_out: log_b }
+
+    let _sa = nv3_ek_hnb_fwd_bwd(m, ba, 1)
+    let ga = @malloc(m.total_params * 8) as *f64
+    nv3_copy(ga, m.grads, m.total_params)
+
+    let _sb = nv3_ek_hnb_fwd_bwd(m, bb, 1)
+
+    var max_diff: f64 = 0.0
+    t = d1_len
+    while t < t_len {
+        var c: i64 = 0
+        while c < 256 {
+            let df = nv3_abs(log_a[t * 256 + c] - log_b[t * 256 + c])
+            if df > max_diff { max_diff = df }
+            c = c + 1
+        }
+        t = t + 1
+    }
+    var p: i64 = 0
+    while p < m.total_params {
+        let dg = nv3_abs(ga[p] - m.grads[p])
+        if dg > max_diff { max_diff = dg }
+        p = p + 1
+    }
+
+    @free(ga as *u8) @free(in_a as *u8) @free(in_b as *u8)
+    @free(prov as *u8) @free(rst as *u8) @free(lw as *u8)
+    @free(log_a as *u8) @free(log_b as *u8)
+    nv3_ek_hnb_free(m)
+    return if max_diff == 0.0 { 1 } else { 0 }
+}
+
+// Check 6: Provenance authority & fail-closed out-of-range check
+fn test_provenance_isolation() -> i64 {
+    if nv3_provenance_can_grant_authority(NOEMA_V3_PROV_UNTRUSTED_SOURCE, NOEMA_V3_PROV_SYSTEM_POLICY, 1) != 0 { return 0 }
+    if nv3_provenance_can_grant_authority(NOEMA_V3_PROV_USER_INPUT, NOEMA_V3_PROV_SYSTEM_POLICY, 1) != 0 { return 0 }
+    if nv3_provenance_can_grant_authority(NOEMA_V3_PROV_HYPOTHESIS, NOEMA_V3_PROV_VERIFIED_KHG, 0) != 0 { return 0 }
+    if nv3_provenance_can_grant_authority(NOEMA_V3_PROV_HYPOTHESIS, NOEMA_V3_PROV_VERIFIED_KHG, 1) != 1 { return 0 }
+    if nv3_provenance_can_grant_authority(NOEMA_V3_PROV_SYSTEM_POLICY, NOEMA_V3_PROV_SYSTEM_POLICY, 0) != 1 { return 0 }
+
+    // Out-of-range provenance tag in batch must fail closed (ok == 0)
+    let cfg = Nv3EkHnbConfig { d_model: 4, d_k: 3, d_h: 5, conv_k: 3, coarse_ckpt: 4, fine_ckpt: 2, use_fp32_ckpt: 1 }
+    let m = nv3_ek_hnb_create(cfg, 99)
+    let ib = @malloc(16) as *i64
+    let pv = @malloc(16) as *i64
+    let rs = @malloc(16) as *i64
+    let lw = @malloc(16) as *f64
+    let lg = @malloc(2 * 256 * 8) as *f64
+    ib[0] = 65 ib[1] = 66
+    pv[0] = 0  pv[1] = 99
+    rs[0] = 1  rs[1] = 0
+    lw[0] = 1.0 lw[1] = 1.0
+    let bad_batch = Nv3EkHnbBatch { t_len: 2, prompt_len: 0, in_bytes: ib, prov_seq: pv, reset_seq: rs, tgt_bytes: ib, loss_weights: lw, logits_out: lg }
+    let st_bad = nv3_ek_hnb_fwd_bwd(m, bad_batch, 0)
+    // Prompt > t_len must also fail closed
+    pv[1] = 1
+    let bad_prompt = Nv3EkHnbBatch { t_len: 2, prompt_len: 5, in_bytes: ib, prov_seq: pv, reset_seq: rs, tgt_bytes: ib, loss_weights: lw, logits_out: lg }
+    let st_bad2 = nv3_ek_hnb_fwd_bwd(m, bad_prompt, 0)
+
+    @free(ib as *u8) @free(pv as *u8) @free(rs as *u8) @free(lw as *u8) @free(lg as *u8)
+    nv3_ek_hnb_free(m)
+    if st_bad.ok == 0 and st_bad2.ok == 0 { return 1 }
+    return 0
+}
+
+fn main() -> i64 {
+    let ok1 = test_ek_hnb_full_fd()
+    println("ek_hnb_full_grad_fd:")
+    printInt(ok1)
+
+    let ok2 = test_hierarchy_and_fp32_ckpt()
+    println("hierarchy_timescale_and_fp32_ckpt:")
+    printInt(ok2)
+
+    let ok3 = test_leak_001_prompt_only_reverse()
+    println("leak_001_prompt_only_reverse:")
+    printInt(ok3)
+
+    let ok4 = test_leak_002_future_response_mask()
+    println("leak_002_future_response_mask:")
+    printInt(ok4)
+
+    let ok5 = test_leak_003_cross_document_reset()
+    println("leak_003_cross_document_reset:")
+    printInt(ok5)
+
+    let ok6 = test_provenance_isolation()
+    println("provenance_isolation_fail_closed:")
+    printInt(ok6)
+
+    let all_ok = if ok1 == 1 and ok2 == 1 and ok3 == 1 and ok4 == 1 and ok5 == 1 and ok6 == 1 { 1 } else { 0 }
+    println("NOEMA_V3_EK_HNB_CAUSALITY_ALL_PASS:")
+    printInt(all_ok)
+    return if all_ok == 1 { 0 } else { 1 }
+}

@@ -1,0 +1,12 @@
+verified_selfplay_rejects_unverified:
+1
+compositional_multi_kernel_chains:
+1
+calibration_ece_exact_and_fail_closed:
+1
+lexicographic_q_gate_non_masking:
+1
+end_to_end_npg_v3_khg_inference_modes:
+1
+NOEMA_V3_PHASE4_SELFPLAY_Q_ALL_PASS:
+1

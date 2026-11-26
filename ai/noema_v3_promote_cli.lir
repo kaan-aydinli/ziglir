@@ -1,0 +1,129 @@
+// NOEMA v3 Phase 6 Pure-LIR Candidate Training & Lexicographic Q-Gate Promotion CLI
+// Usage:
+//   lir run ai/noema_v3_promote_cli.lir [base_npg3] [train_soa] [locked_test_soa] [promoted_out_npg3]
+//
+// 1. Loads production baseline NPG-v3 checkpoint M_base and measures full 7-gate Q(M_base).
+// 2. Continues LIR-PreOpt preconditioned training on train_soa (+12 steps) to form candidate M_cand.
+// 3. Evaluates Q(M_cand) on locked disjoint test_soa and runs nv3_promote_npg_if_q_dominates.
+// 4. Also executes a fail-closed upper-gate masking negative probe (where heldout_bpb & compute_cost
+//    are artificially better, but Q[0] or Q[2] regresses) and verifies promotion is REJECTED.
+
+import "src/noema_v3/noema_v3_ground_promote.lir"
+
+fn main() -> i64 {
+    let argc = @argc()
+    let base_ckpt = if argc >= 2 { @argv(1) } else { "ai/noema_v3/checkpoints/noema_v3_locked.npg3" }
+    let train_soa = if argc >= 3 { @argv(2) } else { "ai/noema_v3/corpus_locked/train_soa" }
+    let test_soa  = if argc >= 4 { @argv(3) } else { "ai/noema_v3/corpus_locked/test_soa" }
+    let out_ckpt  = if argc >= 5 { @argv(4) } else { "ai/noema_v3/checkpoints/noema_v3_promoted.npg3" }
+    let cand_tmp  = "/tmp/nv3_phase6_candidate.npg3"
+    let rej_tmp   = "/tmp/nv3_phase6_must_not_exist.npg3"
+
+    let t0_ns = @time_ns()
+
+    // 1) Measure baseline 7-gate Q(M_base)
+    let base_q = @malloc(56) as *f64
+    let base_steps = nv3_eval_npg_q_vector(base_ckpt, test_soa, 1.0, 0.0, 45000.0, base_q)
+    if base_steps <= 0 {
+        @free(base_q as *u8)
+        println("NOEMA_V3_PROMOTE_REPORT_V1")
+        println("ok=0")
+        println("error=base_checkpoint_load_failed")
+        return 1
+    }
+
+    // 2) Continue preconditioned training (+12 steps) into candidate NPG-v3
+    let tr = nv3_trainer_create(Nv3TrainerCfg {
+        d_model: NV3_P6_D_MODEL, d_k: NV3_P6_D_K, d_h: NV3_P6_D_H, conv_k: NV3_P6_CONV_K,
+        coarse_ckpt: NV3_P6_COARSE_CKPT, fine_ckpt: NV3_P6_FINE_CKPT, use_fp32_ckpt: 1, seed: 20261125
+    })
+    if nv3_trainer_load_npg(tr, base_ckpt) != 1 {
+        nv3_trainer_free(tr)
+        @free(base_q as *u8)
+        println("NOEMA_V3_PROMOTE_REPORT_V1")
+        println("ok=0")
+        println("error=trainer_load_base_failed")
+        return 1
+    }
+
+    var s: i64 = 1
+    while s <= 12 {
+        let lr = nv3_preopt_lr(base_steps + s, 4, 60, 0.018, 0.004)
+        let st = nv3_trainer_run_soa(tr, train_soa, 1, lr, 2.0)
+        if st.ok != 1 {
+            nv3_trainer_free(tr)
+            @free(base_q as *u8)
+            println("NOEMA_V3_PROMOTE_REPORT_V1")
+            println("ok=0")
+            println("error=candidate_training_diverged")
+            return 1
+        }
+        s = s + 1
+    }
+    if nv3_trainer_save_npg(tr, cand_tmp, NV3_NPG_DTYPE_F64) != 1 {
+        nv3_trainer_free(tr)
+        @free(base_q as *u8)
+        println("NOEMA_V3_PROMOTE_REPORT_V1")
+        println("ok=0")
+        println("error=candidate_save_failed")
+        return 1
+    }
+    nv3_trainer_free(tr)
+
+    let t1_ns = @time_ns()
+    let cand_ms = ((t1_ns - t0_ns) as f64) / 1000000.0
+
+    // 3) Evaluate Q(M_cand) on locked test_soa and run lexicographic Q promotion
+    let cand_q = @malloc(56) as *f64
+    let cand_steps = nv3_eval_npg_q_vector(cand_tmp, test_soa, 1.0, 0.0, cand_ms, cand_q)
+
+    let thr = @malloc(56) as *f64
+    thr[0] = 1.0      // Q[0] integrity_safety == 1.0
+    thr[1] = 1.0      // Q[1] verified_reasoning == 1.0
+    thr[2] = 0.0      // Q[2] unsupported_claim_rate <= 0.0
+    thr[3] = 1.0      // Q[3] compositional_gen == 1.0
+    thr[4] = 0.30     // Q[4] calibration_ece <= 0.30
+    thr[5] = base_q[5] - 0.01 // Q[5] heldout_bpb strictly better than baseline
+    thr[6] = 600000.0 // Q[6] compute_cost_ms <= 600s
+
+    let prom = nv3_promote_npg_if_q_dominates(cand_tmp, out_ckpt, base_q, cand_q, thr)
+
+    // 4) Mandatory Negative Probe: Upper-gate regression MUST NOT be masked by better bpb & cost
+    let masked_q = @malloc(56) as *f64
+    masked_q[0] = 1.0
+    masked_q[1] = 1.0
+    masked_q[2] = 0.04  // Unsupported claim rate regressed from 0.0 -> 0.04!
+    masked_q[3] = 1.0
+    masked_q[4] = 0.05  // Artificially much lower ECE
+    masked_q[5] = 4.20  // Artificially much lower heldout_bpb
+    masked_q[6] = 10.0  // Artificially 1000x cheaper compute
+    let neg_prom = nv3_promote_npg_if_q_dominates(cand_tmp, rej_tmp, base_q, masked_q, thr)
+    let masking_blocked = if neg_prom.promoted == 0 and neg_prom.lex_cmp == -1 { 1 } else { 0 }
+
+    let overall_ok = if prom.ok == 1 and prom.promoted == 1 and masking_blocked == 1 and cand_q[5] < base_q[5] { 1 } else { 0 }
+
+    println("NOEMA_V3_PROMOTE_REPORT_V1")
+    print("ok=") printInt(overall_ok)
+    println("base_checkpoint=" + base_ckpt)
+    println("promoted_checkpoint=" + out_ckpt)
+    print("base_steps=") printInt(base_steps)
+    print("cand_steps=") printInt(cand_steps)
+    print("promoted=") printInt(prom.promoted)
+    print("lex_cmp=") printInt(prom.lex_cmp)
+    print("masking_regression_blocked=") printInt(masking_blocked)
+    print("base_test_bpb=") printFloat(base_q[5]) println("")
+    print("cand_test_bpb=") printFloat(cand_q[5]) println("")
+    print("base_test_ece=") printFloat(base_q[4]) println("")
+    print("cand_test_ece=") printFloat(cand_q[4]) println("")
+    print("cand_q0_safety=") printFloat(cand_q[0]) println("")
+    print("cand_q1_reasoning=") printFloat(cand_q[1]) println("")
+    print("cand_q2_unsupported=") printFloat(cand_q[2]) println("")
+    print("cand_q3_compositional=") printFloat(cand_q[3]) println("")
+    print("cand_compute_ms=") printFloat(cand_ms) println("")
+
+    @free(masked_q as *u8)
+    @free(thr as *u8)
+    @free(cand_q as *u8)
+    @free(base_q as *u8)
+    return if overall_ok == 1 { 0 } else { 1 }
+}

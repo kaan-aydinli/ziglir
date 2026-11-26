@@ -1,0 +1,238 @@
+// NOEMA v3 Phase 2 Test 05:
+//   1) Pure-LIR SoA binary shard ingestion + read == accepted + rejected accounting
+//   2) Fail-closed rejection of corrupted SoA shards (FNV-1a64 mismatch, invalid provenance, missing reset)
+//   3) Streaming SoA training + disjoint held-out bpb descent (zero external optimizer/autodiff/tokenizer)
+//   4) NPG-v3 binary checkpoint roundtrip (f64 exact & binary32 fp32)
+//   5) Fail-closed rejection of legacy .nps and bit-flipped NPG-v3 payloads without mutating weights
+//   6) Weight-driven raw UTF-8 generation mode (NOEMA_V3_OUTPUT_WEIGHT_GENERATION)
+
+import "../src/noema_v3/noema_v3_trainer.lir"
+
+// Check 1: Locked SoA binary ingestion and read == accepted + rejected accounting
+fn test_soa_locked_ingestion() -> i64 {
+    let sh_tr = nv3_soa_load("ai/noema_v3/fixtures/soa_shard_sample", 65536)
+    let sh_te = nv3_soa_load("ai/noema_v3/fixtures/soa_shard_heldout", 65536)
+
+    var ok: i64 = 1
+    if sh_tr.ok != 1 or sh_te.ok != 1 { ok = 0 }
+    if sh_tr.num_docs != 2 or sh_te.num_docs != 2 { ok = 0 }
+    if sh_tr.read_docs != (sh_tr.accepted_docs + sh_tr.rejected_docs) { ok = 0 }
+    if sh_te.read_docs != (sh_te.accepted_docs + sh_te.rejected_docs) { ok = 0 }
+    if sh_tr.rejected_docs != 0 or sh_te.rejected_docs != 0 { ok = 0 }
+    // Verify document start reset bits
+    if sh_tr.reset[sh_tr.doc_offsets[0]] != 1 or sh_tr.reset[sh_tr.doc_offsets[1]] != 1 { ok = 0 }
+    if sh_te.reset[sh_te.doc_offsets[0]] != 1 or sh_te.reset[sh_te.doc_offsets[1]] != 1 { ok = 0 }
+
+    nv3_soa_free(sh_tr)
+    nv3_soa_free(sh_te)
+    return ok
+}
+
+// Check 2: Pure-LIR SoA writer + fail-closed rejection of checksum/provenance/reset corruption
+fn test_soa_corrupt_fail_closed() -> i64 {
+    let dir = "/tmp/nv3_soa_test_corrupt"
+    let n: i64 = 10
+    let stream = @malloc(n)
+    let prov = @malloc(n * 8) as *i64
+    let rst = @malloc(n * 8) as *i64
+    let wts = @malloc(n * 8) as *f64
+    let doff = @malloc(16) as *i64
+    let dlen = @malloc(16) as *i64
+    let dmh = @malloc(16) as *i64
+
+    var i: i64 = 0
+    while i < n {
+        @write_u8(@ptr_add(stream, i), (65 + i) as u8)
+        prov[i] = NOEMA_V3_PROV_VERIFIED_KHG
+        rst[i] = if i == 0 or i == 5 { 1 } else { 0 }
+        wts[i] = 1.0
+        i = i + 1
+    }
+    doff[0] = 0 dlen[0] = 5 dmh[0] = 111
+    doff[1] = 5 dlen[1] = 5 dmh[1] = 222
+
+    let spec = Nv3SoaWriteSpec {
+        num_bytes: n, num_docs: 2, stream: stream, prov: prov, reset: rst,
+        weights: wts, doc_offsets: doff, doc_lengths: dlen, doc_manifest_hashes: dmh
+    }
+    let wok = nv3_soa_write(dir, spec)
+    let good = nv3_soa_load(dir, 4096)
+    var ok: i64 = 1
+    if wok != 1 or good.ok != 1 or good.accepted_docs != 2 { ok = 0 }
+    nv3_soa_free(good)
+
+    // Corrupt 1 byte in doc 1 of stream.bin WITHOUT updating docs.idx checksum
+    @write_u8(@ptr_add(stream, 7), 122 as u8)
+    let _wbad = nv3_write_all_file(dir + "/stream.bin", stream, n)
+    let bad_ck = nv3_soa_load(dir, 4096)
+    if bad_ck.ok != 0 { ok = 0 }
+    if bad_ck.read_docs != 2 or bad_ck.accepted_docs != 1 or bad_ck.rejected_docs != 1 { ok = 0 }
+    if bad_ck.read_docs != (bad_ck.accepted_docs + bad_ck.rejected_docs) { ok = 0 }
+    nv3_soa_free(bad_ck)
+
+    // Restore stream, then write missing reset bit on doc 1 -> must fail closed
+    @write_u8(@ptr_add(stream, 7), 72 as u8)
+    rst[5] = 0
+    let _w2 = nv3_soa_write(dir, spec)
+    let bad_rst = nv3_soa_load(dir, 4096)
+    if bad_rst.ok != 0 or bad_rst.rejected_docs != 1 { ok = 0 }
+    nv3_soa_free(bad_rst)
+
+    @free(stream) @free(prov as *u8) @free(rst as *u8) @free(wts as *u8)
+    @free(doff as *u8) @free(dlen as *u8) @free(dmh as *u8)
+    return ok
+}
+
+// Checks 3, 4, 5, 6: SoA streaming training + disjoint heldout bpb + NPG-v3 roundtrip/rejection + generation
+fn run_training_and_checkpoint_suite(out_flags: *i64) {
+    out_flags[0] = 0
+    out_flags[1] = 0
+    out_flags[2] = 0
+    out_flags[3] = 0
+
+    let tcfg = Nv3TrainerCfg {
+        d_model: 6, d_k: 4, d_h: 8, conv_k: 3,
+        coarse_ckpt: 8, fine_ckpt: 2, use_fp32_ckpt: 1, seed: 202603
+    }
+    let tr = nv3_trainer_create(tcfg)
+
+    let tr_init = nv3_trainer_run_soa(tr, "ai/noema_v3/fixtures/soa_shard_sample", 0, 0.0, 1.0)
+    let ho_init = nv3_trainer_run_soa(tr, "ai/noema_v3/fixtures/soa_shard_heldout", 0, 0.0, 1.0)
+    if tr_init.ok != 1 or ho_init.ok != 1 {
+        nv3_trainer_free(tr)
+        return
+    }
+
+    var step: i64 = 1
+    while step <= 10 {
+        let lr = nv3_preopt_lr(step, 2, 12, 0.04, 0.005)
+        let st = nv3_trainer_run_soa(tr, "ai/noema_v3/fixtures/soa_shard_sample", 1, lr, 2.0)
+        if st.ok != 1 {
+            nv3_trainer_free(tr)
+            return
+        }
+        step = step + 1
+    }
+
+    let tr_final = nv3_trainer_run_soa(tr, "ai/noema_v3/fixtures/soa_shard_sample", 0, 0.0, 1.0)
+    let ho_final = nv3_trainer_run_soa(tr, "ai/noema_v3/fixtures/soa_shard_heldout", 0, 0.0, 1.0)
+
+    if tr_final.ok == 1 and ho_final.ok == 1 and nv3_is_finite(tr_final.bpb) == 1 and nv3_is_finite(ho_final.bpb) == 1 {
+        if tr_final.bpb < tr_init.bpb and ho_final.bpb < ho_init.bpb {
+            out_flags[0] = 1
+        }
+    }
+
+    // Check 4: NPG-v3 checkpoint save/load roundtrip in f64 and binary32 (fp32)
+    let p_f64 = "/tmp/nv3_phase2_model_f64.npg3"
+    let p_f32 = "/tmp/nv3_phase2_model_f32.npg3"
+    let sv64 = nv3_trainer_save_npg(tr, p_f64, NV3_NPG_DTYPE_F64)
+    let sv32 = nv3_trainer_save_npg(tr, p_f32, NV3_NPG_DTYPE_F32)
+
+    let tcfg_other = Nv3TrainerCfg {
+        d_model: 6, d_k: 4, d_h: 8, conv_k: 3,
+        coarse_ckpt: 8, fine_ckpt: 2, use_fp32_ckpt: 1, seed: 999991
+    }
+    let tr_reload = nv3_trainer_create(tcfg_other)
+    let ld64 = nv3_trainer_load_npg(tr_reload, p_f64)
+    let ho_r64 = nv3_trainer_run_soa(tr_reload, "ai/noema_v3/fixtures/soa_shard_heldout", 0, 0.0, 1.0)
+
+    let ld32 = nv3_trainer_load_npg(tr_reload, p_f32)
+    let ho_r32 = nv3_trainer_run_soa(tr_reload, "ai/noema_v3/fixtures/soa_shard_heldout", 0, 0.0, 1.0)
+
+    if sv64 == 1 and sv32 == 1 and ld64 == 1 and ld32 == 1 and tr_reload.step_box[0] == 10 {
+        if nv3_abs(ho_r64.bpb - ho_final.bpb) < 0.000000000001 and nv3_abs(ho_r32.bpb - ho_final.bpb) < 0.0001 {
+            out_flags[1] = 1
+        }
+    }
+
+    // Reload exact f64 before testing generation & corruption guards
+    let _ld_exact = nv3_trainer_load_npg(tr_reload, p_f64)
+    let saved_w0 = tr_reload.params[0]
+
+    // Check 6: Weight-driven raw UTF-8 generation reproducibility across NPG-v3 reload
+    let prompt_s = "Kanıt:"
+    let plen = @string_len(prompt_s)
+    let pu8 = @malloc(plen)
+    let pprov = @malloc(plen * 8) as *i64
+    var pi: i64 = 0
+    while pi < plen {
+        @write_u8(@ptr_add(pu8, pi), (@string_char_at(prompt_s, pi) & 255) as u8)
+        pprov[pi] = NOEMA_V3_PROV_USER_INPUT
+        pi = pi + 1
+    }
+    let gen_a = @malloc(6)
+    let gen_b = @malloc(6)
+    let mode_a = nv3_trainer_generate_utf8(tr, pu8, pprov, plen, 6, gen_a)
+    let mode_b = nv3_trainer_generate_utf8(tr_reload, pu8, pprov, plen, 6, gen_b)
+    var gen_match: i64 = 1
+    var gi: i64 = 0
+    while gi < 6 {
+        if @read_u8(@ptr_add(gen_a, gi)) != @read_u8(@ptr_add(gen_b, gi)) { gen_match = 0 }
+        gi = gi + 1
+    }
+    if mode_a == NOEMA_V3_OUTPUT_WEIGHT_GENERATION and mode_b == NOEMA_V3_OUTPUT_WEIGHT_GENERATION and gen_match == 1 {
+        out_flags[3] = 1
+    }
+    @free(pu8) @free(pprov as *u8) @free(gen_a) @free(gen_b)
+
+    // Check 5: Fail-closed rejection of legacy .nps AND corrupted NPG-v3 payload without mutating memory
+    let fake_nps = "/tmp/nv3_legacy_flat.nps"
+    let nps_buf = @malloc(16)
+    @memset(nps_buf, 65, 16)
+    let _wnps = nv3_write_all_file(fake_nps, nps_buf, 16)
+    @free(nps_buf)
+    let rej_nps = nv3_trainer_load_npg(tr_reload, fake_nps)
+
+    // Flip 1 bit inside the payload of p_f32 and verify checksum fail-closed rejection
+    let lbox = @malloc(8) as *i64
+    let raw32 = nv3_read_entire_file(p_f32, 200000, lbox)
+    let rlen = lbox[0]
+    @free(lbox as *u8)
+    var rej_corrupt: i64 = 1
+    if raw32 != (0 as *u8) and rlen > 100 {
+        let old_b = (@read_u8(@ptr_add(raw32, 96)) as i64) ^ 1
+        @write_u8(@ptr_add(raw32, 96), old_b as u8)
+        let _wc = nv3_write_all_file("/tmp/nv3_corrupt.npg3", raw32, rlen)
+        @free(raw32)
+        rej_corrupt = nv3_trainer_load_npg(tr_reload, "/tmp/nv3_corrupt.npg3")
+    }
+
+    if rej_nps == 0 and rej_corrupt == 0 and tr_reload.params[0] == saved_w0 {
+        out_flags[2] = 1
+    }
+
+    nv3_trainer_free(tr)
+    nv3_trainer_free(tr_reload)
+}
+
+fn main() -> i64 {
+    let ok1 = test_soa_locked_ingestion()
+    println("soa_locked_ingestion_accounting:")
+    printInt(ok1)
+
+    let ok2 = test_soa_corrupt_fail_closed()
+    println("soa_corrupt_fail_closed:")
+    printInt(ok2)
+
+    let flags = @malloc(32) as *i64
+    run_training_and_checkpoint_suite(flags)
+
+    println("soa_train_and_heldout_bpb_descent:")
+    printInt(flags[0])
+
+    println("npg_v3_roundtrip_f64_and_f32:")
+    printInt(flags[1])
+
+    println("npg_v3_reject_legacy_nps_and_corruption:")
+    printInt(flags[2])
+
+    println("weight_generation_utf8_mode:")
+    printInt(flags[3])
+
+    let all_ok = if ok1 == 1 and ok2 == 1 and flags[0] == 1 and flags[1] == 1 and flags[2] == 1 and flags[3] == 1 { 1 } else { 0 }
+    @free(flags as *u8)
+    println("NOEMA_V3_SOA_NPG_BPB_ALL_PASS:")
+    printInt(all_ok)
+    return if all_ok == 1 { 0 } else { 1 }
+}

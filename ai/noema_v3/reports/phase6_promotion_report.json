@@ -1,0 +1,37 @@
+{
+  "schema": "noema_v3.phase6_promotion_report.v1",
+  "claim_policy": "measured_internal_locked_benchmark_only_no_unmeasured_frontier_claim",
+  "base_checkpoint": {
+    "path": "ai/noema_v3/checkpoints/noema_v3_locked.npg3",
+    "sha256": "f1d49901631ec41d682f7aae60e1a4e2d798399f40880e1ec741b63d4d2baad6",
+    "steps": 36,
+    "locked_test_bpb": 6.083383,
+    "locked_test_ece": 0.168306
+  },
+  "promoted_checkpoint": {
+    "path": "ai/noema_v3/checkpoints/noema_v3_promoted.npg3",
+    "magic_hex": "4e50477633000300",
+    "schema_version": 3,
+    "byte_size": 70712,
+    "sha256": "b86314c562105e8c65029b3ce1f5a17d731280157cf2a9b2216ca8e98cb49567",
+    "steps": 48,
+    "locked_test_bpb": 5.739479,
+    "locked_test_ece": 0.11853,
+    "bpb_delta_vs_base": -0.343904,
+    "ece_delta_vs_base": -0.049776
+  },
+  "lexicographic_promotion_gate": {
+    "promoted": true,
+    "lex_cmp": 1,
+    "upper_gate_masking_regression_blocked": true,
+    "candidate_q_vector": {
+      "q0_integrity_safety": 1.0,
+      "q1_verified_reasoning": 1.0,
+      "q2_unsupported_claim_rate": 0.0,
+      "q3_compositional_gen": 1.0,
+      "q4_calibration_ece": 0.11853,
+      "q5_heldout_bpb": 5.739479,
+      "q6_compute_cost_ms": 18735.234594
+    }
+  }
+}

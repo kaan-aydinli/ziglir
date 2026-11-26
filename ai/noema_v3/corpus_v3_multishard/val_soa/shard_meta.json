@@ -1,0 +1,27 @@
+{
+  "version": 3,
+  "shard_id": "val_soa",
+  "delimiter": "<veriayrimi>",
+  "files": {
+    "stream.bin": {
+      "byte_length": 344,
+      "sha256": "61223222ce7eafcdec40fe6eb21fdb9598bf8327595961d485dbbac5c8a49557"
+    },
+    "prov.bin": {
+      "byte_length": 344,
+      "sha256": "29f8bdfad76e54934d9d803697ccf84dd97a51f85ca23d900d4e7a9365c9689f"
+    },
+    "reset.bit": {
+      "byte_length": 43,
+      "sha256": "070420041d3e063d31512650732eb844aa5c259756d837cda82629d0f6c357d1"
+    },
+    "weight.bin": {
+      "byte_length": 1376,
+      "sha256": "851ac1679c31ac13b3deaf2bea30874696a2014b36762e11f9b89172cd1664ab"
+    },
+    "docs.idx": {
+      "byte_length": 144,
+      "sha256": "b7c9a53c8e121b1c151334ef004e8f892611be06dcc9a3a876f9b3ae64fc232e"
+    }
+  }
+}

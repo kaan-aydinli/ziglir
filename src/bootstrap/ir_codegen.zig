@@ -33,10 +33,10 @@ const CALLEE_SAVED_POOL = [_]u8{ 3, 12, 13, 14, 15 }; // rbx, r12, r13, r14, r15
 const ALL_ALLOC_REGS = [_]u8{ 8, 9, 10, 6, 7, 3, 12, 13, 14, 15 };
 const NO_REG: u8 = 0xFF;
 
-const MAX_CODE_BYTES = 524288;
-const MAX_RODATA_BYTES = 65536;
-const MAX_VREGS = 4096;
-const DATA_VADDR: u64 = 0x600000; // 64 KiB RW zero-init page: [0x00]=argc, [0x08]=argv, [0x10..0x67]=slab, [0x68]=envp, [0x70]=heap_secret, [0x78]=stack_canary, [0x80]=slab_cur_base, [0x88]=heap_min, [0x90]=heap_max, [0x98]=region_count, [0xA0]=is_multithreaded, [0xB0]=free_ring_cursor, [0x100..]=region_dir
+const MAX_CODE_BYTES = 2097152;
+const MAX_RODATA_BYTES = 262144;
+const MAX_VREGS = 8192;
+const DATA_VADDR: u64 = 0x1000000; // 64 KiB RW zero-init page: [0x00]=argc, [0x08]=argv, [0x10..0x67]=slab, [0x68]=envp, [0x70]=heap_secret, [0x78]=stack_canary, [0x80]=slab_cur_base, [0x88]=heap_min, [0x90]=heap_max, [0x98]=region_count, [0xA0]=is_multithreaded, [0xB0]=free_ring_cursor, [0x100..]=region_dir
 const REGION_DIR_CAP: u32 = 4080;
 
 const FnInfo = struct {
@@ -177,10 +177,10 @@ pub const IRCodegen = struct {
 
     rodata: [MAX_RODATA_BYTES]u8 = undefined,
     rodata_len: u32 = 0,
-    string_offsets: [512]u32 = undefined,
-    string_lens: [512]u32 = undefined,
-    string_hashes: [512]u64 = undefined,
-    string_hash_slots: [1024]u16 = .{0} ** 1024,
+    string_offsets: [2048]u32 = undefined,
+    string_lens: [2048]u32 = undefined,
+    string_hashes: [2048]u64 = undefined,
+    string_hash_slots: [4096]u16 = .{0} ** 4096,
     string_count: u32 = 0,
 
     src: []const u8 = "",
@@ -224,7 +224,7 @@ pub const IRCodegen = struct {
     text_user_end: u32 = 0,
 
     // Relocations
-    relocs: [32768]Reloc = undefined,
+    relocs: [131072]Reloc = undefined,
     reloc_count: u32 = 0,
 
     // Current function allocation & frame state
@@ -1272,6 +1272,7 @@ pub const IRCodegen = struct {
             while (dj < keep_n) {
                 const ov = keep_const_vregs[dj];
                 if (self.vreg_const_imm[ov] == dimm) {
+                    self.vreg_keep_const_reg[ov] = false;
                     self.vreg_keep_const_dup[ov] = dv;
                     keep_const_vregs[dj] = keep_const_vregs[keep_n - 1];
                     keep_n -= 1;
@@ -1813,14 +1814,6 @@ pub const IRCodegen = struct {
         // budget allows. A constant that is not kept is fully elided-or-plain
         // (see below), so a partial selection stays consistent: only `kept_n`
         // entries are marked, and the rest fall back to the untouched analysis.
-        // A duplicate has no register of its own, so the allocator must skip it
-        // and the prologue must not write it. Marking it as elided keeps the
-        // live-range machinery from reserving anything for it, and the
-        // defining instruction is skipped separately below.
-        for (1..@min(@as(usize, max_vreg) + 1, MAX_VREGS)) |dv| {
-            if (self.vreg_keep_const_dup[dv] != 0) self.vreg_elided_const[dv] = true;
-        }
-
         var kept_n: usize = 0;
         for (self.cur_keep_const_vregs[0..self.cur_keep_const_count]) |kv| {
             if (kept_n >= kept_room) break;
@@ -1839,6 +1832,21 @@ pub const IRCodegen = struct {
             self.vreg_keep_const_reg[kv] = false;
         }
         self.cur_keep_const_count = kept_n;
+
+        // A duplicate has no register of its own only when its target is
+        // actually kept; if the target fell outside `kept_n`, drop the
+        // duplicate link so it falls back to normal allocation/materialisation.
+        for (1..@min(@as(usize, max_vreg) + 1, MAX_VREGS)) |dv| {
+            const dup_target = self.vreg_keep_const_dup[dv];
+            if (dup_target != 0) {
+                if (self.vreg_keep_const_reg[dup_target]) {
+                    self.vreg_elided_const[dv] = true;
+                } else {
+                    self.vreg_keep_const_dup[dv] = 0;
+                    self.vreg_keep_const_reg[dv] = false;
+                }
+            }
+        }
 
         // Live ranges are known now, so the peak number of simultaneously live
         // vregs can be measured. That is what decides whether the allocator has
@@ -1885,6 +1893,7 @@ pub const IRCodegen = struct {
         var next_spill: u32 = 1;
 
         for (order[0..order_count]) |cur_v| {
+            if (self.vreg_elided_const[cur_v]) continue;
             const cur_s = self.vreg_start[cur_v];
 
             for (ALL_ALLOC_REGS) |r| {
@@ -2791,17 +2800,16 @@ pub const IRCodegen = struct {
             }
         }
 
-        // Materialise each reused wide constant once, at the top of the
-        // function, into its permanently assigned register. Uses then read the
-        // register: `movabs` inside a loop is replaced by a register read.
-        for (self.cur_keep_const_vregs[0..self.cur_keep_const_count]) |kv| {
-            const preg = self.vregPhys(kv) orelse continue;
-            self.mov64imm(preg, @bitCast(self.vreg_const_imm[kv]));
-        }
-        // Constant-divisor magic multipliers used inside loops: one `movabs`
-        // here instead of one per division.
-        for (self.cur_magic_vals[0..self.cur_magic_count], 0..) |mv, k| {
-            self.mov64imm(self.cur_extra_callee[k], @bitCast(mv));
+        if (!can_shrink) {
+            // Materialise each reused wide constant once, after callee-saved
+            // registers have been saved by the prologue.
+            for (self.cur_keep_const_vregs[0..self.cur_keep_const_count]) |kv| {
+                const preg = self.vregPhys(kv) orelse continue;
+                self.mov64imm(preg, @bitCast(self.vreg_const_imm[kv]));
+            }
+            for (self.cur_magic_vals[0..self.cur_magic_count], 0..) |mv, k| {
+                self.mov64imm(self.cur_extra_callee[k], @bitCast(mv));
+            }
         }
 
         const fn_name = self.irFnName(fi);
@@ -2826,6 +2834,13 @@ pub const IRCodegen = struct {
                 self.subRspImm(self.cur_stack_adj);
                 f.param_store_offset = self.code_len;
                 self.emitParallelRegParamMoves(ir_fn);
+                for (self.cur_keep_const_vregs[0..self.cur_keep_const_count]) |kv| {
+                    const preg = self.vregPhys(kv) orelse continue;
+                    self.mov64imm(preg, @bitCast(self.vreg_const_imm[kv]));
+                }
+                for (self.cur_magic_vals[0..self.cur_magic_count], 0..) |mv, k| {
+                    self.mov64imm(self.cur_extra_callee[k], @bitCast(mv));
+                }
             }
             const bi = emit_order[ord_i];
             self.cur_rcx_const = null;
@@ -5602,13 +5617,14 @@ pub const IRCodegen = struct {
                     self.invalid_reference = true;
                     return;
                 };
-                // Mark process multi-threaded so slab spinlocks engage & invalidate single-thread heap cache
+                // Atomically increment active thread count [DATA_VADDR + 0xA0] & invalidate single-thread heap cache
+                self.emit8(0xF0);
                 self.emit8(0x48);
-                self.emit8(0xC7);
+                self.emit8(0x83);
                 self.emit8(0x04);
                 self.emit8(0x25);
                 self.emit32(@intCast(DATA_VADDR + 0xA0));
-                self.emit32(1);
+                self.emit8(1); // lock add qword [DATA_VADDR + 0xA0], 1
                 self.emit8(0x48);
                 self.emit8(0xC7);
                 self.emit8(0x04);
@@ -5637,6 +5653,13 @@ pub const IRCodegen = struct {
                 self.emit8(0x39);
                 self.emit8(0xD8); // cmp rax, r11
                 const tc_mmap_ok = self.emitJccReloc(0x6, .code_offset, 0, fi); // jbe
+                self.emit8(0xF0);
+                self.emit8(0x48);
+                self.emit8(0x83);
+                self.emit8(0x2C);
+                self.emit8(0x25);
+                self.emit32(@intCast(DATA_VADDR + 0xA0));
+                self.emit8(1); // lock sub qword [DATA_VADDR + 0xA0], 1
                 self.popReg(11);
                 self.mov64imm(0, @bitCast(@as(i64, -1)));
                 const tc_fail_done = self.emitJmpReloc(.code_offset, 0, fi);
@@ -5700,6 +5723,19 @@ pub const IRCodegen = struct {
                 self.xorReg(10, 10);
                 self.mov64imm(0, 61);
                 self.syscallInst();
+                // If wait4 succeeded (rax > 0), atomically decrement active thread count [DATA_VADDR + 0xA0]
+                self.emit8(0x48);
+                self.emit8(0x85);
+                self.emit8(0xC0); // test rax, rax
+                const tj_skip_dec = self.emitJccReloc(0xE, .code_offset, 0, fi); // jle
+                self.emit8(0xF0);
+                self.emit8(0x48);
+                self.emit8(0x83);
+                self.emit8(0x2C);
+                self.emit8(0x25);
+                self.emit32(@intCast(DATA_VADDR + 0xA0));
+                self.emit8(1); // lock sub qword [DATA_VADDR + 0xA0], 1
+                self.relocs[tj_skip_dec].target_id = self.code_len;
                 self.emit8(0x48);
                 self.emit8(0x8B);
                 self.emit8(0x04);
@@ -7227,7 +7263,7 @@ pub const IRCodegen = struct {
         self.emit8(0xFF);
         self.emit8(0xCE);
         self.emit8(0x88);
-        self.emit8(0x16);
+        self.emit8(0x16); // mov [rsi], al
         self.emit8(0x48);
         self.emit8(0x85);
         self.emit8(0xC0);
@@ -8491,7 +8527,29 @@ pub const IRCodegen = struct {
         self.emit32(4119); // lea rsi, [r9 + 24 + 4095]
         self.emitAluRegImm32(4, 6, -4096); // and rsi, -4096 (mapped_size)
 
-        // Mark matching region_dir entry as FREED_MMAP (kind = 2) before munmap
+        // Acquire region_lock [r10 + 0xA8] when multithreaded and mark LIVE_MMAP (kind=1) -> FREED_MMAP (kind=2)
+        self.emit8(0x49);
+        self.emit8(0x83);
+        self.emit8(0xBA);
+        self.emit32(0xA0);
+        self.emit8(0); // cmp qword [r10 + 0xA0], 0
+        const fm_skip_lock = self.emitJccReloc(0x4, .code_offset, 0, 0);
+        const fm_spin = self.code_len;
+        self.emit8(0xB8);
+        self.emit32(1);
+        self.emit8(0x41);
+        self.emit8(0x87);
+        self.emit8(0x82);
+        self.emit32(0xA8); // xchg eax, [r10 + 0xA8]
+        self.emit8(0x85);
+        self.emit8(0xC0);
+        const fm_got_lock = self.emitJccReloc(0x4, .code_offset, 0, 0);
+        self.emit8(0xF3);
+        self.emit8(0x90);
+        _ = self.emitJmpReloc(.code_offset, fm_spin, 0);
+        self.relocs[fm_got_lock].target_id = self.code_len;
+        self.relocs[fm_skip_lock].target_id = self.code_len;
+
         self.emit8(0x49);
         self.emit8(0x8B);
         self.emit8(0x8A);
@@ -8506,6 +8564,16 @@ pub const IRCodegen = struct {
         self.emit8(0x39);
         self.emit8(0x38); // cmp [r8], rdi
         const fm_dir_next = self.emitJccReloc(0x5, .code_offset, 0, 0);
+        self.emit8(0x49);
+        self.emit8(0x8B);
+        self.emit8(0x40);
+        self.emit8(0x08); // mov rax, [r8 + 8]
+        self.emit8(0x48);
+        self.emit8(0xC1);
+        self.emit8(0xE8);
+        self.emit8(62); // shr rax, 62
+        self.emitCmpRegImm32(0, 1); // only transition LIVE_MMAP (kind == 1)
+        const fm_dir_next2 = self.emitJccReloc(0x5, .code_offset, 0, 0);
         self.emit8(0x48);
         self.emit8(0x8D);
         self.emit8(0x04);
@@ -8520,6 +8588,7 @@ pub const IRCodegen = struct {
         self.emit8(0x08); // mov [r8 + 8], rax
         const fm_dir_found = self.emitJmpReloc(.code_offset, 0, 0);
         self.relocs[fm_dir_next].target_id = self.code_len;
+        self.relocs[fm_dir_next2].target_id = self.code_len;
         self.emitAluRegImm32(0, 8, 16);
         self.emit8(0x48);
         self.emit8(0xFF);
@@ -8527,6 +8596,12 @@ pub const IRCodegen = struct {
         _ = self.emitJccReloc(0x5, .code_offset, fm_dir_loop, 0);
         self.relocs[fm_dir_found].target_id = self.code_len;
         self.relocs[fm_dir_done].target_id = self.code_len;
+
+        self.emit8(0x49);
+        self.emit8(0xC7);
+        self.emit8(0x82);
+        self.emit32(0xA8);
+        self.emit32(0); // release region_lock [r10 + 0xA8] = 0
 
         self.xorReg(8, 8);
         self.xorReg(11, 11);

@@ -101,6 +101,8 @@ fn main() -> i64 {
     println("ok=1")
     print("model_id=")
     if trained { println("noema_phi_large") } else if uploaded { println("noema_phi_uploaded") } else if candidate { println("noema_phi_candidate") } else { println("noema_phi_fresh") }
+    // Phase 0 isolation: legacy exemplar-retrieval path. Must never report noema_v3 weight-generation.
+    println("output_mode=legacy_retrieval_exemplar")
     print("training_records=") printInt(noema_pretrain_documents(state))
     print("training_bytes=") printInt(noema_pretrain_training_bytes(state))
     print("training_do_perturbations=") printInt(noema_pretrain_do_count(state))

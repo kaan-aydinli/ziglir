@@ -1,0 +1,10 @@
+Kiyi ikliminde denizden yukselen nemli hava yamaclarda yogusarak duzenli yagis ve serinlik olusturur.
+
+<veriayrimi>
+Bilimsel yontemde olcum belirsizligi ve kanit siniri acikca raporlanir; desteksiz cikarim reddedilir.
+
+<veriayrimi>
+Moduler sistem yaziliminda veri akisi, bellek guvenligi ve diferansiyel arka uc testleri birlikte calisir.
+
+<veriayrimi>
+Heldout symbolic check: 1/4 + 3/4 = 1; 1 km + 200 m = 1200 m.

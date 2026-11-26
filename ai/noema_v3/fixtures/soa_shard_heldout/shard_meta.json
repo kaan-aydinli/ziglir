@@ -1,0 +1,28 @@
+{
+  "version": "3.0.0",
+  "shard_id": "soa_shard_heldout_v3",
+  "num_docs": 2,
+  "num_bytes": 45,
+  "files": {
+    "stream.bin": {
+      "byte_length": 45,
+      "sha256": "4db751f0a9e1f60e95b60cf64af2bb1590954a13088d0949eccb97a632adb6f4"
+    },
+    "prov.bin": {
+      "byte_length": 45,
+      "sha256": "9df021f086b99661f7dad5a45a46c3d1b7e00ca0d754079691971e61daec061a"
+    },
+    "reset.bit": {
+      "byte_length": 6,
+      "sha256": "508b9931dc81450b0e3f7826a5abe503012a867da2fa1110cfb064b357861fdd"
+    },
+    "weight.bin": {
+      "byte_length": 180,
+      "sha256": "24cac2760ec887a76fc17cf15f9012f39ea88a28f39e22c9fd50d3e4dd15f94e"
+    },
+    "docs.idx": {
+      "byte_length": 80,
+      "sha256": "975370b9ca10390855103e6f84daccebcb503decd540242c4f65768b0c0d8eb8"
+    }
+  }
+}

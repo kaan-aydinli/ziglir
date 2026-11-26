@@ -1,0 +1,445 @@
+// NOEMA v3 Phase 1: core kernels with forward+backward for finite-diff checks.
+// Forward/backward are written in LIR; no autodiff/external deps.
+// LIR constraint: max 8 params per function - use context structs.
+
+import "noema_v3_math.lir"
+
+// -----------------------------
+// RMSNorm: y_{r,i} = gamma_i * x_{r,i} / sqrt(mean(x_{r,:}^2) + eps)
+// -----------------------------
+fn nv3_rmsnorm_forward(x: *f64, gamma: *f64, y: *f64, rows: i64, cols: i64, eps: f64) {
+    var r: i64 = 0
+    while r < rows {
+        let base = r * cols
+        var ss: f64 = 0.0
+        var i: i64 = 0
+        while i < cols {
+            let v = x[base + i]
+            ss = ss + v * v
+            i = i + 1
+        }
+        let inv_rms = 1.0 / @sqrt(ss / (cols as f64) + eps)
+        i = 0
+        while i < cols {
+            y[base + i] = gamma[i] * x[base + i] * inv_rms
+            i = i + 1
+        }
+        r = r + 1
+    }
+}
+
+struct Nv3RmsnormGrad {
+    dx: *f64
+    dgamma: *f64
+}
+
+fn nv3_rmsnorm_backward(dy: *f64, x: *f64, gamma: *f64, grad_in: Nv3RmsnormGrad, rows: i64, cols: i64, eps: f64) {
+    var grad = grad_in
+    nv3_zero(grad.dx, rows * cols)
+    nv3_zero(grad.dgamma, cols)
+    var r: i64 = 0
+    while r < rows {
+        let base = r * cols
+        var ss: f64 = 0.0
+        var i: i64 = 0
+        while i < cols {
+            let v = x[base + i]
+            ss = ss + v * v
+            i = i + 1
+        }
+        let mean_sq = ss / (cols as f64) + eps
+        let inv_rms = 1.0 / @sqrt(mean_sq)
+        let inv_rms3 = inv_rms * inv_rms * inv_rms
+        var dot_dy_gamma_x: f64 = 0.0
+        i = 0
+        while i < cols {
+            let xi = x[base + i]
+            let dyi = dy[base + i]
+            let gi = gamma[i]
+            grad.dgamma[i] = grad.dgamma[i] + dyi * xi * inv_rms
+            dot_dy_gamma_x = dot_dy_gamma_x + dyi * gi * xi
+            i = i + 1
+        }
+        let coeff = inv_rms3 / (cols as f64)
+        i = 0
+        while i < cols {
+            let xi = x[base + i]
+            let dyi = dy[base + i]
+            let gi = gamma[i]
+            grad.dx[base + i] = grad.dx[base + i] + gi * inv_rms * dyi - coeff * xi * dot_dy_gamma_x
+            i = i + 1
+        }
+        r = r + 1
+    }
+}
+
+// -----------------------------
+// L2Norm: y_i = x_i / sqrt(sum(x_j^2) + eps)
+// -----------------------------
+fn nv3_l2norm_forward(x: *f64, y: *f64, n: i64, eps: f64) {
+    var ss: f64 = 0.0
+    var i: i64 = 0
+    while i < n { ss = ss + x[i] * x[i] i = i + 1 }
+    let inv = 1.0 / @sqrt(ss + eps)
+    i = 0
+    while i < n { y[i] = x[i] * inv i = i + 1 }
+}
+
+fn nv3_l2norm_backward(dy: *f64, x: *f64, dx: *f64, n: i64, eps: f64) {
+    var ss: f64 = 0.0
+    var i: i64 = 0
+    while i < n { ss = ss + x[i] * x[i] i = i + 1 }
+    let denom = ss + eps
+    let inv = 1.0 / @sqrt(denom)
+    let inv3 = inv * inv * inv
+    var dot_dy_x: f64 = 0.0
+    i = 0
+    while i < n { dot_dy_x = dot_dy_x + dy[i] * x[i] i = i + 1 }
+    i = 0
+    while i < n {
+        dx[i] = dy[i] * inv - x[i] * dot_dy_x * inv3
+        i = i + 1
+    }
+}
+
+// -----------------------------
+// Linear: y = x*W + b  (W: [in,out] row-major)
+// Cache-friendly unit-stride row-SAXPY + 4-way ILP unrolling (IEEE-754 bit-exact with scalar dot).
+// -----------------------------
+fn nv3_linear_forward(x: *f64, w: *f64, b: *f64, y: *f64, in_dim: i64, out_dim: i64) {
+    var o: i64 = 0
+    while (o + 4) <= out_dim {
+        y[o] = b[o]
+        y[o + 1] = b[o + 1]
+        y[o + 2] = b[o + 2]
+        y[o + 3] = b[o + 3]
+        o = o + 4
+    }
+    while o < out_dim {
+        y[o] = b[o]
+        o = o + 1
+    }
+    var i: i64 = 0
+    while i < in_dim {
+        let xi = x[i]
+        let row = i * out_dim
+        var k: i64 = 0
+        while (k + 4) <= out_dim {
+            y[k] = y[k] + xi * w[row + k]
+            y[k + 1] = y[k + 1] + xi * w[row + k + 1]
+            y[k + 2] = y[k + 2] + xi * w[row + k + 2]
+            y[k + 3] = y[k + 3] + xi * w[row + k + 3]
+            k = k + 4
+        }
+        while k < out_dim {
+            y[k] = y[k] + xi * w[row + k]
+            k = k + 1
+        }
+        i = i + 1
+    }
+}
+
+struct Nv3LinearGrad {
+    dx: *f64
+    dw: *f64
+    db: *f64
+}
+
+fn nv3_linear_backward(dy: *f64, x: *f64, w: *f64, grad_in: Nv3LinearGrad, in_dim: i64, out_dim: i64) {
+    var grad = grad_in
+    var ob: i64 = 0
+    while (ob + 4) <= out_dim {
+        grad.db[ob] = grad.db[ob] + dy[ob]
+        grad.db[ob + 1] = grad.db[ob + 1] + dy[ob + 1]
+        grad.db[ob + 2] = grad.db[ob + 2] + dy[ob + 2]
+        grad.db[ob + 3] = grad.db[ob + 3] + dy[ob + 3]
+        ob = ob + 4
+    }
+    while ob < out_dim {
+        grad.db[ob] = grad.db[ob] + dy[ob]
+        ob = ob + 1
+    }
+    var i: i64 = 0
+    while i < in_dim {
+        let xi = x[i]
+        let row = i * out_dim
+        var d0: f64 = 0.0
+        var d1: f64 = 0.0
+        var d2: f64 = 0.0
+        var d3: f64 = 0.0
+        var o: i64 = 0
+        while (o + 4) <= out_dim {
+            let g0 = dy[o]
+            let g1 = dy[o + 1]
+            let g2 = dy[o + 2]
+            let g3 = dy[o + 3]
+            let idx = row + o
+            grad.dw[idx] = grad.dw[idx] + g0 * xi
+            grad.dw[idx + 1] = grad.dw[idx + 1] + g1 * xi
+            grad.dw[idx + 2] = grad.dw[idx + 2] + g2 * xi
+            grad.dw[idx + 3] = grad.dw[idx + 3] + g3 * xi
+            d0 = d0 + g0 * w[idx]
+            d1 = d1 + g1 * w[idx + 1]
+            d2 = d2 + g2 * w[idx + 2]
+            d3 = d3 + g3 * w[idx + 3]
+            o = o + 4
+        }
+        var d_tail = (d0 + d1) + (d2 + d3)
+        while o < out_dim {
+            let go = dy[o]
+            let idx = row + o
+            grad.dw[idx] = grad.dw[idx] + go * xi
+            d_tail = d_tail + go * w[idx]
+            o = o + 1
+        }
+        grad.dx[i] = d_tail
+        i = i + 1
+    }
+}
+
+// -----------------------------
+// SwiGLU MLP: gate=x@Wg+bg, up=x@Wu+bu, hidden=silu(gate)*up, y=hidden@Wo+bo
+// -----------------------------
+struct Nv3SwiGluParams {
+    wg: *f64
+    bg: *f64
+    wu: *f64
+    bu: *f64
+    wo: *f64
+    bo: *f64
+}
+
+struct Nv3SwiGluBuf {
+    gate: *f64
+    up: *f64
+    hidden: *f64
+}
+
+struct Nv3SwiGluDims {
+    in_dim: i64
+    h_dim: i64
+    out_dim: i64
+}
+
+fn nv3_swiglu_forward(x: *f64, p: Nv3SwiGluParams, buf_in: Nv3SwiGluBuf, y: *f64, d: Nv3SwiGluDims) {
+    var buf = buf_in
+    nv3_linear_forward(x, p.wg, p.bg, buf.gate, d.in_dim, d.h_dim)
+    nv3_linear_forward(x, p.wu, p.bu, buf.up, d.in_dim, d.h_dim)
+    var i: i64 = 0
+    while i < d.h_dim {
+        buf.hidden[i] = nv3_silu(buf.gate[i]) * buf.up[i]
+        i = i + 1
+    }
+    nv3_linear_forward(buf.hidden, p.wo, p.bo, y, d.h_dim, d.out_dim)
+}
+
+struct Nv3SwiGluGrad {
+    dx: *f64
+    dwg: *f64
+    dbg: *f64
+    dwu: *f64
+    dbu: *f64
+    dwo: *f64
+    dbo: *f64
+}
+
+fn nv3_swiglu_backward(dy: *f64, x: *f64, p: Nv3SwiGluParams, buf: Nv3SwiGluBuf, g_in: Nv3SwiGluGrad, d: Nv3SwiGluDims) {
+    var g = g_in
+    nv3_zero(g.dx, d.in_dim)
+    nv3_zero(g.dwg, d.in_dim * d.h_dim)
+    nv3_zero(g.dbg, d.h_dim)
+    nv3_zero(g.dwu, d.in_dim * d.h_dim)
+    nv3_zero(g.dbu, d.h_dim)
+    nv3_zero(g.dwo, d.h_dim * d.out_dim)
+    nv3_zero(g.dbo, d.out_dim)
+
+    let dhidden = @malloc(d.h_dim * 8) as *f64
+    nv3_zero(dhidden, d.h_dim)
+    let go = Nv3LinearGrad { dx: dhidden, dw: g.dwo, db: g.dbo }
+    nv3_linear_backward(dy, buf.hidden, p.wo, go, d.h_dim, d.out_dim)
+
+    let dgate = @malloc(d.h_dim * 8) as *f64
+    let dup = @malloc(d.h_dim * 8) as *f64
+    nv3_zero(dgate, d.h_dim)
+    nv3_zero(dup, d.h_dim)
+    var i: i64 = 0
+    while i < d.h_dim {
+        let sg = nv3_silu(buf.gate[i])
+        let s = nv3_sigmoid(buf.gate[i])
+        let dsg = s + buf.gate[i] * s * (1.0 - s)
+        dgate[i] = dhidden[i] * buf.up[i] * dsg
+        dup[i] = dhidden[i] * sg
+        i = i + 1
+    }
+
+    let dx_gate = @malloc(d.in_dim * 8) as *f64
+    let dx_up = @malloc(d.in_dim * 8) as *f64
+    nv3_zero(dx_gate, d.in_dim)
+    nv3_zero(dx_up, d.in_dim)
+    let gg = Nv3LinearGrad { dx: dx_gate, dw: g.dwg, db: g.dbg }
+    let gu = Nv3LinearGrad { dx: dx_up, dw: g.dwu, db: g.dbu }
+    nv3_linear_backward(dgate, x, p.wg, gg, d.in_dim, d.h_dim)
+    nv3_linear_backward(dup, x, p.wu, gu, d.in_dim, d.h_dim)
+    i = 0
+    while i < d.in_dim {
+        g.dx[i] = dx_gate[i] + dx_up[i]
+        i = i + 1
+    }
+
+    @free(dhidden as *u8)
+    @free(dgate as *u8)
+    @free(dup as *u8)
+    @free(dx_gate as *u8)
+    @free(dx_up as *u8)
+}
+
+// -----------------------------
+// CausalDepthwiseConv1D: y[t,c] = sum_k w[c,k] * x_pad[t+k,c] + b[c]
+// -----------------------------
+struct Nv3ConvDims {
+    t_len: i64
+    channels: i64
+    kernel: i64
+}
+
+fn nv3_causal_depthwise_conv1d_forward(x: *f64, w: *f64, b: *f64, y: *f64, d: Nv3ConvDims) {
+    var t: i64 = 0
+    while t < d.t_len {
+        var c: i64 = 0
+        while c < d.channels {
+            var acc = b[c]
+            var k: i64 = 0
+            while k < d.kernel {
+                let src_t = t - (d.kernel - 1 - k)
+                if src_t >= 0 {
+                    acc = acc + w[c * d.kernel + k] * x[src_t * d.channels + c]
+                }
+                k = k + 1
+            }
+            y[t * d.channels + c] = acc
+            c = c + 1
+        }
+        t = t + 1
+    }
+}
+
+struct Nv3ConvGrad {
+    dx: *f64
+    dw: *f64
+    db: *f64
+}
+
+fn nv3_causal_depthwise_conv1d_backward(dy: *f64, x: *f64, w: *f64, g_in: Nv3ConvGrad, d: Nv3ConvDims) {
+    var g = g_in
+    nv3_zero(g.dx, d.t_len * d.channels)
+    nv3_zero(g.dw, d.channels * d.kernel)
+    nv3_zero(g.db, d.channels)
+    var t: i64 = 0
+    while t < d.t_len {
+        var c: i64 = 0
+        while c < d.channels {
+            let gout = dy[t * d.channels + c]
+            g.db[c] = g.db[c] + gout
+            var k: i64 = 0
+            while k < d.kernel {
+                let src_t = t - (d.kernel - 1 - k)
+                if src_t >= 0 {
+                    let x_idx = src_t * d.channels + c
+                    let w_idx = c * d.kernel + k
+                    g.dw[w_idx] = g.dw[w_idx] + gout * x[x_idx]
+                    g.dx[x_idx] = g.dx[x_idx] + gout * w[w_idx]
+                }
+                k = k + 1
+            }
+            c = c + 1
+        }
+        t = t + 1
+    }
+}
+
+// -----------------------------
+// Softmax Cross-Entropy (weighted raw-UTF-8-byte / discrete logit loss)
+// L = sum_{r=0}^{rows-1} w[r] * (log(sum_c exp(logits[r,c])) - logits[r, targets[r]])
+// -----------------------------
+fn nv3_softmax_ce_forward(logits: *f64, targets: *i64, loss_weights: *f64, rows: i64, vocab: i64) -> f64 {
+    if rows <= 0 or vocab <= 0 { return 0.0 }
+    var total_loss: f64 = 0.0
+    var r: i64 = 0
+    while r < rows {
+        let base = r * vocab
+        let wt = loss_weights[r]
+        let tgt = targets[r]
+        if wt != 0.0 and tgt >= 0 and tgt < vocab {
+            var maxv = logits[base]
+            var c: i64 = 1
+            while c < vocab {
+                let v = logits[base + c]
+                if v > maxv { maxv = v }
+                c = c + 1
+            }
+            var sum_exp: f64 = 0.0
+            c = 0
+            while c < vocab {
+                sum_exp = sum_exp + nv3_exp(logits[base + c] - maxv)
+                c = c + 1
+            }
+            let lse = maxv + nv3_log(sum_exp)
+            total_loss = total_loss + wt * (lse - logits[base + tgt])
+        }
+        r = r + 1
+    }
+    return total_loss
+}
+
+fn nv3_softmax_ce_backward(dloss: f64, logits: *f64, targets: *i64, loss_weights: *f64, dlogits: *f64, rows: i64, vocab: i64) {
+    if rows <= 0 or vocab <= 0 { return }
+    nv3_zero(dlogits, rows * vocab)
+    var r: i64 = 0
+    while r < rows {
+        let base = r * vocab
+        let wt = loss_weights[r]
+        let tgt = targets[r]
+        if wt != 0.0 and tgt >= 0 and tgt < vocab {
+            var maxv = logits[base]
+            var c: i64 = 1
+            while c < vocab {
+                let v = logits[base + c]
+                if v > maxv { maxv = v }
+                c = c + 1
+            }
+            var sum_exp: f64 = 0.0
+            c = 0
+            while c < vocab {
+                let e = nv3_exp(logits[base + c] - maxv)
+                dlogits[base + c] = e
+                sum_exp = sum_exp + e
+                c = c + 1
+            }
+            let inv_sum = 1.0 / sum_exp
+            let scale = dloss * wt
+            c = 0
+            while c < vocab {
+                var grad_c = dlogits[base + c] * inv_sum
+                if c == tgt {
+                    grad_c = grad_c - 1.0
+                }
+                dlogits[base + c] = scale * grad_c
+                c = c + 1
+            }
+        }
+        r = r + 1
+    }
+}
+
+fn nv3_bpb_from_nats(total_nats: f64, loss_weights: *f64, rows: i64) -> f64 {
+    var wsum: f64 = 0.0
+    var r: i64 = 0
+    while r < rows {
+        if loss_weights[r] > 0.0 {
+            wsum = wsum + loss_weights[r]
+        }
+        r = r + 1
+    }
+    if wsum <= 0.0 { return 0.0 }
+    return total_nats / (NV3_LN2 * wsum)
+}

@@ -1,0 +1,90 @@
+{
+  "schema": "noema_v3_phase9_full_benchmark_v1",
+  "date_utc": "2026-11-25",
+  "topic_delimiter": "<veriayrimi>",
+  "honesty_policy": {
+    "principle": "Olcmeden Iddia Yok",
+    "external_frontier_claim": false,
+    "scope_statement": "All metrics below are measured reproducibly on this local host over cluster-disjoint <veriayrimi>-packed raw UTF-8 SoA shards and deterministic symbolic proof suites. No claim of superiority over external frontier LLMs is made without external hardware/corpus runs."
+  },
+  "hardware_environment": {
+    "platform": "Linux-6.1.158+-x86_64-with-glibc2.36",
+    "cpu_count_logical": 2,
+    "lir_backend": "native_x86_64_elf",
+    "data_parallel_workers": 2
+  },
+  "multishard_corpus": {
+    "root": "ai/noema_v3/corpus_v3_multishard",
+    "manifest": "ai/noema_v3/corpus_v3_multishard/manifest_multishard.jsonl",
+    "delimiter": "<veriayrimi>",
+    "train_shards": [
+      "train_shard_0",
+      "train_shard_1"
+    ],
+    "train_docs_total": 16,
+    "split_leakage_violations": 0
+  },
+  "worker_determinism": {
+    "workers_compared": [
+      1,
+      2
+    ],
+    "loss_abs_diff": 1.818989e-12,
+    "grad_max_abs_diff": 4.547474e-13
+  },
+  "scaled_checkpoint": {
+    "path": "ai/noema_v3/checkpoints/noema_v3_scaled.npg3",
+    "sha256": "f2076b1bbc45ad2bce61d2292cd6d74c66b80f0acc6c18ed2f898ca28ccf0524",
+    "file_bytes": 49704,
+    "d_model": 16,
+    "d_k": 8,
+    "d_h": 28,
+    "conv_k": 4,
+    "trained_steps": 20,
+    "total_params": 12404
+  },
+  "side_by_side_comparison": {
+    "unscaled_single_shard_baseline": {
+      "total_params": 8840,
+      "docs_per_step": 8,
+      "train_bpb_init": 8.03545,
+      "train_bpb_final": 7.48767,
+      "val_bpb": 7.471486,
+      "val_ece": 0.213943,
+      "locked_test_bpb": 7.4564,
+      "locked_test_ece": 0.246032,
+      "compute_ms": 21888.726499
+    },
+    "scaled_multishard_mt": {
+      "total_params": 12404,
+      "docs_per_step": 16,
+      "train_bpb_init": 7.986109,
+      "train_bpb_final": 6.04951,
+      "val_bpb": 5.971215,
+      "val_ece": 0.1981,
+      "locked_test_bpb": 5.929397,
+      "locked_test_ece": 0.197147,
+      "compute_ms": 148527.263071
+    },
+    "locked_test_bpb_delta": -1.527003,
+    "locked_test_ece_delta": -0.048885
+  },
+  "neuro_symbolic_proof_benchmark": {
+    "passed": 12,
+    "total": 12,
+    "pass_rate": 1.0,
+    "total_proof_steps": 219,
+    "compositional_score": 1.0
+  },
+  "lexicographic_q_gate": {
+    "q_scaled_pass": true,
+    "q_lex_scaled_dominates_base": true,
+    "q_lex_cmp": 1
+  },
+  "blind_human_eval_artifacts": {
+    "packet_jsonl": "ai/noema_v3/reports/phase9_blind_eval_packet.jsonl",
+    "packet_sha256": "f3873418e55dde28ce883b658c092a836388ec4e91508c94550d960f2b94c161",
+    "reveal_key_json": "ai/noema_v3/reports/phase9_blind_eval_key_sha256.json",
+    "num_blinded_pairs": 4
+  }
+}

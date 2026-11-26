@@ -1,0 +1,28 @@
+{
+  "version": "3.0.0",
+  "shard_id": "nv3_locked_train_v1",
+  "num_docs": 6,
+  "num_bytes": 646,
+  "files": {
+    "stream.bin": {
+      "byte_length": 646,
+      "sha256": "b6383def99de407cb3dbef67d8745700bbe754e16d6930a81ded3aa7f948f425"
+    },
+    "prov.bin": {
+      "byte_length": 646,
+      "sha256": "8698187dd2d612e8e9787c67dafccf8d6fb0671722be92f42e43937313965ddd"
+    },
+    "reset.bit": {
+      "byte_length": 81,
+      "sha256": "4048f70cb9b9f3e3569c8d1af730bc85b6d2c2bbc1e7299fa3bd20f58ab2bc70"
+    },
+    "weight.bin": {
+      "byte_length": 2584,
+      "sha256": "43baa0090cf69c7744c240099651e91b089e2804d79ebbda8477de79f2c88f57"
+    },
+    "docs.idx": {
+      "byte_length": 208,
+      "sha256": "ccdaaf9106d74a3cfd6434cee44b7038c93815ee6a6bf2826e566e8a296f626a"
+    }
+  }
+}

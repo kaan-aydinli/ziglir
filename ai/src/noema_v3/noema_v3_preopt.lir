@@ -1,0 +1,274 @@
+// NOEMA v3 Phase 1: LIR-PreOpt — Zero-Dependency Preconditioned Optimizer in LIR.
+// Combines:
+//   1) Pure-LIR Newton-Schulz orthogonalized momentum preconditioning for 2D weight matrices
+//   2) Bias-corrected diagonal second-moment preconditioning for 1D norm/conv/gate/bias vectors
+//   3) Global L2 gradient clipping + fail-closed NaN/Inf numerical safety guard
+//   4) Linear-warmup + cosine decay learning-rate schedule
+
+import "noema_v3_math.lir"
+
+struct Nv3PreOptMatrix {
+    w: *f64
+    mom: *f64
+    rows: i64
+    cols: i64
+    beta: f64
+    weight_decay: f64
+    ns_steps: i64
+    step: i64
+    rejected: i64
+}
+
+struct Nv3PreOptDiag {
+    w: *f64
+    m: *f64
+    v: *f64
+    len: i64
+    beta1: f64
+    beta2: f64
+    eps: f64
+    weight_decay: f64
+    step: i64
+    rejected: i64
+}
+
+fn nv3_pow_int(base: f64, exp_n: i64) -> f64 {
+    var acc: f64 = 1.0
+    var i: i64 = 0
+    while i < exp_n {
+        acc = acc * base
+        i = i + 1
+    }
+    return acc
+}
+
+fn nv3_preopt_lr(step: i64, warmup_steps: i64, total_steps: i64, peak_lr: f64, min_lr: f64) -> f64 {
+    if step <= 0 { return 0.0 }
+    if warmup_steps > 0 and step < warmup_steps {
+        return peak_lr * (step as f64) / (warmup_steps as f64)
+    }
+    if total_steps <= warmup_steps or step >= total_steps {
+        return min_lr
+    }
+    let progress = ((step - warmup_steps) as f64) / ((total_steps - warmup_steps) as f64)
+    return min_lr + 0.5 * (peak_lr - min_lr) * (1.0 + nv3_cos_unit(progress))
+}
+
+// Returns < 0.0 if grad_norm_sq is non-finite (fail-closed reject sentinel).
+fn nv3_preopt_clip_scale(grad_norm_sq: f64, max_norm: f64) -> f64 {
+    if nv3_is_finite(grad_norm_sq) == 0 or grad_norm_sq < 0.0 {
+        return 0.0 - 1.0
+    }
+    let gnorm = @sqrt(grad_norm_sq)
+    if max_norm > 0.0 and gnorm > max_norm {
+        return max_norm / (gnorm + 0.000000000001)
+    }
+    return 1.0
+}
+
+// Helper: transpose src [rows, cols] -> dst [cols, rows]
+fn nv3_mat_transpose(src: *f64, dst: *f64, rows: i64, cols: i64) {
+    var r: i64 = 0
+    while r < rows {
+        var c: i64 = 0
+        while c < cols {
+            dst[c * rows + r] = src[r * cols + c]
+            c = c + 1
+        }
+        r = r + 1
+    }
+}
+
+// Pure-LIR Newton-Schulz polar orthogonalization:
+//   Normalizes Frobenius norm into (0, 1], transposes if tall so m = min(rows, cols),
+//   iterates X_{k+1} = 1.5 * X_k - 0.5 * (X_k * X_k^T) * X_k, and transposes back.
+fn nv3_newton_schulz_ortho(g_in: *f64, out: *f64, rows: i64, cols: i64, ns_steps: i64) {
+    let n = rows * cols
+    let norm2 = nv3_norm_sq(g_in, n)
+    if norm2 <= 1.0e-24 {
+        nv3_zero(out, n)
+        return
+    }
+    let inv_frob = 1.0 / (@sqrt(norm2) + 0.0000001)
+
+    // Ensure working matrix X has shape [m, k_dim] with m <= k_dim
+    let transposed: i64 = if rows > cols { 1 } else { 0 }
+    let m = if transposed == 1 { cols } else { rows }
+    let k_dim = if transposed == 1 { rows } else { cols }
+
+    let x_cur = @malloc(n * 8) as *f64
+    let x_nxt = @malloc(n * 8) as *f64
+    let gram = @malloc(m * m * 8) as *f64
+
+    if transposed == 1 {
+        nv3_mat_transpose(g_in, x_cur, rows, cols)
+    } else {
+        nv3_copy(x_cur, g_in, n)
+    }
+    nv3_scale_inplace(x_cur, inv_frob, n)
+
+    var it: i64 = 0
+    while it < ns_steps {
+        // gram[i, j] = sum_p x_cur[i, p] * x_cur[j, p]
+        var i: i64 = 0
+        while i < m {
+            let row_i = i * k_dim
+            var j: i64 = i
+            while j < m {
+                let row_j = j * k_dim
+                var acc: f64 = 0.0
+                var p: i64 = 0
+                while p < k_dim {
+                    acc = acc + x_cur[row_i + p] * x_cur[row_j + p]
+                    p = p + 1
+                }
+                gram[i * m + j] = acc
+                gram[j * m + i] = acc
+                j = j + 1
+            }
+            i = i + 1
+        }
+
+        // x_nxt[i, p] = 1.5 * x_cur[i, p] - 0.5 * sum_j gram[i, j] * x_cur[j, p]
+        i = 0
+        while i < m {
+            var p: i64 = 0
+            while p < k_dim {
+                var gx: f64 = 0.0
+                var j: i64 = 0
+                while j < m {
+                    gx = gx + gram[i * m + j] * x_cur[j * k_dim + p]
+                    j = j + 1
+                }
+                x_nxt[i * k_dim + p] = 1.5 * x_cur[i * k_dim + p] - 0.5 * gx
+                p = p + 1
+            }
+            i = i + 1
+        }
+        nv3_copy(x_cur, x_nxt, n)
+        it = it + 1
+    }
+
+    if transposed == 1 {
+        nv3_mat_transpose(x_cur, out, m, k_dim)
+    } else {
+        nv3_copy(out, x_cur, n)
+    }
+
+    @free(x_cur as *u8)
+    @free(x_nxt as *u8)
+    @free(gram as *u8)
+}
+
+fn nv3_preopt_matrix_init(w: *f64, rows: i64, cols: i64, beta: f64, weight_decay: f64, ns_steps: i64) -> Nv3PreOptMatrix {
+    let n = rows * cols
+    let mom = @malloc(n * 8) as *f64
+    nv3_zero(mom, n)
+    return Nv3PreOptMatrix {
+        w: w,
+        mom: mom,
+        rows: rows,
+        cols: cols,
+        beta: beta,
+        weight_decay: weight_decay,
+        ns_steps: ns_steps,
+        step: 0,
+        rejected: 0
+    }
+}
+
+fn nv3_preopt_matrix_free(st: Nv3PreOptMatrix) {
+    @free(st.mom as *u8)
+}
+
+fn nv3_preopt_matrix_step(st_in: Nv3PreOptMatrix, grad: *f64, lr: f64, grad_scale: f64) -> i64 {
+    var st = st_in
+    let n = st.rows * st.cols
+    if grad_scale < 0.0 or nv3_is_finite(lr) == 0 or nv3_is_finite(grad_scale) == 0 or nv3_all_finite(grad, n) == 0 {
+        st.rejected = st.rejected + 1
+        return 0
+    }
+
+    let u_buf = @malloc(n * 8) as *f64
+    let ortho = @malloc(n * 8) as *f64
+    let one_minus_b = 1.0 - st.beta
+
+    var i: i64 = 0
+    while i < n {
+        let g_scaled = grad[i] * grad_scale
+        let m_new = st.beta * st.mom[i] + one_minus_b * g_scaled
+        st.mom[i] = m_new
+        // Nesterov lookahead momentum before orthogonal preconditioning
+        u_buf[i] = st.beta * m_new + one_minus_b * g_scaled
+        i = i + 1
+    }
+
+    nv3_newton_schulz_ortho(u_buf, ortho, st.rows, st.cols, st.ns_steps)
+    let aspect = nv3_max(1.0, (st.rows as f64) / (st.cols as f64))
+    let rms_scale = @sqrt(aspect) * 0.2
+    let decay_keep = 1.0 - lr * st.weight_decay
+
+    i = 0
+    while i < n {
+        st.w[i] = st.w[i] * decay_keep - lr * rms_scale * ortho[i]
+        i = i + 1
+    }
+    st.step = st.step + 1
+
+    @free(u_buf as *u8)
+    @free(ortho as *u8)
+    return 1
+}
+
+fn nv3_preopt_diag_init(w: *f64, len: i64, beta1: f64, beta2: f64, eps: f64, weight_decay: f64) -> Nv3PreOptDiag {
+    let m = @malloc(len * 8) as *f64
+    let v = @malloc(len * 8) as *f64
+    nv3_zero(m, len)
+    nv3_zero(v, len)
+    return Nv3PreOptDiag {
+        w: w,
+        m: m,
+        v: v,
+        len: len,
+        beta1: beta1,
+        beta2: beta2,
+        eps: eps,
+        weight_decay: weight_decay,
+        step: 0,
+        rejected: 0
+    }
+}
+
+fn nv3_preopt_diag_free(st: Nv3PreOptDiag) {
+    @free(st.m as *u8)
+    @free(st.v as *u8)
+}
+
+fn nv3_preopt_diag_step(st_in: Nv3PreOptDiag, grad: *f64, lr: f64, grad_scale: f64) -> i64 {
+    var st = st_in
+    let n = st.len
+    if grad_scale < 0.0 or nv3_is_finite(lr) == 0 or nv3_is_finite(grad_scale) == 0 or nv3_all_finite(grad, n) == 0 {
+        st.rejected = st.rejected + 1
+        return 0
+    }
+
+    let next_step = st.step + 1
+    let bc1 = 1.0 - nv3_pow_int(st.beta1, next_step)
+    let bc2 = 1.0 - nv3_pow_int(st.beta2, next_step)
+    let decay_keep = 1.0 - lr * st.weight_decay
+
+    var i: i64 = 0
+    while i < n {
+        let g = grad[i] * grad_scale
+        let m_i = st.beta1 * st.m[i] + (1.0 - st.beta1) * g
+        let v_i = st.beta2 * st.v[i] + (1.0 - st.beta2) * g * g
+        st.m[i] = m_i
+        st.v[i] = v_i
+        let m_hat = m_i / bc1
+        let v_hat = v_i / bc2
+        st.w[i] = st.w[i] * decay_keep - lr * m_hat / (@sqrt(v_hat) + st.eps)
+        i = i + 1
+    }
+    st.step = next_step
+    return 1
+}
