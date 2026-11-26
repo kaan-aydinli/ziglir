@@ -1,0 +1,148 @@
+// NOEMA v3 Phase 10 Differential Test — Production Non-Verbatim Synthesis Contract
+//   1. Exact 4-gram anti-verbatim measurement over an `NV3G1` graph (`nv3_syn_exact_max_run`).
+//   2. Deterministic paraphrase repair that provably breaks the longest verbatim chain
+//      (`nv3_syn_repair_verbatim`), including punctuation safety.
+//   3. Fail-closed graph loading on a missing/corrupt `NV3G1` artifact.
+//   4. Prompt-intent greeting gating (`nv3_syn_apply_greeting_intent`).
+//   5. Deterministic end-to-end synthesis over the shipped production graph with
+//      `0 <= max_corpus_ngram_run <= 4` and valid UTF-8 output.
+
+import "../src/noema_v3/noema_v3_synth.lir"
+
+
+fn p10_chain(seq: *i64, n: i64, base: i64) {
+    var i: i64 = 0
+    while i < n { seq[i] = base + i i = i + 1 }
+}
+
+fn p10_probe(
+    gh: *i64,
+    seq: *i64,
+    slen: i64,
+    echo: *i64,
+    n_echo: i64,
+    out: *i64
+) -> i64 {
+    let span = @malloc(16) as *i64
+    let run = nv3_syn_exact_max_run(gh, echo, n_echo, seq, slen, span)
+    out[0] = span[0]
+    out[1] = span[1]
+    let repaired_len = nv3_syn_repair_verbatim(gh, echo, n_echo, seq, slen, NV3_SYN_MAX_CORPUS_RUN)
+    out[2] = repaired_len
+    if repaired_len > 0 {
+        out[3] = nv3_syn_exact_max_run(gh, echo, n_echo, seq, repaired_len, span)
+    } else {
+        out[3] = 0 - 1
+    }
+    @free(span as *u8)
+    return run
+}
+
+fn p10_end_to_end(prompt: string, out: *i64) {
+    let gen = @malloc(1536)
+    let tel = @malloc(256) as *f64
+    let res = @malloc(320) as *i64
+    var z: i64 = 0
+    while z < 40 { res[z] = 0 z = z + 1 }
+    res[16] = tel as i64
+    res[17] = 768
+    res[18] = 1
+    res[19] = gen as i64
+    res[20] = 0
+    res[21] = prompt.ptr as *u8 as i64
+    res[22] = @string_len(prompt)
+    let _ok = nv3_syn_infer_production("ai/noema_v3/checkpoints/noema_v3_promoted.npg3", "ai/noema_v3/checkpoints/noema_v3_prod.nv3g", res)
+    out[0] = res[0]
+    out[1] = res[1]
+    out[2] = res[2]
+    out[3] = res[4]
+    out[4] = res[5]
+    out[5] = nv3_syn_utf8_valid(gen, res[2])
+    @free(res as *u8)
+    @free(tel as *u8)
+    @free(gen)
+}
+
+fn main() -> i64 {
+    let gh = nv3_syn_load_nv3g("ai/noema_v3/checkpoints/noema_v3_prod.nv3g")
+    var graph_ok: i64 = 0
+    if gh[0] == 1 and gh[1] > 0 and gh[6] > 0 { graph_ok = 1 }
+
+    let seq = @malloc(NV3_SYN_MAX_SEQ * 8) as *i64
+    let echo = @malloc(64 * 8) as *i64
+    let out = @malloc(64) as *i64
+
+    // 1) Short chains are never flagged: fewer than four atoms cannot form a 4-gram.
+    p10_chain(seq, 3, 1)
+    let short_run = p10_probe(gh, seq, 3, echo, 0, out)
+
+    // 2) A long chain of *real* corpus atoms trips the exact gate and is provably repaired down to
+    //    `<= NV3_SYN_MAX_CORPUS_RUN`. The chain is the atom sequence of a shipped corpus sentence,
+    //    resolved through the graph's own tokenizer so the test never hard-codes atom ids.
+    let corpus_line = "Karadeniz kıyı kuşağında denizden yükselen nemli hava kütleleri kıyıya paralel uzanan dik dağ yamaçlarıyla karşılaştığında yoğun orografik yağış bırakır"
+    // 64 stems + 64 packed word shadows written by `nv3_syn_extract_query_features`.
+    let stem_q = @malloc(128 * 8) as *i64
+    let _nq = nv3_syn_extract_query_features(gh, corpus_line.ptr as *u8, @string_len(corpus_line), stem_q, seq)
+    let chain_len = seq[64]
+    let long_run = p10_probe(gh, seq, chain_len, echo, 0, out)
+    let long_repaired_len = out[2]
+    let long_post_run = out[3]
+    var gate_ok: i64 = 0
+    if long_run >= 4 and long_repaired_len > 0 and long_post_run >= 0 and long_post_run <= NV3_SYN_MAX_CORPUS_RUN { gate_ok = 1 }
+    @free(stem_q as *u8)
+
+    // 3) Fail-closed graph load: a missing artifact must never yield a usable graph.
+    //    The loader reports failure through `gh[0] != 1`; it never fabricates a usable graph.
+    let bad = nv3_syn_load_nv3g("ai/noema_v3/checkpoints/does_not_exist_phase10.nv3g")
+    var bad_fail_closed: i64 = 0
+    if bad[0] != 1 { bad_fail_closed = 1 }
+    nv3_syn_graph_free(bad)
+
+    // 4) Greeting intent is prompt-gated, never free-floating.
+    let boost_a = @malloc(gh[1] * 8) as *f64
+    let boost_b = @malloc(gh[1] * 8) as *f64
+    var i: i64 = 0
+    while i < gh[1] { boost_a[i] = 0.0 boost_b[i] = 0.0 i = i + 1 }
+    let q_plain = "Kuvvet nedir?"
+    let q_hello = "Merhaba, nasilsin?"
+    let greet_plain = nv3_syn_apply_greeting_intent(gh, q_plain.ptr as *u8, @string_len(q_plain), boost_a)
+    let greet_hello = nv3_syn_apply_greeting_intent(gh, q_hello.ptr as *u8, @string_len(q_hello), boost_b)
+    var greet_ok: i64 = 0
+    if greet_plain == 0 and greet_hello == 1 { greet_ok = 1 }
+    @free(boost_a as *u8) @free(boost_b as *u8)
+
+    // 5) End-to-end: deterministic production synthesis with the exact gate satisfied.
+    let e2e = @malloc(64) as *i64
+    p10_end_to_end("Trabzon ve Karadeniz kiyi ikliminde yagis nasil olusur?", e2e)
+    var e2e_ok: i64 = 0
+    if e2e[0] == 1 and e2e[3] <= NV3_SYN_MAX_CORPUS_RUN and e2e[4] == 1 and e2e[5] == 1 and e2e[2] > 0 { e2e_ok = 1 }
+
+    // 6) Idempotence: the same prompt must reproduce byte-identical output (no hidden state).
+    let e2e2 = @malloc(64) as *i64
+    p10_end_to_end("Trabzon ve Karadeniz kiyi ikliminde yagis nasil olusur?", e2e2)
+    var deterministic: i64 = 0
+    if e2e[2] == e2e2[2] and e2e[3] == e2e2[3] and e2e[1] == e2e2[1] { deterministic = 1 }
+
+    @println("P10_GRAPH_LOAD=" + @int_to_string(graph_ok))
+    var short_clean: i64 = 0
+    if short_run == 0 { short_clean = 1 }
+    @println("P10_SHORT_CHAIN_CLEAN=" + @int_to_string(short_clean))
+    @println("P10_EXACT_GATE_AND_REPAIR=" + @int_to_string(gate_ok))
+    @println("P10_FAIL_CLOSED_LOAD=" + @int_to_string(bad_fail_closed))
+    @println("P10_GREETING_INTENT_GATED=" + @int_to_string(greet_ok))
+    @println("P10_E2E_NON_VERBATIM=" + @int_to_string(e2e_ok))
+    @println("P10_DETERMINISTIC=" + @int_to_string(deterministic))
+
+    @free(e2e as *u8)
+    @free(e2e2 as *u8)
+    @free(out as *u8)
+    @free(echo as *u8)
+    @free(seq as *u8)
+    nv3_syn_graph_free(gh)
+
+    if graph_ok == 1 and short_run == 0 and gate_ok == 1 and bad_fail_closed == 1 and greet_ok == 1 and e2e_ok == 1 and deterministic == 1 {
+        @println("ALL_PASS")
+        return 0
+    }
+    return 1
+}

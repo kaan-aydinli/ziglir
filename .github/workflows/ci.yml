@@ -96,6 +96,47 @@ jobs:
       - name: AI/tooling machine-contract tests
         run: python3 tests/ai_test.py ./zig-out/bin/lir
 
+      - name: NOEMA v3 Phase 0 audit
+        run: python3 ai/noema_v3/phase0_audit.py
+
+      - name: NOEMA v3 Phase 1 audit
+        run: python3 ai/noema_v3/phase1_audit.py
+
+      - name: NOEMA v3 Phase 2 audit
+        run: python3 ai/noema_v3/phase2_audit.py
+
+      - name: NOEMA v3 Phase 3 audit
+        run: python3 ai/noema_v3/phase3_audit.py
+
+      - name: NOEMA v3 Phase 4 audit
+        run: python3 ai/noema_v3/phase4_audit.py
+
+      - name: NOEMA v3 Phase 5 audit
+        run: python3 ai/noema_v3/phase5_audit.py
+
+      - name: NOEMA v3 Phase 6 audit
+        run: python3 ai/noema_v3/phase6_audit.py
+
+      - name: NOEMA v3 Phase 7 audit
+        run: python3 ai/noema_v3/phase7_audit.py
+
+      - name: NOEMA v3 Phase 8 audit
+        run: python3 ai/noema_v3/phase8_audit.py
+
+      - name: NOEMA v3 Phase 9 audit
+        run: python3 ai/noema_v3/phase9_audit.py
+
+      - name: NOEMA v3 Phase 10 production audit
+        run: python3 ai/noema_v3/phase10_prod_audit.py
+
+      - name: NOEMA v3 chat server smoke test
+        run: python3 ai/noema_v3/server_smoke.py
+
+      # Measures the rendered UI in a real browser (CSP interactions, contrast, occlusion).
+      # Reports SKIP when no Chromium is available instead of failing a run it could not measure.
+      - name: NOEMA v3 UI audit
+        run: python3 ai/noema_v3/ui_audit.py
+
       - name: Browser Wasm host conformance and execution
         run: python3 tests/browser_test.py ./zig-out/bin/lir
 

@@ -1,0 +1,43 @@
+// NOEMA v3 Phase 0: namespace and output-mode contract.
+// This file is the isolation boundary for the new weight-generation architecture.
+// Legacy exemplar/retrieval paths (noema_pretrain.lir, noema_decoder.lir,
+// ai/chat_site_backend.lir) MUST NOT report NOEMA_V3_OUTPUT_WEIGHT_GENERATION.
+
+const NOEMA_V3_SCHEMA_VERSION: i64 = 3
+
+// Output modes reported by /api/chat and backend result envelopes.
+const NOEMA_V3_OUTPUT_LEGACY_RETRIEVAL_EXEMPLAR: i64 = 0
+const NOEMA_V3_OUTPUT_WEIGHT_GENERATION: i64 = 1
+const NOEMA_V3_OUTPUT_WEIGHT_GENERATION_ABSTAIN: i64 = 2
+
+// Provenance tags (KHG node/source isolation; Phase 3+).
+const NOEMA_V3_PROV_SYSTEM_POLICY: i64 = 0
+const NOEMA_V3_PROV_USER_INPUT: i64 = 1
+const NOEMA_V3_PROV_UNTRUSTED_SOURCE: i64 = 2
+const NOEMA_V3_PROV_VERIFIED_KHG: i64 = 3
+const NOEMA_V3_PROV_HYPOTHESIS: i64 = 4
+
+// Phase 0 acceptance gates (lexicographic; upper gates cannot be masked).
+const NOEMA_V3_GATE_INTEGRITY_SAFETY: i64 = 0
+const NOEMA_V3_GATE_VERIFIED_REASONING: i64 = 1
+const NOEMA_V3_GATE_UNSUPPORTED_CLAIM_RATE: i64 = 2
+const NOEMA_V3_GATE_COMPOSITIONAL_GEN: i64 = 3
+const NOEMA_V3_GATE_CALIBRATION_ECE: i64 = 4
+const NOEMA_V3_GATE_HELDOUT_BPB: i64 = 5
+const NOEMA_V3_GATE_COMPUTE_COST: i64 = 6
+
+fn noema_v3_output_mode_is_legacy(mode: i64) -> i64 {
+    if mode == NOEMA_V3_OUTPUT_LEGACY_RETRIEVAL_EXEMPLAR { return 1 }
+    return 0
+}
+
+fn noema_v3_output_mode_is_weight_generation(mode: i64) -> i64 {
+    if mode == NOEMA_V3_OUTPUT_WEIGHT_GENERATION { return 1 }
+    if mode == NOEMA_V3_OUTPUT_WEIGHT_GENERATION_ABSTAIN { return 1 }
+    return 0
+}
+
+fn noema_v3_legacy_path_may_report(mode: i64) -> i64 {
+    // Hard isolation rule: legacy retrieval path can only report legacy mode.
+    return noema_v3_output_mode_is_legacy(mode)
+}

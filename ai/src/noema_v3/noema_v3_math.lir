@@ -1,0 +1,300 @@
+// NOEMA v3 Phase 1: math primitives for fp32/f64 kernels.
+// All execution is in-LIR; no external math/runtime deps.
+
+const NV3_LN2: f64 = 0.693147180559945309417232121458176568
+const NV3_PI: f64 = 3.141592653589793238462643383279502884
+const NV3_EPS: f64 = 0.000000000001
+
+fn nv3_abs(x: f64) -> f64 {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn nv3_max(a: f64, b: f64) -> f64 {
+    if a > b { return a }
+    return b
+}
+
+fn nv3_min(a: f64, b: f64) -> f64 {
+    if a < b { return a }
+    return b
+}
+
+fn nv3_is_nan(x: f64) -> i64 {
+    if x != x { return 1 }
+    return 0
+}
+
+fn nv3_is_inf(x: f64) -> i64 {
+    if x > 1.7976931348623157e308 { return 1 }
+    if x < -1.7976931348623157e308 { return 1 }
+    return 0
+}
+
+fn nv3_is_finite(x: f64) -> i64 {
+    if nv3_is_nan(x) == 1 { return 0 }
+    if nv3_is_inf(x) == 1 { return 0 }
+    return 1
+}
+
+fn nv3_all_finite(buf: *f64, n: i64) -> i64 {
+    var i: i64 = 0
+    while i < n {
+        if nv3_is_finite(buf[i]) == 0 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// Stable exp with range reduction and unrolled 14-term Horner polynomial (machine precision, zero inner loop).
+fn nv3_exp(x: f64) -> f64 {
+    if x <= -80.0 { return 0.0 }
+    if x >= 80.0 { return 5.54062238439351e34 }
+    let k = (x / NV3_LN2) as i64
+    let r = x - (k as f64) * NV3_LN2
+    var p: f64 = 1.0 / 87178291200.0
+    p = 1.0 / 6227020800.0 + r * p
+    p = 1.0 / 479001600.0 + r * p
+    p = 1.0 / 39916800.0 + r * p
+    p = 1.0 / 3628800.0 + r * p
+    p = 1.0 / 362880.0 + r * p
+    p = 1.0 / 40320.0 + r * p
+    p = 1.0 / 5040.0 + r * p
+    p = 1.0 / 720.0 + r * p
+    p = 1.0 / 120.0 + r * p
+    p = 1.0 / 24.0 + r * p
+    p = 1.0 / 6.0 + r * p
+    p = 0.5 + r * p
+    var sum = 1.0 + r * (1.0 + r * p)
+    var scale = k
+    while scale >= 8 { sum = sum * 256.0 scale = scale - 8 }
+    while scale > 0 { sum = sum * 2.0 scale = scale - 1 }
+    while scale <= -8 { sum = sum * 0.00390625 scale = scale + 8 }
+    while scale < 0 { sum = sum * 0.5 scale = scale + 1 }
+    return sum
+}
+
+fn nv3_log(x: f64) -> f64 {
+    if x <= 0.0 { return 0.0 - 1.0e300 }
+    var m = x
+    var exponent: i64 = 0
+    while m >= 16.0 { m = m * 0.0625 exponent = exponent + 4 }
+    while m >= 2.0 { m = m * 0.5 exponent = exponent + 1 }
+    while m < 0.0625 { m = m * 16.0 exponent = exponent - 4 }
+    while m < 1.0 { m = m * 2.0 exponent = exponent - 1 }
+    let z = (m - 1.0) / (m + 1.0)
+    let z2 = z * z
+    var p: f64 = 1.0 / 23.0
+    p = 1.0 / 21.0 + z2 * p
+    p = 1.0 / 19.0 + z2 * p
+    p = 1.0 / 17.0 + z2 * p
+    p = 1.0 / 15.0 + z2 * p
+    p = 1.0 / 13.0 + z2 * p
+    p = 1.0 / 11.0 + z2 * p
+    p = 1.0 / 9.0 + z2 * p
+    p = 1.0 / 7.0 + z2 * p
+    p = 1.0 / 5.0 + z2 * p
+    p = 1.0 / 3.0 + z2 * p
+    let total = z * (1.0 + z2 * p)
+    return 2.0 * total + (exponent as f64) * NV3_LN2
+}
+
+// Cosine on [0, pi] via range-reduced Taylor series (used for LR schedule).
+fn nv3_cos_unit(progress: f64) -> f64 {
+    var p = progress
+    if p < 0.0 { p = 0.0 }
+    if p > 1.0 { p = 1.0 }
+    let theta = p * NV3_PI
+    let x = theta - 0.5 * NV3_PI
+    // cos(theta) = -sin(theta - pi/2) = -sin(x), |x| <= pi/2
+    let x2 = x * x
+    var term = x
+    var sin_x = x
+    var k: i64 = 1
+    while k <= 10 {
+        let denom = ((2 * k) * (2 * k + 1)) as f64
+        term = (0.0 - term) * x2 / denom
+        sin_x = sin_x + term
+        k = k + 1
+    }
+    return 0.0 - sin_x
+}
+
+fn nv3_sigmoid(x: f64) -> f64 {
+    if x >= 40.0 { return 1.0 }
+    if x <= -40.0 { return 0.0 }
+    if x >= 0.0 {
+        let z = nv3_exp(0.0 - x)
+        return 1.0 / (1.0 + z)
+    }
+    let z = nv3_exp(x)
+    return z / (1.0 + z)
+}
+
+fn nv3_tanh(x: f64) -> f64 {
+    if x >= 20.0 { return 1.0 }
+    if x <= -20.0 { return 0.0 - 1.0 }
+    let e2 = nv3_exp(2.0 * x)
+    return (e2 - 1.0) / (e2 + 1.0)
+}
+
+fn nv3_silu(x: f64) -> f64 {
+    return x * nv3_sigmoid(x)
+}
+
+fn nv3_softmax(logits: *f64, out: *f64, n: i64) {
+    if n <= 0 { return }
+    var maxv = logits[0]
+    var i: i64 = 1
+    while i < n {
+        if logits[i] > maxv { maxv = logits[i] }
+        i = i + 1
+    }
+    var sum: f64 = 0.0
+    i = 0
+    while i < n {
+        let e = nv3_exp(logits[i] - maxv)
+        out[i] = e
+        sum = sum + e
+        i = i + 1
+    }
+    if sum <= 0.0 { return }
+    i = 0
+    while i < n {
+        out[i] = out[i] / sum
+        i = i + 1
+    }
+}
+
+// Dot product, norm, and buffer helpers (f64 and fp32 storage)
+fn nv3_dot(a: *f64, b: *f64, n: i64) -> f64 {
+    var s: f64 = 0.0
+    var i: i64 = 0
+    while i < n { s = s + a[i] * b[i] i = i + 1 }
+    return s
+}
+
+fn nv3_norm_sq(a: *f64, n: i64) -> f64 {
+    var s: f64 = 0.0
+    var i: i64 = 0
+    while i < n { s = s + a[i] * a[i] i = i + 1 }
+    return s
+}
+
+fn nv3_zero(out: *f64, n: i64) {
+    var i: i64 = 0
+    while i < n { out[i] = 0.0 i = i + 1 }
+}
+
+fn nv3_copy(dst: *f64, src: *f64, n: i64) {
+    var i: i64 = 0
+    while i < n { dst[i] = src[i] i = i + 1 }
+}
+
+fn nv3_scale_inplace(dst: *f64, s: f64, n: i64) {
+    var i: i64 = 0
+    while i < n { dst[i] = dst[i] * s i = i + 1 }
+}
+
+fn nv3_axpy(dst: *f64, a: f64, x: *f64, n: i64) {
+    var i: i64 = 0
+    while i < n { dst[i] = dst[i] + a * x[i] i = i + 1 }
+}
+
+fn nv3_zero_f32_packed(out_bytes: *u8, n: i64) {
+    if n <= 0 { return }
+    @memset(out_bytes, 0, n * 4)
+}
+
+fn nv3_copy_f32_packed(dst_bytes: *u8, src_bytes: *u8, n: i64) {
+    if n <= 0 { return }
+    @memcpy(dst_bytes, src_bytes, n * 4)
+}
+
+// Pack f64[n] into true 4-byte little-endian IEEE-754 binary32 buffer (n * 4 bytes).
+fn nv3_f64_to_f32_buf(dst_bytes: *u8, src: *f64, n: i64) {
+    if n <= 0 { return }
+    let scratch = @malloc(8)
+    let scratch_f64 = scratch as *f64
+    var i: i64 = 0
+    while i < n {
+        // Hardware/VM round-to-nearest-even to f32 value widened in f64 container
+        let rounded: f64 = ((src[i] as f32) as f64)
+        scratch_f64[0] = rounded
+        let bits64 = @read_u64(scratch)
+        let sign = (bits64 >> 63) & 1
+        let exp64 = (bits64 >> 52) & 2047
+        let mant64 = bits64 & 4503599627370495
+        var bits32: i64 = 0
+        if exp64 == 0 {
+            bits32 = sign << 31
+        } else {
+            if exp64 == 2047 {
+                bits32 = (sign << 31) | (255 << 23) | ((mant64 >> 29) & 8388607)
+            } else {
+                let exp32 = exp64 - 1023 + 127
+                if exp32 <= 0 {
+                    // Subnormal binary32
+                    let shift = 1 - exp32
+                    if shift < 25 {
+                        let full_mant = (1 << 52) | mant64
+                        bits32 = (sign << 31) | ((full_mant >> (29 + shift)) & 8388607)
+                    } else {
+                        bits32 = sign << 31
+                    }
+                } else {
+                    if exp32 >= 255 {
+                        bits32 = (sign << 31) | (255 << 23)
+                    } else {
+                        bits32 = (sign << 31) | (exp32 << 23) | ((mant64 >> 29) & 8388607)
+                    }
+                }
+            }
+        }
+        @write_u32(@ptr_add(dst_bytes, i * 4), bits32 as u32)
+        i = i + 1
+    }
+    @free(scratch)
+}
+
+// Unpack true 4-byte little-endian IEEE-754 binary32 buffer (n * 4 bytes) into f64[n].
+fn nv3_f32_to_f64_buf(dst: *f64, src_bytes: *u8, n: i64) {
+    if n <= 0 { return }
+    let scratch = @malloc(8)
+    let scratch_f64 = scratch as *f64
+    var i: i64 = 0
+    while i < n {
+        let bits32 = (@read_u32(@ptr_add(src_bytes, i * 4)) as i64) & 4294967295
+        let sign = (bits32 >> 31) & 1
+        let exp32 = (bits32 >> 23) & 255
+        let mant32 = bits32 & 8388607
+        var bits64: i64 = 0
+        if exp32 == 0 {
+            if mant32 == 0 {
+                bits64 = sign << 63
+            } else {
+                // Normalize binary32 subnormal into normal binary64
+                var m = mant32
+                var e64: i64 = 1023 - 126
+                while (m & 8388608) == 0 {
+                    m = m << 1
+                    e64 = e64 - 1
+                }
+                let frac = m & 8388607
+                bits64 = (sign << 63) | (e64 << 52) | (frac << 29)
+            }
+        } else {
+            if exp32 == 255 {
+                bits64 = (sign << 63) | (2047 << 52) | (mant32 << 29)
+            } else {
+                let e64 = exp32 - 127 + 1023
+                bits64 = (sign << 63) | (e64 << 52) | (mant32 << 29)
+            }
+        }
+        scratch_f64[0] = 0.0
+        @write_u64(scratch, bits64)
+        dst[i] = scratch_f64[0]
+        i = i + 1
+    }
+    @free(scratch)
+}

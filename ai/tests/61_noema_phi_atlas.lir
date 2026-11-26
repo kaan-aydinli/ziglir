@@ -1,0 +1,42 @@
+// Exact top-K resonance routing over the bounded binary cavity atlas.
+import "../src/noema_phi_atlas.lir"
+fn main() -> i64 {
+    var checks: i64 = 0
+    var passed: i64 = 0
+    let signatures = @malloc(10 * 8) as *f64
+    let norms = @malloc(16 * 8) as *f64
+    let query = @malloc(2 * 8) as *f64
+    let meta = @malloc(4 * 8) as *f64
+    let ids = @malloc(3 * 8) as *f64
+    let scores = @malloc(3 * 8) as *f64
+    let stack = @malloc(64 * 8) as *f64
+    signatures[0] = 1.0 signatures[1] = 0.0
+    signatures[2] = 0.0 signatures[3] = 2.0
+    signatures[4] = 1.0 signatures[5] = 1.0
+    signatures[6] = -1.0 signatures[7] = 0.0
+    signatures[8] = 2.0 signatures[9] = 0.0
+    query[0] = 1.0 query[1] = 0.0
+    meta[0] = 5.0 meta[1] = 2.0 meta[2] = 8.0 meta[3] = 3.0
+    checks = checks + 1
+    if noema_phi_atlas_build_bounds(signatures, 5, 2, 8, norms) == 1 { passed = passed + 1 }
+
+    checks = checks + 1
+    let selected = noema_phi_atlas_select(query, signatures, norms, meta, ids, scores, stack)
+    if selected == 3 and ids[0] == 4.0 and ids[1] == 0.0 and ids[2] == 2.0 and scores[0] == 4.0 and scores[1] == 1.0 and scores[2] == 1.0 { passed = passed + 1 }
+
+    query[0] = 0.0 query[1] = 0.0
+    checks = checks + 1
+    if noema_phi_atlas_select(query, signatures, norms, meta, ids, scores, stack) == 3 and ids[0] == 0.0 and ids[1] == 1.0 and ids[2] == 2.0 { passed = passed + 1 }
+
+    checks = checks + 1
+    if noema_phi_atlas_build_bounds(signatures, 5, 2, 4, norms) == 0 { passed = passed + 1 }
+
+    meta[3] = 5.0
+    checks = checks + 1
+    if noema_phi_atlas_select(query, signatures, norms, meta, ids, scores, stack) == 0 { passed = passed + 1 }
+
+    printInt(passed) print("/") printInt(checks) println("")
+    @free(signatures as *u8) @free(norms as *u8) @free(query as *u8)
+    @free(meta as *u8) @free(ids as *u8) @free(scores as *u8) @free(stack as *u8)
+    return if passed == checks { 0 } else { 1 }
+}

@@ -1,0 +1,586 @@
+// NOEMA v3 Phase 3: Pointer-Addressed Evidence & Hypothesis Graph (KHG)
+// Pure LIR arena/SoA graph with strict epistemic state transitions,
+// byte-span pointer addressing (no stored-answer copying), and
+// provenance authority isolation.
+
+import "noema_v3_contract.lir"
+import "noema_v3_math.lir"
+
+// Epistemic node states
+const NV3_KHG_STATE_OBSERVED: i64 = 0
+const NV3_KHG_STATE_HYPOTHESIS: i64 = 1
+const NV3_KHG_STATE_VERIFIED: i64 = 2
+const NV3_KHG_STATE_REFUTED: i64 = 3
+const NV3_KHG_STATE_ABSTAIN: i64 = 4
+
+// Directed edge relations
+const NV3_KHG_EDGE_SUPPORTS: i64 = 0
+const NV3_KHG_EDGE_DERIVES: i64 = 1
+const NV3_KHG_EDGE_CONTRADICTS: i64 = 2
+const NV3_KHG_EDGE_SUPERSEDES: i64 = 3
+
+// Deterministic verification kernel verdicts
+const NV3_VERDICT_UNVERIFIED: i64 = 0
+const NV3_VERDICT_VERIFIED: i64 = 1
+const NV3_VERDICT_CONTRADICTION: i64 = 2
+const NV3_VERDICT_ABSTAIN: i64 = 3
+const NV3_VERDICT_ISOLATED: i64 = 4
+const NV3_VERDICT_BUDGET_EXCEEDED: i64 = 5
+
+// Deterministic kernel IDs
+const NV3_KERNEL_NONE: i64 = 0
+const NV3_KERNEL_BIGINT_RATIONAL: i64 = 1
+const NV3_KERNEL_SI_UNIT: i64 = 2
+const NV3_KERNEL_CONSTRAINT_LOGIC: i64 = 3
+const NV3_KERNEL_TEMPORAL: i64 = 4
+const NV3_KERNEL_EVIDENCE_GATE: i64 = 5
+const NV3_KERNEL_PROVENANCE: i64 = 6
+
+struct Nv3KhgGraph {
+    max_nodes: i64
+    max_edges: i64
+    d_embed: i64
+    counts: *i64          // [0]=num_nodes, [1]=num_edges, [2]=policy_violations_blocked
+    node_state: *i64      // [max_nodes]
+    node_prov: *i64       // [max_nodes]
+    node_doc_id: *i64     // [max_nodes] pointer-addressed source doc id (-1 if synthetic)
+    node_span_off: *i64   // [max_nodes] byte offset in source buffer
+    node_span_len: *i64   // [max_nodes] byte length in source buffer
+    node_claim_hash: *i64 // [max_nodes] FNV-1a / canonical structural hash
+    node_kernel_id: *i64  // [max_nodes] deterministic kernel that certified state
+    node_conf: *f64       // [max_nodes] epistemic confidence in [0, 1]
+    node_embed: *f64      // [max_nodes * d_embed] continuous latent representation
+    edge_src: *i64        // [max_edges]
+    edge_dst: *i64        // [max_edges]
+    edge_rel: *i64        // [max_edges]
+}
+
+struct Nv3KhgNodeSpec {
+    state: i64
+    prov: i64
+    doc_id: i64
+    span_off: i64
+    span_len: i64
+    claim_hash: i64
+    confidence: f64
+}
+
+fn nv3_khg_create(max_nodes: i64, max_edges: i64, d_embed: i64) -> Nv3KhgGraph {
+    let mn = if max_nodes > 0 { max_nodes } else { 16 }
+    let me = if max_edges > 0 { max_edges } else { 32 }
+    let de = if d_embed > 0 { d_embed } else { 4 }
+
+    let counts = @malloc(24) as *i64
+    counts[0] = 0
+    counts[1] = 0
+    counts[2] = 0
+
+    let ns = @malloc(mn * 8) as *i64
+    let np = @malloc(mn * 8) as *i64
+    let nd = @malloc(mn * 8) as *i64
+    let nso = @malloc(mn * 8) as *i64
+    let nsl = @malloc(mn * 8) as *i64
+    let nch = @malloc(mn * 8) as *i64
+    let nki = @malloc(mn * 8) as *i64
+    let ncf = @malloc(mn * 8) as *f64
+    let nem = @malloc(mn * de * 8) as *f64
+    nv3_zero(nem, mn * de)
+
+    let es = @malloc(me * 8) as *i64
+    let ed = @malloc(me * 8) as *i64
+    let er = @malloc(me * 8) as *i64
+
+    return Nv3KhgGraph {
+        max_nodes: mn,
+        max_edges: me,
+        d_embed: de,
+        counts: counts,
+        node_state: ns,
+        node_prov: np,
+        node_doc_id: nd,
+        node_span_off: nso,
+        node_span_len: nsl,
+        node_claim_hash: nch,
+        node_kernel_id: nki,
+        node_conf: ncf,
+        node_embed: nem,
+        edge_src: es,
+        edge_dst: ed,
+        edge_rel: er
+    }
+}
+
+fn nv3_khg_free(g: Nv3KhgGraph) {
+    @free(g.counts as *u8)
+    @free(g.node_state as *u8)
+    @free(g.node_prov as *u8)
+    @free(g.node_doc_id as *u8)
+    @free(g.node_span_off as *u8)
+    @free(g.node_span_len as *u8)
+    @free(g.node_claim_hash as *u8)
+    @free(g.node_kernel_id as *u8)
+    @free(g.node_conf as *u8)
+    @free(g.node_embed as *u8)
+    @free(g.edge_src as *u8)
+    @free(g.edge_dst as *u8)
+    @free(g.edge_rel as *u8)
+}
+
+fn nv3_khg_reset(g: Nv3KhgGraph) {
+    let cnt = g.counts
+    cnt[0] = 0
+    cnt[1] = 0
+    cnt[2] = 0
+    nv3_zero(g.node_embed, g.max_nodes * g.d_embed)
+}
+
+// Adds a node enforcing fail-closed provenance and epistemic state invariants.
+// Unverified nodes CANNOT be inserted directly as NV3_KHG_STATE_VERIFIED;
+// they must pass nv3_khg_promote_verified with a valid deterministic kernel proof.
+// Returns node_id >= 0 on success, -1 on violation or full arena.
+fn nv3_khg_add_node(g: Nv3KhgGraph, spec: Nv3KhgNodeSpec, embed_opt: *f64) -> i64 {
+    let cnt = g.counts
+    let id = cnt[0]
+    if id >= g.max_nodes { return -1 }
+    if spec.prov < 0 or spec.prov > 4 { return -1 }
+    if spec.state < 0 or spec.state > 4 { return -1 }
+    if spec.span_off < 0 or spec.span_len < 0 { return -1 }
+    if nv3_is_finite(spec.confidence) == 0 { return -1 }
+
+    // Hard Epistemic Law: Direct insertion as VERIFIED is forbidden without kernel certificate.
+    if spec.state == NV3_KHG_STATE_VERIFIED {
+        cnt[2] = cnt[2] + 1
+        return -1
+    }
+    // Hard Provenance Law: UNTRUSTED_SOURCE / HYPOTHESIS cannot claim VERIFIED_KHG or SYSTEM_POLICY
+    if spec.state == NV3_KHG_STATE_HYPOTHESIS and spec.prov == NOEMA_V3_PROV_SYSTEM_POLICY {
+        cnt[2] = cnt[2] + 1
+        return -1
+    }
+    if spec.prov == NOEMA_V3_PROV_VERIFIED_KHG {
+        cnt[2] = cnt[2] + 1
+        return -1
+    }
+
+    let ns = g.node_state
+    let np = g.node_prov
+    let nd = g.node_doc_id
+    let nso = g.node_span_off
+    let nsl = g.node_span_len
+    let nch = g.node_claim_hash
+    let nki = g.node_kernel_id
+    let ncf = g.node_conf
+    let nem = g.node_embed
+
+    ns[id] = spec.state
+    np[id] = spec.prov
+    nd[id] = spec.doc_id
+    nso[id] = spec.span_off
+    nsl[id] = spec.span_len
+    nch[id] = spec.claim_hash
+    nki[id] = NV3_KERNEL_NONE
+    var cval = spec.confidence
+    if cval < 0.0 { cval = 0.0 }
+    if cval > 1.0 { cval = 1.0 }
+    ncf[id] = cval
+
+    var d: i64 = 0
+    while d < g.d_embed {
+        let v = if embed_opt != (0 as *f64) { embed_opt[d] } else { 0.0 }
+        nem[id * g.d_embed + d] = if nv3_is_finite(v) == 1 { v } else { 0.0 }
+        d = d + 1
+    }
+
+    cnt[0] = id + 1
+    return id
+}
+
+// Adds a directed relation edge (src -> dst).
+// Blocks edges where an UNTRUSTED_SOURCE attempts to override/supersede SYSTEM_POLICY.
+fn nv3_khg_add_edge(g: Nv3KhgGraph, src: i64, dst: i64, rel: i64) -> i64 {
+    let cnt = g.counts
+    let n = cnt[0]
+    let e = cnt[1]
+    if src < 0 or src >= n or dst < 0 or dst >= n or src == dst { return -1 }
+    if rel < 0 or rel > 3 { return -1 }
+    if e >= g.max_edges { return -1 }
+
+    // Provenance Isolation Law: UNTRUSTED_SOURCE or HYPOTHESIS cannot supersede SYSTEM_POLICY
+    if g.node_prov[dst] == NOEMA_V3_PROV_SYSTEM_POLICY {
+        if g.node_prov[src] == NOEMA_V3_PROV_UNTRUSTED_SOURCE or g.node_prov[src] == NOEMA_V3_PROV_HYPOTHESIS {
+            cnt[2] = cnt[2] + 1
+            return -1
+        }
+    }
+
+    let es = g.edge_src
+    let ed = g.edge_dst
+    let er = g.edge_rel
+    es[e] = src
+    ed[e] = dst
+    er[e] = rel
+    cnt[1] = e + 1
+    return e
+}
+
+// Attempts to escalate a node's provenance to NOEMA_V3_PROV_SYSTEM_POLICY.
+// Always rejected fail-closed unless the node already originated as SYSTEM_POLICY.
+fn nv3_khg_attempt_policy_escalation(g: Nv3KhgGraph, node_id: i64) -> i64 {
+    let cnt = g.counts
+    if node_id < 0 or node_id >= cnt[0] { return 0 }
+    if g.node_prov[node_id] == NOEMA_V3_PROV_SYSTEM_POLICY { return 1 }
+    cnt[2] = cnt[2] + 1
+    return 0
+}
+
+// Promotes a HYPOTHESIS node to VERIFIED (or REFUTED / ABSTAIN) ONLY via a
+// deterministic pure-LIR verification kernel verdict within step budget,
+// and ONLY if none of its incoming DERIVES/SUPPORTS premises are REFUTED or unverified HYPOTHESIS.
+fn nv3_khg_apply_kernel_verdict(
+    g: Nv3KhgGraph,
+    node_id: i64,
+    kernel_id: i64,
+    verdict: i64,
+    steps_used: i64,
+    step_budget: i64
+) -> i64 {
+    let cnt = g.counts
+    if node_id < 0 or node_id >= cnt[0] { return 0 }
+    if kernel_id <= NV3_KERNEL_NONE or kernel_id > NV3_KERNEL_PROVENANCE { return 0 }
+    let ns = g.node_state
+    let np = g.node_prov
+    let nki = g.node_kernel_id
+
+    if steps_used < 0 or step_budget <= 0 or steps_used > step_budget {
+        ns[node_id] = NV3_KHG_STATE_ABSTAIN
+        nki[node_id] = kernel_id
+        return 0
+    }
+
+    if verdict == NV3_VERDICT_CONTRADICTION {
+        ns[node_id] = NV3_KHG_STATE_REFUTED
+        nki[node_id] = kernel_id
+        return 1
+    }
+    if verdict == NV3_VERDICT_ABSTAIN {
+        ns[node_id] = NV3_KHG_STATE_ABSTAIN
+        nki[node_id] = kernel_id
+        return 1
+    }
+    if verdict != NV3_VERDICT_VERIFIED {
+        return 0
+    }
+
+    // Check all incoming DERIVES / SUPPORTS premises and active CONTRADICTS edges
+    let num_e = cnt[1]
+    var ei: i64 = 0
+    while ei < num_e {
+        if g.edge_dst[ei] == node_id {
+            let s = g.edge_src[ei]
+            let r = g.edge_rel[ei]
+            if r == NV3_KHG_EDGE_CONTRADICTS and ns[s] == NV3_KHG_STATE_VERIFIED {
+                ns[node_id] = NV3_KHG_STATE_REFUTED
+                nki[node_id] = kernel_id
+                return 0
+            }
+            if r == NV3_KHG_EDGE_DERIVES or r == NV3_KHG_EDGE_SUPPORTS {
+                if ns[s] == NV3_KHG_STATE_REFUTED or ns[s] == NV3_KHG_STATE_HYPOTHESIS or ns[s] == NV3_KHG_STATE_ABSTAIN {
+                    cnt[2] = cnt[2] + 1
+                    return 0
+                }
+                // Untrusted raw span cannot directly promote to VERIFIED_KHG via DERIVES without observation check
+                if r == NV3_KHG_EDGE_DERIVES and np[s] == NOEMA_V3_PROV_UNTRUSTED_SOURCE {
+                    cnt[2] = cnt[2] + 1
+                    return 0
+                }
+            }
+        }
+        ei = ei + 1
+    }
+
+    ns[node_id] = NV3_KHG_STATE_VERIFIED
+    np[node_id] = NOEMA_V3_PROV_VERIFIED_KHG
+    nki[node_id] = kernel_id
+    return 1
+}
+
+// Computes authority-isolated continuous KHG summary vector out_vec[d_embed]
+// for conditioning EK-HNB weight generation without copying stored source spans.
+// REFUTED, ABSTAIN, HYPOTHESIS, and UNTRUSTED_SOURCE nodes get zero authority weight.
+fn nv3_khg_authoritative_summary(g: Nv3KhgGraph, out_vec: *f64) -> i64 {
+    nv3_zero(out_vec, g.d_embed)
+    let n = g.counts[0]
+    var active: i64 = 0
+    var wsum: f64 = 0.0
+    var i: i64 = 0
+    while i < n {
+        let st = g.node_state[i]
+        let pv = g.node_prov[i]
+        var w: f64 = 0.0
+        if st == NV3_KHG_STATE_VERIFIED and pv == NOEMA_V3_PROV_VERIFIED_KHG {
+            w = 1.0 * g.node_conf[i]
+        } else {
+            if st == NV3_KHG_STATE_OBSERVED and (pv == NOEMA_V3_PROV_SYSTEM_POLICY or pv == NOEMA_V3_PROV_USER_INPUT) {
+                w = 0.5 * g.node_conf[i]
+            }
+        }
+        if w > 0.0 {
+            var d: i64 = 0
+            while d < g.d_embed {
+                out_vec[d] = out_vec[d] + w * g.node_embed[i * g.d_embed + d]
+                d = d + 1
+            }
+            wsum = wsum + w
+            active = active + 1
+        }
+        i = i + 1
+    }
+    if wsum > 0.0 {
+        let inv = 1.0 / wsum
+        var d: i64 = 0
+        while d < g.d_embed {
+            out_vec[d] = out_vec[d] * inv
+            d = d + 1
+        }
+    }
+    return active
+}
+
+struct Nv3EvidenceGateResult {
+    verdict: i64
+    output_mode: i64
+    supported_claims: i64
+    blocked_claims: i64
+    unsupported_claim_rate: f64
+    steps: i64
+}
+
+struct Nv3ProvenanceResult {
+    verdict: i64
+    promoted_to_system_policy: i64
+    injection_detected: i64
+    effective_prov: i64
+    steps: i64
+}
+
+fn nv3_khg_tick(steps_box: *i64, budget: i64, cost: i64) -> i64 {
+    let nxt = steps_box[0] + cost
+    steps_box[0] = nxt
+    if budget <= 0 or nxt > budget { return 0 }
+    return 1
+}
+
+// Evidence / Epistemic Abstain Gate over Pointer-Addressed KHG.
+// Blocks unsupported claims fail-closed (returning NV3_VERDICT_ABSTAIN and
+// NOEMA_V3_OUTPUT_WEIGHT_ABSTAIN with emitted unsupported_claim_rate = 0.0).
+fn nv3_verify_evidence_gate(
+    g: Nv3KhgGraph,
+    claim_ids: *i64,
+    num_claims: i64,
+    min_conf: f64,
+    budget: i64
+) -> Nv3EvidenceGateResult {
+    let sbox = @malloc(8) as *i64
+    sbox[0] = 0
+    if num_claims <= 0 {
+        @free(sbox as *u8)
+        return Nv3EvidenceGateResult {
+            verdict: NV3_VERDICT_ABSTAIN,
+            output_mode: NOEMA_V3_OUTPUT_WEIGHT_GENERATION_ABSTAIN,
+            supported_claims: 0,
+            blocked_claims: 0,
+            unsupported_claim_rate: 0.0,
+            steps: 1
+        }
+    }
+
+    let n_nodes = g.counts[0]
+    let n_edges = g.counts[1]
+    var supported: i64 = 0
+    var blocked: i64 = 0
+
+    var ci: i64 = 0
+    while ci < num_claims {
+        if nv3_khg_tick(sbox, budget, 1) == 0 {
+            let st = sbox[0]
+            @free(sbox as *u8)
+            return Nv3EvidenceGateResult {
+                verdict: NV3_VERDICT_BUDGET_EXCEEDED,
+                output_mode: NOEMA_V3_OUTPUT_WEIGHT_GENERATION_ABSTAIN,
+                supported_claims: supported,
+                blocked_claims: num_claims - supported,
+                unsupported_claim_rate: 0.0,
+                steps: st
+            }
+        }
+        let nid = claim_ids[ci]
+        var ok_claim: i64 = 0
+        if nid >= 0 and nid < n_nodes {
+            if g.node_state[nid] == NV3_KHG_STATE_VERIFIED and g.node_conf[nid] >= min_conf {
+                ok_claim = 1
+            }
+            var contradicted: i64 = 0
+            var has_evidence_edge: i64 = 0
+            var ei: i64 = 0
+            while ei < n_edges {
+                if nv3_khg_tick(sbox, budget, 1) == 0 {
+                    let st = sbox[0]
+                    @free(sbox as *u8)
+                    return Nv3EvidenceGateResult {
+                        verdict: NV3_VERDICT_BUDGET_EXCEEDED,
+                        output_mode: NOEMA_V3_OUTPUT_WEIGHT_GENERATION_ABSTAIN,
+                        supported_claims: supported,
+                        blocked_claims: num_claims - supported,
+                        unsupported_claim_rate: 0.0,
+                        steps: st
+                    }
+                }
+                if g.edge_dst[ei] == nid {
+                    let s = g.edge_src[ei]
+                    let r = g.edge_rel[ei]
+                    if r == NV3_KHG_EDGE_CONTRADICTS and g.node_state[s] == NV3_KHG_STATE_VERIFIED {
+                        contradicted = 1
+                    }
+                    if r == NV3_KHG_EDGE_SUPPORTS or r == NV3_KHG_EDGE_DERIVES {
+                        let sst = g.node_state[s]
+                        let spv = g.node_prov[s]
+                        if (sst == NV3_KHG_STATE_VERIFIED or (sst == NV3_KHG_STATE_OBSERVED and spv != NOEMA_V3_PROV_UNTRUSTED_SOURCE)) and g.node_conf[s] >= min_conf {
+                            has_evidence_edge = 1
+                        }
+                    }
+                }
+                ei = ei + 1
+            }
+            if has_evidence_edge == 1 { ok_claim = 1 }
+            if contradicted == 1 or g.node_state[nid] == NV3_KHG_STATE_REFUTED { ok_claim = 0 }
+        }
+        if ok_claim == 1 {
+            supported = supported + 1
+        } else {
+            blocked = blocked + 1
+        }
+        ci = ci + 1
+    }
+
+    let st = sbox[0]
+    @free(sbox as *u8)
+    if blocked > 0 or supported == 0 {
+        return Nv3EvidenceGateResult {
+            verdict: NV3_VERDICT_ABSTAIN,
+            output_mode: NOEMA_V3_OUTPUT_WEIGHT_GENERATION_ABSTAIN,
+            supported_claims: supported,
+            blocked_claims: blocked,
+            unsupported_claim_rate: 0.0,
+            steps: st
+        }
+    }
+    return Nv3EvidenceGateResult {
+        verdict: NV3_VERDICT_VERIFIED,
+        output_mode: NOEMA_V3_OUTPUT_WEIGHT_GENERATION,
+        supported_claims: supported,
+        blocked_claims: 0,
+        unsupported_claim_rate: 0.0,
+        steps: st
+    }
+}
+
+// Substring scan with a first-byte filter. The filter is what keeps the quarantine kernel inside a
+// fixed budget: eight needles over a 100-byte span would otherwise bill 800 ticks against a 500-tick
+// budget and report a *clean* document as an injection. Only positions whose first byte matches the
+// needle's first byte are billed and compared, so a clean span costs O(hlen) ticks in total.
+fn nv3_contains_substr(hay: string, needle: string, sbox: *i64, budget: i64) -> i64 {
+    let hlen = @string_len(hay)
+    let nlen = @string_len(needle)
+    if nlen <= 0 or hlen < nlen { return 0 }
+    let hp = hay.ptr as *u8
+    let np = needle.ptr as *u8
+    let n0 = @read_u8(np)
+    let last = hlen - nlen
+    var i: i64 = 0
+    while i <= last {
+        if @read_u8(@ptr_add(hp, i)) == n0 {
+            if nv3_khg_tick(sbox, budget, 1) == 0 { return -1 }
+            if @string_eq(@string_sub(hay, i, nlen), needle) { return 1 }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Provenance Authority Isolation & Prompt-Injection Quarantine Kernel.
+fn nv3_verify_provenance_isolation(doc_text: string, input_prov: i64, g: Nv3KhgGraph, budget: i64) -> Nv3ProvenanceResult {
+    let sbox = @malloc(8) as *i64
+    sbox[0] = 0
+    if input_prov < 0 or input_prov > 4 {
+        @free(sbox as *u8)
+        return Nv3ProvenanceResult {
+            verdict: NV3_VERDICT_CONTRADICTION,
+            promoted_to_system_policy: 0,
+            injection_detected: 1,
+            effective_prov: NOEMA_V3_PROV_UNTRUSTED_SOURCE,
+            steps: 1
+        }
+    }
+
+    var inj: i64 = 0
+    if input_prov != NOEMA_V3_PROV_SYSTEM_POLICY {
+        let m1 = nv3_contains_substr(doc_text, "SYSTEM_POLICY", sbox, budget)
+        let m2 = nv3_contains_substr(doc_text, "Ignore previous", sbox, budget)
+        let m3 = nv3_contains_substr(doc_text, "VERIFIED_KHG", sbox, budget)
+        // The quarantine kernel is multilingual on purpose: a policy override expressed in the
+        // operator's own language is the same escalation attempt as its English spelling.
+        let m4 = nv3_contains_substr(doc_text, "system policy", sbox, budget)
+        let m5 = nv3_contains_substr(doc_text, "talimatları unut", sbox, budget)
+        let m6 = nv3_contains_substr(doc_text, "talimatlari unut", sbox, budget)
+        let m7 = nv3_contains_substr(doc_text, "sistem istemini", sbox, budget)
+        let m8 = nv3_contains_substr(doc_text, "önceki talimatları", sbox, budget)
+        if m1 < 0 or m2 < 0 or m3 < 0 or m4 < 0 or m5 < 0 or m6 < 0 or m7 < 0 or m8 < 0 {
+            let st = sbox[0]
+            @free(sbox as *u8)
+            return Nv3ProvenanceResult {
+                verdict: NV3_VERDICT_BUDGET_EXCEEDED,
+                promoted_to_system_policy: 0,
+                injection_detected: 1,
+                effective_prov: NOEMA_V3_PROV_UNTRUSTED_SOURCE,
+                steps: st
+            }
+        }
+        if m1 == 1 or m2 == 1 or m3 == 1 or m4 == 1 or m5 == 1 or m6 == 1 or m7 == 1 or m8 == 1 { inj = 1 }
+    }
+
+    let eff_prov = if input_prov == NOEMA_V3_PROV_SYSTEM_POLICY {
+        NOEMA_V3_PROV_SYSTEM_POLICY
+    } else {
+        if inj == 1 or input_prov == NOEMA_V3_PROV_UNTRUSTED_SOURCE {
+            NOEMA_V3_PROV_UNTRUSTED_SOURCE
+        } else {
+            input_prov
+        }
+    }
+
+    let spec = Nv3KhgNodeSpec {
+        state: NV3_KHG_STATE_OBSERVED,
+        prov: eff_prov,
+        doc_id: 0,
+        span_off: 0,
+        span_len: @string_len(doc_text),
+        claim_hash: 0,
+        confidence: 0.5
+    }
+    let nid = nv3_khg_add_node(g, spec, 0 as *f64)
+    var promoted: i64 = 0
+    if nid >= 0 and eff_prov != NOEMA_V3_PROV_SYSTEM_POLICY {
+        promoted = nv3_khg_attempt_policy_escalation(g, nid)
+    }
+
+    let st = sbox[0]
+    @free(sbox as *u8)
+    let verd = if promoted == 0 { NV3_VERDICT_ISOLATED } else { NV3_VERDICT_CONTRADICTION }
+    return Nv3ProvenanceResult {
+        verdict: verd,
+        promoted_to_system_policy: promoted,
+        injection_detected: inj,
+        effective_prov: eff_prov,
+        steps: st
+    }
+}

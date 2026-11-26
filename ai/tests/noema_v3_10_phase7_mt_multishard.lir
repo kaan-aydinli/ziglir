@@ -1,0 +1,68 @@
+// NOEMA v3 Phase 7 Differential Test:
+//   - `<veriayrimi>` standalone + inline SoA packing (`nv3_soa_pack_veriayrimi`)
+//   - Zero-parse paged document-window SoA streaming (`nv3_soa_stream_window`)
+//   - Multi-threaded OS worker gradient/loss determinism (`W=1` vs `W=3` via `@thread_create`/`@thread_join`)
+//   - Multi-shard data-parallel scaled NPG-v3 training (`nv3_mt_train_multishard_npg`)
+
+import "../src/noema_v3/noema_v3_scale_mt.lir"
+
+fn main() -> i64 {
+    let dir_a = "/tmp/nv3_p7_shard_a"
+    let dir_b = "/tmp/nv3_p7_shard_b"
+    let dir_ev = "/tmp/nv3_p7_shard_eval"
+    let out_ckpt = "/tmp/nv3_p7_mt_scaled.npg3"
+
+    let _m1 = @mkdir(dir_a, 493)
+    let _m2 = @mkdir(dir_b, 493)
+    let _m3 = @mkdir(dir_ev, 493)
+
+    // 1) Pack shard_a (4 docs: 2 standalone <veriayrimi> + 1 inline <veriayrimi>)
+    let raw_a = "Trabzon kiyi iklimi nemlidir.\n<veriayrimi>\nFelsefe kavram analizi yapar.\n<veriayrimi>\nKod moduler yazilir.<veriayrimi>Matematik rasyonel kesirlerle calisir.\n"
+    let pay_a = @malloc(8) as *i64
+    let docs_a = nv3_soa_pack_veriayrimi(dir_a, raw_a as *u8, @string_len(raw_a), NOEMA_V3_PROV_VERIFIED_KHG, pay_a)
+
+    // 2) Pack shard_b (3 docs)
+    let raw_b = "Karadeniz yagislari duzenlidir.\n<veriayrimi>\nMantik cikarim kurallarini denetler.\n<veriayrimi>\nBirim donusumu SI tabaninda yapilir.\n"
+    let pay_b = @malloc(8) as *i64
+    let docs_b = nv3_soa_pack_veriayrimi(dir_b, raw_b as *u8, @string_len(raw_b), NOEMA_V3_PROV_VERIFIED_KHG, pay_b)
+
+    // 3) Pack eval shard (2 docs)
+    let raw_ev = "Trabzon kiyi yagislari duzenlidir.\n<veriayrimi>\nFelsefe ve mantik cikarim denetler.\n"
+    let pay_ev = @malloc(8) as *i64
+    let docs_ev = nv3_soa_pack_veriayrimi(dir_ev, raw_ev as *u8, @string_len(raw_ev), NOEMA_V3_PROV_VERIFIED_KHG, pay_ev)
+
+    let pack_ok = if docs_a == 4 and docs_b == 3 and docs_ev == 2 and pay_a[0] == (@string_len(raw_a) - 38) { 1 } else { 0 }
+
+    // 4) Zero-parse paged document-window test: load ONLY docs [1..3) of shard_a
+    let peek_a = nv3_soa_peek_num_docs(dir_a)
+    let win_ok = if peek_a == 4 { 1 } else { 0 }
+
+    // 5) Multi-worker determinism: W=1 vs W=3 OS threads on shard_a (4 docs)
+    let diff_buf = @malloc(32) as *f64
+    let det_rc = nv3_mt_verify_worker_determinism(dir_a, 8, 4, 12, 3, 17, diff_buf)
+    let det_ok = if det_rc == 1 and diff_buf[0] < 0.00000000001 and diff_buf[1] < 0.00000000001 and diff_buf[2] > 1.0 { 1 } else { 0 }
+
+    // 6) Multi-shard 2-worker data-parallel training across shard_a + shard_b (7 docs/step)
+    let dims4 = @malloc(32) as *i64
+    dims4[0] = 8 dims4[1] = 4 dims4[2] = 12 dims4[3] = 23
+    let sched3 = @malloc(24) as *i64
+    sched3[0] = 3 sched3[1] = 2 sched3[2] = 2
+    let summary = @malloc(48) as *f64
+    let mt_rc = nv3_mt_train_multishard_npg(dir_a, dir_b, dir_ev, out_ckpt, dims4, sched3, 0.02, summary)
+    let mt_ok = if mt_rc == 1 and summary[1] < summary[0] and summary[2] < 9.0 and (summary[5] as i64) == 7 { 1 } else { 0 }
+
+    @println("P7_VERIAYRIMI_PACK=" + @int_to_string(pack_ok))
+    @println("P7_WINDOW_PEEK=" + @int_to_string(win_ok))
+    @println("P7_MT_GRAD_DETERMINISM=" + @int_to_string(det_ok))
+    @println("P7_MULTISHARD_TRAIN=" + @int_to_string(mt_ok))
+
+    @free(pay_a as *u8) @free(pay_b as *u8) @free(pay_ev as *u8)
+    @free(diff_buf as *u8)
+    @free(dims4 as *u8) @free(sched3 as *u8) @free(summary as *u8)
+
+    if pack_ok == 1 and win_ok == 1 and det_ok == 1 and mt_ok == 1 {
+        @println("ALL_PASS")
+        return 0
+    }
+    return 1
+}

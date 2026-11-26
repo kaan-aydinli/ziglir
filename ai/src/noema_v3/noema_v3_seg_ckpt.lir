@@ -1,0 +1,380 @@
+// NOEMA v3 Phase 1: Two-Level Segment Checkpointing for Causal HAIB Memory.
+// Pure LIR implementation:
+//   - Exact causal forward/backward with per-byte document/provenance reset bit
+//   - Level-1 (coarse) + Level-2 (fine) segment checkpointing
+//   - Supports both exact f64 boundary snapshots and fp32-compressed HAIB state snapshots
+//   - Zero heap allocations inside step loops
+
+import "noema_v3_haib.lir"
+
+struct Nv3HaibSeq {
+    t_len: i64
+    d_v: i64
+    d_k: i64
+    m0: *f64
+    k_seq: *f64
+    v_seq: *f64
+    q_seq: *f64
+    gamma_seq: *f64
+    eta_seq: *f64
+    reset_seq: *i64
+    r_out: *f64
+}
+
+struct Nv3HaibSeqGrad {
+    dm0: *f64
+    dk_seq: *f64
+    dv_seq: *f64
+    dq_seq: *f64
+    dgamma_seq: *f64
+    deta_seq: *f64
+}
+
+fn nv3_div_ceil(n: i64, step: i64) -> i64 {
+    if n <= 0 or step <= 0 { return 0 }
+    return (n + step - 1) / step
+}
+
+// Total state matrices held concurrently by two-level segment checkpointing:
+//   coarse_slots + fine_slots + (fine_len + 1) micro-window states
+fn nv3_seg_ckpt_slot_budget(t_len: i64, coarse_len: i64, fine_len: i64) -> i64 {
+    let n_coarse = nv3_div_ceil(t_len, coarse_len)
+    let n_fine = nv3_div_ceil(coarse_len, fine_len)
+    return n_coarse + n_fine + (fine_len + 1)
+}
+
+// Zero-alloc Householder-Delta write: m_out = gamma * m_in + eta * (v - gamma * m_in * k) * k^T
+fn nv3_haib_write_raw(m_in: *f64, k: *f64, v: *f64, gamma: f64, eta: f64, m_out: *f64, d_v: i64, d_k: i64) {
+    var i: i64 = 0
+    while i < d_v {
+        let base = i * d_k
+        var v_old_i: f64 = 0.0
+        var j: i64 = 0
+        while j < d_k {
+            v_old_i = v_old_i + gamma * m_in[base + j] * k[j]
+            j = j + 1
+        }
+        let delta = eta * (v[i] - v_old_i)
+        j = 0
+        while j < d_k {
+            m_out[base + j] = gamma * m_in[base + j] + delta * k[j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+// Advance one causal step t: applies reset_seq[t], writes M_t, and optionally writes r_t.
+fn nv3_haib_seq_step_fwd(seq: Nv3HaibSeq, t: i64, m_prev: *f64, m_zero: *f64, m_next: *f64, emit_read: i64) {
+    let d_v = seq.d_v
+    let d_k = seq.d_k
+    var m_eff = m_prev
+    if seq.reset_seq[t] != 0 {
+        m_eff = m_zero
+    }
+    let kt = @ptr_add(seq.k_seq as *u8, t * d_k * 8) as *f64
+    let vt = @ptr_add(seq.v_seq as *u8, t * d_v * 8) as *f64
+    nv3_haib_write_raw(m_eff, kt, vt, seq.gamma_seq[t], seq.eta_seq[t], m_next, d_v, d_k)
+    if emit_read != 0 {
+        let qt = @ptr_add(seq.q_seq as *u8, t * d_k * 8) as *f64
+        let rt = @ptr_add(seq.r_out as *u8, t * d_v * 8) as *f64
+        nv3_haib_read_forward(m_next, qt, rt, d_v, d_k)
+    }
+}
+
+// Backward one causal step t given m_in_eff (already zeroed if reset_seq[t] != 0) and m_t.
+// Updates grad arrays at t and writes recurrent gradient for M_{t-1} into dm_rec (zeroed if reset_seq[t] != 0).
+fn nv3_haib_seq_step_bwd(seq: Nv3HaibSeq, dr_seq: *f64, grad_in: Nv3HaibSeqGrad, t: i64,
+                         m_in_eff: *f64, m_t: *f64, dm_rec: *f64, dm_work: *f64) {
+    var grad = grad_in
+    let d_v = seq.d_v
+    let d_k = seq.d_k
+    let mn = d_v * d_k
+    let kt = @ptr_add(seq.k_seq as *u8, t * d_k * 8) as *f64
+    let vt = @ptr_add(seq.v_seq as *u8, t * d_v * 8) as *f64
+    let qt = @ptr_add(seq.q_seq as *u8, t * d_k * 8) as *f64
+    let drt = @ptr_add(dr_seq as *u8, t * d_v * 8) as *f64
+
+    let dkt = @ptr_add(grad.dk_seq as *u8, t * d_k * 8) as *f64
+    let dvt = @ptr_add(grad.dv_seq as *u8, t * d_v * 8) as *f64
+    let dqt = @ptr_add(grad.dq_seq as *u8, t * d_k * 8) as *f64
+    nv3_zero(dkt, d_k)
+    nv3_zero(dvt, d_v)
+    nv3_zero(dqt, d_k)
+
+    // 1) Read backward: dm_work = dm_rec + dr_t * q_t^T, dqt = M_t^T * dr_t
+    var i: i64 = 0
+    while i < d_v {
+        let dri = drt[i]
+        let base = i * d_k
+        var j: i64 = 0
+        while j < d_k {
+            dm_work[base + j] = dm_rec[base + j] + dri * qt[j]
+            dqt[j] = dqt[j] + dri * m_t[base + j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    // 2) Householder-Delta write backward from dm_work through (m_in_eff, kt, vt, gamma_t, eta_t)
+    let gamma = seq.gamma_seq[t]
+    let eta = seq.eta_seq[t]
+    nv3_zero(dm_rec, mn)
+    var dgamma: f64 = 0.0
+    var deta: f64 = 0.0
+
+    i = 0
+    while i < d_v {
+        let base = i * d_k
+        var v_old_i: f64 = 0.0
+        var j: i64 = 0
+        while j < d_k {
+            v_old_i = v_old_i + gamma * m_in_eff[base + j] * kt[j]
+            j = j + 1
+        }
+        let delta_i = eta * (vt[i] - v_old_i)
+
+        var ddelta_i: f64 = 0.0
+        j = 0
+        while j < d_k {
+            ddelta_i = ddelta_i + dm_work[base + j] * kt[j]
+            j = j + 1
+        }
+        j = 0
+        while j < d_k {
+            dkt[j] = dkt[j] + dm_work[base + j] * delta_i
+            j = j + 1
+        }
+
+        deta = deta + ddelta_i * (vt[i] - v_old_i)
+        dvt[i] = dvt[i] + eta * ddelta_i
+        let dv_old_i = 0.0 - eta * ddelta_i
+
+        j = 0
+        while j < d_k {
+            let dm_tilde_ij = dm_work[base + j] + dv_old_i * kt[j]
+            dm_rec[base + j] = dm_rec[base + j] + gamma * dm_tilde_ij
+            dgamma = dgamma + dm_tilde_ij * m_in_eff[base + j]
+            dkt[j] = dkt[j] + gamma * m_in_eff[base + j] * dv_old_i
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    grad.dgamma_seq[t] = dgamma
+    grad.deta_seq[t] = deta
+
+    // 3) Hard causal isolation across document/provenance reset boundaries:
+    //    if reset_seq[t] != 0, M_{in,t} was reset to 0, so dL/dM_{t-1} is strictly 0.
+    if seq.reset_seq[t] != 0 {
+        nv3_zero(dm_rec, mn)
+    }
+}
+
+// Reference uncheckpointed forward+backward (stores all T+1 states, used for verification).
+fn nv3_haib_seq_full_fwd_bwd(seq: Nv3HaibSeq, dr_seq: *f64, grad_in: Nv3HaibSeqGrad) {
+    var grad = grad_in
+    let t_len = seq.t_len
+    let mn = seq.d_v * seq.d_k
+    let states = @malloc((t_len + 1) * mn * 8) as *f64
+    let m_zero = @malloc(mn * 8) as *f64
+    let dm_rec = @malloc(mn * 8) as *f64
+    let dm_work = @malloc(mn * 8) as *f64
+    nv3_zero(m_zero, mn)
+    nv3_zero(dm_rec, mn)
+    nv3_copy(states, seq.m0, mn)
+
+    var t: i64 = 0
+    while t < t_len {
+        let s_prev = @ptr_add(states as *u8, t * mn * 8) as *f64
+        let s_next = @ptr_add(states as *u8, (t + 1) * mn * 8) as *f64
+        nv3_haib_seq_step_fwd(seq, t, s_prev, m_zero, s_next, 1)
+        t = t + 1
+    }
+
+    t = t_len - 1
+    while t >= 0 {
+        let s_prev = @ptr_add(states as *u8, t * mn * 8) as *f64
+        let s_curr = @ptr_add(states as *u8, (t + 1) * mn * 8) as *f64
+        var m_in_eff = s_prev
+        if seq.reset_seq[t] != 0 {
+            m_in_eff = m_zero
+        }
+        nv3_haib_seq_step_bwd(seq, dr_seq, grad, t, m_in_eff, s_curr, dm_rec, dm_work)
+        t = t - 1
+    }
+    nv3_copy(grad.dm0, dm_rec, mn)
+
+    @free(states as *u8)
+    @free(m_zero as *u8)
+    @free(dm_rec as *u8)
+    @free(dm_work as *u8)
+}
+
+// Two-level segment-checkpointed forward+backward.
+//   coarse_len: Level-1 macro-segment length C1
+//   fine_len:   Level-2 micro-segment length C2
+//   use_fp32_ckpt: if 1, coarse+fine checkpoint pools store HAIB M states in *f32 (4 bytes/cell);
+//                  if 0, stores exact *f64 boundary states.
+fn nv3_haib_seq_two_level_fwd_bwd(seq: Nv3HaibSeq, dr_seq: *f64, grad_in: Nv3HaibSeqGrad,
+                                  coarse_len: i64, fine_len: i64, use_fp32_ckpt: i64) {
+    var grad = grad_in
+    let t_len = seq.t_len
+    let mn = seq.d_v * seq.d_k
+    let n_coarse = nv3_div_ceil(t_len, coarse_len)
+    let n_fine_max = nv3_div_ceil(coarse_len, fine_len)
+
+    // Allocate ONLY O(T/C1 + C1/C2 + C2) state buffers (never O(T)).
+    var coarse_bytes = (n_coarse + 1) * mn * 8
+    var fine_bytes = (n_fine_max + 1) * mn * 8
+    if use_fp32_ckpt != 0 {
+        coarse_bytes = (n_coarse + 1) * mn * 4
+        fine_bytes = (n_fine_max + 1) * mn * 4
+    }
+    let coarse_pool = @malloc(coarse_bytes)
+    let fine_pool = @malloc(fine_bytes)
+    let micro_states = @malloc((fine_len + 1) * mn * 8) as *f64
+
+    let m_cur = @malloc(mn * 8) as *f64
+    let m_nxt = @malloc(mn * 8) as *f64
+    let m_zero = @malloc(mn * 8) as *f64
+    let dm_rec = @malloc(mn * 8) as *f64
+    let dm_work = @malloc(mn * 8) as *f64
+    nv3_zero(m_zero, mn)
+    nv3_zero(dm_rec, mn)
+    nv3_copy(m_cur, seq.m0, mn)
+
+    // Forward pass: emit r_out and snapshot ONLY coarse segment boundaries.
+    var t: i64 = 0
+    while t < t_len {
+        if (t % coarse_len) == 0 {
+            let cb = t / coarse_len
+            if use_fp32_ckpt != 0 {
+                let dst32 = @ptr_add(coarse_pool, cb * mn * 4)
+                nv3_f64_to_f32_buf(dst32, m_cur, mn)
+                nv3_f32_to_f64_buf(m_cur, dst32, mn)
+            } else {
+                let dst64 = @ptr_add(coarse_pool, cb * mn * 8) as *f64
+                nv3_copy(dst64, m_cur, mn)
+            }
+        }
+        nv3_haib_seq_step_fwd(seq, t, m_cur, m_zero, m_nxt, 1)
+        if use_fp32_ckpt != 0 {
+            var q_i: i64 = 0
+            while q_i < mn {
+                m_cur[q_i] = ((m_nxt[q_i] as f32) as f64)
+                q_i = q_i + 1
+            }
+        } else {
+            nv3_copy(m_cur, m_nxt, mn)
+        }
+        t = t + 1
+    }
+
+    // Backward pass: reverse over coarse blocks, recomputing fine checkpoints per coarse block,
+    // then reverse over fine blocks, recomputing micro-window states per fine block.
+    var cb = n_coarse - 1
+    while cb >= 0 {
+        let c_start = cb * coarse_len
+        var c_end = c_start + coarse_len
+        if c_end > t_len { c_end = t_len }
+        let c_span = c_end - c_start
+        let n_fine = nv3_div_ceil(c_span, fine_len)
+
+        // Restore coarse boundary state into m_cur
+        if use_fp32_ckpt != 0 {
+            let src32 = @ptr_add(coarse_pool, cb * mn * 4)
+            nv3_f32_to_f64_buf(m_cur, src32, mn)
+        } else {
+            let src64 = @ptr_add(coarse_pool, cb * mn * 8) as *f64
+            nv3_copy(m_cur, src64, mn)
+        }
+
+        // Level-2 forward recomputation of fine boundary snapshots inside [c_start, c_end)
+        var pos = c_start
+        while pos < c_end {
+            let rel = pos - c_start
+            if (rel % fine_len) == 0 {
+                let fb = rel / fine_len
+                if use_fp32_ckpt != 0 {
+                    let fdst32 = @ptr_add(fine_pool, fb * mn * 4)
+                    nv3_f64_to_f32_buf(fdst32, m_cur, mn)
+                } else {
+                    let fdst64 = @ptr_add(fine_pool, fb * mn * 8) as *f64
+                    nv3_copy(fdst64, m_cur, mn)
+                }
+            }
+            nv3_haib_seq_step_fwd(seq, pos, m_cur, m_zero, m_nxt, 0)
+            if use_fp32_ckpt != 0 {
+                var q_i: i64 = 0
+                while q_i < mn {
+                    m_cur[q_i] = ((m_nxt[q_i] as f32) as f64)
+                    q_i = q_i + 1
+                }
+            } else {
+                nv3_copy(m_cur, m_nxt, mn)
+            }
+            pos = pos + 1
+        }
+
+        // Reverse over fine blocks inside coarse block cb
+        var fb = n_fine - 1
+        while fb >= 0 {
+            let f_start = c_start + fb * fine_len
+            var f_end = f_start + fine_len
+            if f_end > c_end { f_end = c_end }
+            let w_len = f_end - f_start
+
+            // Restore fine boundary into micro_states[0]
+            if use_fp32_ckpt != 0 {
+                let fsrc32 = @ptr_add(fine_pool, fb * mn * 4)
+                nv3_f32_to_f64_buf(micro_states, fsrc32, mn)
+            } else {
+                let fsrc64 = @ptr_add(fine_pool, fb * mn * 8) as *f64
+                nv3_copy(micro_states, fsrc64, mn)
+            }
+
+            // Recompute micro-window states [0 .. w_len]
+            var w: i64 = 0
+            while w < w_len {
+                let ms_prev = @ptr_add(micro_states as *u8, w * mn * 8) as *f64
+                let ms_next = @ptr_add(micro_states as *u8, (w + 1) * mn * 8) as *f64
+                nv3_haib_seq_step_fwd(seq, f_start + w, ms_prev, m_zero, ms_next, 0)
+                if use_fp32_ckpt != 0 {
+                    var q_i: i64 = 0
+                    while q_i < mn {
+                        ms_next[q_i] = ((ms_next[q_i] as f32) as f64)
+                        q_i = q_i + 1
+                    }
+                }
+                w = w + 1
+            }
+
+            // Exact reverse step backward within micro-window
+            w = w_len - 1
+            while w >= 0 {
+                let ms_prev = @ptr_add(micro_states as *u8, w * mn * 8) as *f64
+                let ms_curr = @ptr_add(micro_states as *u8, (w + 1) * mn * 8) as *f64
+                let step_t = f_start + w
+                var m_in_eff = ms_prev
+                if seq.reset_seq[step_t] != 0 {
+                    m_in_eff = m_zero
+                }
+                nv3_haib_seq_step_bwd(seq, dr_seq, grad, step_t, m_in_eff, ms_curr, dm_rec, dm_work)
+                w = w - 1
+            }
+            fb = fb - 1
+        }
+        cb = cb - 1
+    }
+    nv3_copy(grad.dm0, dm_rec, mn)
+
+    @free(coarse_pool)
+    @free(fine_pool)
+    @free(micro_states as *u8)
+    @free(m_cur as *u8)
+    @free(m_nxt as *u8)
+    @free(m_zero as *u8)
+    @free(dm_rec as *u8)
+    @free(dm_work as *u8)
+}

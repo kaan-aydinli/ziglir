@@ -1,0 +1,196 @@
+// NOEMA v3 Phase 1: Householder-Delta fast memory (HAIB) kernel.
+// M is [d_v, d_k] row-major. k,q are [d_k], v,r are [d_v].
+// Spec: M_tilde = gamma*M; v_old = M_tilde*k; M_k = M_tilde + eta*(v-v_old)*k^T
+
+import "noema_v3_math.lir"
+
+// r = M * q
+fn nv3_haib_read_forward(m: *f64, q: *f64, r: *f64, d_v: i64, d_k: i64) {
+    var i: i64 = 0
+    while i < d_v {
+        var acc: f64 = 0.0
+        let base = i * d_k
+        var j: i64 = 0
+        while j < d_k {
+            acc = acc + m[base + j] * q[j]
+            j = j + 1
+        }
+        r[i] = acc
+        i = i + 1
+    }
+}
+
+struct Nv3HaibReadGrad {
+    dm: *f64
+    dq: *f64
+}
+
+// Backward for r = M*q: dM[i,j]+=dr[i]*q[j], dq[j]+=sum_i dr[i]*M[i,j]
+fn nv3_haib_read_backward(dr: *f64, m: *f64, q: *f64, g_in: Nv3HaibReadGrad, d_v: i64, d_k: i64) {
+    var g = g_in
+    nv3_zero(g.dm, d_v * d_k)
+    nv3_zero(g.dq, d_k)
+    var i: i64 = 0
+    while i < d_v {
+        let dri = dr[i]
+        let base = i * d_k
+        var j: i64 = 0
+        while j < d_k {
+            g.dm[base + j] = g.dm[base + j] + dri * q[j]
+            g.dq[j] = g.dq[j] + dri * m[base + j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+struct Nv3HaibWriteBuf {
+    m_prev: *f64
+    k: *f64
+    v: *f64
+    m_next: *f64
+    v_old: *f64
+}
+
+struct Nv3HaibDims {
+    d_v: i64
+    d_k: i64
+}
+
+// Householder-Delta write forward.
+fn nv3_haib_write_forward(buf_in: Nv3HaibWriteBuf, gamma: f64, eta: f64, d: Nv3HaibDims) {
+    var buf = buf_in
+    var i: i64 = 0
+    while i < d.d_v {
+        let base = i * d.d_k
+        var v_old_i: f64 = 0.0
+        var j: i64 = 0
+        while j < d.d_k {
+            v_old_i = v_old_i + gamma * buf.m_prev[base + j] * buf.k[j]
+            j = j + 1
+        }
+        buf.v_old[i] = v_old_i
+        let delta = eta * (buf.v[i] - v_old_i)
+        j = 0
+        while j < d.d_k {
+            buf.m_next[base + j] = gamma * buf.m_prev[base + j] + delta * buf.k[j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+struct Nv3HaibWriteGrad {
+    dm_prev: *f64
+    dk: *f64
+    dv: *f64
+    dgamma_out: *f64
+    deta_out: *f64
+}
+
+// Backward for Householder-Delta write.
+fn nv3_haib_write_backward(d_m_next: *f64, buf: Nv3HaibWriteBuf, gamma: f64, eta: f64, g_in: Nv3HaibWriteGrad, d: Nv3HaibDims) {
+    var g = g_in
+    nv3_zero(g.dm_prev, d.d_v * d.d_k)
+    nv3_zero(g.dk, d.d_k)
+    nv3_zero(g.dv, d.d_v)
+    var dgamma: f64 = 0.0
+    var deta: f64 = 0.0
+
+    var i: i64 = 0
+    while i < d.d_v {
+        let base = i * d.d_k
+        var v_old_i: f64 = 0.0
+        var j: i64 = 0
+        while j < d.d_k {
+            v_old_i = v_old_i + gamma * buf.m_prev[base + j] * buf.k[j]
+            j = j + 1
+        }
+        let delta_i = eta * (buf.v[i] - v_old_i)
+
+        var ddelta_i: f64 = 0.0
+        j = 0
+        while j < d.d_k {
+            ddelta_i = ddelta_i + d_m_next[base + j] * buf.k[j]
+            j = j + 1
+        }
+        j = 0
+        while j < d.d_k {
+            g.dk[j] = g.dk[j] + d_m_next[base + j] * delta_i
+            j = j + 1
+        }
+
+        deta = deta + ddelta_i * (buf.v[i] - v_old_i)
+        g.dv[i] = g.dv[i] + eta * ddelta_i
+        let dv_old_i = 0.0 - eta * ddelta_i
+
+        j = 0
+        while j < d.d_k {
+            let dm_tilde_ij = d_m_next[base + j] + dv_old_i * buf.k[j]
+            g.dm_prev[base + j] = g.dm_prev[base + j] + gamma * dm_tilde_ij
+            dgamma = dgamma + dm_tilde_ij * buf.m_prev[base + j]
+            g.dk[j] = g.dk[j] + gamma * buf.m_prev[base + j] * dv_old_i
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    g.dgamma_out[0] = dgamma
+    g.deta_out[0] = deta
+}
+
+// -----------------------------
+// fp32-state Householder-Delta HAIB (M stored in packed 4-byte binary32 *u8, accumulated in f64)
+// Enforces the NOEMA v3 fp32 fast-associative-memory storage contract (4 bytes per cell).
+// -----------------------------
+struct Nv3HaibF32StepBuf {
+    m_prev: *u8
+    k: *f64
+    v: *f64
+    q: *f64
+    m_next: *u8
+    r_out: *f64
+}
+
+fn nv3_haib_read_f32_state(m_bytes: *u8, q: *f64, r: *f64, d_v: i64, d_k: i64) {
+    let mn = d_v * d_k
+    let m_tmp = @malloc(mn * 8) as *f64
+    nv3_f32_to_f64_buf(m_tmp, m_bytes, mn)
+    nv3_haib_read_forward(m_tmp, q, r, d_v, d_k)
+    @free(m_tmp as *u8)
+}
+
+fn nv3_haib_write_f32_state(buf_in: Nv3HaibF32StepBuf, gamma: f64, eta: f64, reset_flag: i64, d: Nv3HaibDims) {
+    var buf = buf_in
+    let mn = d.d_v * d.d_k
+    let m_in_tmp = @malloc(mn * 8) as *f64
+    let m_out_tmp = @malloc(mn * 8) as *f64
+    if reset_flag != 0 {
+        nv3_zero(m_in_tmp, mn)
+    } else {
+        nv3_f32_to_f64_buf(m_in_tmp, buf.m_prev, mn)
+    }
+    var i: i64 = 0
+    while i < d.d_v {
+        let base = i * d.d_k
+        var v_old_i: f64 = 0.0
+        var j: i64 = 0
+        while j < d.d_k {
+            v_old_i = v_old_i + gamma * m_in_tmp[base + j] * buf.k[j]
+            j = j + 1
+        }
+        let delta = eta * (buf.v[i] - v_old_i)
+        j = 0
+        while j < d.d_k {
+            m_out_tmp[base + j] = gamma * m_in_tmp[base + j] + delta * buf.k[j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    nv3_f64_to_f32_buf(buf.m_next, m_out_tmp, mn)
+    nv3_f32_to_f64_buf(m_out_tmp, buf.m_next, mn)
+    nv3_haib_read_forward(m_out_tmp, buf.q, buf.r_out, d.d_v, d.d_k)
+    @free(m_in_tmp as *u8)
+    @free(m_out_tmp as *u8)
+}
+

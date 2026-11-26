@@ -1,207 +1,55 @@
-// Generate canonical Turkish v2 data, train SEL classifier + conditional byte
-// response head on TRAIN only, persist both, and evaluate on held-out rows.
+// Read a plain-text corpus and split topics on '<veriayrimi>' delimiters.
+// Every topic is passed unchanged as raw UTF-8 to a distinct pretraining record.
 // Run from repository root: ./zig-out/bin/lir run ai/train_turkish_corpus.lir --backend=native
-import "src/noema_corpus.lir"
-import "src/noema_text.lir"
-import "src/noema_text_jsonl.lir"
-import "src/noema_fit.lir"
-import "src/ledger.lir"
-import "src/noema_decoder.lir"
-fn print_inline(value: i64) {
-    let buf = @malloc(32)
-    var n = value
-    var len: i64 = 0
-    if n == 0 { @write_u8(buf, 48 as u8) len = 1 }
-    else {
-        if n < 0 { @write_u8(buf, 45 as u8) len = 1 n = 0 - n }
-        let start = len
-        while n > 0 { @write_u8(@ptr_add(buf, len), (48 + n % 10) as u8) len = len + 1 n = n / 10 }
-        var lo = start
-        var hi = len - 1
-        while lo < hi { let a = @read_u8(@ptr_add(buf, lo)) let b = @read_u8(@ptr_add(buf, hi)) @write_u8(@ptr_add(buf, lo), b) @write_u8(@ptr_add(buf, hi), a) lo = lo + 1 hi = hi - 1 }
-    }
-    @write(1, buf, len)
-}
-fn print_matrix(name: string, matrix: *u8) {
-    print(name)
-    var r: i64 = 0
-    while r < 4 { var c: i64 = 0 while c < 4 { print_inline(@read_u64(@ptr_add(matrix, (r * 4 + c) * 8)) as i64) if c < 3 { print(",") } c = c + 1 } println("") r = r + 1 }
-}
-fn prompt_answer(edges: *u8, bias: *u8, output: *u8, decoder: *u8, prompt: string) {
-    let feature = @malloc(128 * 8)
-    if noema_text_encode_prompt(prompt.len as i64, prompt.ptr as *u8, 128, feature) <= 0 { println("PROMPT_ENCODING_FAILED") return }
-    let model = SelBlock { edges: edges, bias: bias, out: output, nin: 128, nout: 4, k: 32 }
-    forward(model, feature)
-    var best = 0 - 9223372036854775807
-    var label: i64 = 0
-    var c: i64 = 0
-    while c < 4 { let score = @read_u64(@ptr_add(model.out, c * 8)) as i64 if score > best { best = score label = c } c = c + 1 }
-    print("Soru: ") println(prompt)
-    print("Model cevabı: ")
-    let generated = @malloc(DECODER_MAX_OUTPUT)
-    let n = noema_decoder_generate(decoder, label, feature, 128, generated, DECODER_MAX_OUTPUT)
-    if n > 0 { @write(1, generated, n) } else { print("(boş çıktı)") }
-    println("")
-}
+import "src/noema_pretrain.lir"
+const PRETRAIN_SOURCE_CAP: i64 = 2097152
+const PRETRAIN_TOPIC_CAP: i64 = 16384
 fn main() -> i64 {
-    let per_template: i64 = 2750
-    let expected_rows = per_template * 40
-    if generate_turkish_corpus(per_template) != expected_rows { println("CORPUS_GENERATION_FAILED") return 1 }
-    let fd = @open("ai/noema-training/turkish_synthetic.v2.jsonl", 0, 0)
-    if fd < 0 { println("TRAINING_JSONL_MISSING") return 1 }
-    let bytes = @malloc(134217728)
-    let nbytes = @read(fd, bytes, 134217728)
+    let source_path = "ai/noema-training/pretrain_corpus_large.tr.txt"
+    let source_fd = @open(source_path,0,0)
+    if source_fd < 0 { println("PLAIN_TEXT_CORPUS_MISSING") return 1 }
+    let source = @malloc(PRETRAIN_SOURCE_CAP) as *u8
+    let source_len = @read(source_fd,source,PRETRAIN_SOURCE_CAP)
+    @close(source_fd)
+    if source_len <= 0 or source_len >= PRETRAIN_SOURCE_CAP {
+        @free(source)
+        println("PLAIN_TEXT_CORPUS_SIZE_INVALID")
+        return 1
+    }
+    let nbin_path = "/tmp/noema_phi_turkish_pretrain_v3.nbin"
+    let out = @open(nbin_path,577,420)
+    if out < 0 { @free(source) println("NBIN_OUTPUT_OPEN_FAILED") return 1 }
+    let payload_bytes = @malloc(8) as *i64
+    let topics = noema_pretrain_pack_topics(out,source,source_len,payload_bytes)
+    @close(out)
+    @free(source)
+    if topics <= 0 { println("NO_PLAIN_TEXT_TOPICS_FOUND") return 1 }
+    let fd = @open(nbin_path,0,0)
+    if fd < 0 { println("NBIN_INPUT_OPEN_FAILED") return 1 }
+    let state = noema_pretrain_create_with_memory(64,8,128,20261124,topics)
+    let records = noema_pretrain_nbin_train_auto(state,fd,topics,PRETRAIN_TOPIC_CAP,4)
     @close(fd)
-    if nbytes <= 0 or nbytes >= 134217728 { println("TRAINING_JSONL_READ_FAILED") return 1 }
-    let dim: i64 = 128
-    let features = @malloc(expected_rows * dim * 8)
-    let targets = @malloc(expected_rows * 4 * 8)
-    let splits = @malloc(expected_rows * 8)
-    let metadata = @malloc(expected_rows * 2 * 8)
-    let rows = noema_text_decode_jsonl(nbytes, bytes, expected_rows, dim, features, targets, splits, metadata)
-    if rows != expected_rows { println("TRAINING_JSONL_SCHEMA_INVALID") return 1 }
-
-    let reply_spans = @malloc(rows * 16)
-    var scan_pos: i64 = 0
-    var row: i64 = 0
-    while row < rows {
-        let line_start = scan_pos
-        var line_end = line_start
-        while line_end < nbytes and (@read_u8(@ptr_add(bytes, line_end)) as i64) != 10 { line_end = line_end + 1 }
-        if noema_jsonl_target_span(bytes, line_start, line_end, @ptr_add(reply_spans, row * 16)) != 1 { println("TRAINING_JSONL_TARGET_MISSING") return 1 }
-        scan_pos = if line_end < nbytes { line_end + 1 } else { nbytes }
-        row = row + 1
+    if records != topics {
+        noema_pretrain_destroy(state)
+        println("NBIN_TRAIN_FAILED")
+        return 1
     }
-
-    // Train conditional response byte weights strictly on TRAIN records.
-    println("TRAINING_PROMPT_CONDITIONED_RESPONSE_WEIGHTS")
-    let decoder = @malloc(DECODER_CELLS * 8)
-    noema_decoder_zero(decoder)
-    var decoder_rows: i64 = 0
-    row = 0
-    while row < rows {
-        if (@read_u64(@ptr_add(splits, row * 8)) as i64) == FIT_TRAIN and row % 20 == 0 {
-            var label: i64 = -1
-            var c: i64 = 0
-            while c < 4 { if (@read_u64(@ptr_add(targets, (row * 4 + c) * 8)) as i64) == 4294967296 { label = c } c = c + 1 }
-            let start = @read_u64(@ptr_add(reply_spans, row * 16)) as i64
-            let end = @read_u64(@ptr_add(reply_spans, row * 16 + 8)) as i64
-            let x = @ptr_add(features, row * dim * 8)
-            if label < 0 or end <= start or noema_decoder_train(decoder, label, @ptr_add(bytes, start), end - start, x, dim) != end - start { println("RESPONSE_TRAINING_RECORD_INVALID") return 1 }
-            decoder_rows = decoder_rows + 1
-        }
-        row = row + 1
+    if noema_pretrain_save(state,"/tmp/noema-pretrain-large.nps") != 1 {
+        noema_pretrain_destroy(state)
+        @free(payload_bytes as *u8)
+        println("MODEL_STATE_SAVE_FAILED")
+        return 1
     }
-    if decoder_rows != 4400 or noema_decoder_save(decoder, "ai/noema-training/turkish_decoder.seltok", decoder_rows, 11, 1729) != 1 { println("RESPONSE_WEIGHT_SAVE_FAILED") return 1 }
-    println("RESPONSE_WEIGHT_ARTIFACT_SAVED")
-
-    // Fit classifier and persist/reload before any evaluation.
-    let history = @malloc(11 * 8)
-    let fit_config = @malloc(32)
-    @write_u64(fit_config, (ONE / 64) as u64)
-    @write_u64(@ptr_add(fit_config, 8), 11 as u64)
-    @write_u64(@ptr_add(fit_config, 16), 12 as u64)
-    @write_u64(@ptr_add(fit_config, 24), 0 as u64)
-    // A 32-edge sparse classifier reduces per-row training/evaluation work by 4x
-    // versus fully connected 128-bin SEL while retaining 128-bin prompt features.
-    let model = block_new(dim, 4, 32, 1729)
-    let epochs = noema_fit_early_stop(model, rows, features, targets, splits, fit_config, history)
-    if epochs != 11 { println("CLASSIFIER_TRAINING_FAILED") return 1 }
-    if sel_checkpoint_save(model, "ai/noema-training/turkish_model.selcp", 88000, epochs, 1729) != 1 { println("CLASSIFIER_WEIGHT_SAVE_FAILED") return 1 }
-    @write_u64(model.bias, 0 as u64)
-    if sel_checkpoint_load(model, "ai/noema-training/turkish_model.selcp") != 1 { println("CLASSIFIER_WEIGHT_RELOAD_FAILED") return 1 }
-    let decoder_runtime = @malloc(DECODER_CELLS * 8)
-    if noema_decoder_load(decoder_runtime, "ai/noema-training/turkish_decoder.seltok") != 1 { println("RESPONSE_WEIGHT_RELOAD_FAILED") return 1 }
-    println("22 held-out interactive prompts; generated outputs follow (synthetic-domain model, not factual QA)")
-    prompt_answer(model.edges, model.bias, model.out, decoder_runtime, "17 ile 25 sayılarının toplamı kaçtır?")
-    prompt_answer(model.edges, model.bias, model.out, decoder_runtime, "Bir sepette 12 elma ve 8 armut var. Toplam kaç meyve vardır?")
-    prompt_answer(model.edges, model.bias, model.out, decoder_runtime, "Bir otobüste 31 yolcu vardı, 9 kişi daha bindi. Kaç yolcu oldu?")
-    prompt_answer(model.edges, model.bias, model.out, decoder_runtime, "45 kitabın yanına 17 kitap daha kondu. Toplam kaç kitap var?")
-    prompt_answer(model.edges, model.bias, model.out, decoder_runtime, "Bir bahçeye 23 fidan ve 14 fidan daha dikildi. Toplam kaç fidan?")
-    prompt_answer(model.edges, model.bias, model.out, decoder_runtime, "Sınıfta 28 öğrenci vardı, 11 öğrenci geldi. Yeni toplam kaçtır?")
-    prompt_answer(model.edges, model.bias, model.out, decoder_runtime, "Depoda 42 koli vardı ve 16 koli daha geldi. Kaç koli oldu?")
-    prompt_answer(model.edges, model.bias, model.out, decoder_runtime, "Çiftlikte 19 koyun ve 21 keçi var. Hayvanların toplamı nedir?")
-    prompt_answer(model.edges, model.bias, model.out, decoder_runtime, "Bir kutuda kaç parça olduğu bilinmiyor. Her parçanın kütlesi kaçtır?")
-    prompt_answer(model.edges, model.bias, model.out, decoder_runtime, "Dikdörtgenin alanı 48 santimetrekare. Bir kenarının uzunluğu nedir?")
-    prompt_answer(model.edges, model.bias, model.out, decoder_runtime, "Bir yolculuk 3 saat sürdü. Alınan yol kaç kilometredir?")
-    prompt_answer(model.edges, model.bias, model.out, decoder_runtime, "Bir sınıfta 30 öğrenci var. Kaçı kız öğrencidir?")
-    prompt_answer(model.edges, model.bias, model.out, decoder_runtime, "Bir havuzda 500 litre su var. Havuzun derinliği nedir?")
-    prompt_answer(model.edges, model.bias, model.out, decoder_runtime, "Bir ürünün fiyatı 90 liradır. İndirimli fiyatı nedir?")
-    prompt_answer(model.edges, model.bias, model.out, decoder_runtime, "Şemsiye satışı arttı ve kaldırım ıslandı. Bu kanıtlar nedenselliği gösterir mi?")
-    prompt_answer(model.edges, model.bias, model.out, decoder_runtime, "Dondurma satışı ile sağlık başvuruları birlikte arttı. Dondurma başvurulara neden oldu mu?")
-    prompt_answer(model.edges, model.bias, model.out, decoder_runtime, "Reklam harcaması ve satışlar arttı. Reklam artışın kesin nedeni midir?")
-    prompt_answer(model.edges, model.bias, model.out, decoder_runtime, "Kahve tüketimi ile üretkenlik puanı birlikte yükseldi. Nedensellik kanıtlandı mı?")
-    prompt_answer(model.edges, model.bias, model.out, decoder_runtime, "Bir LIR fonksiyonunu derleyip test etmem gerekiyor. Hangi araçları kullanmalıyım?")
-    prompt_answer(model.edges, model.bias, model.out, decoder_runtime, "Uzunluğu 20 olan listedeki en büyük değeri bulan LIR kodunu yaz.")
-    prompt_answer(model.edges, model.bias, model.out, decoder_runtime, "En fazla 100 satırlı dosyanın satırlarını sayan program oluştur.")
-    prompt_answer(model.edges, model.bias, model.out, decoder_runtime, "Belirli bir dosyada kayıt arayıp eşleşmeyi bulmak istiyorum. Ne yapmalıyım?")
-
-    let train_matrix = @malloc(128)
-    let dev_matrix = @malloc(128)
-    let test_matrix = @malloc(128)
-    let train_n = noema_confusion_split(model, rows, features, targets, splits, FIT_TRAIN, train_matrix)
-    let dev_n = noema_confusion_split(model, rows, features, targets, splits, FIT_DEV, dev_matrix)
-    let test_n = noema_confusion_split(model, rows, features, targets, splits, FIT_TEST, test_matrix)
-    let prediction_fd = @open("ai/noema-training/turkish_test_predictions.v1.jsonl", 577, 420)
-    let decoder_fd = @open("ai/noema-training/turkish_decoder_predictions.v1.jsonl", 577, 420)
-    if prediction_fd < 0 or decoder_fd < 0 { println("EVALUATION_OUTPUT_OPEN_FAILED") return 1 }
-    let sample_counts = @malloc(32)
-    var c: i64 = 0
-    while c < 4 { @write_u64(@ptr_add(sample_counts, c * 8), 0 as u64) c = c + 1 }
-    let generated = @malloc(DECODER_MAX_OUTPUT)
-    var prediction_rows: i64 = 0
-    var decoder_rows_test: i64 = 0
-    row = 0
-    while row < rows {
-        if (@read_u64(@ptr_add(splits, row * 8)) as i64) == FIT_TEST {
-            let x = @ptr_add(features, row * dim * 8)
-            let target = @ptr_add(targets, row * 4 * 8)
-            forward(model, x)
-            var actual: i64 = 0
-            var predicted: i64 = 0
-            var best_a = 0 - 9223372036854775807
-            var best_p = 0 - 9223372036854775807
-            c = 0
-            while c < 4 {
-                let a = @read_u64(@ptr_add(target, c * 8)) as i64
-                let p = @read_u64(@ptr_add(model.out, c * 8)) as i64
-                if a > best_a { best_a = a actual = c }
-                if p > best_p { best_p = p predicted = c }
-                c = c + 1
-            }
-            corpus_write(prediction_fd, "{\"row_index\":") corpus_write_i64(prediction_fd, row) corpus_write(prediction_fd, ",\"actual_class\":") corpus_write_i64(prediction_fd, actual) corpus_write(prediction_fd, ",\"predicted_class\":") corpus_write_i64(prediction_fd, predicted) corpus_write(prediction_fd, "}\n")
-            prediction_rows = prediction_rows + 1
-            let used = @read_u64(@ptr_add(sample_counts, actual * 8)) as i64
-            if used < 10 {
-                let generated_len = noema_decoder_generate(decoder_runtime, predicted, x, dim, generated, DECODER_MAX_OUTPUT)
-                if generated_len <= 0 { @close(prediction_fd) @close(decoder_fd) println("HELDOUT_DECODER_EMPTY") return 1 }
-                corpus_write(decoder_fd, "{\"row_index\":") corpus_write_i64(decoder_fd, row) corpus_write(decoder_fd, ",\"actual_class\":") corpus_write_i64(decoder_fd, actual) corpus_write(decoder_fd, ",\"predicted_class\":") corpus_write_i64(decoder_fd, predicted) corpus_write(decoder_fd, ",\"generated_text\":\"")
-                var outpos: i64 = 0
-                while outpos < generated_len { let written = @write(decoder_fd, @ptr_add(generated, outpos), generated_len - outpos) if written <= 0 { @close(decoder_fd) println("HELDOUT_DECODER_WRITE_FAILED") return 1 } outpos = outpos + written }
-                corpus_write(decoder_fd, "\"}\n")
-                @write_u64(@ptr_add(sample_counts, actual * 8), (used + 1) as u64)
-                decoder_rows_test = decoder_rows_test + 1
-            }
-        }
-        row = row + 1
-    }
-    if @close(prediction_fd) != 0 or @close(decoder_fd) != 0 or prediction_rows != test_n or decoder_rows_test != 40 { println("HELDOUT_EXPORT_INCOMPLETE") return 1 }
-
-    let metric = @malloc(8)
-    noema_evaluate_split(model, rows, features, targets, splits, FIT_DEV, metric)
-    let dev_loss = @read_u64(metric) as i64
-    noema_evaluate_split(model, rows, features, targets, splits, FIT_TEST, metric)
-    let test_loss = @read_u64(metric) as i64
-    let train_correct = (@read_u64(train_matrix) as i64) + (@read_u64(@ptr_add(train_matrix, 40)) as i64) + (@read_u64(@ptr_add(train_matrix, 80)) as i64) + (@read_u64(@ptr_add(train_matrix, 120)) as i64)
-    let dev_correct = (@read_u64(dev_matrix) as i64) + (@read_u64(@ptr_add(dev_matrix, 40)) as i64) + (@read_u64(@ptr_add(dev_matrix, 80)) as i64) + (@read_u64(@ptr_add(dev_matrix, 120)) as i64)
-    let test_correct = (@read_u64(test_matrix) as i64) + (@read_u64(@ptr_add(test_matrix, 40)) as i64) + (@read_u64(@ptr_add(test_matrix, 80)) as i64) + (@read_u64(@ptr_add(test_matrix, 120)) as i64)
-    println("LIR classifier + prompt-conditioned response-byte weights; synthetic-only evaluation")
-    print("rows train/dev/test: ") print_inline(train_n) print("/") print_inline(dev_n) print("/") print_inline(test_n) println("")
-    print("classifier epochs used: ") print_inline(epochs) println("")
-    print("decoder train rows: ") print_inline(decoder_rows) print("; heldout generated outputs: ") print_inline(decoder_rows_test) println("")
-    print("accuracy train/dev/test: ") print_inline(train_correct) print("/") print_inline(train_n) print("; ") print_inline(dev_correct) print("/") print_inline(dev_n) print("; ") print_inline(test_correct) print("/") print_inline(test_n) println("")
-    print("dev/test MSE Q32.32 raw: ") print_inline(dev_loss) print("/") print_inline(test_loss) println("")
-    print_matrix("test confusion matrix:\n", test_matrix)
-    println("Synthetic template benchmark only; not a general language-quality claim.")
+    print("plain-text topics: ") printInt(topics)
+    print(" pretraining records: ") printInt(records)
+    print(" raw payload bytes: ") printInt(payload_bytes[0])
+    print(" state-accounted train bytes: ") printInt(noema_pretrain_training_bytes(state))
+    print(" source bytes incl. separators: ") printInt(source_len)
+    print(" spectral curriculum stage: ") printInt(noema_pretrain_stage(state))
+    print(" do-perturbations: ") printInt(noema_pretrain_do_count(state))
+    print(" adaptive macro mean: ") printFloat(noema_pretrain_auto_macros_mean(state))
+    print(" learned text exemplars: ") printInt(noema_pretrain_memory_count(state)) println("")
+    noema_pretrain_destroy(state)
+    @free(payload_bytes as *u8)
     return 0
 }

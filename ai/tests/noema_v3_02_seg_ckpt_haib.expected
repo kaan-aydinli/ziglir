@@ -1,0 +1,8 @@
+SEG_HAIB_CHECK test=fp32_haib_orthogonal_overwrite_and_reset pass=1
+SEG_HAIB_CHECK test=slot_budget_512_is_25 pass=1
+SEG_HAIB_CHECK test=two_level_f64_matches_full_bwd pass=1
+SEG_HAIB_CHECK test=two_level_fp32_drift_within_1e5 pass=1
+SEG_HAIB_CHECK test=no_future_leakage_haib_seq pass=1
+SEG_HAIB_CHECK test=no_future_leakage_causal_conv1d pass=1
+SEG_HAIB_CHECK test=reset_boundary_blocks_grad_leakage pass=1
+ALL_PASS

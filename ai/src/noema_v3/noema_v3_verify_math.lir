@@ -1,0 +1,617 @@
+// NOEMA v3 Phase 3: Pure-LIR Deterministic Exact Math & SI Unit Verification Kernels
+// Pure, side-effect-free, step-budgeted kernels:
+//   1) Arbitrary-precision signed BigInt (base 10^9 limbs in *i64)
+//   2) Exact canonical reduced Rational (p / q, q > 0, Euclidean GCD)
+//   3) 7-Base-Dimension SI Unit Algebra ([m, kg, s, A, K, mol, cd])
+
+import "noema_v3_khg.lir"
+
+const NV3_BIGINT_BASE: i64 = 1000000000
+
+const NV3_OP_ADD: i64 = 0
+const NV3_OP_SUB: i64 = 1
+const NV3_OP_MUL: i64 = 2
+const NV3_OP_DIV: i64 = 3
+
+struct Nv3BigInt {
+    cap: i64
+    meta: *i64   // [0]=len, [1]=sign (+1 or -1), [2]=ok (1 or 0)
+    limbs: *i64  // little-endian base-10^9 limbs
+}
+
+struct Nv3Rational {
+    p: i64
+    q: i64
+    verdict: i64
+    steps: i64
+}
+
+struct Nv3SiQuantity {
+    p: i64
+    q: i64
+    dims: *i64   // [7]: [m, kg, s, A, K, mol, cd]
+    verdict: i64
+    steps: i64
+}
+
+fn nv3_step_tick(steps_box: *i64, budget: i64, cost: i64) -> i64 {
+    let nxt = steps_box[0] + cost
+    steps_box[0] = nxt
+    if budget <= 0 or nxt > budget { return 0 }
+    return 1
+}
+
+// ---------------- Arbitrary-Precision BigInt ----------------
+
+fn nv3_bigint_alloc(cap: i64) -> Nv3BigInt {
+    let c = if cap > 2 { cap } else { 8 }
+    let meta = @malloc(24) as *i64
+    let limbs = @malloc(c * 8) as *i64
+    meta[0] = 1
+    meta[1] = 1
+    meta[2] = 1
+    var i: i64 = 0
+    while i < c { limbs[i] = 0 i = i + 1 }
+    return Nv3BigInt { cap: c, meta: meta, limbs: limbs }
+}
+
+fn nv3_bigint_free(b: Nv3BigInt) {
+    @free(b.meta as *u8)
+    @free(b.limbs as *u8)
+}
+
+fn nv3_bigint_trim(b: Nv3BigInt) {
+    let meta = b.meta
+    var n = meta[0]
+    while n > 1 and b.limbs[n - 1] == 0 {
+        n = n - 1
+    }
+    meta[0] = n
+    if n == 1 and b.limbs[0] == 0 {
+        meta[1] = 1
+    }
+}
+
+fn nv3_bigint_from_str(s: string, out: Nv3BigInt, steps_box: *i64, budget: i64) -> i64 {
+    let meta = out.meta
+    let limbs = out.limbs
+    var i: i64 = 0
+    while i < out.cap { limbs[i] = 0 i = i + 1 }
+    meta[0] = 1
+    meta[1] = 1
+    meta[2] = 0
+
+    let slen = @string_len(s)
+    if slen <= 0 { return NV3_VERDICT_CONTRADICTION }
+
+    var start: i64 = 0
+    var sign: i64 = 1
+    let c0 = @string_char_at(s, 0)
+    if c0 == 45 {
+        sign = -1
+        start = 1
+    } else {
+        if c0 == 43 { start = 1 }
+    }
+    if start >= slen { return NV3_VERDICT_CONTRADICTION }
+
+    // Validate all digits first
+    var p = start
+    while p < slen {
+        if nv3_step_tick(steps_box, budget, 1) == 0 { return NV3_VERDICT_BUDGET_EXCEEDED }
+        let ch = @string_char_at(s, p)
+        if ch < 48 or ch > 57 { return NV3_VERDICT_CONTRADICTION }
+        p = p + 1
+    }
+
+    // Parse 9-digit chunks from right to left
+    var pos = slen
+    var li: i64 = 0
+    while pos > start {
+        if nv3_step_tick(steps_box, budget, 1) == 0 { return NV3_VERDICT_BUDGET_EXCEEDED }
+        if li >= out.cap { return NV3_VERDICT_CONTRADICTION }
+        let chunk_start = if (pos - 9) > start { pos - 9 } else { start }
+        var val: i64 = 0
+        var k = chunk_start
+        while k < pos {
+            val = val * 10 + (@string_char_at(s, k) - 48)
+            k = k + 1
+        }
+        limbs[li] = val
+        li = li + 1
+        pos = chunk_start
+    }
+
+    meta[0] = if li > 0 { li } else { 1 }
+    meta[1] = sign
+    meta[2] = 1
+    nv3_bigint_trim(out)
+    return NV3_VERDICT_VERIFIED
+}
+
+fn nv3_bigint_to_str(b: Nv3BigInt) -> string {
+    if b.meta[2] != 1 { return "INVALID" }
+    let n = b.meta[0]
+    if n == 1 and b.limbs[0] == 0 { return "0" }
+
+    let max_chars = n * 9 + 4
+    let buf = @malloc(max_chars)
+    var pos: i64 = 0
+    if b.meta[1] < 0 {
+        @write_u8(@ptr_add(buf, pos), 45 as u8)
+        pos = pos + 1
+    }
+
+    // Highest limb without leading zeros
+    let top = b.limbs[n - 1]
+    let tmp = @malloc(16)
+    var tlen: i64 = 0
+    var tv = top
+    if tv == 0 {
+        @write_u8(@ptr_add(tmp, 0), 48 as u8)
+        tlen = 1
+    } else {
+        while tv > 0 {
+            @write_u8(@ptr_add(tmp, tlen), (48 + (tv % 10)) as u8)
+            tv = tv / 10
+            tlen = tlen + 1
+        }
+    }
+    var ti = tlen - 1
+    while ti >= 0 {
+        @write_u8(@ptr_add(buf, pos), @read_u8(@ptr_add(tmp, ti)))
+        pos = pos + 1
+        ti = ti - 1
+    }
+    @free(tmp)
+
+    // Remaining limbs zero-padded to 9 digits
+    var li = n - 2
+    while li >= 0 {
+        var lv = b.limbs[li]
+        var d: i64 = 8
+        while d >= 0 {
+            @write_u8(@ptr_add(buf, pos + d), (48 + (lv % 10)) as u8)
+            lv = lv / 10
+            d = d - 1
+        }
+        pos = pos + 9
+        li = li - 1
+    }
+
+    let s = @string_new(buf, pos)
+    @free(buf)
+    return s
+}
+
+fn nv3_bigint_abs_cmp(a: Nv3BigInt, b: Nv3BigInt) -> i64 {
+    let na = a.meta[0]
+    let nb = b.meta[0]
+    if na > nb { return 1 }
+    if na < nb { return -1 }
+    var i = na - 1
+    while i >= 0 {
+        if a.limbs[i] > b.limbs[i] { return 1 }
+        if a.limbs[i] < b.limbs[i] { return -1 }
+        i = i - 1
+    }
+    return 0
+}
+
+fn nv3_bigint_abs_add(a: Nv3BigInt, b: Nv3BigInt, out: Nv3BigInt, steps_box: *i64, budget: i64) -> i64 {
+    let om = out.meta
+    let ol = out.limbs
+    let na = a.meta[0]
+    let nb = b.meta[0]
+    let nmax = if na > nb { na } else { nb }
+    if nmax + 1 > out.cap { om[2] = 0 return NV3_VERDICT_CONTRADICTION }
+
+    var carry: i64 = 0
+    var i: i64 = 0
+    while i < nmax {
+        if nv3_step_tick(steps_box, budget, 1) == 0 { om[2] = 0 return NV3_VERDICT_BUDGET_EXCEEDED }
+        let va = if i < na { a.limbs[i] } else { 0 }
+        let vb = if i < nb { b.limbs[i] } else { 0 }
+        let sum = va + vb + carry
+        ol[i] = sum % NV3_BIGINT_BASE
+        carry = sum / NV3_BIGINT_BASE
+        i = i + 1
+    }
+    var nout = nmax
+    if carry > 0 {
+        ol[nout] = carry
+        nout = nout + 1
+    }
+    om[0] = nout
+    om[2] = 1
+    nv3_bigint_trim(out)
+    return NV3_VERDICT_VERIFIED
+}
+
+// Assumes |a| >= |b|
+fn nv3_bigint_abs_sub(a: Nv3BigInt, b: Nv3BigInt, out: Nv3BigInt, steps_box: *i64, budget: i64) -> i64 {
+    let om = out.meta
+    let ol = out.limbs
+    let na = a.meta[0]
+    let nb = b.meta[0]
+    if na > out.cap { om[2] = 0 return NV3_VERDICT_CONTRADICTION }
+
+    var borrow: i64 = 0
+    var i: i64 = 0
+    while i < na {
+        if nv3_step_tick(steps_box, budget, 1) == 0 { om[2] = 0 return NV3_VERDICT_BUDGET_EXCEEDED }
+        let va = a.limbs[i]
+        let vb = if i < nb { b.limbs[i] } else { 0 }
+        var diff = va - vb - borrow
+        if diff < 0 {
+            diff = diff + NV3_BIGINT_BASE
+            borrow = 1
+        } else {
+            borrow = 0
+        }
+        ol[i] = diff
+        i = i + 1
+    }
+    om[0] = na
+    om[2] = 1
+    nv3_bigint_trim(out)
+    return NV3_VERDICT_VERIFIED
+}
+
+fn nv3_bigint_eval_op(op: i64, a: Nv3BigInt, b: Nv3BigInt, out: Nv3BigInt, steps_box: *i64, budget: i64) -> i64 {
+    let om = out.meta
+    let ol = out.limbs
+    if a.meta[2] != 1 or b.meta[2] != 1 { om[2] = 0 return NV3_VERDICT_CONTRADICTION }
+    let sa = a.meta[1]
+    let sb_eff = if op == NV3_OP_SUB { 0 - b.meta[1] } else { b.meta[1] }
+
+    if op == NV3_OP_ADD or op == NV3_OP_SUB {
+        if sa == sb_eff {
+            let v = nv3_bigint_abs_add(a, b, out, steps_box, budget)
+            om[1] = sa
+            nv3_bigint_trim(out)
+            return v
+        }
+        let cmp = nv3_bigint_abs_cmp(a, b)
+        if cmp == 0 {
+            ol[0] = 0
+            om[0] = 1
+            om[1] = 1
+            om[2] = 1
+            return NV3_VERDICT_VERIFIED
+        }
+        if cmp > 0 {
+            let v = nv3_bigint_abs_sub(a, b, out, steps_box, budget)
+            om[1] = sa
+            nv3_bigint_trim(out)
+            return v
+        }
+        let v = nv3_bigint_abs_sub(b, a, out, steps_box, budget)
+        om[1] = sb_eff
+        nv3_bigint_trim(out)
+        return v
+    }
+
+    if op == NV3_OP_MUL {
+        let na = a.meta[0]
+        let nb = b.meta[0]
+        if na + nb > out.cap { om[2] = 0 return NV3_VERDICT_CONTRADICTION }
+        var k: i64 = 0
+        while k < out.cap { ol[k] = 0 k = k + 1 }
+        var i: i64 = 0
+        while i < na {
+            var carry: i64 = 0
+            var j: i64 = 0
+            while j < nb {
+                if nv3_step_tick(steps_box, budget, 1) == 0 { om[2] = 0 return NV3_VERDICT_BUDGET_EXCEEDED }
+                let cur = ol[i + j] + a.limbs[i] * b.limbs[j] + carry
+                ol[i + j] = cur % NV3_BIGINT_BASE
+                carry = cur / NV3_BIGINT_BASE
+                j = j + 1
+            }
+            if carry > 0 {
+                ol[i + nb] = ol[i + nb] + carry
+            }
+            i = i + 1
+        }
+        om[0] = na + nb
+        om[1] = sa * b.meta[1]
+        om[2] = 1
+        nv3_bigint_trim(out)
+        return NV3_VERDICT_VERIFIED
+    }
+
+    om[2] = 0
+    return NV3_VERDICT_CONTRADICTION
+}
+
+// ---------------- Exact Canonical Rational (p / q) ----------------
+
+fn nv3_i64_abs(x: i64) -> i64 {
+    return if x < 0 { 0 - x } else { x }
+}
+
+fn nv3_gcd_budgeted(a_in: i64, b_in: i64, steps_box: *i64, budget: i64) -> i64 {
+    var a = nv3_i64_abs(a_in)
+    var b = nv3_i64_abs(b_in)
+    while b != 0 {
+        if nv3_step_tick(steps_box, budget, 1) == 0 { return -1 }
+        let r = a % b
+        a = b
+        b = r
+    }
+    return if a > 0 { a } else { 1 }
+}
+
+fn nv3_rational_make(p_in: i64, q_in: i64, steps_box: *i64, budget: i64) -> Nv3Rational {
+    if q_in == 0 {
+        return Nv3Rational { p: 0, q: 1, verdict: NV3_VERDICT_CONTRADICTION, steps: steps_box[0] }
+    }
+    var p = p_in
+    var q = q_in
+    if q < 0 {
+        p = 0 - p
+        q = 0 - q
+    }
+    if p == 0 {
+        return Nv3Rational { p: 0, q: 1, verdict: NV3_VERDICT_VERIFIED, steps: steps_box[0] }
+    }
+    let g = nv3_gcd_budgeted(p, q, steps_box, budget)
+    if g <= 0 {
+        return Nv3Rational { p: 0, q: 1, verdict: NV3_VERDICT_BUDGET_EXCEEDED, steps: steps_box[0] }
+    }
+    return Nv3Rational {
+        p: p / g,
+        q: q / g,
+        verdict: NV3_VERDICT_VERIFIED,
+        steps: steps_box[0]
+    }
+}
+
+fn nv3_rational_eval(op: i64, ap: i64, aq: i64, bp: i64, bq: i64, budget: i64) -> Nv3Rational {
+    let sbox = @malloc(8) as *i64
+    sbox[0] = 0
+    let ra = nv3_rational_make(ap, aq, sbox, budget)
+    let rb = nv3_rational_make(bp, bq, sbox, budget)
+    if ra.verdict != NV3_VERDICT_VERIFIED {
+        let st = sbox[0]
+        @free(sbox as *u8)
+        return Nv3Rational { p: 0, q: 1, verdict: ra.verdict, steps: st }
+    }
+    if rb.verdict != NV3_VERDICT_VERIFIED {
+        let st = sbox[0]
+        @free(sbox as *u8)
+        return Nv3Rational { p: 0, q: 1, verdict: rb.verdict, steps: st }
+    }
+
+    var res = Nv3Rational { p: 0, q: 1, verdict: NV3_VERDICT_CONTRADICTION, steps: sbox[0] }
+    if op == NV3_OP_ADD {
+        res = nv3_rational_make(ra.p * rb.q + rb.p * ra.q, ra.q * rb.q, sbox, budget)
+    } else {
+        if op == NV3_OP_SUB {
+            res = nv3_rational_make(ra.p * rb.q - rb.p * ra.q, ra.q * rb.q, sbox, budget)
+        } else {
+            if op == NV3_OP_MUL {
+                res = nv3_rational_make(ra.p * rb.p, ra.q * rb.q, sbox, budget)
+            } else {
+                if op == NV3_OP_DIV {
+                    if rb.p == 0 {
+                        res = Nv3Rational { p: 0, q: 1, verdict: NV3_VERDICT_CONTRADICTION, steps: sbox[0] }
+                    } else {
+                        res = nv3_rational_make(ra.p * rb.q, ra.q * rb.p, sbox, budget)
+                    }
+                }
+            }
+        }
+    }
+    @free(sbox as *u8)
+    return res
+}
+
+// ---------------- 7-Base-Dimension SI Unit Algebra ----------------
+// dims[0..6] = [m, kg, s, A, K, mol, cd]
+
+fn nv3_si_add_atom(sym: string, scale_exp: i64, dims: *i64) -> i64 {
+    if @string_eq(sym, "1") or @string_len(sym) == 0 { return 1 }
+    if @string_eq(sym, "m") { dims[0] = dims[0] + scale_exp return 1 }
+    if @string_eq(sym, "kg") { dims[1] = dims[1] + scale_exp return 1 }
+    if @string_eq(sym, "s") { dims[2] = dims[2] + scale_exp return 1 }
+    if @string_eq(sym, "A") { dims[3] = dims[3] + scale_exp return 1 }
+    if @string_eq(sym, "K") { dims[4] = dims[4] + scale_exp return 1 }
+    if @string_eq(sym, "mol") { dims[5] = dims[5] + scale_exp return 1 }
+    if @string_eq(sym, "cd") { dims[6] = dims[6] + scale_exp return 1 }
+    // Derived coherent SI units:
+    // N = kg * m * s^-2
+    if @string_eq(sym, "N") {
+        dims[0] = dims[0] + scale_exp
+        dims[1] = dims[1] + scale_exp
+        dims[2] = dims[2] - 2 * scale_exp
+        return 1
+    }
+    // J = kg * m^2 * s^-2
+    if @string_eq(sym, "J") {
+        dims[0] = dims[0] + 2 * scale_exp
+        dims[1] = dims[1] + scale_exp
+        dims[2] = dims[2] - 2 * scale_exp
+        return 1
+    }
+    // W = kg * m^2 * s^-3
+    if @string_eq(sym, "W") {
+        dims[0] = dims[0] + 2 * scale_exp
+        dims[1] = dims[1] + scale_exp
+        dims[2] = dims[2] - 3 * scale_exp
+        return 1
+    }
+    // Pa = kg * m^-1 * s^-2
+    if @string_eq(sym, "Pa") {
+        dims[0] = dims[0] - scale_exp
+        dims[1] = dims[1] + scale_exp
+        dims[2] = dims[2] - 2 * scale_exp
+        return 1
+    }
+    // Hz = s^-1
+    if @string_eq(sym, "Hz") {
+        dims[2] = dims[2] - scale_exp
+        return 1
+    }
+    return 0
+}
+
+// Parses compound SI unit strings such as "kg", "m/s^2", "kg*m/s^2", "N", "J/s"
+fn nv3_si_parse_unit(unit_str: string, out_dims: *i64, steps_box: *i64, budget: i64) -> i64 {
+    var d: i64 = 0
+    while d < 7 { out_dims[d] = 0 d = d + 1 }
+
+    let slen = @string_len(unit_str)
+    if slen == 0 { return NV3_VERDICT_VERIFIED }
+
+    var pos: i64 = 0
+    var cur_sign: i64 = 1
+    while pos < slen {
+        if nv3_step_tick(steps_box, budget, 1) == 0 { return NV3_VERDICT_BUDGET_EXCEEDED }
+        let ch = @string_char_at(unit_str, pos)
+        if ch == 32 {
+            pos = pos + 1
+        } else {
+            if ch == 42 {
+                cur_sign = 1
+                pos = pos + 1
+            } else {
+                if ch == 47 {
+                    cur_sign = -1
+                    pos = pos + 1
+                } else {
+                    // Read alphabetic/digit unit atom up to '*', '/', '^', or ' '
+                    let sym_start = pos
+                    while pos < slen {
+                        let c2 = @string_char_at(unit_str, pos)
+                        if c2 == 42 or c2 == 47 or c2 == 94 or c2 == 32 {
+                            break
+                        }
+                        pos = pos + 1
+                    }
+                    let sym = @string_slice(unit_str, sym_start, pos)
+                    var exp_val: i64 = 1
+                    if pos < slen and @string_char_at(unit_str, pos) == 94 {
+                        pos = pos + 1
+                        if pos >= slen { return NV3_VERDICT_CONTRADICTION }
+                        var exp_sign: i64 = 1
+                        if @string_char_at(unit_str, pos) == 45 {
+                            exp_sign = -1
+                            pos = pos + 1
+                        }
+                        if pos >= slen { return NV3_VERDICT_CONTRADICTION }
+                        var ev: i64 = 0
+                        var edigits: i64 = 0
+                        while pos < slen {
+                            let cd = @string_char_at(unit_str, pos)
+                            if cd < 48 or cd > 57 { break }
+                            ev = ev * 10 + (cd - 48)
+                            edigits = edigits + 1
+                            pos = pos + 1
+                        }
+                        if edigits == 0 { return NV3_VERDICT_CONTRADICTION }
+                        exp_val = ev * exp_sign
+                    }
+                    if nv3_si_add_atom(sym, cur_sign * exp_val, out_dims) == 0 {
+                        return NV3_VERDICT_CONTRADICTION
+                    }
+                    cur_sign = 1
+                }
+            }
+        }
+    }
+    return NV3_VERDICT_VERIFIED
+}
+
+fn nv3_si_canonical_symbol(dims: *i64) -> string {
+    let m = dims[0]
+    let kg = dims[1]
+    let s = dims[2]
+    let a = dims[3]
+    let k = dims[4]
+    let mol = dims[5]
+    let cd = dims[6]
+    let rest_zero = if a == 0 and k == 0 and mol == 0 and cd == 0 { 1 } else { 0 }
+
+    if rest_zero == 1 {
+        if m == 0 and kg == 0 and s == 0 { return "1" }
+        if m == 1 and kg == 0 and s == 0 { return "m" }
+        if m == 0 and kg == 1 and s == 0 { return "kg" }
+        if m == 0 and kg == 0 and s == 1 { return "s" }
+        if m == 1 and kg == 1 and s == -2 { return "N" }
+        if m == 2 and kg == 1 and s == -2 { return "J" }
+        if m == 2 and kg == 1 and s == -3 { return "W" }
+        if m == -1 and kg == 1 and s == -2 { return "Pa" }
+        if m == 0 and kg == 0 and s == -1 { return "Hz" }
+        if m == 1 and kg == 0 and s == -1 { return "m/s" }
+        if m == 1 and kg == 0 and s == -2 { return "m/s^2" }
+    }
+    return "SI_COMPOUND"
+}
+
+fn nv3_si_make(p: i64, q: i64, unit_str: string, budget: i64) -> Nv3SiQuantity {
+    let sbox = @malloc(8) as *i64
+    sbox[0] = 0
+    let dims = @malloc(56) as *i64
+    let r = nv3_rational_make(p, q, sbox, budget)
+    if r.verdict != NV3_VERDICT_VERIFIED {
+        let st = sbox[0]
+        @free(sbox as *u8)
+        return Nv3SiQuantity { p: 0, q: 1, dims: dims, verdict: r.verdict, steps: st }
+    }
+    let uv = nv3_si_parse_unit(unit_str, dims, sbox, budget)
+    let st = sbox[0]
+    @free(sbox as *u8)
+    return Nv3SiQuantity { p: r.p, q: r.q, dims: dims, verdict: uv, steps: st }
+}
+
+fn nv3_si_free(qty: Nv3SiQuantity) {
+    @free(qty.dims as *u8)
+}
+
+fn nv3_si_eval_op(op: i64, a: Nv3SiQuantity, b: Nv3SiQuantity, budget: i64) -> Nv3SiQuantity {
+    let dims = @malloc(56) as *i64
+    var d: i64 = 0
+    while d < 7 { dims[d] = 0 d = d + 1 }
+
+    if a.verdict != NV3_VERDICT_VERIFIED or b.verdict != NV3_VERDICT_VERIFIED {
+        let v = if a.verdict != NV3_VERDICT_VERIFIED { a.verdict } else { b.verdict }
+        return Nv3SiQuantity { p: 0, q: 1, dims: dims, verdict: v, steps: a.steps + b.steps }
+    }
+
+    if op == NV3_OP_ADD or op == NV3_OP_SUB {
+        var di: i64 = 0
+        while di < 7 {
+            if a.dims[di] != b.dims[di] {
+                return Nv3SiQuantity { p: 0, q: 1, dims: dims, verdict: NV3_VERDICT_CONTRADICTION, steps: a.steps + b.steps + 7 }
+            }
+            dims[di] = a.dims[di]
+            di = di + 1
+        }
+        let rv = nv3_rational_eval(op, a.p, a.q, b.p, b.q, budget)
+        return Nv3SiQuantity { p: rv.p, q: rv.q, dims: dims, verdict: rv.verdict, steps: a.steps + b.steps + rv.steps }
+    }
+
+    if op == NV3_OP_MUL {
+        var di: i64 = 0
+        while di < 7 {
+            dims[di] = a.dims[di] + b.dims[di]
+            di = di + 1
+        }
+        let rv = nv3_rational_eval(NV3_OP_MUL, a.p, a.q, b.p, b.q, budget)
+        return Nv3SiQuantity { p: rv.p, q: rv.q, dims: dims, verdict: rv.verdict, steps: a.steps + b.steps + rv.steps }
+    }
+
+    if op == NV3_OP_DIV {
+        var di: i64 = 0
+        while di < 7 {
+            dims[di] = a.dims[di] - b.dims[di]
+            di = di + 1
+        }
+        let rv = nv3_rational_eval(NV3_OP_DIV, a.p, a.q, b.p, b.q, budget)
+        return Nv3SiQuantity { p: rv.p, q: rv.q, dims: dims, verdict: rv.verdict, steps: a.steps + b.steps + rv.steps }
+    }
+
+    return Nv3SiQuantity { p: 0, q: 1, dims: dims, verdict: NV3_VERDICT_CONTRADICTION, steps: a.steps + b.steps }
+}

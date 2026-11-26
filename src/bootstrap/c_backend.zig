@@ -1566,12 +1566,19 @@ pub fn compileCWithToolchain(
     var argv = std.ArrayListUnmanaged([]const u8){};
     defer argv.deinit(alloc);
 
-    const zig_exe = findZigExe(alloc);
-    defer if (zig_exe) |ze| alloc.free(ze);
-    const host_cc = if (zig_exe == null and target.isHost()) findHostCC(alloc) else null;
+    // For host targets, prefer the platform C compiler: it links against the system libc directly
+    // and typically finishes in seconds, while `zig cc` has to unpack its own sysroot and compile
+    // libc shims (8-10x slower on this codebase, and slow enough to hit tool timeouts on the
+    // phase-10 translation unit). `zig cc` stays the cross-compiler and the fallback when no host
+    // compiler exists.
+    const host_cc = if (target.isHost()) findHostCC(alloc) else null;
     defer if (host_cc) |hc| alloc.free(hc);
+    const zig_exe = if (host_cc == null) findZigExe(alloc) else null;
+    defer if (zig_exe) |ze| alloc.free(ze);
 
-    if (zig_exe) |ze| {
+    if (host_cc) |hc| {
+        try argv.append(alloc, hc);
+    } else if (zig_exe) |ze| {
         try argv.append(alloc, ze);
         try argv.append(alloc, "cc");
         try argv.append(alloc, "-target");
@@ -1580,8 +1587,6 @@ pub fn compileCWithToolchain(
         // A host `cc` can only produce host binaries; silently emitting a host
         // binary for a cross target would be a miscompile.
         return error.CrossCompilerNotFound;
-    } else if (host_cc) |hc| {
-        try argv.append(alloc, hc);
     } else {
         return error.CCompilerNotFound;
     }

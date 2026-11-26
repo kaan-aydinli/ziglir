@@ -19,6 +19,13 @@ bin/
 *.pdb
 *.ilk
 *.bin
+!ai/noema_v3/**/*.bin
+!ai/noema_v3/**/*.npg3
+!ai/noema_v3/**/*.nv3g
+
+# NOEMA v3 user-trained state: produced at runtime by uploads, one pair per training run.
+ai/noema_v3/checkpoints/user_v3_*
+ai/noema_v3/corpus_user/
 
 # Generated compiler/test binaries
 /hello
@@ -55,3 +62,12 @@ ai/noema-training/turkish_decoder_predictions.v1.jsonl
 ai/noema-training/turkish_chat_memory.nsm
 ai/noema-training/turkish_training_stdout.txt
 ai/noema-training/turkish_training_time.txt
+ai/noema-training/pretrain_large.nps
+ai/noema-training/pretrain_large_v*.nps
+ai/noema-training/pretrain_large_latest.nps
+ai/noema-training/pretrain_large.lock
+ai/noema-training/user_pretrain.nps
+ai/noema-training/user_pretrain_*.nps
+
+# Ad-hoc LIR reproduction probes used during debugging; not part of the build or tests.
+/tmp_dbg/

@@ -1,0 +1,22 @@
+FD_CHECK kernel=rmsnorm param=dx eps=1e-4 tol=1e-5 pass=1
+FD_CHECK kernel=rmsnorm param=dgamma eps=1e-4 tol=1e-5 pass=1
+FD_CHECK kernel=l2norm param=dx eps=1e-4 tol=1e-5 pass=1
+FD_CHECK kernel=swiglu param=dx eps=1e-4 tol=1e-5 pass=1
+FD_CHECK kernel=swiglu param=dwg eps=1e-4 tol=1e-5 pass=1
+FD_CHECK kernel=swiglu param=dwu eps=1e-4 tol=1e-5 pass=1
+FD_CHECK kernel=swiglu param=dwo eps=1e-4 tol=1e-5 pass=1
+FD_CHECK kernel=swiglu param=dbg eps=1e-4 tol=1e-5 pass=1
+FD_CHECK kernel=swiglu param=dbu eps=1e-4 tol=1e-5 pass=1
+FD_CHECK kernel=swiglu param=dbo eps=1e-4 tol=1e-5 pass=1
+FD_CHECK kernel=causal_depthwise_conv1d param=dx eps=1e-4 tol=1e-5 pass=1
+FD_CHECK kernel=causal_depthwise_conv1d param=dw eps=1e-4 tol=1e-5 pass=1
+FD_CHECK kernel=causal_depthwise_conv1d param=db eps=1e-4 tol=1e-5 pass=1
+FD_CHECK kernel=householder_delta_read param=dm eps=1e-4 tol=1e-5 pass=1
+FD_CHECK kernel=householder_delta_read param=dq eps=1e-4 tol=1e-5 pass=1
+FD_CHECK kernel=householder_delta_write param=dm_prev eps=1e-4 tol=1e-5 pass=1
+FD_CHECK kernel=householder_delta_write param=dk eps=1e-4 tol=1e-5 pass=1
+FD_CHECK kernel=householder_delta_write param=dv eps=1e-4 tol=1e-5 pass=1
+FD_CHECK kernel=householder_delta_write param=dgamma eps=1e-4 tol=1e-5 pass=1
+FD_CHECK kernel=householder_delta_write param=deta eps=1e-4 tol=1e-5 pass=1
+FD_CHECK kernel=softmax_cross_entropy param=dlogits eps=1e-4 tol=1e-5 pass=1
+ALL_PASS

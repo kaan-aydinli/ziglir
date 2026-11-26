@@ -1,0 +1,598 @@
+// NOEMA v3 Phase 1: central finite-difference gradient check harness.
+// Contract (ai/noema_v3/fixtures/finite_diff_harness.json):
+//   abs(analytic - numeric) / max(1e-12, abs(analytic) + abs(numeric)) <= 1e-5
+//   with central finite-difference step eps = 1e-4 across all 7 Phase 1 kernels.
+
+import "../src/noema_v3/noema_v3_kernels.lir"
+import "../src/noema_v3/noema_v3_haib.lir"
+
+fn fd_rel_err(analytic: f64, numeric: f64) -> f64 {
+    let diff = nv3_abs(analytic - numeric)
+    let denom = nv3_max(0.000000000001, nv3_abs(analytic) + nv3_abs(numeric))
+    return diff / denom
+}
+
+fn fd_max_err(analytic: *f64, numeric: *f64, n: i64) -> f64 {
+    var max_err: f64 = 0.0
+    var i: i64 = 0
+    while i < n {
+        let e = fd_rel_err(analytic[i], numeric[i])
+        if e > max_err { max_err = e }
+        i = i + 1
+    }
+    return max_err
+}
+
+fn report_fd(kernel: string, param: string, analytic: *f64, numeric: *f64, n: i64, tol: f64) -> i64 {
+    if nv3_all_finite(analytic, n) == 0 or nv3_all_finite(numeric, n) == 0 {
+        print("FD_CHECK kernel=")
+        print(kernel)
+        print(" param=")
+        print(param)
+        println(" eps=1e-4 tol=1e-5 pass=0 reason=non_finite")
+        return 0
+    }
+    let max_err = fd_max_err(analytic, numeric, n)
+    if max_err <= tol {
+        print("FD_CHECK kernel=")
+        print(kernel)
+        print(" param=")
+        print(param)
+        println(" eps=1e-4 tol=1e-5 pass=1")
+        return 1
+    }
+    print("FD_CHECK kernel=")
+    print(kernel)
+    print(" param=")
+    print(param)
+    print(" eps=1e-4 tol=1e-5 pass=0 max_rel_err=")
+    printFloat(max_err)
+    println("")
+    return 0
+}
+
+fn loss_dot(y: *f64, dout: *f64, n: i64) -> f64 {
+    var s: f64 = 0.0
+    var i: i64 = 0
+    while i < n { s = s + y[i] * dout[i] i = i + 1 }
+    return s
+}
+
+fn test_rmsnorm() -> i64 {
+    let rows: i64 = 2
+    let cols: i64 = 4
+    let n = rows * cols
+    let eps: f64 = 0.00001
+    let h: f64 = 0.0001
+    let tol: f64 = 0.00001
+
+    let x = @malloc(n * 8) as *f64
+    let gamma = @malloc(cols * 8) as *f64
+    let y = @malloc(n * 8) as *f64
+    let dy = @malloc(n * 8) as *f64
+    let dx = @malloc(n * 8) as *f64
+    let dgamma = @malloc(cols * 8) as *f64
+    let ndx = @malloc(n * 8) as *f64
+    let ndgamma = @malloc(cols * 8) as *f64
+    let y1 = @malloc(n * 8) as *f64
+    let y2 = @malloc(n * 8) as *f64
+
+    x[0]=0.5 x[1]=-1.0 x[2]=2.0 x[3]=0.3
+    x[4]=1.5 x[5]=0.2 x[6]=-0.7 x[7]=0.9
+    gamma[0]=1.0 gamma[1]=0.8 gamma[2]=1.2 gamma[3]=0.9
+    dy[0]=0.1 dy[1]=-0.2 dy[2]=0.05 dy[3]=0.3
+    dy[4]=-0.1 dy[5]=0.4 dy[6]=0.2 dy[7]=-0.3
+
+    nv3_rmsnorm_forward(x, gamma, y, rows, cols, eps)
+    let grad = Nv3RmsnormGrad { dx: dx, dgamma: dgamma }
+    nv3_rmsnorm_backward(dy, x, gamma, grad, rows, cols, eps)
+
+    var i: i64 = 0
+    while i < n {
+        let orig = x[i]
+        x[i] = orig + h
+        nv3_rmsnorm_forward(x, gamma, y1, rows, cols, eps)
+        x[i] = orig - h
+        nv3_rmsnorm_forward(x, gamma, y2, rows, cols, eps)
+        x[i] = orig
+        ndx[i] = (loss_dot(y1, dy, n) - loss_dot(y2, dy, n)) / (2.0 * h)
+        i = i + 1
+    }
+    i = 0
+    while i < cols {
+        let orig = gamma[i]
+        gamma[i] = orig + h
+        nv3_rmsnorm_forward(x, gamma, y1, rows, cols, eps)
+        gamma[i] = orig - h
+        nv3_rmsnorm_forward(x, gamma, y2, rows, cols, eps)
+        gamma[i] = orig
+        ndgamma[i] = (loss_dot(y1, dy, n) - loss_dot(y2, dy, n)) / (2.0 * h)
+        i = i + 1
+    }
+
+    let ok1 = report_fd("rmsnorm", "dx", dx, ndx, n, tol)
+    let ok2 = report_fd("rmsnorm", "dgamma", dgamma, ndgamma, cols, tol)
+
+    @free(x as *u8) @free(gamma as *u8) @free(y as *u8) @free(dy as *u8)
+    @free(dx as *u8) @free(dgamma as *u8) @free(ndx as *u8) @free(ndgamma as *u8)
+    @free(y1 as *u8) @free(y2 as *u8)
+    if ok1 == 1 and ok2 == 1 { return 1 }
+    return 0
+}
+
+fn test_l2norm() -> i64 {
+    let n: i64 = 5
+    let eps: f64 = 0.00001
+    let h: f64 = 0.0001
+    let tol: f64 = 0.00001
+    let x = @malloc(n * 8) as *f64
+    let y = @malloc(n * 8) as *f64
+    let dy = @malloc(n * 8) as *f64
+    let dx = @malloc(n * 8) as *f64
+    let ndx = @malloc(n * 8) as *f64
+    let y1 = @malloc(n * 8) as *f64
+    let y2 = @malloc(n * 8) as *f64
+    x[0]=0.3 x[1]=-1.2 x[2]=0.7 x[3]=2.0 x[4]=-0.5
+    dy[0]=0.2 dy[1]=-0.1 dy[2]=0.4 dy[3]=-0.3 dy[4]=0.05
+    nv3_l2norm_forward(x, y, n, eps)
+    nv3_l2norm_backward(dy, x, dx, n, eps)
+    var i: i64 = 0
+    while i < n {
+        let orig = x[i]
+        x[i] = orig + h
+        nv3_l2norm_forward(x, y1, n, eps)
+        x[i] = orig - h
+        nv3_l2norm_forward(x, y2, n, eps)
+        x[i] = orig
+        ndx[i] = (loss_dot(y1, dy, n) - loss_dot(y2, dy, n)) / (2.0 * h)
+        i = i + 1
+    }
+    let ok = report_fd("l2norm", "dx", dx, ndx, n, tol)
+    @free(x as *u8) @free(y as *u8) @free(dy as *u8) @free(dx as *u8) @free(ndx as *u8) @free(y1 as *u8) @free(y2 as *u8)
+    return ok
+}
+
+struct FdSwiGluCtx {
+    x: *f64
+    wg: *f64
+    bg: *f64
+    wu: *f64
+    bu: *f64
+    wo: *f64
+    bo: *f64
+    dy: *f64
+}
+
+fn swiglu_perturb_check(param_name: string, target_arr: *f64, target_len: i64, analytic: *f64,
+                        ctx: FdSwiGluCtx, in_dim: i64, h_dim: i64, out_dim: i64) -> i64 {
+    let h: f64 = 0.0001
+    let tol: f64 = 0.00001
+    let gate = @malloc(h_dim * 8) as *f64
+    let up = @malloc(h_dim * 8) as *f64
+    let hidden = @malloc(h_dim * 8) as *f64
+    let y1 = @malloc(out_dim * 8) as *f64
+    let y2 = @malloc(out_dim * 8) as *f64
+    let num = @malloc(target_len * 8) as *f64
+    let dims = Nv3SwiGluDims { in_dim: in_dim, h_dim: h_dim, out_dim: out_dim }
+    let params = Nv3SwiGluParams { wg: ctx.wg, bg: ctx.bg, wu: ctx.wu, bu: ctx.bu, wo: ctx.wo, bo: ctx.bo }
+    let buf = Nv3SwiGluBuf { gate: gate, up: up, hidden: hidden }
+    var i: i64 = 0
+    while i < target_len {
+        let orig = target_arr[i]
+        target_arr[i] = orig + h
+        nv3_swiglu_forward(ctx.x, params, buf, y1, dims)
+        target_arr[i] = orig - h
+        nv3_swiglu_forward(ctx.x, params, buf, y2, dims)
+        target_arr[i] = orig
+        num[i] = (loss_dot(y1, ctx.dy, out_dim) - loss_dot(y2, ctx.dy, out_dim)) / (2.0 * h)
+        i = i + 1
+    }
+    let ok = report_fd("swiglu", param_name, analytic, num, target_len, tol)
+    @free(gate as *u8) @free(up as *u8) @free(hidden as *u8)
+    @free(y1 as *u8) @free(y2 as *u8) @free(num as *u8)
+    return ok
+}
+
+fn test_swiglu() -> i64 {
+    let in_dim: i64 = 3
+    let h_dim: i64 = 4
+    let out_dim: i64 = 2
+    let dims = Nv3SwiGluDims { in_dim: in_dim, h_dim: h_dim, out_dim: out_dim }
+
+    let x = @malloc(in_dim * 8) as *f64
+    let wg = @malloc(in_dim * h_dim * 8) as *f64
+    let bg = @malloc(h_dim * 8) as *f64
+    let wu = @malloc(in_dim * h_dim * 8) as *f64
+    let bu = @malloc(h_dim * 8) as *f64
+    let wo = @malloc(h_dim * out_dim * 8) as *f64
+    let bo = @malloc(out_dim * 8) as *f64
+    let gate = @malloc(h_dim * 8) as *f64
+    let up = @malloc(h_dim * 8) as *f64
+    let hidden = @malloc(h_dim * 8) as *f64
+    let y = @malloc(out_dim * 8) as *f64
+    let dy = @malloc(out_dim * 8) as *f64
+
+    x[0]=0.2 x[1]=-0.3 x[2]=0.5
+    wg[0]=0.1 wg[1]=-0.2 wg[2]=0.3 wg[3]=0.05 wg[4]=-0.1 wg[5]=0.2 wg[6]=-0.3 wg[7]=0.4 wg[8]=0.2 wg[9]=0.1 wg[10]=-0.2 wg[11]=0.3
+    bg[0]=0.01 bg[1]=-0.02 bg[2]=0.03 bg[3]=-0.01
+    wu[0]=-0.1 wu[1]=0.2 wu[2]=0.1 wu[3]=-0.2 wu[4]=0.3 wu[5]=-0.1 wu[6]=0.2 wu[7]=0.1 wu[8]=-0.2 wu[9]=0.3 wu[10]=0.05 wu[11]=-0.1
+    bu[0]=0.01 bu[1]=0.02 bu[2]=-0.01 bu[3]=0.03
+    wo[0]=0.2 wo[1]=-0.1 wo[2]=0.3 wo[3]=0.2 wo[4]=-0.2 wo[5]=0.1 wo[6]=0.4 wo[7]=-0.3
+    bo[0]=0.01 bo[1]=-0.02
+    dy[0]=0.3 dy[1]=-0.5
+
+    let params = Nv3SwiGluParams { wg: wg, bg: bg, wu: wu, bu: bu, wo: wo, bo: bo }
+    let buf = Nv3SwiGluBuf { gate: gate, up: up, hidden: hidden }
+    nv3_swiglu_forward(x, params, buf, y, dims)
+
+    let dx = @malloc(in_dim * 8) as *f64
+    let dwg = @malloc(in_dim * h_dim * 8) as *f64
+    let dbg = @malloc(h_dim * 8) as *f64
+    let dwu = @malloc(in_dim * h_dim * 8) as *f64
+    let dbu = @malloc(h_dim * 8) as *f64
+    let dwo = @malloc(h_dim * out_dim * 8) as *f64
+    let dbo = @malloc(out_dim * 8) as *f64
+    let g = Nv3SwiGluGrad { dx: dx, dwg: dwg, dbg: dbg, dwu: dwu, dbu: dbu, dwo: dwo, dbo: dbo }
+    nv3_swiglu_backward(dy, x, params, buf, g, dims)
+
+    let ctx = FdSwiGluCtx { x: x, wg: wg, bg: bg, wu: wu, bu: bu, wo: wo, bo: bo, dy: dy }
+    let ok1 = swiglu_perturb_check("dx", x, in_dim, dx, ctx, in_dim, h_dim, out_dim)
+    let ok2 = swiglu_perturb_check("dwg", wg, in_dim * h_dim, dwg, ctx, in_dim, h_dim, out_dim)
+    let ok3 = swiglu_perturb_check("dwu", wu, in_dim * h_dim, dwu, ctx, in_dim, h_dim, out_dim)
+    let ok4 = swiglu_perturb_check("dwo", wo, h_dim * out_dim, dwo, ctx, in_dim, h_dim, out_dim)
+    let ok5 = swiglu_perturb_check("dbg", bg, h_dim, dbg, ctx, in_dim, h_dim, out_dim)
+    let ok6 = swiglu_perturb_check("dbu", bu, h_dim, dbu, ctx, in_dim, h_dim, out_dim)
+    let ok7 = swiglu_perturb_check("dbo", bo, out_dim, dbo, ctx, in_dim, h_dim, out_dim)
+
+    @free(x as *u8) @free(wg as *u8) @free(bg as *u8) @free(wu as *u8) @free(bu as *u8) @free(wo as *u8) @free(bo as *u8)
+    @free(gate as *u8) @free(up as *u8) @free(hidden as *u8) @free(y as *u8) @free(dy as *u8)
+    @free(dx as *u8) @free(dwg as *u8) @free(dbg as *u8) @free(dwu as *u8) @free(dbu as *u8) @free(dwo as *u8) @free(dbo as *u8)
+    if ok1 == 1 and ok2 == 1 and ok3 == 1 and ok4 == 1 and ok5 == 1 and ok6 == 1 and ok7 == 1 { return 1 }
+    return 0
+}
+
+fn test_conv1d() -> i64 {
+    let t_len: i64 = 4
+    let channels: i64 = 2
+    let kernel: i64 = 3
+    let n = t_len * channels
+    let h: f64 = 0.0001
+    let tol: f64 = 0.00001
+    let dims = Nv3ConvDims { t_len: t_len, channels: channels, kernel: kernel }
+    let x = @malloc(n * 8) as *f64
+    let w = @malloc(channels * kernel * 8) as *f64
+    let b = @malloc(channels * 8) as *f64
+    let y = @malloc(n * 8) as *f64
+    let dy = @malloc(n * 8) as *f64
+    let dx = @malloc(n * 8) as *f64
+    let dw = @malloc(channels * kernel * 8) as *f64
+    let db = @malloc(channels * 8) as *f64
+    let ndx = @malloc(n * 8) as *f64
+    let ndw = @malloc(channels * kernel * 8) as *f64
+    let ndb = @malloc(channels * 8) as *f64
+    let y1 = @malloc(n * 8) as *f64
+    let y2 = @malloc(n * 8) as *f64
+    x[0]=0.1 x[1]=-0.2 x[2]=0.3 x[3]=0.4 x[4]=-0.5 x[5]=0.2 x[6]=0.7 x[7]=-0.1
+    w[0]=0.2 w[1]=-0.1 w[2]=0.3 w[3]=0.1 w[4]=0.4 w[5]=-0.2
+    b[0]=0.05 b[1]=-0.03
+    dy[0]=0.1 dy[1]=-0.2 dy[2]=0.3 dy[3]=0.1 dy[4]=-0.1 dy[5]=0.2 dy[6]=0.05 dy[7]=-0.4
+    nv3_causal_depthwise_conv1d_forward(x, w, b, y, dims)
+    let g = Nv3ConvGrad { dx: dx, dw: dw, db: db }
+    nv3_causal_depthwise_conv1d_backward(dy, x, w, g, dims)
+    var i: i64 = 0
+    while i < n {
+        let orig = x[i]
+        x[i] = orig + h
+        nv3_causal_depthwise_conv1d_forward(x, w, b, y1, dims)
+        x[i] = orig - h
+        nv3_causal_depthwise_conv1d_forward(x, w, b, y2, dims)
+        x[i] = orig
+        ndx[i] = (loss_dot(y1, dy, n) - loss_dot(y2, dy, n)) / (2.0 * h)
+        i = i + 1
+    }
+    i = 0
+    while i < channels * kernel {
+        let orig = w[i]
+        w[i] = orig + h
+        nv3_causal_depthwise_conv1d_forward(x, w, b, y1, dims)
+        w[i] = orig - h
+        nv3_causal_depthwise_conv1d_forward(x, w, b, y2, dims)
+        w[i] = orig
+        ndw[i] = (loss_dot(y1, dy, n) - loss_dot(y2, dy, n)) / (2.0 * h)
+        i = i + 1
+    }
+    i = 0
+    while i < channels {
+        let orig = b[i]
+        b[i] = orig + h
+        nv3_causal_depthwise_conv1d_forward(x, w, b, y1, dims)
+        b[i] = orig - h
+        nv3_causal_depthwise_conv1d_forward(x, w, b, y2, dims)
+        b[i] = orig
+        ndb[i] = (loss_dot(y1, dy, n) - loss_dot(y2, dy, n)) / (2.0 * h)
+        i = i + 1
+    }
+    let ok1 = report_fd("causal_depthwise_conv1d", "dx", dx, ndx, n, tol)
+    let ok2 = report_fd("causal_depthwise_conv1d", "dw", dw, ndw, channels * kernel, tol)
+    let ok3 = report_fd("causal_depthwise_conv1d", "db", db, ndb, channels, tol)
+    @free(x as *u8) @free(w as *u8) @free(b as *u8) @free(y as *u8) @free(dy as *u8)
+    @free(dx as *u8) @free(dw as *u8) @free(db as *u8)
+    @free(ndx as *u8) @free(ndw as *u8) @free(ndb as *u8) @free(y1 as *u8) @free(y2 as *u8)
+    if ok1 == 1 and ok2 == 1 and ok3 == 1 { return 1 }
+    return 0
+}
+
+fn test_haib_read() -> i64 {
+    let d_v: i64 = 3
+    let d_k: i64 = 4
+    let mn = d_v * d_k
+    let h: f64 = 0.0001
+    let tol: f64 = 0.00001
+    let m = @malloc(mn * 8) as *f64
+    let q = @malloc(d_k * 8) as *f64
+    let r = @malloc(d_v * 8) as *f64
+    let dr = @malloc(d_v * 8) as *f64
+    let dm = @malloc(mn * 8) as *f64
+    let dq = @malloc(d_k * 8) as *f64
+    let ndm = @malloc(mn * 8) as *f64
+    let ndq = @malloc(d_k * 8) as *f64
+    let r1 = @malloc(d_v * 8) as *f64
+    let r2 = @malloc(d_v * 8) as *f64
+    m[0]=0.1 m[1]=-0.2 m[2]=0.3 m[3]=0.05 m[4]=0.2 m[5]=0.1 m[6]=-0.1 m[7]=0.4 m[8]=-0.3 m[9]=0.2 m[10]=0.1 m[11]=-0.2
+    q[0]=0.5 q[1]=-0.3 q[2]=0.8 q[3]=0.1
+    dr[0]=0.2 dr[1]=-0.4 dr[2]=0.3
+    nv3_haib_read_forward(m, q, r, d_v, d_k)
+    let g = Nv3HaibReadGrad { dm: dm, dq: dq }
+    nv3_haib_read_backward(dr, m, q, g, d_v, d_k)
+    var i: i64 = 0
+    while i < mn {
+        let orig = m[i]
+        m[i] = orig + h
+        nv3_haib_read_forward(m, q, r1, d_v, d_k)
+        m[i] = orig - h
+        nv3_haib_read_forward(m, q, r2, d_v, d_k)
+        m[i] = orig
+        ndm[i] = (loss_dot(r1, dr, d_v) - loss_dot(r2, dr, d_v)) / (2.0 * h)
+        i = i + 1
+    }
+    i = 0
+    while i < d_k {
+        let orig = q[i]
+        q[i] = orig + h
+        nv3_haib_read_forward(m, q, r1, d_v, d_k)
+        q[i] = orig - h
+        nv3_haib_read_forward(m, q, r2, d_v, d_k)
+        q[i] = orig
+        ndq[i] = (loss_dot(r1, dr, d_v) - loss_dot(r2, dr, d_v)) / (2.0 * h)
+        i = i + 1
+    }
+    let ok1 = report_fd("householder_delta_read", "dm", dm, ndm, mn, tol)
+    let ok2 = report_fd("householder_delta_read", "dq", dq, ndq, d_k, tol)
+    @free(m as *u8) @free(q as *u8) @free(r as *u8) @free(dr as *u8) @free(dm as *u8) @free(dq as *u8) @free(ndm as *u8) @free(ndq as *u8) @free(r1 as *u8) @free(r2 as *u8)
+    if ok1 == 1 and ok2 == 1 { return 1 }
+    return 0
+}
+
+fn test_haib_write_params() -> i64 {
+    let d_v: i64 = 3
+    let d_k: i64 = 4
+    let mn = d_v * d_k
+    let h: f64 = 0.0001
+    let tol: f64 = 0.00001
+    let dims = Nv3HaibDims { d_v: d_v, d_k: d_k }
+    let m_prev = @malloc(mn * 8) as *f64
+    let k = @malloc(d_k * 8) as *f64
+    let v = @malloc(d_v * 8) as *f64
+    let m_next = @malloc(mn * 8) as *f64
+    let v_old = @malloc(d_v * 8) as *f64
+    let d_m_next = @malloc(mn * 8) as *f64
+    let dm_prev = @malloc(mn * 8) as *f64
+    let dk = @malloc(d_k * 8) as *f64
+    let dv = @malloc(d_v * 8) as *f64
+    let dgamma_out = @malloc(8) as *f64
+    let deta_out = @malloc(8) as *f64
+    let ndm_prev = @malloc(mn * 8) as *f64
+    let ndk = @malloc(d_k * 8) as *f64
+    let ndv = @malloc(d_v * 8) as *f64
+    let m1 = @malloc(mn * 8) as *f64
+    let m2 = @malloc(mn * 8) as *f64
+    let v_old_tmp = @malloc(d_v * 8) as *f64
+
+    m_prev[0]=0.1 m_prev[1]=-0.2 m_prev[2]=0.3 m_prev[3]=0.05 m_prev[4]=0.2 m_prev[5]=0.1 m_prev[6]=-0.1 m_prev[7]=0.4 m_prev[8]=-0.3 m_prev[9]=0.2 m_prev[10]=0.1 m_prev[11]=-0.2
+    k[0]=0.5 k[1]=-0.2 k[2]=0.8 k[3]=0.3
+    let kss: f64 = k[0]*k[0] + k[1]*k[1] + k[2]*k[2] + k[3]*k[3]
+    let kinv = 1.0 / @sqrt(kss + 0.000000000001)
+    k[0]=k[0]*kinv k[1]=k[1]*kinv k[2]=k[2]*kinv k[3]=k[3]*kinv
+    v[0]=0.4 v[1]=-0.1 v[2]=0.2
+    d_m_next[0]=0.05 d_m_next[1]=-0.1 d_m_next[2]=0.02 d_m_next[3]=0.03 d_m_next[4]=-0.02 d_m_next[5]=0.1 d_m_next[6]=0.04 d_m_next[7]=-0.05 d_m_next[8]=0.01 d_m_next[9]=-0.03 d_m_next[10]=0.07 d_m_next[11]=0.02
+    let gamma: f64 = 0.9
+    let eta: f64 = 1.2
+
+    let buf = Nv3HaibWriteBuf { m_prev: m_prev, k: k, v: v, m_next: m_next, v_old: v_old }
+    nv3_haib_write_forward(buf, gamma, eta, dims)
+    let g = Nv3HaibWriteGrad { dm_prev: dm_prev, dk: dk, dv: dv, dgamma_out: dgamma_out, deta_out: deta_out }
+    nv3_haib_write_backward(d_m_next, buf, gamma, eta, g, dims)
+
+    var i: i64 = 0
+    while i < mn {
+        let orig = m_prev[i]
+        m_prev[i] = orig + h
+        let b1 = Nv3HaibWriteBuf { m_prev: m_prev, k: k, v: v, m_next: m1, v_old: v_old_tmp }
+        nv3_haib_write_forward(b1, gamma, eta, dims)
+        m_prev[i] = orig - h
+        let b2 = Nv3HaibWriteBuf { m_prev: m_prev, k: k, v: v, m_next: m2, v_old: v_old_tmp }
+        nv3_haib_write_forward(b2, gamma, eta, dims)
+        m_prev[i] = orig
+        ndm_prev[i] = (loss_dot(m1, d_m_next, mn) - loss_dot(m2, d_m_next, mn)) / (2.0 * h)
+        i = i + 1
+    }
+    i = 0
+    while i < d_k {
+        let orig = k[i]
+        k[i] = orig + h
+        let b1k = Nv3HaibWriteBuf { m_prev: m_prev, k: k, v: v, m_next: m1, v_old: v_old_tmp }
+        nv3_haib_write_forward(b1k, gamma, eta, dims)
+        k[i] = orig - h
+        let b2k = Nv3HaibWriteBuf { m_prev: m_prev, k: k, v: v, m_next: m2, v_old: v_old_tmp }
+        nv3_haib_write_forward(b2k, gamma, eta, dims)
+        k[i] = orig
+        ndk[i] = (loss_dot(m1, d_m_next, mn) - loss_dot(m2, d_m_next, mn)) / (2.0 * h)
+        i = i + 1
+    }
+    i = 0
+    while i < d_v {
+        let orig = v[i]
+        v[i] = orig + h
+        let b1v = Nv3HaibWriteBuf { m_prev: m_prev, k: k, v: v, m_next: m1, v_old: v_old_tmp }
+        nv3_haib_write_forward(b1v, gamma, eta, dims)
+        v[i] = orig - h
+        let b2v = Nv3HaibWriteBuf { m_prev: m_prev, k: k, v: v, m_next: m2, v_old: v_old_tmp }
+        nv3_haib_write_forward(b2v, gamma, eta, dims)
+        v[i] = orig
+        ndv[i] = (loss_dot(m1, d_m_next, mn) - loss_dot(m2, d_m_next, mn)) / (2.0 * h)
+        i = i + 1
+    }
+
+    let ok1 = report_fd("householder_delta_write", "dm_prev", dm_prev, ndm_prev, mn, tol)
+    let ok2 = report_fd("householder_delta_write", "dk", dk, ndk, d_k, tol)
+    let ok3 = report_fd("householder_delta_write", "dv", dv, ndv, d_v, tol)
+
+    @free(m_prev as *u8) @free(k as *u8) @free(v as *u8) @free(m_next as *u8) @free(v_old as *u8) @free(d_m_next as *u8)
+    @free(dm_prev as *u8) @free(dk as *u8) @free(dv as *u8) @free(dgamma_out as *u8) @free(deta_out as *u8)
+    @free(ndm_prev as *u8) @free(ndk as *u8) @free(ndv as *u8) @free(m1 as *u8) @free(m2 as *u8) @free(v_old_tmp as *u8)
+    if ok1 == 1 and ok2 == 1 and ok3 == 1 { return 1 }
+    return 0
+}
+
+fn test_haib_write_scalars() -> i64 {
+    let d_v: i64 = 3
+    let d_k: i64 = 4
+    let mn = d_v * d_k
+    let h: f64 = 0.0001
+    let tol: f64 = 0.00001
+    let dims = Nv3HaibDims { d_v: d_v, d_k: d_k }
+    let m_prev = @malloc(mn * 8) as *f64
+    let k = @malloc(d_k * 8) as *f64
+    let v = @malloc(d_v * 8) as *f64
+    let m_next = @malloc(mn * 8) as *f64
+    let v_old = @malloc(d_v * 8) as *f64
+    let d_m_next = @malloc(mn * 8) as *f64
+    let dm_prev = @malloc(mn * 8) as *f64
+    let dk = @malloc(d_k * 8) as *f64
+    let dv = @malloc(d_v * 8) as *f64
+    let dgamma_out = @malloc(8) as *f64
+    let deta_out = @malloc(8) as *f64
+    let ndgamma = @malloc(8) as *f64
+    let ndeta = @malloc(8) as *f64
+    let m1 = @malloc(mn * 8) as *f64
+    let m2 = @malloc(mn * 8) as *f64
+    let v_old_tmp = @malloc(d_v * 8) as *f64
+
+    m_prev[0]=0.1 m_prev[1]=-0.2 m_prev[2]=0.3 m_prev[3]=0.05 m_prev[4]=0.2 m_prev[5]=0.1 m_prev[6]=-0.1 m_prev[7]=0.4 m_prev[8]=-0.3 m_prev[9]=0.2 m_prev[10]=0.1 m_prev[11]=-0.2
+    k[0]=0.5 k[1]=-0.2 k[2]=0.8 k[3]=0.3
+    let kss: f64 = k[0]*k[0] + k[1]*k[1] + k[2]*k[2] + k[3]*k[3]
+    let kinv = 1.0 / @sqrt(kss + 0.000000000001)
+    k[0]=k[0]*kinv k[1]=k[1]*kinv k[2]=k[2]*kinv k[3]=k[3]*kinv
+    v[0]=0.4 v[1]=-0.1 v[2]=0.2
+    d_m_next[0]=0.05 d_m_next[1]=-0.1 d_m_next[2]=0.02 d_m_next[3]=0.03 d_m_next[4]=-0.02 d_m_next[5]=0.1 d_m_next[6]=0.04 d_m_next[7]=-0.05 d_m_next[8]=0.01 d_m_next[9]=-0.03 d_m_next[10]=0.07 d_m_next[11]=0.02
+    let gamma: f64 = 0.9
+    let eta: f64 = 1.2
+
+    let buf = Nv3HaibWriteBuf { m_prev: m_prev, k: k, v: v, m_next: m_next, v_old: v_old }
+    nv3_haib_write_forward(buf, gamma, eta, dims)
+    let g = Nv3HaibWriteGrad { dm_prev: dm_prev, dk: dk, dv: dv, dgamma_out: dgamma_out, deta_out: deta_out }
+    nv3_haib_write_backward(d_m_next, buf, gamma, eta, g, dims)
+
+    let b1g = Nv3HaibWriteBuf { m_prev: m_prev, k: k, v: v, m_next: m1, v_old: v_old_tmp }
+    nv3_haib_write_forward(b1g, gamma + h, eta, dims)
+    let b2g = Nv3HaibWriteBuf { m_prev: m_prev, k: k, v: v, m_next: m2, v_old: v_old_tmp }
+    nv3_haib_write_forward(b2g, gamma - h, eta, dims)
+    ndgamma[0] = (loss_dot(m1, d_m_next, mn) - loss_dot(m2, d_m_next, mn)) / (2.0 * h)
+    let b1e = Nv3HaibWriteBuf { m_prev: m_prev, k: k, v: v, m_next: m1, v_old: v_old_tmp }
+    nv3_haib_write_forward(b1e, gamma, eta + h, dims)
+    let b2e = Nv3HaibWriteBuf { m_prev: m_prev, k: k, v: v, m_next: m2, v_old: v_old_tmp }
+    nv3_haib_write_forward(b2e, gamma, eta - h, dims)
+    ndeta[0] = (loss_dot(m1, d_m_next, mn) - loss_dot(m2, d_m_next, mn)) / (2.0 * h)
+
+    let ok4 = report_fd("householder_delta_write", "dgamma", dgamma_out, ndgamma, 1, tol)
+    let ok5 = report_fd("householder_delta_write", "deta", deta_out, ndeta, 1, tol)
+
+    @free(m_prev as *u8) @free(k as *u8) @free(v as *u8) @free(m_next as *u8) @free(v_old as *u8) @free(d_m_next as *u8)
+    @free(dm_prev as *u8) @free(dk as *u8) @free(dv as *u8) @free(dgamma_out as *u8) @free(deta_out as *u8)
+    @free(ndgamma as *u8) @free(ndeta as *u8) @free(m1 as *u8) @free(m2 as *u8) @free(v_old_tmp as *u8)
+    if ok4 == 1 and ok5 == 1 { return 1 }
+    return 0
+}
+
+fn test_softmax_cross_entropy() -> i64 {
+    let rows: i64 = 3
+    let vocab: i64 = 5
+    let n = rows * vocab
+    let h: f64 = 0.0001
+    let tol: f64 = 0.00001
+    let dloss: f64 = 0.75
+
+    let logits = @malloc(n * 8) as *f64
+    let targets = @malloc(rows * 8) as *i64
+    let weights = @malloc(rows * 8) as *f64
+    let dlogits = @malloc(n * 8) as *f64
+    let ndlogits = @malloc(n * 8) as *f64
+
+    logits[0]=1.2 logits[1]=-0.4 logits[2]=0.7 logits[3]=0.0 logits[4]=-1.1
+    logits[5]=-0.3 logits[6]=2.1 logits[7]=0.5 logits[8]=-0.8 logits[9]=0.2
+    logits[10]=0.9 logits[11]=0.1 logits[12]=-0.6 logits[13]=1.4 logits[14]=-0.2
+
+    targets[0] = 2
+    targets[1] = 0
+    targets[2] = 3
+    // Include weighted (1.0, 0.4) and masked (0.0) provenance rows
+    weights[0] = 1.0
+    weights[1] = 0.0
+    weights[2] = 0.4
+
+    nv3_softmax_ce_backward(dloss, logits, targets, weights, dlogits, rows, vocab)
+
+    var i: i64 = 0
+    while i < n {
+        let orig = logits[i]
+        logits[i] = orig + h
+        let l1 = dloss * nv3_softmax_ce_forward(logits, targets, weights, rows, vocab)
+        logits[i] = orig - h
+        let l2 = dloss * nv3_softmax_ce_forward(logits, targets, weights, rows, vocab)
+        logits[i] = orig
+        ndlogits[i] = (l1 - l2) / (2.0 * h)
+        i = i + 1
+    }
+
+    let ok = report_fd("softmax_cross_entropy", "dlogits", dlogits, ndlogits, n, tol)
+    @free(logits as *u8) @free(targets as *u8) @free(weights as *u8)
+    @free(dlogits as *u8) @free(ndlogits as *u8)
+    return ok
+}
+
+fn main() -> i64 {
+    var pass: i64 = 0
+    var total: i64 = 0
+    total = total + 1
+    pass = pass + test_rmsnorm()
+    total = total + 1
+    pass = pass + test_l2norm()
+    total = total + 1
+    pass = pass + test_swiglu()
+    total = total + 1
+    pass = pass + test_conv1d()
+    total = total + 1
+    pass = pass + test_haib_read()
+    total = total + 1
+    pass = pass + test_haib_write_params()
+    total = total + 1
+    pass = pass + test_haib_write_scalars()
+    total = total + 1
+    pass = pass + test_softmax_cross_entropy()
+    if pass == total {
+        println("ALL_PASS")
+        return 0
+    }
+    println("SOME_FAIL")
+    return 1
+}

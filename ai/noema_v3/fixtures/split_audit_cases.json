@@ -1,0 +1,36 @@
+{
+  "version": "0.1.0-phase0",
+  "name": "leakage_free_split_audit",
+  "description": "Audit cases ensuring source family and near-duplicate cluster cannot cross train/dev/test splits.",
+  "cases": [
+    {
+      "id": "split_001",
+      "records": [
+        {"source_id": "s1", "source_family": "wiki_en", "near_duplicate_cluster_id": "c1", "assigned_split": "train"},
+        {"source_id": "s2", "source_family": "wiki_en", "near_duplicate_cluster_id": "c2", "assigned_split": "test"}
+      ],
+      "expected": {"pass": false, "reason": "source_family_overlap"}
+    },
+    {
+      "id": "split_002",
+      "records": [
+        {"source_id": "s3", "source_family": "news_a", "near_duplicate_cluster_id": "c9", "assigned_split": "train"},
+        {"source_id": "s4", "source_family": "news_b", "near_duplicate_cluster_id": "c9", "assigned_split": "dev"}
+      ],
+      "expected": {"pass": false, "reason": "near_duplicate_cluster_overlap"}
+    },
+    {
+      "id": "split_003",
+      "records": [
+        {"source_id": "s5", "source_family": "code_repo_a", "near_duplicate_cluster_id": "c10", "assigned_split": "train"},
+        {"source_id": "s6", "source_family": "code_repo_a", "near_duplicate_cluster_id": "c10", "assigned_split": "train"},
+        {"source_id": "s7", "source_family": "paper_b", "near_duplicate_cluster_id": "c11", "assigned_split": "test"}
+      ],
+      "expected": {"pass": true}
+    }
+  ],
+  "gate": {
+    "must_pass_before_training_run": true,
+    "failure_action": "BLOCK_TRAINING"
+  }
+}

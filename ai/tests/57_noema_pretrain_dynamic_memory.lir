@@ -1,0 +1,64 @@
+// Exemplar capacity grows beyond the legacy 256-slot default, persists in v4
+// checkpoints, and preserves earlier records through explicit expansion.
+import "../src/noema_pretrain.lir"
+fn same_bytes(a: *u8,b: *u8,n: i64) -> i64 {
+    var i:i64=0
+    while i<n { if @read_u8(@ptr_add(a,i))!=@read_u8(@ptr_add(b,i)) { return 0 } i=i+1 }
+    return 1
+}
+fn main() -> i64 {
+    let st0=noema_pretrain_create_with_memory(64,4,8,57,2)
+    let a="A measured result remains in the training memory."
+    let b="A second verified sentence expands the memory."
+    let c="A third example is stored without evicting earlier data."
+    let d="A fourth example completes the test collection."
+    noema_pretrain_document(st0,a as *u8,a.len as i64,0,0)
+    noema_pretrain_document(st0,b as *u8,b.len as i64,0,0)
+    let long_line=@malloc(300) as *u8
+    var k:i64=0
+    while k<300 { @write_u8(@ptr_add(long_line,k),120) k=k+1 }
+    let long_result=noema_pretrain_document(st0,long_line,300,0,0)
+    var long_training_ok:i64=0
+    if long_result>=0.0 and noema_pretrain_memory_count(st0)==2 { long_training_ok=1 }
+    @free(long_line)
+    printInt(long_training_ok)
+    println("")
+    let blocked=noema_pretrain_document(st0,c as *u8,c.len as i64,0,0)
+    var no_eviction:i64=0
+    if blocked<0.0 and noema_pretrain_memory_count(st0)==2 { no_eviction=1 }
+    printInt(no_eviction)
+    println("")
+    let st=noema_pretrain_expand_memory(st0,300)
+    noema_pretrain_document(st,c as *u8,c.len as i64,0,0)
+    noema_pretrain_document(st,d as *u8,d.len as i64,0,0)
+    var i:i64=4
+    while i<300 { noema_pretrain_document(st,c as *u8,c.len as i64,0,0) i=i+1 }
+    var capacity_ok:i64=0
+    if noema_pretrain_memory_capacity(st)==300 and noema_pretrain_memory_count(st)==300 { capacity_ok=1 }
+    printInt(capacity_ok)
+    println("")
+
+    let output=@malloc(256) as *u8
+    let prompt="A measured result remains in the training memory."
+    let n=noema_pretrain_infer(st,prompt as *u8,prompt.len as i64,output,256,0)
+    var retained:i64=0
+    if n==a.len as i64 and same_bytes(output,a as *u8,n)==1 and noema_pretrain_last_match(st)>0.99 { retained=1 }
+    printInt(retained)
+    println("")
+
+    let path="/tmp/noema_phi_dynamic_memory_test.nps"
+    noema_pretrain_save(st,path)
+    let loaded=noema_pretrain_load(path)
+    var persisted:i64=0
+    if loaded!=0 as *f64 {
+        let n2=noema_pretrain_infer(loaded,prompt as *u8,prompt.len as i64,output,256,0)
+        if noema_pretrain_memory_capacity(loaded)==300 and noema_pretrain_memory_count(loaded)==300 and n2==n and same_bytes(output,a as *u8,n2)==1 { persisted=1 }
+        noema_pretrain_destroy(loaded)
+    }
+    printInt(persisted)
+    println("")
+    @unlink(path)
+    @free(output)
+    noema_pretrain_destroy(st)
+    return 0
+}

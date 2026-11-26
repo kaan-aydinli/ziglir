@@ -1,0 +1,68 @@
+{
+  "schema": "noema_v3.locked_q_report.v1",
+  "architecture": "NOEMA v3 (EK-HNB + HAIB + KHG + LIR-PreOpt)",
+  "implementation": "100% pure LIR (zero external LLM/LMM/tokenizer/optimizer/autodiff)",
+  "claim_policy": "measured_internal_locked_benchmark_only_no_unmeasured_frontier_claim",
+  "corpus": {
+    "manifest_path": "ai/noema_v3/corpus_locked/manifest.jsonl",
+    "manifest_sha256": "30dc620c71ed3b12159fa8aece568ae2dd680adb0d9408bd21a392fd9d60b241",
+    "splits": {
+      "train": {
+        "soa_dir": "ai/noema_v3/corpus_locked/train_soa",
+        "stream_sha256": "b6383def99de407cb3dbef67d8745700bbe754e16d6930a81ded3aa7f948f425"
+      },
+      "dev": {
+        "soa_dir": "ai/noema_v3/corpus_locked/dev_soa",
+        "stream_sha256": "5e4bb1bbeb22ed4c5f2b4d3b3f62d0c8925ef7147f892556aa16e12fe4a1af86"
+      },
+      "test": {
+        "soa_dir": "ai/noema_v3/corpus_locked/test_soa",
+        "stream_sha256": "d3c30cf6881c22c5b1b68aeade966162e141bf300857826d7cf66eab25a5e814"
+      }
+    },
+    "split_disjointness_verified": true
+  },
+  "checkpoint": {
+    "path": "ai/noema_v3/checkpoints/noema_v3_locked.npg3",
+    "magic_hex": "4e50477633000300",
+    "schema_version": 3,
+    "byte_size": 70712,
+    "sha256": "f1d49901631ec41d682f7aae60e1a4e2d798399f40880e1ec741b63d4d2baad6",
+    "total_params": 8828,
+    "trained_steps": 36
+  },
+  "verified_selfplay": {
+    "candidates_total": 4,
+    "admitted_verified": 2,
+    "rejected_unverified_or_contradicted": 2
+  },
+  "bpb_trajectory": {
+    "train": {
+      "init": 7.987905,
+      "final": 5.959565,
+      "delta": -2.02834
+    },
+    "dev": {
+      "init": 7.983638,
+      "final": 6.11168,
+      "delta": -1.871958
+    },
+    "test": {
+      "init": 7.983105,
+      "final": 6.083383,
+      "delta": -1.899722
+    },
+    "all_splits_improved": true
+  },
+  "lexicographic_q_vector": {
+    "q0_integrity_safety": 1.0,
+    "q1_verified_reasoning": 1.0,
+    "q2_unsupported_claim_rate": 0.0,
+    "q3_compositional_gen": 1.0,
+    "q4_calibration_ece": 0.168306,
+    "q5_heldout_bpb": 6.083383,
+    "q6_compute_cost_ms": 45271.0,
+    "all_gates_passed": true,
+    "first_failed_gate": -1
+  }
+}

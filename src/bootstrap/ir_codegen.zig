@@ -33,10 +33,10 @@ const CALLEE_SAVED_POOL = [_]u8{ 3, 12, 13, 14, 15 }; // rbx, r12, r13, r14, r15
 const ALL_ALLOC_REGS = [_]u8{ 8, 9, 10, 6, 7, 3, 12, 13, 14, 15 };
 const NO_REG: u8 = 0xFF;
 
-const MAX_CODE_BYTES = 524288;
-const MAX_RODATA_BYTES = 65536;
-const MAX_VREGS = 4096;
-const DATA_VADDR: u64 = 0x600000; // 64 KiB RW zero-init page: [0x00]=argc, [0x08]=argv, [0x10..0x67]=slab, [0x68]=envp, [0x70]=heap_secret, [0x78]=stack_canary, [0x80]=slab_cur_base, [0x88]=heap_min, [0x90]=heap_max, [0x98]=region_count, [0xA0]=is_multithreaded, [0xB0]=free_ring_cursor, [0x100..]=region_dir
+const MAX_CODE_BYTES = 2097152;
+const MAX_RODATA_BYTES = 262144;
+const MAX_VREGS = 8192;
+const DATA_VADDR: u64 = 0x1000000; // 64 KiB RW zero-init page: [0x00]=argc, [0x08]=argv, [0x10..0x67]=slab, [0x68]=envp, [0x70]=heap_secret, [0x78]=stack_canary, [0x80]=slab_cur_base, [0x88]=heap_min, [0x90]=heap_max, [0x98]=region_count, [0xA0]=is_multithreaded, [0xB0]=free_ring_cursor, [0x100..]=region_dir
 const REGION_DIR_CAP: u32 = 4080;
 
 const FnInfo = struct {
@@ -177,10 +177,10 @@ pub const IRCodegen = struct {
 
     rodata: [MAX_RODATA_BYTES]u8 = undefined,
     rodata_len: u32 = 0,
-    string_offsets: [512]u32 = undefined,
-    string_lens: [512]u32 = undefined,
-    string_hashes: [512]u64 = undefined,
-    string_hash_slots: [1024]u16 = .{0} ** 1024,
+    string_offsets: [2048]u32 = undefined,
+    string_lens: [2048]u32 = undefined,
+    string_hashes: [2048]u64 = undefined,
+    string_hash_slots: [4096]u16 = .{0} ** 4096,
     string_count: u32 = 0,
 
     src: []const u8 = "",
@@ -224,7 +224,7 @@ pub const IRCodegen = struct {
     text_user_end: u32 = 0,
 
     // Relocations
-    relocs: [32768]Reloc = undefined,
+    relocs: [131072]Reloc = undefined,
     reloc_count: u32 = 0,
 
     // Current function allocation & frame state
@@ -249,8 +249,28 @@ pub const IRCodegen = struct {
     vreg_const_known: [MAX_VREGS]bool = undefined,
     vreg_const_imm: [MAX_VREGS]i64 = undefined,
     vreg_elided_const: [MAX_VREGS]bool = undefined,
+    /// Wide (non-imm32) constants that are declared once and reused: they keep a
+    /// hardware register instead of being re-materialised with `movabs` at
+    /// every use.
+    vreg_keep_const_reg: [MAX_VREGS]bool = undefined,
+    /// For a wide constant that duplicates an already-kept one: the vreg whose
+    /// register holds the same bits. 0 means "not a duplicate".
+    vreg_keep_const_dup: [MAX_VREGS]u16 = undefined,
     vreg_copy_hint: [MAX_VREGS]u16 = undefined,
     vreg_pref_hw_reg: [MAX_VREGS]u8 = undefined,
+    /// Magic multipliers of constant divisors used inside a loop, parked in a
+    /// callee-saved register for the whole function (one `movabs` at entry
+    /// instead of one per division).
+    cur_magic_vals: [4]i64 = .{ 0, 0, 0, 0 },
+    cur_magic_shifts: [4]u8 = .{ 0, 0, 0, 0 },
+    cur_magic_regs: [4]u8 = .{ NO_REG, NO_REG, NO_REG, NO_REG },
+    cur_magic_count: usize = 0,
+    cur_extra_callee: [4]u8 = .{ NO_REG, NO_REG, NO_REG, NO_REG },
+    cur_extra_callee_count: usize = 0,
+    cur_keep_const_vregs: [MAX_VREGS]u16 = undefined,
+    pending_keep_const_vregs: [MAX_VREGS]u16 = undefined,
+    pending_keep_const_count: usize = 0,
+    cur_keep_const_count: usize = 0,
     cur_rcx_const: ?i64 = null,
     cur_r11_const: ?i64 = null,
     cur_shrink_shared: bool = false,
@@ -1071,6 +1091,8 @@ pub const IRCodegen = struct {
         @memset(self.vreg_const_known[0..nv], false);
         @memset(self.vreg_const_imm[0..nv], 0);
         @memset(self.vreg_elided_const[0..nv], false);
+        @memset(self.vreg_keep_const_reg[0..nv], false);
+        @memset(self.vreg_keep_const_dup[0..nv], 0);
         @memset(self.vreg_def_cnt[0..nv], 0);
 
         for (0..ir_fn.block_count) |bi| {
@@ -1089,6 +1111,8 @@ pub const IRCodegen = struct {
 
         var use_cnt: [MAX_VREGS]u16 = .{0} ** MAX_VREGS;
         var non_foldable: [MAX_VREGS]bool = .{false} ** MAX_VREGS;
+        var keep_const_vregs: [MAX_VREGS]u16 = undefined;
+        var keep_n: usize = 0;
 
         for (0..nv) |v| {
             if (self.vreg_def_cnt[v] != 1) self.vreg_const_known[v] = false;
@@ -1127,10 +1151,49 @@ pub const IRCodegen = struct {
             }
         }
 
+        // Constants that are re-materialised on every loop iteration are worth a
+        // register even when they appear only once statically. Two cheap facts
+        // are needed for that: which blocks are inside a loop, and whether the
+        // constant is passed to a call (a call-clobbered register cannot hold a
+        // value across a call, so pinning such a constant would spend one of the
+        // five callee-saved registers on a value that is live for a few
+        // instructions - that is how `@sqrt(9.0)` style literals ended up
+        // evicting live values).
+        var block_in_loop: [ir_mod.MAX_BLOCKS_PER_FN]bool = .{false} ** ir_mod.MAX_BLOCKS_PER_FN;
         for (0..ir_fn.block_count) |bi| {
             const blk = &ir_fn.blocks[bi];
+            if (blk.inst_count == 0) continue;
+            const term = blk.insts[blk.inst_count - 1];
+            var back: [2]u16 = .{ 0xFFFF, 0xFFFF };
+            if (term.op == .jump and term.target_block <= bi) back[0] = term.target_block;
+            if (term.op == .cond_jump) {
+                if (term.target_block <= bi) back[0] = term.target_block;
+                if (term.alt_block <= bi) back[1] = term.alt_block;
+            }
+            for (back) |bt| {
+                if (bt == 0xFFFF or bt >= ir_fn.block_count) continue;
+                var lb: u32 = bt;
+                while (lb <= bi) : (lb += 1) block_in_loop[lb] = true;
+            }
+        }
+        var used_in_loop: [MAX_VREGS]bool = .{false} ** MAX_VREGS;
+        var used_as_call_arg: [MAX_VREGS]bool = .{false} ** MAX_VREGS;
+
+        for (0..ir_fn.block_count) |bi| {
+            const blk = &ir_fn.blocks[bi];
+            const in_loop = block_in_loop[bi];
             for (0..blk.inst_count) |ii| {
                 const inst = blk.insts[ii];
+                if (in_loop) {
+                    if (inst.src1 > 0 and inst.src1 < MAX_VREGS) used_in_loop[inst.src1] = true;
+                    if (inst.src2 > 0 and inst.src2 < MAX_VREGS) used_in_loop[inst.src2] = true;
+                }
+                if (inst.op == .call) {
+                    for (0..@min(inst.arg_count, inst.args.len)) |ai| {
+                        const a = inst.args[ai];
+                        if (a > 0 and a < MAX_VREGS) used_as_call_arg[a] = true;
+                    }
+                }
                 if (inst.src1 > 0 and inst.src1 < MAX_VREGS) {
                     use_cnt[inst.src1] = use_cnt[inst.src1] +| 1;
                     if (inst.op != .ret and !(isCommutative(inst.op) and self.vreg_const_known[inst.src1] and fitsI32NonMin(self.vreg_const_imm[inst.src1]))) {
@@ -1156,11 +1219,274 @@ pub const IRCodegen = struct {
             }
         }
 
+        // A constant that does not fit in a sign-extended imm32 is materialised
+        // with a 10-byte `movabs` at every use. Folding it into an instruction
+        // is therefore impossible, and when the use sits inside a loop the
+        // `movabs` is re-issued on every iteration: the FNV prime in a hash
+        // loop alone costs 10 bytes of I-cache and a full decode per round.
+        //
+        // Such a constant is instead given a register of its own (the
+        // allocator below keeps it live across the whole function, so the
+        // `movabs` is hoisted to the entry block) whenever the value is reused
+        // or used inside a loop. A single use outside every loop still folds /
+        // re-materialises, because writing it to a register once is not cheaper
+        // than using it once.
+        const kReuseThreshold = 2;
         for (1..nv) |v| {
-            if (self.vreg_const_known[v] and (!non_foldable[v] or use_cnt[v] <= 1 or fitsI32NonMin(self.vreg_const_imm[v]))) {
+            if (!self.vreg_const_known[v]) continue;
+            const foldable = fitsI32NonMin(self.vreg_const_imm[v]);
+            // Cheap to elide: imm32 folds straight into the using instruction,
+            // and a single use pays for at most one `movabs` -- as long as that
+            // one use is not inside a loop. "One static use" inside a loop body
+            // means one `movabs` per iteration, which for a wide literal is
+            // real per-iteration work and ten bytes of hot code.
+            const single_use_is_cheap = use_cnt[v] <= 1 and
+                !(used_in_loop[v] and !used_as_call_arg[v]);
+            if (foldable or !non_foldable[v] or single_use_is_cheap) {
                 self.vreg_elided_const[v] = true;
+                continue;
+            }
+            // A value earns a register when it is reused at least twice, or
+            // when it is used inside a loop and is not a call argument (inside a
+            // loop each use costs one `movabs` per iteration, so even a single
+            // static use pays off).
+            const loop_hot = used_in_loop[v] and !used_as_call_arg[v];
+            if (use_cnt[v] >= kReuseThreshold or loop_hot) {
+                // Keep a register for it: it is re-materialised per use
+                // otherwise, and each use is a 10-byte movabs.
+                self.vreg_keep_const_reg[v] = true;
+                keep_const_vregs[keep_n] = @intCast(v);
+                keep_n += 1;
             }
         }
+        // A function can define the same wide literal more than once (the
+        // unroller copies constant definitions into each body, and separate
+        // expressions may spell the same literal). One register can serve all
+        // of them: they are the same bits. Collapsing duplicates keeps the
+        // register budget for distinct values.
+        var di: usize = 0;
+        while (di < keep_n) : (di += 1) {
+            const dv = keep_const_vregs[di];
+            const dimm = self.vreg_const_imm[dv];
+            var dj: usize = di + 1;
+            while (dj < keep_n) {
+                const ov = keep_const_vregs[dj];
+                if (self.vreg_const_imm[ov] == dimm) {
+                    self.vreg_keep_const_reg[ov] = false;
+                    self.vreg_keep_const_dup[ov] = dv;
+                    keep_const_vregs[dj] = keep_const_vregs[keep_n - 1];
+                    keep_n -= 1;
+                } else {
+                    dj += 1;
+                }
+            }
+        }
+
+        // Most-used constants first: they save the most `movabs` bytes.
+        var ki: usize = 1;
+        while (ki < keep_n) : (ki += 1) {
+            const key = keep_const_vregs[ki];
+            const key_uses = use_cnt[key];
+            var kj: usize = ki;
+            while (kj > 0 and use_cnt[keep_const_vregs[kj - 1]] < key_uses) : (kj -= 1) {
+                keep_const_vregs[kj] = keep_const_vregs[kj - 1];
+            }
+            keep_const_vregs[kj] = key;
+        }
+        self.pending_keep_const_vregs = keep_const_vregs;
+        self.pending_keep_const_count = keep_n;
+    }
+
+
+    /// Constant divisors whose division sits inside a loop are compiled to a
+    /// `movabs` of the magic multiplier plus `imul rcx`. Inside a loop that
+    /// `movabs` is re-issued every iteration, so a handful of hot divisions can
+    /// spend most of the loop body on materialising multipliers.
+    ///
+    /// The multipliers are therefore hoisted: each distinct one gets a
+    /// callee-saved register, materialised once in the prologue. The registers
+    /// are handed out here, before the vreg allocator runs, so it simply never
+    /// sees them as free; they are saved/restored like any other callee-saved
+    /// register the allocator would have used.
+    fn analyzeParkedMagic(self: *IRCodegen, ir_fn: *const IRFn, peak_live: u32, kept_constants: usize) void {
+        self.cur_magic_count = 0;
+        self.cur_extra_callee_count = 0;
+        for (&self.cur_magic_regs) |*r| r.* = NO_REG;
+        for (&self.cur_extra_callee) |*r| r.* = NO_REG;
+
+        var block_in_loop: [ir_mod.MAX_BLOCKS_PER_FN]bool = .{false} ** ir_mod.MAX_BLOCKS_PER_FN;
+        for (0..ir_fn.block_count) |bi| {
+            const blk = &ir_fn.blocks[bi];
+            if (blk.inst_count == 0) continue;
+            const term = blk.insts[blk.inst_count - 1];
+            var back: [2]u16 = .{ 0xFFFF, 0xFFFF };
+            if (term.op == .jump and term.target_block <= bi) back[0] = term.target_block;
+            if (term.op == .cond_jump) {
+                if (term.target_block <= bi) back[0] = term.target_block;
+                if (term.alt_block <= bi) back[1] = term.alt_block;
+            }
+            for (back) |bt| {
+                if (bt == 0xFFFF or bt >= ir_fn.block_count) continue;
+                var lb: u32 = bt;
+                while (lb <= bi) : (lb += 1) block_in_loop[lb] = true;
+            }
+        }
+
+        var cand_imm: [4]i64 = .{ 0, 0, 0, 0 };
+        var cand_shift: [4]u8 = .{ 0, 0, 0, 0 };
+        var cand_uses: [4]u16 = .{ 0, 0, 0, 0 };
+        var cand_n: usize = 0;
+        for (0..ir_fn.block_count) |bi| {
+            if (!block_in_loop[bi]) continue;
+            const blk = &ir_fn.blocks[bi];
+            for (0..blk.inst_count) |ii| {
+                const inst = blk.insts[ii];
+                if (inst.op != .@"div" and inst.op != .@"mod") continue;
+                const dv = inst.src2;
+                if (dv == 0 or dv >= MAX_VREGS) continue;
+                if (!self.vreg_const_known[dv]) continue;
+                const imm = self.vreg_const_imm[dv];
+                if (imm <= 1) continue;
+                const magic = signedDivMagic(imm);
+                var found = false;
+                for (cand_imm[0..cand_n], 0..) |ci, ck| {
+                    if (ci == magic.multiplier and cand_shift[ck] == magic.shift) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (found) continue;
+                if (cand_n == cand_imm.len) continue;
+                cand_imm[cand_n] = magic.multiplier;
+                cand_shift[cand_n] = magic.shift;
+                cand_uses[cand_n] = 0;
+                cand_n += 1;
+            }
+        }
+        if (cand_n == 0) return;
+
+        // How many times each candidate is actually needed, so that when there
+        // are more candidates than spare registers the hottest ones win.
+        for (0..ir_fn.block_count) |bi| {
+            if (!block_in_loop[bi]) continue;
+            const blk = &ir_fn.blocks[bi];
+            for (0..blk.inst_count) |ii| {
+                const inst = blk.insts[ii];
+                if (inst.op != .@"div" and inst.op != .@"mod") continue;
+                const dv = inst.src2;
+                if (dv == 0 or dv >= MAX_VREGS) continue;
+                if (!self.vreg_const_known[dv]) continue;
+                const imm = self.vreg_const_imm[dv];
+                if (imm <= 1) continue;
+                const mg = signedDivMagic(imm);
+                for (cand_imm[0..cand_n], 0..) |ci, k| {
+                    if (ci == mg.multiplier and cand_shift[k] == mg.shift) cand_uses[k] +|= 1;
+                }
+            }
+        }
+        // Insertion sort, most-needed first.
+        var a: usize = 1;
+        while (a < cand_n) : (a += 1) {
+            const ki = cand_imm[a];
+            const ku = cand_uses[a];
+            const ks = cand_shift[a];
+            var b: usize = a;
+            while (b > 0 and cand_uses[b - 1] < ku) : (b -= 1) {
+                cand_imm[b] = cand_imm[b - 1];
+                cand_uses[b] = cand_uses[b - 1];
+                cand_shift[b] = cand_shift[b - 1];
+            }
+            cand_imm[b] = ki;
+            cand_uses[b] = ku;
+            cand_shift[b] = ks;
+        }
+
+        // Budget: never reserve a register the allocator actually needs. Each
+        // parked multiplier removes one register from the pool for the whole
+        // function, so it can only be afforded while the peak live-vreg count
+        // stays below the pool size.
+        // `peak_live` already counts the kept constants, which hold permanent
+        // registers. What matters for parking is the pressure from the *other*
+        // live values: those are the ones a callee-saved register would have to
+        // serve if it were not parked.
+        var peak_no_consts: u32 = 0;
+        {
+            var live_delta: [MAX_VREGS + 2]i32 = .{0} ** (MAX_VREGS + 2);
+            const span = @min(@as(usize, peak_live) + 2, MAX_VREGS);
+            _ = span;
+            var max_pos: u32 = 0;
+            for (1..@min(@as(usize, ir_fn.vreg_count) + 2, MAX_VREGS)) |lv| {
+                if (self.vreg_elided_const[lv] or self.vreg_keep_const_reg[lv]) continue;
+                if (self.vreg_start[lv] > self.vreg_end[lv]) continue;
+                const ls: usize = @min(self.vreg_start[lv], @as(u32, @intCast(MAX_VREGS - 1)));
+                const le: usize = @min(self.vreg_end[lv] + 1, @as(u32, @intCast(MAX_VREGS - 1)));
+                live_delta[ls] += 1;
+                live_delta[le] -= 1;
+                max_pos = @max(max_pos, self.vreg_end[lv]);
+            }
+            var run: i32 = 0;
+            const stop = @min(@as(usize, max_pos) + 2, MAX_VREGS);
+            for (0..stop) |lp| {
+                run += live_delta[lp];
+                if (run > 0 and @as(u32, @intCast(run)) > peak_no_consts) peak_no_consts = @intCast(run);
+            }
+        }
+        // One callee-saved register is kept back as headroom, and the kept
+        // constants are already out of the pool.
+        const capacity: u32 = ALL_ALLOC_REGS.len;
+        if (peak_no_consts + 1 >= capacity) return;
+        const room_all: usize = @intCast(capacity - peak_no_consts - 1);
+        const callee_free: usize = if (kept_constants + 1 >= CALLEE_SAVED_POOL.len)
+            0
+        else
+            CALLEE_SAVED_POOL.len - kept_constants - 1;
+        const room = @min(room_all, callee_free);
+        if (cand_n > room) cand_n = room;
+        for (0..cand_n) |k| {
+            self.cur_magic_vals[k] = cand_imm[k];
+            self.cur_magic_shifts[k] = cand_shift[k];
+            self.cur_extra_callee[k] = CALLEE_SAVED_POOL[CALLEE_SAVED_POOL.len - 1 - k];
+            self.cur_extra_callee_count += 1;
+        }
+        self.cur_magic_count = cand_n;
+    }
+
+    /// Hand back the callee-saved register whose current owner dies soonest,
+    /// evicting it to a spill slot. Used only for values that must live in a
+    /// callee-saved register.
+    fn stealCalleeReg(self: *IRCodegen, reg_owner: *[16]u16, used_callee_mask: *u16, next_spill: *u32) u8 {
+        _ = used_callee_mask;
+        var best_r: u8 = NO_REG;
+        var best_end: u32 = std.math.maxInt(u32);
+        for (CALLEE_SAVED_POOL) |r| {
+            if (self.isParkedMagicReg(r)) continue;
+            const own = reg_owner[r];
+            if (own == 0) continue;
+            // Never evict a kept wide constant: its register is what allows the
+            // prologue to define it at all, so eviction would leave the value
+            // undefined instead of merely slower.
+            if (self.vreg_keep_const_reg[own]) continue;
+            if (self.vreg_end[own] < best_end) {
+                best_end = self.vreg_end[own];
+                best_r = r;
+            }
+        }
+        if (best_r == NO_REG) return NO_REG;
+        const evicted = reg_owner[best_r];
+        self.vreg_reg[evicted] = NO_REG;
+        self.vreg_spill_slot[evicted] = self.cur_total_locals + next_spill.*;
+        next_spill.* += 1;
+        reg_owner[best_r] = 0;
+        return best_r;
+    }
+
+    /// True when `r` was taken out of the allocator pool by
+    /// `analyzeParkedMagic` for this function.
+    fn isParkedMagicReg(self: *const IRCodegen, r: u8) bool {
+        for (self.cur_extra_callee[0..self.cur_extra_callee_count]) |mr| {
+            if (mr == r) return true;
+        }
+        return false;
     }
 
     fn isCommutative(op: IROp) bool {
@@ -1186,7 +1512,14 @@ pub const IRCodegen = struct {
         @memset(self.vreg_copy_hint[0..n_vregs], 0);
         @memset(self.vreg_pref_hw_reg[0..n_vregs], NO_REG);
 
+        self.pending_keep_const_count = 0;
         self.analyzeElidedConsts(ir_fn);
+        // analyzeElidedConsts decides which wide constants deserve a register;
+        // snapshot that list here, once per function, so later passes cannot
+        // leave a stale list pointing into another function's vreg space.
+        const keep_n = self.pending_keep_const_count;
+        for (0..keep_n) |k| self.cur_keep_const_vregs[k] = self.pending_keep_const_vregs[k];
+        self.cur_keep_const_count = keep_n;
 
         var block_start_pos: [ir_mod.MAX_BLOCKS_PER_FN]u32 = .{0} ** ir_mod.MAX_BLOCKS_PER_FN;
         var block_end_pos: [ir_mod.MAX_BLOCKS_PER_FN]u32 = .{0} ** ir_mod.MAX_BLOCKS_PER_FN;
@@ -1452,6 +1785,98 @@ pub const IRCodegen = struct {
             }
         }
 
+        // Wider-than-imm32 constants that are reused many times keep a register:
+        // force their live range over the whole function so the allocator both
+        // assigns one and never evicts them (eviction would re-issue the
+        // `movabs` inside the loop, which is the cost this avoids).
+        //
+        // A register can only be promised while callee-saved ones are left. The
+        // allocator hands out caller-saved registers first for values that do
+        // not cross a call, but a kept constant must survive the whole function,
+        // so it can only live in the five callee-saved registers. Keeping more
+        // constants than that was a correctness bug: the extras received no
+        // register, yet both the prologue materialisation and the defining
+        // `const_int` instruction skipped them, so every later read saw whatever
+        // happened to be in the register the allocator reused. Function entry
+        // holds no live values, so the count of live values at position zero
+        // plus the kept constants is a safe upper bound on the pressure.
+        var live_at_entry: u32 = 0;
+        for (1..@min(@as(usize, max_vreg) + 1, MAX_VREGS)) |lv| {
+            if (self.vreg_elided_const[lv] or vreg_fused_skip[lv]) continue;
+            if (self.vreg_start[lv] > self.vreg_end[lv]) continue;
+            if (self.vreg_start[lv] == 0) live_at_entry += 1;
+        }
+        const kept_room: usize = if (live_at_entry + 1 >= CALLEE_SAVED_POOL.len)
+            0
+        else
+            @as(usize, CALLEE_SAVED_POOL.len - 1 - live_at_entry);
+        // The list is ordered most-used first; keep as many as the register
+        // budget allows. A constant that is not kept is fully elided-or-plain
+        // (see below), so a partial selection stays consistent: only `kept_n`
+        // entries are marked, and the rest fall back to the untouched analysis.
+        var kept_n: usize = 0;
+        for (self.cur_keep_const_vregs[0..self.cur_keep_const_count]) |kv| {
+            if (kept_n >= kept_room) break;
+            self.vreg_keep_const_reg[kv] = true;
+            self.vreg_start[kv] = 0;
+            self.vreg_end[kv] = pos + 1;
+            self.vreg_crosses_call[kv] = true;
+            vreg_weight[kv] +|= 1 << 20;
+            self.cur_keep_const_vregs[kept_n] = kv;
+            kept_n += 1;
+        }
+        // Anything beyond the budget must not stay marked as kept by the
+        // analysis pass, or it would be skipped by both the prologue and the
+        // defining `const_int`.
+        for (self.cur_keep_const_vregs[kept_n..self.cur_keep_const_count]) |kv| {
+            self.vreg_keep_const_reg[kv] = false;
+        }
+        self.cur_keep_const_count = kept_n;
+
+        // A duplicate has no register of its own only when its target is
+        // actually kept; if the target fell outside `kept_n`, drop the
+        // duplicate link so it falls back to normal allocation/materialisation.
+        for (1..@min(@as(usize, max_vreg) + 1, MAX_VREGS)) |dv| {
+            const dup_target = self.vreg_keep_const_dup[dv];
+            if (dup_target != 0) {
+                if (self.vreg_keep_const_reg[dup_target]) {
+                    self.vreg_elided_const[dv] = true;
+                } else {
+                    self.vreg_keep_const_dup[dv] = 0;
+                    self.vreg_keep_const_reg[dv] = false;
+                }
+            }
+        }
+
+        // Live ranges are known now, so the peak number of simultaneously live
+        // vregs can be measured. That is what decides whether the allocator has
+        // a register to spare for a parked magic multiplier: reserving one in a
+        // loop that already runs at capacity only trades a `movabs` for spill
+        // traffic, which is a net loss.
+        var peak_live: u32 = 0;
+        {
+            var live_delta: [MAX_VREGS + 2]i32 = .{0} ** (MAX_VREGS + 2);
+            const span = @min(@as(usize, pos) + 2, MAX_VREGS);
+            for (1..@min(@as(usize, max_vreg) + 1, MAX_VREGS)) |lv| {
+                if (self.vreg_elided_const[lv] or vreg_fused_skip[lv]) continue;
+                if (self.vreg_start[lv] > self.vreg_end[lv]) continue;
+                const ls: usize = @min(self.vreg_start[lv], @as(u32, @intCast(MAX_VREGS - 1)));
+                const le: usize = @min(self.vreg_end[lv] + 1, @as(u32, @intCast(MAX_VREGS - 1)));
+                live_delta[ls] += 1;
+                live_delta[le] -= 1;
+            }
+            var run: i32 = 0;
+            for (0..span) |lp| {
+                run += live_delta[lp];
+                if (run > 0 and @as(u32, @intCast(run)) > peak_live) peak_live = @intCast(run);
+            }
+        }
+        // Kept constants and parked magic multipliers compete for the same five
+        // callee-saved registers. Budget them together: whatever the kept
+        // constants left over is what parking may use, otherwise the two
+        // decisions independently believe they have room for more.
+        self.analyzeParkedMagic(ir_fn, peak_live, kept_n);
+
         var i: usize = 1;
         while (i < order_count) : (i += 1) {
             const key = order[i];
@@ -1468,6 +1893,7 @@ pub const IRCodegen = struct {
         var next_spill: u32 = 1;
 
         for (order[0..order_count]) |cur_v| {
+            if (self.vreg_elided_const[cur_v]) continue;
             const cur_s = self.vreg_start[cur_v];
 
             for (ALL_ALLOC_REGS) |r| {
@@ -1479,13 +1905,44 @@ pub const IRCodegen = struct {
 
             var chosen: u8 = NO_REG;
 
+            // A kept wide constant is live over the whole function, so it must
+            // land in a callee-saved register: a caller-saved one is destroyed
+            // by the first call in its range, and the prologue materialisation
+            // writes it once at entry. This has to be decided before the copy
+            // hint and hardware-preference paths below, which can hand out
+            // caller-saved registers. Such a value is never spilled either -
+            // spilling would reintroduce the `movabs` this removes, and a
+            // spilled value would leave the prologue with no register to write.
+            if (self.vreg_keep_const_reg[cur_v]) {
+                for (CALLEE_SAVED_POOL) |r| {
+                    if (reg_owner[r] == 0 and !self.isParkedMagicReg(r)) {
+                        chosen = r;
+                        break;
+                    }
+                }
+                if (chosen == NO_REG) chosen = self.stealCalleeReg(&reg_owner, &used_callee_mask, &next_spill);
+                if (chosen != NO_REG) {
+                    reg_owner[chosen] = cur_v;
+                    self.vreg_reg[cur_v] = chosen;
+                    used_callee_mask |= @as(u16, 1) << @intCast(chosen);
+                } else {
+                    // Unreachable while the kept count is capped by the pool
+                    // size. Give up the register so the defining `const_int`
+                    // falls back to a plain `movabs`, keeping the value defined.
+                    self.vreg_keep_const_reg[cur_v] = false;
+                    self.vreg_reg[cur_v] = NO_REG;
+                }
+                continue;
+            }
+
             // Check copy coalescing / dying two-address reuse hint first
             const hint_v = self.vreg_copy_hint[cur_v];
             if (hint_v > 0 and hint_v < MAX_VREGS) {
                 const hr = self.vreg_reg[hint_v];
                 if (hr != NO_REG) {
-                    const can_take = (reg_owner[hr] == 0) or
-                        (reg_owner[hr] == hint_v and self.vreg_end[hint_v] <= cur_s);
+                    const can_take = ((reg_owner[hr] == 0) or
+                        (reg_owner[hr] == hint_v and self.vreg_end[hint_v] <= cur_s)) and
+                        !self.isParkedMagicReg(hr);
                     const is_callee = (hr == 3 or hr >= 12);
                     if (can_take and (!self.vreg_crosses_call[cur_v] or is_callee)) {
                         chosen = hr;
@@ -1496,7 +1953,7 @@ pub const IRCodegen = struct {
             // Check hardware register preference (e.g. call argument setup)
             if (chosen == NO_REG and !self.vreg_crosses_call[cur_v]) {
                 const pref_hw = self.vreg_pref_hw_reg[cur_v];
-                if (pref_hw != NO_REG and reg_owner[pref_hw] == 0) {
+                if (pref_hw != NO_REG and reg_owner[pref_hw] == 0 and !self.isParkedMagicReg(pref_hw)) {
                     chosen = pref_hw;
                 }
             }
@@ -1511,7 +1968,7 @@ pub const IRCodegen = struct {
             }
             if (chosen == NO_REG) {
                 for (CALLEE_SAVED_POOL) |r| {
-                    if (reg_owner[r] == 0) {
+                    if (reg_owner[r] == 0 and !self.isParkedMagicReg(r)) {
                         chosen = r;
                         break;
                     }
@@ -1530,8 +1987,10 @@ pub const IRCodegen = struct {
                 var best_weight: u32 = vreg_weight[cur_v];
                 var best_end: u32 = self.vreg_end[cur_v];
                 for (pool) |r| {
+                    if (self.isParkedMagicReg(r)) continue;
                     const own = reg_owner[r];
                     if (own == 0) continue;
+                    if (self.vreg_keep_const_reg[own]) continue;
                     const ow = vreg_weight[own];
                     const oe = self.vreg_end[own];
                     if (ow < best_weight or (ow == best_weight and oe > best_end)) {
@@ -1566,6 +2025,12 @@ pub const IRCodegen = struct {
                 self.cur_callee_count += 1;
             }
         }
+        // Parked magic multipliers live in callee-saved registers too, so they
+        // take part in the prologue/epilogue save-restore like any other.
+        for (self.cur_extra_callee[0..self.cur_extra_callee_count]) |r| {
+            self.cur_callee_regs[self.cur_callee_count] = r;
+            self.cur_callee_count += 1;
+        }
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -1574,6 +2039,16 @@ pub const IRCodegen = struct {
 
     fn vregPhys(self: *const IRCodegen, vreg: u16) ?u8 {
         if (vreg == 0 or vreg >= MAX_VREGS) return null;
+        // A wide constant that duplicates a kept one is never given a register
+        // of its own: its bits already sit in the register of the vreg it
+        // mirrors, so every read resolves there. This is checked before the
+        // elided test because duplicates are marked elided to keep the
+        // allocator away from them.
+        const dup = self.vreg_keep_const_dup[vreg];
+        if (dup != 0) {
+            const dr = self.vreg_reg[dup];
+            return if (dr == NO_REG) null else dr;
+        }
         if (self.vreg_elided_const[vreg]) return null;
         const r = self.vreg_reg[vreg];
         return if (r == NO_REG) null else r;
@@ -2012,6 +2487,16 @@ pub const IRCodegen = struct {
         }
         self.cur_canary_active = self.cur_frame_active and has_stack_addr_taken;
 
+        // Magic multipliers parked in callee-saved registers are materialised at
+        // the top of the function body, after the frame is set up. A shrink-
+        // wrapped entry jumps straight past the prologue on some paths, so the
+        // materialisation would be skipped: leave them unparked there and load
+        // each multiplier inline as usual.
+        if ((self.cur_frame_active or !has_calls) and self.cur_magic_count > 0) {
+            self.cur_magic_count = 0;
+            self.cur_extra_callee_count = 0;
+        }
+
         // Check whether function qualifies for shrink-wrapping:
         // B0 only inspects register-only params/constants, compares, and branches to an immediate-return leaf block.
         var shrink_ret_bi: u16 = 0xFFFF;
@@ -2315,6 +2800,18 @@ pub const IRCodegen = struct {
             }
         }
 
+        if (!can_shrink) {
+            // Materialise each reused wide constant once, after callee-saved
+            // registers have been saved by the prologue.
+            for (self.cur_keep_const_vregs[0..self.cur_keep_const_count]) |kv| {
+                const preg = self.vregPhys(kv) orelse continue;
+                self.mov64imm(preg, @bitCast(self.vreg_const_imm[kv]));
+            }
+            for (self.cur_magic_vals[0..self.cur_magic_count], 0..) |mv, k| {
+                self.mov64imm(self.cur_extra_callee[k], @bitCast(mv));
+            }
+        }
+
         const fn_name = self.irFnName(fi);
 
         for (0..ir_fn.block_count) |ord_i| {
@@ -2337,6 +2834,13 @@ pub const IRCodegen = struct {
                 self.subRspImm(self.cur_stack_adj);
                 f.param_store_offset = self.code_len;
                 self.emitParallelRegParamMoves(ir_fn);
+                for (self.cur_keep_const_vregs[0..self.cur_keep_const_count]) |kv| {
+                    const preg = self.vregPhys(kv) orelse continue;
+                    self.mov64imm(preg, @bitCast(self.vreg_const_imm[kv]));
+                }
+                for (self.cur_magic_vals[0..self.cur_magic_count], 0..) |mv, k| {
+                    self.mov64imm(self.cur_extra_callee[k], @bitCast(mv));
+                }
             }
             const bi = emit_order[ord_i];
             self.cur_rcx_const = null;
@@ -3067,7 +3571,14 @@ pub const IRCodegen = struct {
     fn compileIRInst(self: *IRCodegen, inst: IRInst, cur_bi: u16, fi: u32) void {
         switch (inst.op) {
             .const_int => {
-                if (inst.dest > 0 and inst.dest < MAX_VREGS and self.vreg_elided_const[inst.dest]) return;
+                if (inst.dest > 0 and inst.dest < MAX_VREGS) {
+                    if (self.vreg_elided_const[inst.dest]) return;
+                    // A reused wide constant was already materialised at
+                    // function entry into the register allocated for it; the
+                    // defining instruction itself emits nothing. Re-emitting
+                    // the `movabs` here would put it back inside the loop.
+                    if (self.vreg_keep_const_reg[inst.dest]) return;
+                }
                 if (self.vregPhys(inst.dest)) |rd| {
                     self.mov64imm(rd, @bitCast(inst.imm));
                 } else {
@@ -3274,12 +3785,27 @@ pub const IRCodegen = struct {
                     // into rcx; a cached "rcx holds the magic" assumption then
                     // silently multiplies by the runtime divisor on the next
                     // iteration (wrong `-O2` answers). Load it fresh each time.
-                    self.mov64imm(1, @bitCast(magic.multiplier));
+                    // A multiplier parked in a callee-saved register by
+                    // analyzeParkedMagic is reused as-is: materialising it into
+                    // rcx again would put the `movabs` back inside the loop.
+                    // A parked register is only usable when the post-shift
+                    // still lands in rdx: the doubled-multiplier form below
+                    // relies on that too.
+                    var mul_reg: u8 = 1;
+                    for (self.cur_magic_vals[0..self.cur_magic_count], 0..) |mv, k| {
+                        if (mv == magic.multiplier and self.cur_magic_shifts[k] == magic.shift) {
+                            mul_reg = self.cur_extra_callee[k];
+                            break;
+                        }
+                    }
+                    if (mul_reg == 1) {
+                        self.mov64imm(1, @bitCast(magic.multiplier));
+                    }
                     self.cur_rcx_const = null;
                     self.cur_r11_const = null;
-                    self.emit8(0x48);
+                    self.emitRex(4, mul_reg); // REX.W (+REX.B for r13-r15)
                     self.emit8(0xF7);
-                    self.emit8(0xE9); // imul rcx -> rdx:rax
+                    self.emitModRM(3, 5, mul_reg); // imul mul_reg -> rdx:rax
                     if (magic.multiplier < 0) {
                         self.emitRex(save_reg, 2);
                         self.emit8(0x01);
@@ -5091,13 +5617,14 @@ pub const IRCodegen = struct {
                     self.invalid_reference = true;
                     return;
                 };
-                // Mark process multi-threaded so slab spinlocks engage & invalidate single-thread heap cache
+                // Atomically increment active thread count [DATA_VADDR + 0xA0] & invalidate single-thread heap cache
+                self.emit8(0xF0);
                 self.emit8(0x48);
-                self.emit8(0xC7);
+                self.emit8(0x83);
                 self.emit8(0x04);
                 self.emit8(0x25);
                 self.emit32(@intCast(DATA_VADDR + 0xA0));
-                self.emit32(1);
+                self.emit8(1); // lock add qword [DATA_VADDR + 0xA0], 1
                 self.emit8(0x48);
                 self.emit8(0xC7);
                 self.emit8(0x04);
@@ -5126,6 +5653,13 @@ pub const IRCodegen = struct {
                 self.emit8(0x39);
                 self.emit8(0xD8); // cmp rax, r11
                 const tc_mmap_ok = self.emitJccReloc(0x6, .code_offset, 0, fi); // jbe
+                self.emit8(0xF0);
+                self.emit8(0x48);
+                self.emit8(0x83);
+                self.emit8(0x2C);
+                self.emit8(0x25);
+                self.emit32(@intCast(DATA_VADDR + 0xA0));
+                self.emit8(1); // lock sub qword [DATA_VADDR + 0xA0], 1
                 self.popReg(11);
                 self.mov64imm(0, @bitCast(@as(i64, -1)));
                 const tc_fail_done = self.emitJmpReloc(.code_offset, 0, fi);
@@ -5189,6 +5723,19 @@ pub const IRCodegen = struct {
                 self.xorReg(10, 10);
                 self.mov64imm(0, 61);
                 self.syscallInst();
+                // If wait4 succeeded (rax > 0), atomically decrement active thread count [DATA_VADDR + 0xA0]
+                self.emit8(0x48);
+                self.emit8(0x85);
+                self.emit8(0xC0); // test rax, rax
+                const tj_skip_dec = self.emitJccReloc(0xE, .code_offset, 0, fi); // jle
+                self.emit8(0xF0);
+                self.emit8(0x48);
+                self.emit8(0x83);
+                self.emit8(0x2C);
+                self.emit8(0x25);
+                self.emit32(@intCast(DATA_VADDR + 0xA0));
+                self.emit8(1); // lock sub qword [DATA_VADDR + 0xA0], 1
+                self.relocs[tj_skip_dec].target_id = self.code_len;
                 self.emit8(0x48);
                 self.emit8(0x8B);
                 self.emit8(0x04);
@@ -6716,7 +7263,7 @@ pub const IRCodegen = struct {
         self.emit8(0xFF);
         self.emit8(0xCE);
         self.emit8(0x88);
-        self.emit8(0x16);
+        self.emit8(0x16); // mov [rsi], al
         self.emit8(0x48);
         self.emit8(0x85);
         self.emit8(0xC0);
@@ -7980,7 +8527,29 @@ pub const IRCodegen = struct {
         self.emit32(4119); // lea rsi, [r9 + 24 + 4095]
         self.emitAluRegImm32(4, 6, -4096); // and rsi, -4096 (mapped_size)
 
-        // Mark matching region_dir entry as FREED_MMAP (kind = 2) before munmap
+        // Acquire region_lock [r10 + 0xA8] when multithreaded and mark LIVE_MMAP (kind=1) -> FREED_MMAP (kind=2)
+        self.emit8(0x49);
+        self.emit8(0x83);
+        self.emit8(0xBA);
+        self.emit32(0xA0);
+        self.emit8(0); // cmp qword [r10 + 0xA0], 0
+        const fm_skip_lock = self.emitJccReloc(0x4, .code_offset, 0, 0);
+        const fm_spin = self.code_len;
+        self.emit8(0xB8);
+        self.emit32(1);
+        self.emit8(0x41);
+        self.emit8(0x87);
+        self.emit8(0x82);
+        self.emit32(0xA8); // xchg eax, [r10 + 0xA8]
+        self.emit8(0x85);
+        self.emit8(0xC0);
+        const fm_got_lock = self.emitJccReloc(0x4, .code_offset, 0, 0);
+        self.emit8(0xF3);
+        self.emit8(0x90);
+        _ = self.emitJmpReloc(.code_offset, fm_spin, 0);
+        self.relocs[fm_got_lock].target_id = self.code_len;
+        self.relocs[fm_skip_lock].target_id = self.code_len;
+
         self.emit8(0x49);
         self.emit8(0x8B);
         self.emit8(0x8A);
@@ -7995,6 +8564,16 @@ pub const IRCodegen = struct {
         self.emit8(0x39);
         self.emit8(0x38); // cmp [r8], rdi
         const fm_dir_next = self.emitJccReloc(0x5, .code_offset, 0, 0);
+        self.emit8(0x49);
+        self.emit8(0x8B);
+        self.emit8(0x40);
+        self.emit8(0x08); // mov rax, [r8 + 8]
+        self.emit8(0x48);
+        self.emit8(0xC1);
+        self.emit8(0xE8);
+        self.emit8(62); // shr rax, 62
+        self.emitCmpRegImm32(0, 1); // only transition LIVE_MMAP (kind == 1)
+        const fm_dir_next2 = self.emitJccReloc(0x5, .code_offset, 0, 0);
         self.emit8(0x48);
         self.emit8(0x8D);
         self.emit8(0x04);
@@ -8009,6 +8588,7 @@ pub const IRCodegen = struct {
         self.emit8(0x08); // mov [r8 + 8], rax
         const fm_dir_found = self.emitJmpReloc(.code_offset, 0, 0);
         self.relocs[fm_dir_next].target_id = self.code_len;
+        self.relocs[fm_dir_next2].target_id = self.code_len;
         self.emitAluRegImm32(0, 8, 16);
         self.emit8(0x48);
         self.emit8(0xFF);
@@ -8016,6 +8596,12 @@ pub const IRCodegen = struct {
         _ = self.emitJccReloc(0x5, .code_offset, fm_dir_loop, 0);
         self.relocs[fm_dir_found].target_id = self.code_len;
         self.relocs[fm_dir_done].target_id = self.code_len;
+
+        self.emit8(0x49);
+        self.emit8(0xC7);
+        self.emit8(0x82);
+        self.emit32(0xA8);
+        self.emit32(0); // release region_lock [r10 + 0xA8] = 0
 
         self.xorReg(8, 8);
         self.xorReg(11, 11);

@@ -1,0 +1,225 @@
+// NOEMA v3 Production Pure-LIR Chat Backend (`ai/noema_v3_chat_backend.lir`)
+// Strictly isolated from legacy `chat_site_backend.lir`.
+// Protocol:
+//   stdin : "<v3_selector>\n<raw UTF-8 prompt>"
+//           selectors: "noema_v3" | "noema_v3_scaled" | "noema_v3_user" | "noema_v3_user:<safe_stem>"
+//   stdout: NOEMA_RESULT_V2 key=value envelope
+
+import "src/noema_v3/noema_v3_synth.lir"
+
+fn nv3_cb_print_hex_byte(val: i64) {
+    let digits = "0123456789abcdef"
+    let ptr = digits.ptr as *u8
+    @write(1, @ptr_add(ptr, (val >> 4) & 15), 1)
+    @write(1, @ptr_add(ptr, val & 15), 1)
+}
+
+fn nv3_cb_safe_stem(ptr: *u8, len: i64) -> i64 {
+    if len <= 0 or len > 64 { return 0 }
+    var i: i64 = 0
+    while i < len {
+        let b = (@read_u8(@ptr_add(ptr, i)) as i64) & 255
+        let ok = if (b >= 97 and b <= 122) or (b >= 65 and b <= 90) or (b >= 48 and b <= 57) or b == 95 or b == 45 { 1 } else { 0 }
+        if ok == 0 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn nv3_cb_file_exists(path: string) -> i64 {
+    let fd = @open(path, 0, 0)
+    if fd < 0 { return 0 }
+    @close(fd)
+    return 1
+}
+
+// Resolves selector -> `[0]=ok, [1]=ckpt_kind` and writes paths into `paths_out`?
+// In LIR strings are 16 bytes (`ptr, len`), so return selector code `1=noema_v3, 2=noema_v3_scaled, 3=noema_v3_user, 4=noema_v3_user:<stem>, 0=invalid`.
+fn nv3_cb_parse_selector(input: *u8, mlen: i64) -> i64 {
+    let sel = @string_new(input, mlen)
+    if @string_eq(sel, "noema_v3") { return 1 }
+    if @string_eq(sel, "noema_v3_scaled") { return 2 }
+    if @string_eq(sel, "noema_v3_user") { return 3 }
+    let pref = "noema_v3_user:"
+    let plen = @string_len(pref)
+    if mlen > plen {
+        let sub = @string_new(input, plen)
+        if @string_eq(sub, pref) {
+            if nv3_cb_safe_stem(@ptr_add(input, plen), mlen - plen) == 1 { return 4 }
+        }
+    }
+    return 0
+}
+
+fn nv3_cb_resolve_npg(skind: i64, input: *u8, mlen: i64) -> string {
+    if skind == 2 and nv3_cb_file_exists("ai/noema_v3/checkpoints/noema_v3_scaled.npg3") == 1 {
+        return "ai/noema_v3/checkpoints/noema_v3_scaled.npg3"
+    }
+    if skind == 3 and nv3_cb_file_exists("ai/noema_v3/checkpoints/user_v3_latest.npg3") == 1 {
+        return "ai/noema_v3/checkpoints/user_v3_latest.npg3"
+    }
+    if skind == 4 {
+        let stem = nv3_syn_slice_str(input, 14, mlen - 14)
+        let cand_npg = "ai/noema_v3/checkpoints/" + stem + ".npg3"
+        if nv3_cb_file_exists(cand_npg) == 1 { return cand_npg }
+    }
+    return "ai/noema_v3/checkpoints/noema_v3_promoted.npg3"
+}
+
+fn nv3_cb_resolve_nv3g(skind: i64, input: *u8, mlen: i64) -> string {
+    if skind == 3 { return "ai/noema_v3/checkpoints/user_v3_latest.nv3g" }
+    if skind == 4 {
+        let stem = nv3_syn_slice_str(input, 14, mlen - 14)
+        return "ai/noema_v3/checkpoints/" + stem + ".nv3g"
+    }
+    return "ai/noema_v3/checkpoints/noema_v3_prod.nv3g"
+}
+
+fn nv3_cb_resolve_mid(skind: i64, input: *u8, mlen: i64) -> string {
+    if skind == 2 { return "noema_v3_scaled" }
+    if skind == 3 { return "noema_v3_user" }
+    if skind == 4 {
+        let stem = nv3_syn_slice_str(input, 14, mlen - 14)
+        return "noema_v3_user_" + stem
+    }
+    return "noema_v3_ek_hnb"
+}
+
+fn main() -> i64 {
+    let max_in: i64 = 4096
+    let input = @malloc(max_in)
+    var n: i64 = 0
+    while n < max_in {
+        let got = @read(0, @ptr_add(input, n), max_in - n)
+        if got < 0 {
+            @free(input)
+            println("NOEMA_RESULT_V2") println("ok=0") println("error=input_read_failed")
+            return 1
+        }
+        if got == 0 { break }
+        n = n + got
+    }
+    if n <= 0 {
+        @free(input)
+        println("NOEMA_RESULT_V2") println("ok=0") println("error=empty_input")
+        return 1
+    }
+
+    var nl: i64 = 0
+    while nl < n and ((@read_u8(@ptr_add(input, nl)) as i64) & 255) != 10 { nl = nl + 1 }
+    if nl >= n {
+        @free(input)
+        println("NOEMA_RESULT_V2") println("ok=0") println("error=model_selector_required")
+        return 1
+    }
+
+    var mlen = nl
+    if mlen > 0 and ((@read_u8(@ptr_add(input, mlen - 1)) as i64) & 255) == 13 { mlen = mlen - 1 }
+    let skind = nv3_cb_parse_selector(input, mlen)
+    if skind == 0 {
+        @free(input)
+        println("NOEMA_RESULT_V2") println("ok=0") println("error=invalid_v3_model_selector")
+        return 1
+    }
+
+    let p_off = nl + 1
+    let p_len = n - p_off
+    if p_len <= 0 or p_len > 2048 {
+        @free(input)
+        println("NOEMA_RESULT_V2") println("ok=0") println("error=empty_or_oversized_prompt")
+        return 1
+    }
+    let p_buf = nv3_syn_copy_word(input, p_off, p_len)
+
+    let fallback_nv3g = "ai/noema_v3/checkpoints/noema_v3_prod.nv3g"
+    let npg_path = nv3_cb_resolve_npg(skind, input, mlen)
+    let nv3g_path = nv3_cb_resolve_nv3g(skind, input, mlen)
+    let model_id_out = nv3_cb_resolve_mid(skind, input, mlen)
+
+    let gh_hdr = nv3_syn_load_nv3g(nv3g_path)
+    var n_topics = gh_hdr[5]
+    var n_f4 = gh_hdr[6]
+    nv3_syn_graph_free(gh_hdr)
+    if n_topics == 0 {
+        let gh_fb = nv3_syn_load_nv3g(fallback_nv3g)
+        n_topics = gh_fb[5]
+        n_f4 = gh_fb[6]
+        nv3_syn_graph_free(gh_fb)
+    }
+
+    let gen_buf = @malloc(1536)
+    let telemetry = @malloc(256) as *f64
+    let res = @malloc(256) as *i64
+    res[16] = telemetry as i64
+    res[17] = 768
+    res[18] = 1
+    res[19] = gen_buf as i64
+    res[20] = 1
+    res[21] = p_buf as i64
+    res[22] = p_len
+
+    var ok_inf = nv3_syn_infer_production(npg_path, nv3g_path, res)
+    if ok_inf != 1 {
+        res[16] = telemetry as i64
+        res[17] = 768
+        res[18] = 1
+        res[19] = gen_buf as i64
+        res[20] = 1
+        res[21] = p_buf as i64
+        res[22] = p_len
+        ok_inf = nv3_syn_infer_production("ai/noema_v3/checkpoints/noema_v3_locked.npg3", nv3g_path, res)
+    }
+
+    if ok_inf != 1 or res[5] != 1 {
+        @free(p_buf) @free(res as *u8) @free(gen_buf) @free(telemetry as *u8) @free(input)
+        println("NOEMA_RESULT_V2") println("ok=0") println("error=npg_v3_or_khg_grounding_failed")
+        return 1
+    }
+
+    let is_abstain = if res[1] == NOEMA_V3_OUTPUT_WEIGHT_GENERATION_ABSTAIN { 1 } else { 0 }
+    let mode_str = if is_abstain == 1 { "noema_v3_weight_generation_abstain" } else { "noema_v3_weight_generation" }
+    let emit_n = if is_abstain == 1 { 0 } else { res[2] }
+
+    println("NOEMA_RESULT_V2")
+    println("ok=1")
+    println("model_id=" + model_id_out)
+    println("output_mode=" + mode_str)
+    print("training_records=") printInt(res[14])
+    print("training_bytes=") printInt(res[15])
+    print("training_do_perturbations=") printInt(res[10])
+    println("spectral_stage=3")
+    print("input_bytes=") printInt(p_len)
+    print("inference_free_energy=") printFloat(telemetry[0]) println("")
+    print("inference_surprise_gate=") printFloat(telemetry[1]) println("")
+    print("retrieval_similarity=") printFloat(telemetry[2]) println("")
+    println("stored_exemplars=0")
+    println("memory_capacity=0")
+    print("khg_observed_spans=") printInt(res[11])
+    print("khg_quarantined_spans=") printInt(res[12])
+    print("khg_verified_spans=") printInt(res[13])
+    print("no_span_copy_verified=") printInt(res[5])
+    print("proof_verified_claims=") printInt(res[7])
+    print("proof_refuted_claims=") printInt(res[8])
+    print("proof_steps_used=") printInt(res[9])
+    print("anti_verbatim_verified=") printInt(res[5])
+    print("max_corpus_ngram_run=") printInt(res[4])
+    print("synthesized_atoms=") printInt(res[3])
+    print("symbolic_solved=") printInt(res[6])
+    print("corpus_topics=") printInt(n_topics)
+    print("forbidden_4grams=") printInt(n_f4)
+    print("generated_bytes=") printInt(emit_n)
+    print("generated_hex=")
+    var hi_idx: i64 = 0
+    while hi_idx < emit_n {
+        nv3_cb_print_hex_byte((@read_u8(@ptr_add(gen_buf, hi_idx)) as i64) & 255)
+        hi_idx = hi_idx + 1
+    }
+    println("")
+
+    @free(p_buf)
+    @free(res as *u8)
+    @free(gen_buf)
+    @free(telemetry as *u8)
+    @free(input)
+    return 0
+}

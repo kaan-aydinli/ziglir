@@ -2348,7 +2348,7 @@ fn ensureBlockConst(
 fn localConstantFoldAndLVN(f: *IRFn) bool {
     var changed = false;
 
-    var const_known: [MAX_TRACKED_VREGS]bool = undefined;
+    var const_known: [MAX_TRACKED_VREGS]bool = .{false} ** MAX_TRACKED_VREGS;
     var const_val: [MAX_TRACKED_VREGS]i64 = undefined;
     // `def_inst` is stamped with the owning block instead of being cleared to
     // null: only the current block's definitions are observable (the consumers
@@ -2357,7 +2357,7 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
     // generation stamp keeps the "cleared every block" semantics while touching
     // only the entries this block defined.
     var def_inst: [MAX_TRACKED_VREGS]u16 = undefined;
-    var def_gen: [MAX_TRACKED_VREGS]u16 = undefined;
+    var def_gen: [MAX_TRACKED_VREGS]u16 = .{0xFFFF} ** MAX_TRACKED_VREGS;
     var expr_table: [128]ExprKey = undefined;
     // Vregs whose `const_known` entry is currently true, so the next block can
     // clear them without scanning the whole table.
@@ -2634,7 +2634,15 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
                             const dii = def_inst[inst.src1];
                             if (dii < b.inst_count and b.insts[dii].dest == inst.src1) {
                                 const prev = b.insts[dii];
-                                if (prev.src2 > 0 and prev.src2 < MAX_TRACKED_VREGS and const_known[prev.src2]) {
+                                // In-place update: `x = x + c1; x = x + c2` (the shape a
+                                // loop-carried counter takes after out-of-SSA destruction)
+                                // means the second instruction's source ALREADY holds the
+                                // first addition, so folding both constants would add c2
+                                // twice per iteration. prev.src1 reading prev.dest or
+                                // inst.dest is exactly the pattern this pass reads on the
+                                // *next* iteration, not within this block.
+                                const in_place = prev.src1 == inst.dest or prev.src1 == prev.dest or prev.dest == inst.dest;
+                                if (!in_place and prev.src2 > 0 and prev.src2 < MAX_TRACKED_VREGS and const_known[prev.src2]) {
                                     const c1 = const_val[prev.src2];
                                     const c2 = bv;
                                     var folded_c: ?i64 = null;
@@ -3216,11 +3224,16 @@ fn deadCodeElimination(f: *IRFn, level: OptLevel) bool {
     // `gen` is bumped once per call; a slot is live exactly when it was stamped.
     const live_gen = struct {
         var counter: u32 = 0;
+        var inst_live: [MAX_BLOCKS_PER_FN][MAX_INSTS_PER_BLOCK]u32 =
+            .{.{0} ** MAX_INSTS_PER_BLOCK} ** MAX_BLOCKS_PER_FN;
     };
     live_gen.counter +%= 1;
-    if (live_gen.counter == 0) live_gen.counter = 1; // 0 means "never stamped"
+    if (live_gen.counter == 0) {
+        @memset(std.mem.asBytes(&live_gen.inst_live), 0);
+        live_gen.counter = 1; // 0 means "never stamped"
+    }
     const cur_gen: u32 = live_gen.counter;
-    var inst_live: [MAX_BLOCKS_PER_FN][MAX_INSTS_PER_BLOCK]u32 = undefined;
+    const inst_live = &live_gen.inst_live;
 
     const markInputs = struct {
         fn call(inst: IRInst, vlive: *[MAX_TRACKED_VREGS]bool) bool {
@@ -3487,20 +3500,28 @@ fn coalesceCopiesPostSSA(f: *IRFn) bool {
             const di = def_i orelse continue;
             if (b.insts[di].op == .phi or b.insts[di].op.isTerminator()) continue;
 
+            // Nothing may read or write `dst` between the definition and the
+            // copy (otherwise those reads would see the moved value), and
+            // nothing may redefine `src` in that window either: the copy reads
+            // `src` at `j`, so renaming the earlier definition would leave
+            // `dst` holding a value the copy never saw.
             var safe = true;
             var m: u16 = di + 1;
             while (m < j) : (m += 1) {
                 const mi = b.insts[m];
-                if (mi.dest == dst or instReadsVreg(mi, dst)) {
+                if (mi.dest == dst or mi.dest == src or instReadsVreg(mi, dst)) {
                     safe = false;
                     break;
                 }
             }
-            // Renaming the definition to `dst` turns it into a second definition
-            // of `dst` inside this block. That is only harmless when `dst` has no
-            // readers between the definition and the copy: otherwise those reads
-            // now see the wrong value. It also needs `dst` not to be written
-            // twice, or the block has two definitions of one name.
+            // `dst` must have exactly one definition in the function: renaming
+            // turns the moved instruction into a second definition of the same
+            // name, and two definitions of one name in a block have no defined
+            // ordering. Relaxing this to "one definition per block" was tried
+            // (it lets the loop-carried counter collapse to `i = i + 1`, which
+            // in turn makes the counted-loop unroller fire) but the unroller is
+            // not yet able to rename those in-place updates correctly and
+            // produced wrong answers for `a = b; b = t` style swaps.
             if (safe and def_cnt[dst] != 1) safe = false;
             if (safe) {
                 b.insts[di].dest = dst;

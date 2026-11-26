@@ -1,0 +1,1064 @@
+// LEGACY / ISOLATED (NOEMA v3 Phase 0): exemplar-retrieval pretrain prototype.
+// This file is NOT NOEMA v3 weight-generation. New work belongs under ai/src/noema_v3/.
+// Do not report this path as noema_v3_weight_generation; output_mode must remain
+// legacy_retrieval_exemplar when served through legacy backends.
+//
+// NOEMA-Phi pretraining and inference prototype, LIR-only model execution.
+// Raw UTF-8 byte streams; no tokenizer, fixed vocabulary, attention/softmax,
+// MLP, backprop tape, or external optimizer. The online core is bounded field
+// evolution over four sparse cavities and eight phase streams.
+import "noema_phi_atlas.lir"
+import "noema_phi_etd.lir"
+const NP_C_MIN: i64 = 64
+const NP_MAX_STATE_FLOATS: i64 = 1152921504606846975
+const NP_K: i64 = 4
+const NP_R: i64 = 4
+const NP_B: i64 = 8
+const NP_SIG: i64 = 8
+const NP_MODES: i64 = 5
+const NP_DO_EVERY: i64 = 8
+const NP_KONS: i64 = 16
+const NP_RING: i64 = 256
+const NP_DT: f64 = 0.15
+const NP_DT_COARSE: f64 = 0.30
+const NP_SIG_MIN: f64 = 0.0-2.5
+const NP_SIG_MAX: f64 = 2.5
+const NP_U_MAX: f64 = 3.0
+const NP_B_MAX: f64 = 0.85
+const NP_ALPHA_S: f64 = 0.001
+const NP_ALPHA_U: f64 = 0.0005
+const NP_ALPHA_B: f64 = 0.0008
+const NP_MARGIN: f64 = 1.25
+const NP_M: f64 = 1.5
+const NP_FLOOR: f64 = 0.000000000001
+const NP_THETA_SNR: f64 = 0.0001
+const NP_MEM_SLOTS: i64 = 256
+const NP_MEM_BYTES: i64 = 256
+const NP_MEM_FEATURES: i64 = 512
+const NP_MEM_MIN_SCORE: f64 = 0.22
+const NP_META: i64 = 32
+const NP_C: i64 = 0
+const NP_D: i64 = 1
+const NP_N: i64 = 2
+const NP_DOCS: i64 = 3
+const NP_STAGE: i64 = 4
+const NP_PRNG: i64 = 5
+const NP_DO: i64 = 6
+const NP_GSUM: i64 = 7
+const NP_GN: i64 = 8
+const NP_KCOUNT: i64 = 9
+const NP_FBAR: i64 = 10
+const NP_EARLY: i64 = 11
+const NP_TRAIN_BYTES: i64 = 12
+const NP_DOMAIN: i64 = 13
+const NP_LAST_F: i64 = 14
+const NP_LAST_GATE: i64 = 15
+const NP_LAST_INPUT: i64 = 16
+const NP_LAST_OUTPUT: i64 = 17
+const NP_RINGHEAD: i64 = 18
+const NP_RINGCOUNT: i64 = 19
+const NP_RESET_COUNT: i64 = 20
+const NP_LEARN_COUNT: i64 = 21
+const NP_STAGE_DOCS: i64 = 22
+const NP_PLATEAU: i64 = 23
+const NP_NUMERIC_FAILURES: i64 = 24
+const NP_MEM_COUNT: i64 = 25
+const NP_MEM_NEXT: i64 = 26
+const NP_LAST_MATCH: i64 = 27
+const NP_MEM_CAP: i64 = 28
+const NP_AUTO_LAST_MACROS: i64 = 29
+const NP_AUTO_MACRO_SUM: i64 = 30
+const NP_AUTO_MACRO_COUNT: i64 = 31
+const NP_ETA0: f64 = 0.2
+const NP_LAMBDA0: f64 = 0.001
+const NP_PI2: f64 = 6.283185307179586
+
+fn np_c(st: *f64) -> i64 { return st[NP_C] as i64 }
+fn np_d(st: *f64) -> i64 { return st[NP_D] as i64 }
+fn np_n(st: *f64) -> i64 { return st[NP_N] as i64 }
+fn np_sig_off() -> i64 { return NP_META }
+fn np_sigma_off(st: *f64) -> i64 { return NP_META+np_c(st)*NP_SIG }
+fn np_bias_off(st: *f64) -> i64 { return np_sigma_off(st)+np_c(st) }
+fn np_u_off(st: *f64) -> i64 { return np_bias_off(st)+np_c(st)*np_d(st) }
+fn np_field_off(st: *f64) -> i64 { return np_u_off(st)+np_c(st)*np_d(st)*NP_R }
+fn np_field_len(st: *f64) -> i64 { return NP_K*NP_B*np_n(st) }
+fn np_array(st: *f64, a: i64) -> i64 { return np_field_off(st)+a*np_field_len(st) }
+fn np_orta(st: *f64, i: i64) -> i64 { return np_field_off(st)+8*np_field_len(st)+i }
+fn np_ring(st: *f64, i: i64, j: i64) -> i64 { return np_field_off(st)+8*np_field_len(st)+2*np_n(st)+i*4+j }
+fn np_scratch_off(st: *f64) -> i64 { return np_field_off(st)+8*np_field_len(st)+2*np_n(st)+NP_RING*4 }
+fn np_mem_capacity(st: *f64) -> i64 { return st[NP_MEM_CAP] as i64 }
+fn np_mem_len_off(st: *f64) -> i64 { return np_scratch_off(st)+64 }
+fn np_mem_feat_off(st: *f64) -> i64 { return np_mem_len_off(st)+np_mem_capacity(st) }
+fn np_mem_bytes_off(st: *f64) -> i64 { return (np_mem_feat_off(st)+np_mem_capacity(st)*NP_MEM_FEATURES)*8 }
+fn np_mem_query_off(st: *f64) -> i64 { return np_mem_bytes_off(st)+np_mem_capacity(st)*NP_MEM_BYTES }
+fn np_mem_bytes_ptr(st: *f64,slot: i64) -> *u8 { return @ptr_add(st as *u8,np_mem_bytes_off(st)+slot*NP_MEM_BYTES) }
+fn np_at(slot: i64, stream: i64, cell: i64, n: i64) -> i64 { return (slot*NP_B+stream)*n+cell }
+fn np_sig(_st: *f64, card: i64, j: i64) -> i64 { return np_sig_off()+card*NP_SIG+j }
+fn np_sigma(st: *f64, card: i64) -> i64 { return np_sigma_off(st)+card }
+fn np_bias(st: *f64, card: i64, j: i64) -> i64 { return np_bias_off(st)+card*np_d(st)+j }
+fn np_metric(st: *f64, card: i64, r: i64, j: i64) -> i64 { return np_u_off(st)+(card*NP_R+r)*np_d(st)+j }
+fn np_size_add(a:i64,b:i64) -> i64 {
+    if a<0 or b<0 or a>NP_MAX_STATE_FLOATS-b { return -1 }
+    return a+b
+}
+fn np_size_mul(a:i64,b:i64) -> i64 {
+    if a<0 or b<0 { return -1 }
+    if a==0 or b==0 { return 0 }
+    if a>NP_MAX_STATE_FLOATS/b { return -1 }
+    return a*b
+}
+fn np_state_floats_legacy(cards: i64,dim_d: i64,dim_n: i64) -> i64 {
+    if cards<=0 or dim_d<=0 or dim_n<=0 { return -1 }
+    let card_dim=np_size_mul(cards,dim_d)
+    if card_dim<0 { return -1 }
+    let card_rank=np_size_mul(card_dim,NP_R)
+    let field=np_size_mul(NP_K*NP_B*8,dim_n)
+    let twice_dim=np_size_mul(2,dim_n)
+    if card_rank<0 or field<0 or twice_dim<0 { return -1 }
+    var total=NP_META
+    total=np_size_add(total,np_size_mul(cards,NP_SIG))
+    total=np_size_add(total,cards)
+    total=np_size_add(total,card_dim)
+    total=np_size_add(total,card_rank)
+    total=np_size_add(total,field)
+    total=np_size_add(total,twice_dim)
+    total=np_size_add(total,NP_RING*4+64)
+    return total
+}
+fn np_state_floats_cap(cards: i64,dim_d: i64,dim_n: i64,memory_slots: i64) -> i64 {
+    if memory_slots<=0 { return -1 }
+    var total=np_state_floats_legacy(cards,dim_d,dim_n)
+    if total<0 { return -1 }
+    total=np_size_add(total,memory_slots)
+    total=np_size_add(total,np_size_mul(memory_slots,NP_MEM_FEATURES))
+    total=np_size_add(total,np_size_mul(memory_slots,NP_MEM_BYTES/8))
+    total=np_size_add(total,NP_MEM_FEATURES)
+    return total
+}
+fn np_state_floats(cards: i64,dim_d: i64,dim_n: i64) -> i64 { return np_state_floats_cap(cards,dim_d,dim_n,NP_MEM_SLOTS) }
+
+fn np_rand(st: *f64) -> f64 {
+    let x = @wrapping_add(@wrapping_mul(st[NP_PRNG] as i64,1103515245),12345) & 2147483647
+    st[NP_PRNG] = x as f64
+    return x as f64/2147483648.0
+}
+fn np_finite(x: f64) -> i64 {
+    if x!=x { return 0 }
+    if @fabs(x)>1.0e300 { return 0 }
+    return 1
+}
+fn np_exp(x: f64) -> f64 {
+    let y = @clamp(x,0.0-30.0,30.0)
+    let k = @floor(y/0.6931471805599453) as i64
+    let r = y-k as f64*0.6931471805599453
+    let r2=r*r
+    let r3=r2*r
+    let r4=r3*r
+    return (1.0+r+r2/2.0+r3/6.0+r4/24.0)*np_pow2(k)
+}
+fn np_pow2(k: i64) -> f64 {
+    var v: f64 = 1.0
+    var i: i64 = 0
+    if k >= 0 { while i < k { v=v*2.0 i=i+1 } }
+    else { while i < 0-k { v=v*0.5 i=i+1 } }
+    return v
+}
+fn np_phase_real(q: i64) -> f64 { if q==0 { return 1.0 } if q==2 { return 0.0-1.0 } return 0.0 }
+fn np_phase_imag(q: i64) -> f64 { if q==1 { return 1.0 } if q==3 { return 0.0-1.0 } return 0.0 }
+fn np_phase_quadrant(x: f64,y: f64) -> i64 {
+    if x>=0.0 and y>=0.0 { return if x>=y { 0 } else { 1 } }
+    if x<0.0 and y>=0.0 { return if y>=0.0-x { 1 } else { 2 } }
+    if x<0.0 and y<0.0 { return if 0.0-x>=0.0-y { 2 } else { 3 } }
+    return if 0.0-y>=x { 3 } else { 0 }
+}
+
+fn noema_pretrain_create(cards: i64,dim_d: i64,dim_n: i64,seed: i64) -> *f64 {
+    return noema_pretrain_create_with_memory(cards,dim_d,dim_n,seed,NP_MEM_SLOTS)
+}
+fn noema_pretrain_create_with_memory(cards: i64,dim_d: i64,dim_n: i64,seed: i64,memory_slots: i64) -> *f64 {
+    if cards<NP_C_MIN or dim_d<2 or dim_n<8 or memory_slots<=0 { exit(2) }
+    let count=np_state_floats_cap(cards,dim_d,dim_n,memory_slots)
+    if count<=0 or count>NP_MAX_STATE_FLOATS { exit(2) }
+    let st=@malloc(count*8) as *f64
+    if st==0 as *f64 { exit(2) }
+    var i: i64=0
+    while i<count { st[i]=0.0 i=i+1 }
+    st[NP_D]=dim_d as f64
+    st[NP_N]=dim_n as f64
+    st[NP_MEM_CAP]=memory_slots as f64
+    st[NP_PRNG]=(@fabs(seed as f64)%2147483647.0)+1.0
+    i=0
+    while i<cards {
+        st[np_sigma(st,i)]=0.0
+        var j: i64=0
+        while j<NP_SIG { st[np_sig(st,i,j)]=(np_rand(st)*2.0-1.0)*0.2 j=j+1 }
+        j=0
+        while j<dim_d {
+            st[np_bias(st,i,j)]=0.0
+            var r: i64=0
+            while r<NP_R { st[np_metric(st,i,r,j)]=(np_rand(st)*2.0-1.0)*0.05 r=r+1 }
+            j=j+1
+        }
+        i=i+1
+    }
+    st[NP_C]=cards as f64
+    return st
+}
+fn noema_pretrain_expand_memory(st: *f64,new_capacity: i64) -> *f64 {
+    let old_capacity=np_mem_capacity(st)
+    if new_capacity<=old_capacity { return st }
+    let expanded=noema_pretrain_create_with_memory(np_c(st),np_d(st),np_n(st),1,new_capacity)
+    if expanded==0 as *f64 { return 0 as *f64 }
+    let legacy=np_state_floats_legacy(np_c(st),np_d(st),np_n(st))
+    var i:i64=0
+    while i<legacy { expanded[i]=st[i] i=i+1 }
+    expanded[NP_MEM_CAP]=new_capacity as f64
+    let count=st[NP_MEM_COUNT] as i64
+    expanded[NP_MEM_COUNT]=st[NP_MEM_COUNT]
+    expanded[NP_MEM_NEXT]=st[NP_MEM_NEXT]
+    var slot:i64=0
+    while slot<count {
+        expanded[np_mem_len_off(expanded)+slot]=st[np_mem_len_off(st)+slot]
+        i=0
+        while i<NP_MEM_FEATURES {
+            expanded[np_mem_feat_off(expanded)+slot*NP_MEM_FEATURES+i]=st[np_mem_feat_off(st)+slot*NP_MEM_FEATURES+i]
+            i=i+1
+        }
+        let src=np_mem_bytes_ptr(st,slot)
+        let dst=np_mem_bytes_ptr(expanded,slot)
+        i=0
+        while i<NP_MEM_BYTES { @write_u8(@ptr_add(dst,i),@read_u8(@ptr_add(src,i))) i=i+1 }
+        slot=slot+1
+    }
+    noema_pretrain_destroy(st)
+    return expanded
+}
+fn noema_pretrain_destroy(st: *f64) { @free(st as *u8) }
+
+// reset kind 0 clears cross-document context; kind 1 retains the context ring.
+fn noema_pretrain_reset(st: *f64, kind: i64) {
+    var i: i64=0
+    while i<8*np_field_len(st) { st[np_field_off(st)+i]=0.0 i=i+1 }
+    if kind==0 {
+        i=0
+        while i<2*np_n(st) { st[np_orta(st,0)+i]=0.0 i=i+1 }
+        i=0
+        while i<NP_RING*4 { st[np_ring(st,i/4,i%4)]=0.0 i=i+1 }
+        st[NP_RINGHEAD]=0.0 st[NP_RINGCOUNT]=0.0
+        st[NP_RESET_COUNT]=st[NP_RESET_COUNT]+1.0
+    }
+}
+
+// Four damped sinusoidal projections; large records are sampled evenly so
+// preprocessing cost is bounded instead of scaling trig calls with file size.
+const NP_SIG_MAX_SAMPLES: i64 = 8192
+fn np_signature(bytes: *u8,length: i64,out: *f64) {
+    var k: i64=0
+    while k<NP_SIG { out[k]=0.0 k=k+1 }
+    if length<=0 { return }
+    let samples=if length<NP_SIG_MAX_SAMPLES { length } else { NP_SIG_MAX_SAMPLES }
+    let scale=1.0/@sqrt(samples as f64)
+    // Harmonic oscillator recurrence computes the same sampled Fourier
+    // projections without per-byte trigonometric calls or a token table.
+    k=0
+    while k<4 {
+        let w=NP_PI2*(k+1) as f64/(samples+1) as f64
+        let cw=@cos(w)
+        let sw=@sin(w)
+        var phase_re:f64=1.0
+        var phase_im:f64=0.0
+        var sum_re:f64=0.0
+        var sum_im:f64=0.0
+        var i: i64=0
+        while i<samples {
+            let source=(i*length)/samples
+            let x=(@read_u8(@ptr_add(bytes,source)) as i64) as f64/255.0
+            sum_re=sum_re+x*phase_re
+            sum_im=sum_im+x*phase_im
+            let next_re=phase_re*cw-phase_im*sw
+            let next_im=phase_re*sw+phase_im*cw
+            phase_re=next_re phase_im=next_im
+            i=i+1
+        }
+        out[k*2]=sum_re*scale
+        out[k*2+1]=sum_im*scale
+        k=k+1
+    }
+}
+
+// Hash raw UTF-8 byte 5-grams into a normalized resonance signature.
+// This is a fixed internal-memory index, not an external embedding model.
+fn np_text_features(bytes: *u8,length: i64,out: *f64) {
+    var k:i64=0
+    while k<NP_MEM_FEATURES { out[k]=0.0 k=k+1 }
+    var i:i64=0
+    while i+4<length {
+        var hash:i64=0
+        var j:i64=0
+        while j<5 { hash=(hash*257+@read_u8(@ptr_add(bytes,i+j)) as i64+1)&2147483647 j=j+1 }
+        let bucket=(hash%NP_MEM_FEATURES) as i64
+        out[bucket]=out[bucket]+1.0
+        i=i+1
+    }
+    var norm:f64=0.0
+    k=0
+    while k<NP_MEM_FEATURES { norm=norm+out[k]*out[k] k=k+1 }
+    if norm>0.0 {
+        norm=@sqrt(norm)
+        k=0
+        while k<NP_MEM_FEATURES { out[k]=out[k]/norm k=k+1 }
+    }
+}
+
+fn np_memory_has_eligible_line(bytes: *u8,length: i64) -> i64 {
+    var pos:i64=0
+    while pos<length {
+        let line_start=pos
+        while pos<length and (@read_u8(@ptr_add(bytes,pos)) as i64)!=10 { pos=pos+1 }
+        var start=line_start
+        var end=pos
+        if end>start and (@read_u8(@ptr_add(bytes,end-1)) as i64)==13 { end=end-1 }
+        while start<end {
+            let c=@read_u8(@ptr_add(bytes,start)) as i64
+            if c==32 or c==9 { start=start+1 } else { break }
+        }
+        while end>start {
+            let c=@read_u8(@ptr_add(bytes,end-1)) as i64
+            if c==32 or c==9 { end=end-1 } else { break }
+        }
+        if end>start and end-start<=NP_MEM_BYTES { return 1 }
+        if pos<length and (@read_u8(@ptr_add(bytes,pos)) as i64)==10 { pos=pos+1 }
+    }
+    return 0
+}
+
+// Store the first whole, short source line per successful training record.
+// This deterministic anchor keeps training examples reproducible and lets the
+// generator emit an exact per-record validation fixture.
+fn np_memory_add(st: *f64,bytes: *u8,length: i64) {
+    if length<=0 or st[NP_MEM_COUNT]>=np_mem_capacity(st) as f64 { return }
+    var pos:i64=0
+    var found:i64=0
+    while pos<length and found==0 {
+        let line_start=pos
+        while pos<length and (@read_u8(@ptr_add(bytes,pos)) as i64)!=10 { pos=pos+1 }
+        var line_end=pos
+        if line_end>line_start and (@read_u8(@ptr_add(bytes,line_end-1)) as i64)==13 { line_end=line_end-1 }
+        var start=line_start
+        var end=line_end
+        while start<end {
+            let c=@read_u8(@ptr_add(bytes,start)) as i64
+            if c==32 or c==9 { start=start+1 } else { break }
+        }
+        while end>start {
+            let c=@read_u8(@ptr_add(bytes,end-1)) as i64
+            if c==32 or c==9 { end=end-1 } else { break }
+        }
+        if end>start and end-start<=NP_MEM_BYTES {
+            var slot=st[NP_MEM_NEXT] as i64
+            if st[NP_MEM_COUNT]<np_mem_capacity(st) as f64 {
+                slot=st[NP_MEM_COUNT] as i64
+                st[NP_MEM_COUNT]=st[NP_MEM_COUNT]+1.0
+            }
+            st[np_mem_len_off(st)+slot]= (end-start) as f64
+            let feat=@ptr_add(st as *u8,(np_mem_feat_off(st)+slot*NP_MEM_FEATURES)*8) as *f64
+            np_text_features(@ptr_add(bytes,start),end-start,feat)
+            let dst=np_mem_bytes_ptr(st,slot)
+            var j:i64=0
+            while j<NP_MEM_BYTES { @write_u8(@ptr_add(dst,j),0) j=j+1 }
+            j=0
+            while j<end-start { @write_u8(@ptr_add(dst,j),@read_u8(@ptr_add(bytes,start+j))) j=j+1 }
+            if st[NP_MEM_COUNT]>=np_mem_capacity(st) as f64 { st[NP_MEM_NEXT]=((slot+1)%np_mem_capacity(st)) as f64 }
+            found=1
+        }
+        if pos<length and (@read_u8(@ptr_add(bytes,pos)) as i64)==10 { pos=pos+1 }
+    }
+}
+
+fn np_memory_word_byte(value:i64) -> i64 {
+    if (value>=48 and value<=57) or (value>=65 and value<=90) or (value>=97 and value<=122) or value>=128 { return 1 }
+    return 0
+}
+fn np_memory_contains(source: *u8,source_len: i64,query: *u8,query_len: i64) -> i64 {
+    if query_len<8 or query_len>source_len { return 0 }
+    let first=@read_u8(query) as i64
+    var at:i64=0
+    while at+query_len<=source_len {
+        if (@read_u8(@ptr_add(source,at)) as i64)==first {
+            var j:i64=1
+            while j<query_len and @read_u8(@ptr_add(source,at+j))==@read_u8(@ptr_add(query,j)) { j=j+1 }
+            if j==query_len {
+                let left_ok=if at==0 { 1 } else { 1-np_memory_word_byte(@read_u8(@ptr_add(source,at-1)) as i64) }
+                let end=at+query_len
+                let right_ok=if end>=source_len { 1 } else { 1-np_memory_word_byte(@read_u8(@ptr_add(source,end)) as i64) }
+                if left_ok==1 and right_ok==1 { return 1 }
+            }
+        }
+        at=at+1
+    }
+    return 0
+}
+fn np_memory_exact_slot(st: *f64,prompt: *u8,prompt_len: i64) -> i64 {
+    var slot:i64=0
+    while slot<st[NP_MEM_COUNT] as i64 {
+        let length=st[np_mem_len_off(st)+slot] as i64
+        if np_memory_contains(np_mem_bytes_ptr(st,slot),length,prompt,prompt_len)==1 { return slot }
+        slot=slot+1
+    }
+    return -1
+}
+fn np_memory_lower_byte(value:i64) -> i64 { return if value>=65 and value<=90 { value+32 } else { value } }
+fn np_memory_contains_token(source: *u8,source_len: i64,query: *u8,query_len: i64) -> i64 {
+    if query_len<4 or query_len>source_len { return 0 }
+    let first=np_memory_lower_byte(@read_u8(query) as i64)
+    var at:i64=0
+    while at+query_len<=source_len {
+        if np_memory_lower_byte(@read_u8(@ptr_add(source,at)) as i64)==first {
+            var j:i64=1
+            while j<query_len and np_memory_lower_byte(@read_u8(@ptr_add(source,at+j)) as i64)==np_memory_lower_byte(@read_u8(@ptr_add(query,j)) as i64) { j=j+1 }
+            if j==query_len {
+                let left_ok=if at==0 { 1 } else { 1-np_memory_word_byte(@read_u8(@ptr_add(source,at-1)) as i64) }
+                let end=at+query_len
+                let right_ok=if end>=source_len { 1 } else { 1-np_memory_word_byte(@read_u8(@ptr_add(source,end)) as i64) }
+                if left_ok==1 and right_ok==1 { return 1 }
+            }
+        }
+        at=at+1
+    }
+    return 0
+}
+fn np_memory_token_overlap(source: *u8,source_len: i64,query: *u8,query_len: i64) -> i64 {
+    var at:i64=0
+    while at<query_len {
+        while at<query_len and np_memory_word_byte(@read_u8(@ptr_add(query,at)) as i64)==0 { at=at+1 }
+        let start=at
+        while at<query_len and np_memory_word_byte(@read_u8(@ptr_add(query,at)) as i64)==1 { at=at+1 }
+        let token_len=at-start
+        if token_len>=4 and np_memory_contains_token(source,source_len,@ptr_add(query,start),token_len)==1 { return 1 }
+    }
+    return 0
+}
+fn np_memory_retrieve(st: *f64,prompt: *u8,prompt_len: i64,output: *u8,capacity: i64) -> i64 {
+    st[NP_LAST_MATCH]=0.0
+    if prompt_len<5 or capacity<=0 or st[NP_MEM_COUNT]<=0.0 { return 0 }
+    let exact_slot=np_memory_exact_slot(st,prompt,prompt_len)
+    if exact_slot>=0 {
+        var exact_count=st[np_mem_len_off(st)+exact_slot] as i64
+        if exact_count>capacity { exact_count=capacity }
+        st[NP_LAST_MATCH]=1.0
+        let exact_src=np_mem_bytes_ptr(st,exact_slot)
+        var exact_i:i64=0
+        while exact_i<exact_count { @write_u8(@ptr_add(output,exact_i),@read_u8(@ptr_add(exact_src,exact_i))) exact_i=exact_i+1 }
+        return exact_count
+    }
+    let query=@ptr_add(st as *u8,np_mem_query_off(st)) as *f64
+    np_text_features(prompt,prompt_len,query)
+    var best_score=0.0-1.0
+    var best_slot:i64=0
+    var slot:i64=0
+    while slot<st[NP_MEM_COUNT] as i64 {
+        let text_len=st[np_mem_len_off(st)+slot] as i64
+        if np_memory_token_overlap(np_mem_bytes_ptr(st,slot),text_len,prompt,prompt_len)==1 {
+            let feat=@ptr_add(st as *u8,(np_mem_feat_off(st)+slot*NP_MEM_FEATURES)*8) as *f64
+            var score:f64=0.0
+            var j:i64=0
+            while j<NP_MEM_FEATURES { score=score+query[j]*feat[j] j=j+1 }
+            if score>best_score { best_score=score best_slot=slot }
+        }
+        slot=slot+1
+    }
+    st[NP_LAST_MATCH]=if best_score<0.0 { 0.0 } else { best_score }
+    if best_score<NP_MEM_MIN_SCORE { return 0 }
+    var count=st[np_mem_len_off(st)+best_slot] as i64
+    if count>capacity { count=capacity }
+    let src=np_mem_bytes_ptr(st,best_slot)
+    var i:i64=0
+    while i<count { @write_u8(@ptr_add(output,i),@read_u8(@ptr_add(src,i))) i=i+1 }
+    return count
+}
+
+fn noema_pretrain_memory_count(st: *f64) -> i64 { return st[NP_MEM_COUNT] as i64 }
+fn noema_pretrain_memory_capacity(st: *f64) -> i64 { return np_mem_capacity(st) }
+fn noema_pretrain_last_match(st: *f64) -> f64 { return st[NP_LAST_MATCH] }
+
+// Select exactly four sparse cards through the shared hierarchical resonance
+// atlas. Temporary bounds are built from the persisted card signatures; the
+// exact branch-and-bound selector is deterministic with a direct-scan fallback.
+fn np_select(st: *f64,sig: *f64,ids: *f64) {
+    let cards=np_c(st)
+    var base:i64=1
+    while base<cards { base=base*2 }
+    let signatures=@malloc(cards*NP_SIG*8) as *f64
+    let bounds=@malloc(base*2*8) as *f64
+    let meta=@malloc(4*8) as *f64
+    let scores=@malloc(NP_K*8) as *f64
+    let stack=@malloc(64*8) as *f64
+    var card:i64=0
+    while card<cards {
+        var j:i64=0
+        while j<NP_SIG { signatures[card*NP_SIG+j]=st[np_sig(st,card,j)] j=j+1 }
+        card=card+1
+    }
+    meta[0]=cards as f64 meta[1]=NP_SIG as f64 meta[2]=base as f64 meta[3]=NP_K as f64
+    let built=noema_phi_atlas_build_bounds(signatures,cards,NP_SIG,base,bounds)
+    var selected:i64=0
+    if built==1 { selected=noema_phi_atlas_select(sig,signatures,bounds,meta,ids,scores,stack) }
+    if selected!=NP_K {
+        var pick:i64=0
+        while pick<NP_K {
+            var best=-1.0e300
+            var best_card:i64=0
+            card=0
+            while card<cards {
+                var used:i64=0
+                var t:i64=0
+                while t<pick { if ids[t] as i64==card { used=1 } t=t+1 }
+                if used==0 {
+                    var score:f64=0.0
+                    var j2:i64=0
+                    while j2<NP_SIG { score=score+sig[j2]*st[np_sig(st,card,j2)] j2=j2+1 }
+                    score=score*score
+                    if score>best { best=score best_card=card }
+                }
+                card=card+1
+            }
+            ids[pick]=best_card as f64
+            pick=pick+1
+        }
+    }
+    @free(signatures as *u8) @free(bounds as *u8) @free(meta as *u8)
+    @free(scores as *u8) @free(stack as *u8)
+}
+
+fn np_inject(st: *f64,bytes: *u8,length: i64,ids: *f64,sig: *f64,do_mode: i64,learn: i64) {
+    let n=np_n(st)
+    var slot: i64=0
+    while slot<NP_K {
+        let card=ids[slot] as i64
+        var stream: i64=0
+        while stream<NP_B {
+            var i: i64=0
+            while i<n {
+                var source: i64=0
+                var b: i64=0
+                if length>0 { source=(slot*31+stream*17+i*7)%length b=@read_u8(@ptr_add(bytes,source)) as i64 }
+                let feature=sig[(i+stream+slot)%NP_SIG]
+                var chart: f64=0.0
+                var d: i64=0
+                while d<np_d(st) {
+                    chart=chart+st[np_bias(st,card,d)]*sig[d%NP_SIG]
+                    var r: i64=0
+                    while r<NP_R { chart=chart+st[np_metric(st,card,r,d)]*sig[(d+r)%NP_SIG]/NP_R as f64 r=r+1 }
+                    d=d+1
+                }
+                let energy=(feature/@sqrt(length as f64+1.0)+chart)*np_exp(0.0-2.0*st[np_sigma(st,card)])
+                let q=(b>>((stream%4)*2))&3
+                let amp=0.35+b as f64/255.0*0.25
+                let at=np_at(slot,stream,i,n)
+                let x=energy+amp*np_phase_real(q)+0.05*st[np_orta(st,i)]
+                let y=amp*np_phase_imag(q)+0.05*st[np_orta(st,n+i)]
+                st[np_array(st,0)+at]=x st[np_array(st,1)+at]=y
+                st[np_array(st,2)+at]=0.0 st[np_array(st,3)+at]=0.0
+                // A deterministic one-in-eight-document counterfactual row
+                // reverses the encoded phase variable in the alternate branch.
+                let qcf=if do_mode==1 { (q+2)%4 } else { q }
+                st[np_array(st,4)+at]=energy+amp*np_phase_real(qcf)+0.05*st[np_orta(st,i)]
+                st[np_array(st,5)+at]=amp*np_phase_imag(qcf)+0.05*st[np_orta(st,n+i)]
+                st[np_array(st,6)+at]=0.0 st[np_array(st,7)+at]=0.0
+                i=i+1
+            }
+            stream=stream+1
+        }
+        if learn==1 { st[np_sigma(st,card)]=@clamp(st[np_sigma(st,card)],NP_SIG_MIN,NP_SIG_MAX) }
+        slot=slot+1
+    }
+}
+
+fn np_energy(st: *f64,branch: i64) -> f64 {
+    let n=np_n(st)
+    var e: f64=0.0
+    var slot: i64=0
+    while slot<NP_K {
+        var stream: i64=0
+        while stream<NP_B {
+            var i: i64=0
+            while i<n {
+                let at=np_at(slot,stream,i,n)
+                let x=st[np_array(st,branch)+at]
+                let y=st[np_array(st,branch+1)+at]
+                let p=st[np_array(st,branch+2)+at]
+                let q=st[np_array(st,branch+3)+at]
+                let mag=x*x+y*y
+                let omega=1.0+0.25*i as f64/n as f64
+                e=e+0.5*(p*p+q*q)+0.5*omega*mag+0.125*(mag-1.0)*(mag-1.0)
+                i=i+1
+            }
+            stream=stream+1
+        }
+        slot=slot+1
+    }
+    return e
+}
+
+// Nonlinear half-kick / analytic linear ETD / nonlinear half-kick.
+// The 25/50/75/100% spectral curriculum remains the active-mode cutoff.
+// For this prototype, tau2=.5 and gamma=.06 reproduce the legacy linear
+// damping rate .12; the radial quartic force is derived from np_energy.
+fn np_step(st: *f64,branch: i64,dt: f64,stage: i64) {
+    let n=np_n(st)
+    let cutoff=((stage+1)*n)/4
+    let fields=@malloc(4*8) as *f64
+    let cfg=@malloc(4*8) as *f64
+    cfg[0]=0.5 cfg[1]=0.06 cfg[3]=dt
+    var slot:i64=0
+    while slot<NP_K {
+        var stream:i64=0
+        while stream<NP_B {
+            var i:i64=0
+            while i<cutoff {
+                let at=np_at(slot,stream,i,n)
+                fields[0]=st[np_array(st,branch)+at]
+                fields[1]=st[np_array(st,branch+1)+at]
+                fields[2]=st[np_array(st,branch+2)+at]
+                fields[3]=st[np_array(st,branch+3)+at]
+                let mag=fields[0]*fields[0]+fields[1]*fields[1]
+                fields[2]=fields[2]-0.25*dt*(mag-1.0)*fields[0]
+                fields[3]=fields[3]-0.25*dt*(mag-1.0)*fields[1]
+                cfg[2]=1.0+0.25*i as f64/n as f64
+                if noema_phi_etd_step(fields,cfg)==1 {
+                    let mag2=fields[0]*fields[0]+fields[1]*fields[1]
+                    fields[2]=fields[2]-0.25*dt*(mag2-1.0)*fields[0]
+                    fields[3]=fields[3]-0.25*dt*(mag2-1.0)*fields[1]
+                    st[np_array(st,branch)+at]=fields[0]
+                    st[np_array(st,branch+1)+at]=fields[1]
+                    st[np_array(st,branch+2)+at]=fields[2]
+                    st[np_array(st,branch+3)+at]=fields[3]
+                }
+                i=i+1
+            }
+            stream=stream+1
+        }
+        slot=slot+1
+    }
+    @free(fields as *u8) @free(cfg as *u8)
+}
+
+fn np_gate(delta: f64,ref: f64) -> f64 { return @clamp((0.0-delta-0.001)/(ref+NP_FLOOR),0.0,1.0) }
+fn np_commit_document(st: *f64,length: i64,before: f64,after: f64,gate: f64,do_mode: i64) {
+    st[NP_DOCS]=st[NP_DOCS]+1.0
+    st[NP_TRAIN_BYTES]=st[NP_TRAIN_BYTES]+length as f64
+    st[NP_FBAR]=after
+    st[NP_GSUM]=st[NP_GSUM]+gate
+    st[NP_GN]=st[NP_GN]+1.0
+    if do_mode==1 { st[NP_DO]=st[NP_DO]+1.0 }
+    st[NP_STAGE_DOCS]=st[NP_STAGE_DOCS]+1.0
+    let relative_change=@fabs(after-before)/(@fabs(before)+NP_FLOOR)
+    if relative_change<0.005 { st[NP_PLATEAU]=st[NP_PLATEAU]+1.0 } else { st[NP_PLATEAU]=0.0 }
+    // Unlock the next 25% of spectral modes only after eight plateau records.
+    if st[NP_STAGE]<3.0 and st[NP_STAGE_DOCS]>=8.0 and st[NP_PLATEAU]>=8.0 {
+        st[NP_STAGE]=st[NP_STAGE]+1.0
+        st[NP_STAGE_DOCS]=0.0
+        st[NP_PLATEAU]=0.0
+    }
+}
+/// Deterministic resource planner for automatic corpus training. The spectral
+/// stage sets the base budget; long records and recent useful learning add work,
+/// while recent plateau/early-exit evidence removes it. The cap is caller-owned.
+fn np_auto_macros(st: *f64,length: i64,cap: i64) -> i64 {
+    if length<=0 or cap<=0 or cap>16 or st[NP_NUMERIC_FAILURES]>0.0 { return 0 }
+    var budget=2+st[NP_STAGE] as i64
+    if length>65536 { budget=budget+1 }
+    if length<1024 { budget=budget-1 }
+    if st[NP_DOCS]>0.0 {
+        if st[NP_LAST_GATE]>=0.5 { budget=budget+1 }
+        if st[NP_LAST_GATE]<0.05 and st[NP_PLATEAU]>=2.0 { budget=budget-1 }
+        if st[NP_EARLY]>st[NP_DOCS]/2.0 { budget=budget-1 }
+    }
+    if budget<1 { budget=1 }
+    if budget>cap { budget=cap }
+    return budget
+}
+fn noema_pretrain_auto_macros_suggest(st: *f64,length: i64,cap: i64) -> i64 { return np_auto_macros(st,length,cap) }
+fn noema_pretrain_auto_macros_last(st: *f64) -> i64 { return st[NP_AUTO_LAST_MACROS] as i64 }
+fn noema_pretrain_auto_macros_mean(st: *f64) -> f64 { if st[NP_AUTO_MACRO_COUNT]<=0.0 { return 0.0 } return st[NP_AUTO_MACRO_SUM]/st[NP_AUTO_MACRO_COUNT] }
+fn noema_pretrain_auto_records(st: *f64) -> i64 { return st[NP_AUTO_MACRO_COUNT] as i64 }
+
+fn np_margin(fplus: f64,fminus: f64) -> f64 { return 1.0/(1.0+np_exp(0.0-(fplus-fminus+NP_M)/0.25)) }
+fn np_consolidate(st: *f64,ids: *f64,sig: *f64,gate: f64) {
+    var s: i64=0
+    while s<NP_K {
+        let card=ids[s] as i64
+        var norm: f64=0.0
+        var stream: i64=0
+        while stream<NP_B {
+            var i: i64=0
+            while i<np_n(st) {
+                let at=np_at(s,stream,i,np_n(st))
+                let x=st[np_array(st,0)+at]
+                let y=st[np_array(st,1)+at]
+                norm=norm+x*x+y*y
+                i=i+1
+            }
+            stream=stream+1
+        }
+        let grad=norm/(NP_B*np_n(st)) as f64+NP_LAMBDA0
+        st[np_sigma(st,card)]=@clamp(st[np_sigma(st,card)]-NP_ALPHA_S*gate*(NP_ETA0*grad+0.001*st[np_sigma(st,card)]),NP_SIG_MIN,NP_SIG_MAX)
+        var j: i64=0
+        while j<NP_SIG { st[np_sig(st,card,j)]=st[np_sig(st,card,j)]+NP_ALPHA_S*gate*(sig[j]-st[np_sig(st,card,j)]) j=j+1 }
+        var d: i64=0
+        while d<np_d(st) {
+            let idx=np_bias(st,card,d)
+            st[idx]=st[idx]-NP_ALPHA_B*gate*(NP_ETA0*grad+0.005*st[idx])
+            var r: i64=0
+            while r<NP_R {
+                let ui=np_metric(st,card,r,d)
+                st[ui]=st[ui]-NP_ALPHA_U*gate*(NP_ETA0*grad*st[ui]+0.005*st[ui])
+                r=r+1
+            }
+            d=d+1
+        }
+        s=s+1
+    }
+    st[NP_LEARN_COUNT]=st[NP_LEARN_COUNT]+1.0
+}
+
+fn noema_pretrain_document(st: *f64,bytes: *u8,length: i64,reset: i64,macros: i64) -> f64 {
+    if length<=0 { return 0.0 }
+    // Never silently evict a learned exemplar when the current allocation is
+    // full. The caller can grow the state with noema_pretrain_expand_memory
+    // and retry this document; physical allocation is the only upper bound.
+    if st[NP_MEM_COUNT]>=np_mem_capacity(st) as f64 and np_memory_has_eligible_line(bytes,length)==1 { return 0.0-2.0 }
+    noema_pretrain_reset(st,reset)
+    let scratch=@ptr_add(st as *u8,np_scratch_off(st)*8) as *f64
+    let sig=scratch
+    let ids=@ptr_add(st as *u8,(np_scratch_off(st)+NP_SIG)*8) as *f64
+    np_signature(bytes,length,sig)
+    np_select(st,sig,ids)
+    let do_mode=if (st[NP_DOCS] as i64)%NP_DO_EVERY==NP_DO_EVERY-1 { 1 } else { 0 }
+    np_inject(st,bytes,length,ids,sig,do_mode,1)
+    let before=np_energy(st,0)
+    if np_finite(before)==0 {
+        st[NP_NUMERIC_FAILURES]=st[NP_NUMERIC_FAILURES]+1.0
+        return -1.0
+    }
+    var m: i64=0
+    while m<macros {
+        let dt=if m==0 { NP_DT_COARSE } else { NP_DT }
+        var sub: i64=0
+        while sub<4 {
+            np_step(st,0,dt,st[NP_STAGE] as i64)
+            if do_mode==1 { np_step(st,4,dt,st[NP_STAGE] as i64) }
+            sub=sub+1
+        }
+        if m>0 {
+            var velocity: f64=0.0
+            var i: i64=0
+            while i<np_field_len(st) { velocity=velocity+st[np_array(st,2)+i]*st[np_array(st,2)+i]+st[np_array(st,3)+i]*st[np_array(st,3)+i] i=i+1 }
+            if @sqrt(velocity)<0.001 { st[NP_EARLY]=st[NP_EARLY]+1.0 m=macros } else { m=m+1 }
+        } else { m=m+1 }
+    }
+    let after=np_energy(st,0)
+    if np_finite(after)==0 {
+        st[NP_NUMERIC_FAILURES]=st[NP_NUMERIC_FAILURES]+1.0
+        return -1.0
+    }
+    let gate=np_gate(after-before,before)
+    if do_mode==1 {
+        let fp=np_energy(st,0)
+        let fm=np_energy(st,4)
+        let wm=np_margin(fp,fm)
+        let h=st[NP_RINGHEAD] as i64
+        st[np_ring(st,h,0)]=wm st[np_ring(st,h,1)]=fp st[np_ring(st,h,2)]=fm st[np_ring(st,h,3)]=st[NP_DOCS]
+        st[NP_RINGHEAD]=((h+1)%NP_RING) as f64
+        if st[NP_RINGCOUNT]<NP_RING as f64 { st[NP_RINGCOUNT]=st[NP_RINGCOUNT]+1.0 }
+    }
+    st[NP_KCOUNT]=st[NP_KCOUNT]+1.0
+    if st[NP_KCOUNT]>=NP_KONS as f64 {
+        st[NP_KCOUNT]=0.0
+        if do_mode==0 or np_energy(st,4)-after<=NP_MARGIN*NP_M { np_consolidate(st,ids,sig,gate) }
+    }
+    // Consolidate accounting after each completed document.
+    np_commit_document(st,length,before,after,gate,do_mode)
+    np_memory_add(st,bytes,length)
+    return after
+}
+
+fn noema_pretrain_infer(st: *f64,prompt: *u8,prompt_len: i64,output: *u8,capacity: i64,macros: i64) -> i64 {
+    if prompt_len<=0 or capacity<=0 { return 0 }
+    noema_pretrain_reset(st,0)
+    let scratch=@ptr_add(st as *u8,np_scratch_off(st)*8) as *f64
+    let sig=scratch
+    let ids=@ptr_add(st as *u8,(np_scratch_off(st)+NP_SIG)*8) as *f64
+    np_signature(prompt,prompt_len,sig)
+    np_select(st,sig,ids)
+    np_inject(st,prompt,prompt_len,ids,sig,0,0)
+    let before=np_energy(st,0)
+    if np_finite(before)==0 { st[NP_NUMERIC_FAILURES]=st[NP_NUMERIC_FAILURES]+1.0 return -1 }
+    var m: i64=0
+    while m<macros {
+        let dt=if m==0 { NP_DT_COARSE } else { NP_DT }
+        var sub: i64=0
+        while sub<4 { np_step(st,0,dt,st[NP_STAGE] as i64) sub=sub+1 }
+        m=m+1
+    }
+    let after=np_energy(st,0)
+    if np_finite(after)==0 { st[NP_NUMERIC_FAILURES]=st[NP_NUMERIC_FAILURES]+1.0 return -1 }
+    st[NP_LAST_F]=after st[NP_LAST_GATE]=np_gate(after-before,before)
+    st[NP_LAST_INPUT]=prompt_len as f64
+    // Return a corpus-derived line only when its raw-byte resonance is strong
+    // enough. There is no canned fallback text or synthetic byte stream.
+    let generated=np_memory_retrieve(st,prompt,prompt_len,output,capacity)
+    st[NP_LAST_OUTPUT]=generated as f64
+    return generated
+}
+
+fn noema_pretrain_documents(st: *f64) -> i64 { return st[NP_DOCS] as i64 }
+fn noema_pretrain_stage(st: *f64) -> i64 { return st[NP_STAGE] as i64 }
+fn noema_pretrain_active_cavities() -> i64 { return NP_K }
+fn noema_pretrain_batch_streams() -> i64 { return NP_B }
+fn noema_pretrain_gate_mean(st: *f64) -> f64 { if st[NP_GN]<=0.0 { return 0.0 } return st[NP_GSUM]/st[NP_GN] }
+fn noema_pretrain_do_count(st: *f64) -> i64 { return st[NP_DO] as i64 }
+fn noema_pretrain_training_bytes(st: *f64) -> i64 { return st[NP_TRAIN_BYTES] as i64 }
+fn noema_pretrain_last_energy(st: *f64) -> f64 { return st[NP_LAST_F] }
+fn noema_pretrain_last_gate(st: *f64) -> f64 { return st[NP_LAST_GATE] }
+fn noema_pretrain_last_output_bytes(st: *f64) -> i64 { return st[NP_LAST_OUTPUT] as i64 }
+fn noema_pretrain_early_exits(st: *f64) -> i64 { return st[NP_EARLY] as i64 }
+fn noema_pretrain_numeric_failures(st: *f64) -> i64 { return st[NP_NUMERIC_FAILURES] as i64 }
+
+fn np_checkpoint_checksum(bytes: *u8,length: i64) -> i64 {
+    var hash: i64=2166136261
+    var i: i64=0
+    while i<length {
+        hash=@wrapping_mul(hash^(@read_u8(@ptr_add(bytes,i)) as i64),16777619)&4294967295
+        i=i+1
+    }
+    return hash
+}
+
+fn np_read_exact(fd: i64,dst: *u8,n: i64) -> i64 {
+    var got: i64=0
+    while got<n { let r=@read(fd,@ptr_add(dst,got),n-got) if r<=0 { return got } got=got+r }
+    return got
+}
+fn np_write_exact(fd: i64,src: *u8,n: i64) -> i64 {
+    var sent: i64=0
+    while sent<n { let r=@write(fd,@ptr_add(src,sent),n-sent) if r<=0 { return sent } sent=sent+r }
+    return sent
+}
+
+// Zero-parse .nbin prototype record: u64 LE length, reset u8, domain u8, bytes.
+fn noema_pretrain_nbin_write(fd: i64,bytes: *u8,length: i64,reset: i64,domain: i64) -> i64 {
+    if length<0 or reset<0 or reset>1 or domain<0 or domain>2 { return -1 }
+    let header=@malloc(10) as *u8
+    var i: i64=0
+    while i<8 { @write_u8(@ptr_add(header,i),((length>>(i*8))&255) as u8) i=i+1 }
+    @write_u8(@ptr_add(header,8),reset as u8) @write_u8(@ptr_add(header,9),domain as u8)
+    let h=np_write_exact(fd,header,10)
+    @free(header)
+    if h!=10 { return -1 }
+    return np_write_exact(fd,bytes,length)
+}
+fn np_pretrain_nbin_train_internal(st: *f64,fd: i64,max_records: i64,max_payload: i64,macros: i64,auto_mode: i64) -> i64 {
+    if max_records<0 or max_payload<=0 or (auto_mode!=0 and auto_mode!=1) { return -1 }
+    if auto_mode==1 and (macros<=0 or macros>16) { return -1 }
+    let header=@malloc(10) as *u8
+    let buf0=@malloc(max_payload) as *u8
+    let buf1=@malloc(max_payload) as *u8
+    var count: i64=0
+    var which: i64=0
+    var done: i64=0
+    while count<max_records and done==0 {
+        let nr=np_read_exact(fd,header,10)
+        if nr==0 { done=1 }
+        else if nr!=10 { done=2 }
+        else {
+            var length: i64=0
+            var j: i64=0
+            while j<8 { length=length|((@read_u8(@ptr_add(header,j)) as i64)<<(j*8)) j=j+1 }
+            let reset=@read_u8(@ptr_add(header,8)) as i64
+            let domain=@read_u8(@ptr_add(header,9)) as i64
+            if length<0 or length>max_payload or reset>1 or domain>2 { done=2 }
+            else {
+                var dst=buf0
+                if which==1 { dst=buf1 }
+                if np_read_exact(fd,dst,length)!=length { done=2 }
+                else {
+                    let chosen=if auto_mode==1 { np_auto_macros(st,length,macros) } else { macros }
+                    if chosen<0 or (auto_mode==1 and chosen==0) { done=2 }
+                    else {
+                        st[NP_DOMAIN]=domain as f64
+                        let energy=noema_pretrain_document(st,dst,length,reset,chosen)
+                        if energy<0.0 { done=2 }
+                        else {
+                            count=count+1
+                            which=1-which
+                            if auto_mode==1 {
+                                st[NP_AUTO_LAST_MACROS]=chosen as f64
+                                st[NP_AUTO_MACRO_SUM]=st[NP_AUTO_MACRO_SUM]+chosen as f64
+                                st[NP_AUTO_MACRO_COUNT]=st[NP_AUTO_MACRO_COUNT]+1.0
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    @free(header) @free(buf0) @free(buf1)
+    if done==2 { return -1 }
+    return count
+}
+fn noema_pretrain_nbin_train(st: *f64,fd: i64,max_records: i64,max_payload: i64,macros: i64) -> i64 {
+    return np_pretrain_nbin_train_internal(st,fd,max_records,max_payload,macros,0)
+}
+fn noema_pretrain_nbin_train_auto(st: *f64,fd: i64,max_records: i64,max_payload: i64,macro_cap: i64) -> i64 {
+    return np_pretrain_nbin_train_internal(st,fd,max_records,max_payload,macro_cap,1)
+}
+fn noema_pretrain_nbin_record(st: *f64,fd: i64,macros: i64) -> i64 {
+    let header=@malloc(10) as *u8
+    let got=np_read_exact(fd,header,10)
+    if got==0 { @free(header) return 0 }
+    if got!=10 { @free(header) return -1 }
+    var length: i64=0
+    var i: i64=0
+    while i<8 { length=length|((@read_u8(@ptr_add(header,i)) as i64)<<(i*8)) i=i+1 }
+    let reset=@read_u8(@ptr_add(header,8)) as i64
+    let domain=@read_u8(@ptr_add(header,9)) as i64
+    @free(header)
+    if length<0 or reset>1 or domain>2 { return -1 }
+    let bytes=@malloc(if length>0 { length } else { 1 }) as *u8
+    if np_read_exact(fd,bytes,length)!=length { @free(bytes) return -1 }
+    st[NP_DOMAIN]=domain as f64
+    let energy=noema_pretrain_document(st,bytes,length,reset,macros)
+    @free(bytes)
+    return if energy<0.0 { -1 } else { 1 }
+}
+
+fn np_pack_topic(fd: i64,bytes: *u8,raw_start: i64,raw_end: i64) -> i64 {
+    if raw_start<0 or raw_end<raw_start { return -1 }
+    var i=raw_start
+    var has_content:i64=0
+    while i<raw_end {
+        let c=@read_u8(@ptr_add(bytes,i)) as i64
+        if c!=10 and c!=13 and c!=32 and c!=9 { has_content=1 }
+        i=i+1
+    }
+    if has_content==0 { return 0 }
+    return noema_pretrain_nbin_write(fd,@ptr_add(bytes,raw_start),raw_end-raw_start,0,0)
+}
+fn np_is_veriayrimi(bytes: *u8, length: i64, pos: i64) -> i64 {
+    if pos < 0 or (pos + 12) > length { return 0 }
+    if ((@read_u8(@ptr_add(bytes, pos)) as i64) & 255) != 60 { return 0 }
+    if ((@read_u8(@ptr_add(bytes, pos + 1)) as i64) & 255) != 118 { return 0 }
+    if ((@read_u8(@ptr_add(bytes, pos + 2)) as i64) & 255) != 101 { return 0 }
+    if ((@read_u8(@ptr_add(bytes, pos + 3)) as i64) & 255) != 114 { return 0 }
+    if ((@read_u8(@ptr_add(bytes, pos + 4)) as i64) & 255) != 105 { return 0 }
+    if ((@read_u8(@ptr_add(bytes, pos + 5)) as i64) & 255) != 97 { return 0 }
+    if ((@read_u8(@ptr_add(bytes, pos + 6)) as i64) & 255) != 121 { return 0 }
+    if ((@read_u8(@ptr_add(bytes, pos + 7)) as i64) & 255) != 114 { return 0 }
+    if ((@read_u8(@ptr_add(bytes, pos + 8)) as i64) & 255) != 105 { return 0 }
+    if ((@read_u8(@ptr_add(bytes, pos + 9)) as i64) & 255) != 109 { return 0 }
+    if ((@read_u8(@ptr_add(bytes, pos + 10)) as i64) & 255) != 105 { return 0 }
+    if ((@read_u8(@ptr_add(bytes, pos + 11)) as i64) & 255) != 62 { return 0 }
+    return 1
+}
+fn noema_pretrain_pack_topics(fd: i64,bytes: *u8,length: i64,payload_bytes: *i64) -> i64 {
+    payload_bytes[0]=0
+    if length<0 { return -1 }
+    var start: i64=0
+    var pos: i64=0
+    var count: i64=0
+    while pos < length {
+        if np_is_veriayrimi(bytes, length, pos) == 1 {
+            let wrote = np_pack_topic(fd, bytes, start, pos)
+            if wrote < 0 { return -1 }
+            if wrote > 0 { count = count + 1 payload_bytes[0] = payload_bytes[0] + wrote }
+            // Omit trailing line-ending when <veriayrimi> stands alone on its line
+            var next_pos = pos + 12
+            if pos == 0 or ((@read_u8(@ptr_add(bytes, pos - 1)) as i64) & 255) == 10 {
+                if next_pos < length and ((@read_u8(@ptr_add(bytes, next_pos)) as i64) & 255) == 10 {
+                    next_pos = next_pos + 1
+                } else if (next_pos + 1) < length and ((@read_u8(@ptr_add(bytes, next_pos)) as i64) & 255) == 13 and ((@read_u8(@ptr_add(bytes, next_pos + 1)) as i64) & 255) == 10 {
+                    next_pos = next_pos + 2
+                }
+            }
+            start = next_pos
+            pos = next_pos
+        } else {
+            pos = pos + 1
+        }
+    }
+    let last=np_pack_topic(fd,bytes,start,length)
+    if last<0 { return -1 }
+    if last>0 { count=count+1 payload_bytes[0]=payload_bytes[0]+last }
+    return count
+}
+
+// Flat state snapshot with payload checksum. v4 sizes exemplar memory from the
+// checkpoint; v1-v3 remain readable.
+fn noema_pretrain_save(st: *f64,path: string) -> i64 {
+    let floats=np_state_floats_cap(np_c(st),np_d(st),np_n(st),np_mem_capacity(st))
+    var i:i64=0
+    while i<floats { if np_finite(st[i])==0 { return 0 } i=i+1 }
+    let fd=@open(path,577,420)
+    if fd<0 { return 0 }
+    let header=@malloc(48) as *u8
+    @memset(header,0,48)
+    @write_u8(header,78) @write_u8(@ptr_add(header,1),80) @write_u8(@ptr_add(header,2),83) @write_u8(@ptr_add(header,3),49)
+    @write_u32(@ptr_add(header,4),4 as u32)
+    @write_u64(@ptr_add(header,8),np_c(st) as u64)
+    @write_u64(@ptr_add(header,16),np_d(st) as u64)
+    @write_u64(@ptr_add(header,24),np_n(st) as u64)
+    @write_u64(@ptr_add(header,32),floats as u64)
+    @write_u64(@ptr_add(header,40),np_checkpoint_checksum(st as *u8,floats*8) as u64)
+    let h=np_write_exact(fd,header,48)
+    @free(header)
+    if h!=48 { @close(fd) return 0 }
+    let n=np_write_exact(fd,st as *u8,floats*8)
+    @close(fd)
+    return if n==floats*8 { 1 } else { 0 }
+}
+fn noema_pretrain_load(path: string) -> *f64 {
+    let fd=@open(path,0,0)
+    if fd<0 { return 0 as *f64 }
+    let header=@malloc(40) as *u8
+    if np_read_exact(fd,header,40)!=40 { @free(header) @close(fd) return 0 as *f64 }
+    let magic=(@read_u8(header) as i64)==78 and (@read_u8(@ptr_add(header,1)) as i64)==80 and (@read_u8(@ptr_add(header,2)) as i64)==83 and (@read_u8(@ptr_add(header,3)) as i64)==49
+    let version=@read_u32(@ptr_add(header,4)) as i64
+    let c=@read_u64(@ptr_add(header,8)) as i64
+    let d=@read_u64(@ptr_add(header,16)) as i64
+    let n=@read_u64(@ptr_add(header,24)) as i64
+    let floats=@read_u64(@ptr_add(header,32)) as i64
+    @free(header)
+    if magic==false or version<1 or version>4 or c<NP_C_MIN or d<2 or n<8 or floats<=0 or floats>NP_MAX_STATE_FLOATS { @close(fd) return 0 as *f64 }
+    let legacy_floats=np_state_floats_legacy(c,d,n)
+    if legacy_floats<=0 { @close(fd) return 0 as *f64 }
+    var memory_slots=NP_MEM_SLOTS
+    var expected_floats=legacy_floats
+    if version==3 { expected_floats=np_state_floats(c,d,n) }
+    if version>=4 {
+        let per_slot=1+NP_MEM_FEATURES+NP_MEM_BYTES/8
+        let extra=floats-np_state_floats_legacy(c,d,n)-NP_MEM_FEATURES
+        if extra<=0 or extra%per_slot!=0 { @close(fd) return 0 as *f64 }
+        memory_slots=extra/per_slot
+        if memory_slots<=0 { @close(fd) return 0 as *f64 }
+        expected_floats=np_state_floats_cap(c,d,n,memory_slots)
+    }
+    if floats!=expected_floats { @close(fd) return 0 as *f64 }
+    var expected_checksum: i64=0
+    if version>=2 {
+        let checksum_bytes=@malloc(8) as *u8
+        if np_read_exact(fd,checksum_bytes,8)!=8 { @free(checksum_bytes) @close(fd) return 0 as *f64 }
+        expected_checksum=@read_u64(checksum_bytes) as i64
+        @free(checksum_bytes)
+    }
+    let st=noema_pretrain_create_with_memory(c,d,n,1,memory_slots)
+    let got=np_read_exact(fd,st as *u8,floats*8)
+    let extra=@malloc(1) as *u8
+    let trailing=@read(fd,extra,1)
+    @free(extra) @close(fd)
+    if got!=floats*8 or trailing!=0 { noema_pretrain_destroy(st) return 0 as *f64 }
+    if version>=2 and np_checkpoint_checksum(st as *u8,floats*8)!=expected_checksum { noema_pretrain_destroy(st) return 0 as *f64 }
+    var i:i64=0
+    while i<floats { if np_finite(st[i])==0 { noema_pretrain_destroy(st) return 0 as *f64 } i=i+1 }
+    return st
+}

@@ -1,0 +1,408 @@
+// NOEMA v3 Phase 3: Pure-LIR Deterministic Constraint/Logic & Temporal Verification Kernels
+// Pure, side-effect-free, step-budgeted verification kernels:
+//   1) Propositional Constraint / Clause DPLL Solver + Minimal Unsat-Core Extraction
+//   2) Temporal Interval Consistency & Supersession Kernel (ISO-8601 Gregorian validation)
+// (Evidence/Abstain Gate & Provenance Isolation live on Nv3KhgGraph in noema_v3_khg.lir)
+
+import "noema_v3_verify_math.lir"
+
+struct Nv3LogicResult {
+    verdict: i64
+    unsat_core_mask: i64
+    unsat_core_nonempty: i64
+    steps: i64
+}
+
+struct Nv3TemporalResult {
+    verdict: i64
+    selected_claim_id: i64
+    report_conflict: i64
+    steps: i64
+}
+
+// ---------------- 1) Constraint / Clause DPLL + Unsat Core ----------------
+// Clauses stored in flat fixed-width rows (max 4 literals per clause, up to 30 clauses).
+// Literal encoding: +v for variable v in 1..16, -v for !v, 0 for unused slot.
+
+fn nv3_char_to_var(ch: i64) -> i64 {
+    if ch >= 65 and ch <= 80 { return (ch - 65) + 1 }
+    if ch >= 97 and ch <= 112 { return (ch - 97) + 1 }
+    return 0
+}
+
+fn nv3_logic_parse_clause(expr: string, out_lits: *i64) -> i64 {
+    out_lits[0] = 0 out_lits[1] = 0 out_lits[2] = 0 out_lits[3] = 0
+    let slen = @string_len(expr)
+    if slen <= 0 { return 0 }
+
+    var arrow_pos: i64 = -1
+    var i: i64 = 0
+    while i + 1 < slen {
+        if @string_char_at(expr, i) == 61 and @string_char_at(expr, i + 1) == 62 {
+            arrow_pos = i
+            break
+        }
+        i = i + 1
+    }
+
+    if arrow_pos >= 0 {
+        var lhs_neg: i64 = 0
+        var lhs_var: i64 = 0
+        var p: i64 = 0
+        while p < arrow_pos {
+            let c = @string_char_at(expr, p)
+            if c == 33 or c == 126 { lhs_neg = 1 - lhs_neg }
+            let v = nv3_char_to_var(c)
+            if v > 0 { lhs_var = v break }
+            p = p + 1
+        }
+        var rhs_neg: i64 = 0
+        var rhs_var: i64 = 0
+        var q: i64 = arrow_pos + 2
+        while q < slen {
+            let c = @string_char_at(expr, q)
+            if c == 33 or c == 126 { rhs_neg = 1 - rhs_neg }
+            let v = nv3_char_to_var(c)
+            if v > 0 { rhs_var = v break }
+            q = q + 1
+        }
+        if lhs_var <= 0 or rhs_var <= 0 { return 0 }
+        out_lits[0] = if lhs_neg == 1 { lhs_var } else { 0 - lhs_var }
+        out_lits[1] = if rhs_neg == 1 { 0 - rhs_var } else { rhs_var }
+        return 1
+    }
+
+    var lit_idx: i64 = 0
+    var cur_neg: i64 = 0
+    var pos: i64 = 0
+    while pos < slen {
+        let c = @string_char_at(expr, pos)
+        if c == 33 or c == 126 {
+            cur_neg = 1 - cur_neg
+        } else {
+            if c == 124 {
+                cur_neg = 0
+            } else {
+                let v = nv3_char_to_var(c)
+                if v > 0 {
+                    if lit_idx >= 4 { return 0 }
+                    out_lits[lit_idx] = if cur_neg == 1 { 0 - v } else { v }
+                    lit_idx = lit_idx + 1
+                    cur_neg = 0
+                }
+            }
+        }
+        pos = pos + 1
+    }
+    return if lit_idx > 0 { 1 } else { 0 }
+}
+
+fn nv3_dpll_sat(
+    clauses: *i64,
+    num_clauses: i64,
+    active_mask: i64,
+    assign_in: *i64,
+    steps_box: *i64,
+    budget: i64
+) -> i64 {
+    if nv3_step_tick(steps_box, budget, 1) == 0 { return -1 }
+
+    let assign = @malloc(136) as *i64
+    var vi: i64 = 0
+    while vi <= 16 { assign[vi] = assign_in[vi] vi = vi + 1 }
+
+    var changed: i64 = 1
+    while changed == 1 {
+        changed = 0
+        var ci: i64 = 0
+        while ci < num_clauses {
+            if ((active_mask >> ci) & 1) == 1 {
+                if nv3_step_tick(steps_box, budget, 1) == 0 {
+                    @free(assign as *u8)
+                    return -1
+                }
+                var sat_clause: i64 = 0
+                var unassigned_cnt: i64 = 0
+                var last_unassigned_lit: i64 = 0
+                var k: i64 = 0
+                while k < 4 {
+                    let lit = clauses[ci * 4 + k]
+                    if lit != 0 {
+                        let v = if lit < 0 { 0 - lit } else { lit }
+                        let sg = if lit < 0 { -1 } else { 1 }
+                        let av = assign[v]
+                        if av == sg {
+                            sat_clause = 1
+                        } else {
+                            if av == 0 {
+                                unassigned_cnt = unassigned_cnt + 1
+                                last_unassigned_lit = lit
+                            }
+                        }
+                    }
+                    k = k + 1
+                }
+                if sat_clause == 0 {
+                    if unassigned_cnt == 0 {
+                        @free(assign as *u8)
+                        return 0
+                    }
+                    if unassigned_cnt == 1 {
+                        let uv = if last_unassigned_lit < 0 { 0 - last_unassigned_lit } else { last_unassigned_lit }
+                        let usg = if last_unassigned_lit < 0 { -1 } else { 1 }
+                        assign[uv] = usg
+                        changed = 1
+                    }
+                }
+            }
+            ci = ci + 1
+        }
+    }
+
+    var all_sat: i64 = 1
+    var branch_var: i64 = 0
+    var ci2: i64 = 0
+    while ci2 < num_clauses {
+        if ((active_mask >> ci2) & 1) == 1 {
+            var sat_c: i64 = 0
+            var k2: i64 = 0
+            while k2 < 4 {
+                let lit = clauses[ci2 * 4 + k2]
+                if lit != 0 {
+                    let v = if lit < 0 { 0 - lit } else { lit }
+                    let sg = if lit < 0 { -1 } else { 1 }
+                    if assign[v] == sg { sat_c = 1 }
+                    if assign[v] == 0 and branch_var == 0 { branch_var = v }
+                }
+                k2 = k2 + 1
+            }
+            if sat_c == 0 { all_sat = 0 }
+        }
+        ci2 = ci2 + 1
+    }
+
+    if all_sat == 1 or branch_var == 0 {
+        var wi: i64 = 1
+        while wi <= 16 { assign_in[wi] = assign[wi] wi = wi + 1 }
+        @free(assign as *u8)
+        return 1
+    }
+
+    assign[branch_var] = 1
+    let r_pos = nv3_dpll_sat(clauses, num_clauses, active_mask, assign, steps_box, budget)
+    if r_pos == 1 {
+        var wi: i64 = 1
+        while wi <= 16 { assign_in[wi] = assign[wi] wi = wi + 1 }
+        @free(assign as *u8)
+        return 1
+    }
+    if r_pos < 0 {
+        @free(assign as *u8)
+        return -1
+    }
+
+    assign[branch_var] = -1
+    let r_neg = nv3_dpll_sat(clauses, num_clauses, active_mask, assign, steps_box, budget)
+    if r_neg == 1 {
+        var wi: i64 = 1
+        while wi <= 16 { assign_in[wi] = assign[wi] wi = wi + 1 }
+        @free(assign as *u8)
+        return 1
+    }
+    @free(assign as *u8)
+    return r_neg
+}
+
+fn nv3_logic_solve(clauses: *i64, num_clauses: i64, out_witness: *i64, budget: i64) -> Nv3LogicResult {
+    if num_clauses <= 0 or num_clauses > 30 {
+        return Nv3LogicResult { verdict: NV3_VERDICT_CONTRADICTION, unsat_core_mask: 0, unsat_core_nonempty: 0, steps: 0 }
+    }
+    let sbox = @malloc(8) as *i64
+    sbox[0] = 0
+    let assign = @malloc(136) as *i64
+    var i: i64 = 0
+    while i <= 16 { assign[i] = 0 i = i + 1 }
+
+    let full_mask = (1 << num_clauses) - 1
+    let sat = nv3_dpll_sat(clauses, num_clauses, full_mask, assign, sbox, budget)
+    if sat < 0 {
+        let st = sbox[0]
+        @free(sbox as *u8) @free(assign as *u8)
+        return Nv3LogicResult { verdict: NV3_VERDICT_BUDGET_EXCEEDED, unsat_core_mask: 0, unsat_core_nonempty: 0, steps: st }
+    }
+    if sat == 1 {
+        if out_witness != (0 as *i64) {
+            var v: i64 = 1
+            while v <= 16 { out_witness[v] = assign[v] v = v + 1 }
+        }
+        let st = sbox[0]
+        @free(sbox as *u8) @free(assign as *u8)
+        return Nv3LogicResult { verdict: NV3_VERDICT_VERIFIED, unsat_core_mask: 0, unsat_core_nonempty: 0, steps: st }
+    }
+
+    var core_mask = full_mask
+    var ci: i64 = 0
+    while ci < num_clauses {
+        let cand_mask = core_mask & (full_mask ^ (1 << ci))
+        var z: i64 = 0
+        while z <= 16 { assign[z] = 0 z = z + 1 }
+        let r = nv3_dpll_sat(clauses, num_clauses, cand_mask, assign, sbox, budget)
+        if r < 0 {
+            let st = sbox[0]
+            @free(sbox as *u8) @free(assign as *u8)
+            return Nv3LogicResult { verdict: NV3_VERDICT_BUDGET_EXCEEDED, unsat_core_mask: 0, unsat_core_nonempty: 0, steps: st }
+        }
+        if r == 0 {
+            core_mask = cand_mask
+        }
+        ci = ci + 1
+    }
+
+    let st = sbox[0]
+    @free(sbox as *u8) @free(assign as *u8)
+    let non_empty = if core_mask != 0 { 1 } else { 0 }
+    return Nv3LogicResult {
+        verdict: NV3_VERDICT_CONTRADICTION,
+        unsat_core_mask: core_mask,
+        unsat_core_nonempty: non_empty,
+        steps: st
+    }
+}
+
+// ---------------- 2) Temporal Consistency & Supersession Kernel ----------------
+
+fn nv3_is_leap_year(y: i64) -> i64 {
+    if (y % 400) == 0 { return 1 }
+    if (y % 100) == 0 { return 0 }
+    if (y % 4) == 0 { return 1 }
+    return 0
+}
+
+fn nv3_days_in_month(y: i64, m: i64) -> i64 {
+    if m == 1 or m == 3 or m == 5 or m == 7 or m == 8 or m == 10 or m == 12 { return 31 }
+    if m == 4 or m == 6 or m == 9 or m == 11 { return 30 }
+    if m == 2 { return if nv3_is_leap_year(y) == 1 { 29 } else { 28 } }
+    return 0
+}
+
+fn nv3_parse_iso_date(s: string) -> i64 {
+    if @string_len(s) != 10 { return -1 }
+    if @string_char_at(s, 4) != 45 or @string_char_at(s, 7) != 45 { return -1 }
+    var idx: i64 = 0
+    while idx < 10 {
+        if idx != 4 and idx != 7 {
+            let c = @string_char_at(s, idx)
+            if c < 48 or c > 57 { return -1 }
+        }
+        idx = idx + 1
+    }
+    let y = (@string_char_at(s, 0) - 48) * 1000 + (@string_char_at(s, 1) - 48) * 100 + (@string_char_at(s, 2) - 48) * 10 + (@string_char_at(s, 3) - 48)
+    let m = (@string_char_at(s, 5) - 48) * 10 + (@string_char_at(s, 6) - 48)
+    let d = (@string_char_at(s, 8) - 48) * 10 + (@string_char_at(s, 9) - 48)
+    if y < 1 or m < 1 or m > 12 { return -1 }
+    let dim = nv3_days_in_month(y, m)
+    if d < 1 or d > dim { return -1 }
+
+    let yprev = y - 1
+    var days = yprev * 365 + (yprev / 4) - (yprev / 100) + (yprev / 400)
+    var mi: i64 = 1
+    while mi < m {
+        days = days + nv3_days_in_month(y, mi)
+        mi = mi + 1
+    }
+    return days + d
+}
+
+fn nv3_temporal_eval(claims_flat: *i64, num_claims: i64, subject_id: i64, query_day: i64, budget: i64) -> Nv3TemporalResult {
+    let sbox = @malloc(8) as *i64
+    sbox[0] = 0
+    if query_day <= 0 or num_claims <= 0 {
+        @free(sbox as *u8)
+        return Nv3TemporalResult { verdict: NV3_VERDICT_ABSTAIN, selected_claim_id: -1, report_conflict: 0, steps: 1 }
+    }
+
+    let inf_day: i64 = 1000000000
+    var report_conflict: i64 = 0
+    var active_contradiction: i64 = 0
+
+    var i: i64 = 0
+    while i < num_claims {
+        let base_i = i * 6
+        if claims_flat[base_i + 1] == subject_id {
+            let fi = claims_flat[base_i + 3]
+            let ti_raw = claims_flat[base_i + 4]
+            let ti = if ti_raw < 0 { inf_day } else { ti_raw }
+            if fi <= 0 or ti <= fi {
+                let st = sbox[0]
+                @free(sbox as *u8)
+                return Nv3TemporalResult { verdict: NV3_VERDICT_CONTRADICTION, selected_claim_id: -1, report_conflict: 1, steps: st }
+            }
+            var j = i + 1
+            while j < num_claims {
+                if nv3_step_tick(sbox, budget, 1) == 0 {
+                    let st = sbox[0]
+                    @free(sbox as *u8)
+                    return Nv3TemporalResult { verdict: NV3_VERDICT_BUDGET_EXCEEDED, selected_claim_id: -1, report_conflict: 0, steps: st }
+                }
+                let base_j = j * 6
+                if claims_flat[base_j + 1] == subject_id {
+                    let fj = claims_flat[base_j + 3]
+                    let tj_raw = claims_flat[base_j + 4]
+                    let tj = if tj_raw < 0 { inf_day } else { tj_raw }
+                    if claims_flat[base_i + 2] != claims_flat[base_j + 2] {
+                        report_conflict = 1
+                        let ov_lo = if fi > fj { fi } else { fj }
+                        let ov_hi = if ti < tj { ti } else { tj }
+                        if ov_lo < ov_hi {
+                            active_contradiction = 1
+                        }
+                    }
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+
+    if active_contradiction == 1 {
+        let st = sbox[0]
+        @free(sbox as *u8)
+        return Nv3TemporalResult { verdict: NV3_VERDICT_CONTRADICTION, selected_claim_id: -1, report_conflict: 1, steps: st }
+    }
+
+    var best_id: i64 = -1
+    var best_src_day: i64 = -1
+    var k: i64 = 0
+    while k < num_claims {
+        if nv3_step_tick(sbox, budget, 1) == 0 {
+            let st = sbox[0]
+            @free(sbox as *u8)
+            return Nv3TemporalResult { verdict: NV3_VERDICT_BUDGET_EXCEEDED, selected_claim_id: -1, report_conflict: report_conflict, steps: st }
+        }
+        let b = k * 6
+        if claims_flat[b + 1] == subject_id {
+            let f = claims_flat[b + 3]
+            let traw = claims_flat[b + 4]
+            let t = if traw < 0 { inf_day } else { traw }
+            if query_day >= f and query_day < t {
+                if claims_flat[b + 5] >= best_src_day {
+                    best_src_day = claims_flat[b + 5]
+                    best_id = claims_flat[b + 0]
+                }
+            }
+        }
+        k = k + 1
+    }
+
+    let st = sbox[0]
+    @free(sbox as *u8)
+    if best_id < 0 {
+        return Nv3TemporalResult { verdict: NV3_VERDICT_ABSTAIN, selected_claim_id: -1, report_conflict: report_conflict, steps: st }
+    }
+    return Nv3TemporalResult {
+        verdict: NV3_VERDICT_VERIFIED,
+        selected_claim_id: best_id,
+        report_conflict: report_conflict,
+        steps: st
+    }
+}

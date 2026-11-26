@@ -1,0 +1,384 @@
+// NOEMA-Phi v3 mathematical kernel, phase 1: bounded Randers/Woodbury geometry
+// and pointwise terms of the specified free-energy density.
+// All vectors are caller-owned f64 buffers; no external model/runtime is used.
+const NPHI_R_MAX: i64 = 4
+const NPHI_D_MAX: i64 = 1048576
+const NPHI_VALID_MAX: i64 = 4096
+const NPHI_SIGMA_MIN: f64 = -2.5
+const NPHI_SIGMA_MAX: f64 = 2.5
+const NPHI_U_MAX: f64 = 3.0
+const NPHI_B_MAX: f64 = 0.85
+const NPHI_EPS: f64 = 1.0e-12
+
+fn nphi_finite(x: f64) -> i64 {
+    if x != x { return 0 }
+    if @fabs(x) > 1.0e300 { return 0 }
+    return 1
+}
+
+fn nphi_exp(x: f64) -> f64 {
+    // Range-reduced Taylor evaluation; callers use x in [-5, 5].
+    let y = @clamp(x, -20.0, 20.0)
+    let k = @floor(y / 0.6931471805599453) as i64
+    let r = y - k as f64 * 0.6931471805599453
+    var term: f64 = 1.0
+    var sum: f64 = 1.0
+    var n: i64 = 1
+    while n <= 18 {
+        term = term * r / n as f64
+        sum = sum + term
+        n = n + 1
+    }
+    var scale: f64 = 1.0
+    if k >= 0 {
+        var i: i64 = 0
+        while i < k { scale = scale * 2.0 i = i + 1 }
+    } else {
+        var i: i64 = 0
+        while i < 0 - k { scale = scale * 0.5 i = i + 1 }
+    }
+    return sum * scale
+}
+
+fn nphi_geo_valid(sigma: f64, dim: i64, rank: i64, u: *f64) -> i64 {
+    if nphi_finite(sigma) == 0 or sigma < NPHI_SIGMA_MIN or sigma > NPHI_SIGMA_MAX { return 0 }
+    if dim <= 0 or dim > NPHI_D_MAX or rank <= 0 or rank > NPHI_R_MAX { return 0 }
+    var i: i64 = 0
+    while i < rank * dim {
+        if nphi_finite(u[i]) == 0 or @fabs(u[i]) > NPHI_U_MAX { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+/// Apply g^{-1}v = c v - c^2 U (I+c U^T U)^{-1} U^T v.
+/// c=exp(-2*sigma), U is row-major [rank, dim]. Scratch has rank^2+2*rank
+/// f64 cells. The small SPD system is solved by Cholesky; no dim-by-dim matrix
+/// is materialized. Returns 1 on success, 0 for invalid/non-SPD input.
+fn noema_phi_inverse_apply(sigma: f64, dim: i64, rank: i64, u: *f64, v: *f64, out: *f64, scratch: *f64) -> i64 {
+    if nphi_geo_valid(sigma, dim, rank, u) == 0 { return 0 }
+    let c = nphi_exp(0.0 - 2.0 * sigma)
+    let lo = scratch
+    let rhs = @ptr_add(scratch as *u8, rank * rank * 8) as *f64
+    let sol = @ptr_add(scratch as *u8, (rank * rank + rank) * 8) as *f64
+    var i: i64 = 0
+    while i < rank {
+        var j: i64 = 0
+        while j < rank {
+            var value: f64 = if i == j { 1.0 } else { 0.0 }
+            var d: i64 = 0
+            while d < dim {
+                value = value + c * u[i * dim + d] * u[j * dim + d]
+                d = d + 1
+            }
+            lo[i * rank + j] = value
+            j = j + 1
+        }
+        var d2: i64 = 0
+        var dot: f64 = 0.0
+        while d2 < dim { dot = dot + u[i * dim + d2] * v[d2] d2 = d2 + 1 }
+        rhs[i] = dot
+        i = i + 1
+    }
+    // In-place lower-triangular Cholesky factorization.
+    i = 0
+    while i < rank {
+        var j: i64 = 0
+        while j <= i {
+            var value = lo[i * rank + j]
+            var k: i64 = 0
+            while k < j { value = value - lo[i * rank + k] * lo[j * rank + k] k = k + 1 }
+            if i == j {
+                if value <= NPHI_EPS or nphi_finite(value) == 0 { return 0 }
+                lo[i * rank + j] = @sqrt(value)
+            } else {
+                lo[i * rank + j] = value / lo[j * rank + j]
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    // Forward solve L y = U^T v, then backward solve L^T x = y.
+    i = 0
+    while i < rank {
+        var value = rhs[i]
+        var j: i64 = 0
+        while j < i { value = value - lo[i * rank + j] * sol[j] j = j + 1 }
+        sol[i] = value / lo[i * rank + i]
+        i = i + 1
+    }
+    i = rank - 1
+    while i >= 0 {
+        var value = sol[i]
+        var j: i64 = i + 1
+        while j < rank { value = value - lo[j * rank + i] * rhs[j] j = j + 1 }
+        rhs[i] = value / lo[i * rank + i]
+        i = i - 1
+    }
+    var d3: i64 = 0
+    while d3 < dim {
+        var correction: f64 = 0.0
+        var r: i64 = 0
+        while r < rank { correction = correction + u[r * dim + d3] * rhs[r] r = r + 1 }
+        out[d3] = c * v[d3] - c * c * correction
+        if nphi_finite(out[d3]) == 0 { return 0 }
+        d3 = d3 + 1
+    }
+    return 1
+}
+
+/// Project an unconstrained drift into ||b||_g <= b_max using the Woodbury
+/// inverse. Writes projected b and its g-dual norm; returns success flag.
+fn noema_phi_project_drift(sigma: f64, dim: i64, rank: i64, u: *f64, raw_b: *f64, projected_b: *f64, dual_norm: *f64, scratch: *f64) -> i64 {
+    if dim <= 0 or dim > NPHI_D_MAX or rank <= 0 or rank > NPHI_R_MAX { return 0 }
+    let invb = @ptr_add(scratch as *u8, (rank * rank + 2 * rank) * 8) as *f64
+    if noema_phi_inverse_apply(sigma, dim, rank, u, raw_b, invb, scratch) == 0 { return 0 }
+    var norm2: f64 = 0.0
+    var i: i64 = 0
+    while i < dim { norm2 = norm2 + raw_b[i] * invb[i] i = i + 1 }
+    if norm2 < 0.0 and norm2 > 0.0 - 1.0e-10 { norm2 = 0.0 }
+    if norm2 < 0.0 or nphi_finite(norm2) == 0 { return 0 }
+    let norm = @sqrt(norm2)
+    let scale = NPHI_B_MAX / @max(NPHI_B_MAX, norm)
+    i = 0
+    while i < dim { projected_b[i] = raw_b[i] * scale i = i + 1 }
+    dual_norm[0] = norm * scale
+    return 1
+}
+
+/// Evaluate the Randers norm sqrt(v^T g v)+b.v, projecting raw drift first.
+/// Returns the norm, or -1 on invalid input. Scratch needs rank^2+3*rank+dim
+/// cells; the projected drift is written to caller storage.
+fn noema_phi_randers_norm(sigma: f64, dim: i64, rank: i64, u: *f64, raw_b: *f64, v: *f64, projected_b: *f64, scratch: *f64) -> f64 {
+    let dual = @ptr_add(scratch as *u8, (rank * rank + 2 * rank + dim) * 8) as *f64
+    if noema_phi_project_drift(sigma, dim, rank, u, raw_b, projected_b, dual, scratch) == 0 { return -1.0 }
+    let c = nphi_exp(0.0 - 2.0 * sigma)
+    var metric: f64 = 0.0
+    var drift: f64 = 0.0
+    var d: i64 = 0
+    while d < dim { metric = metric + v[d] * v[d] / c drift = drift + projected_b[d] * v[d] d = d + 1 }
+    var r: i64 = 0
+    while r < rank {
+        var uv: f64 = 0.0
+        d = 0
+        while d < dim { uv = uv + u[r * dim + d] * v[d] d = d + 1 }
+        metric = metric + uv * uv
+        r = r + 1
+    }
+    if metric < 0.0 or nphi_finite(metric) == 0 { return -1.0 }
+    return @sqrt(metric) + drift
+}
+
+/// Complex U(1)-covariant kinetic density Re(p†g^{-1}p)/2 from §3.4/§4.1.
+/// `field` is [sigma, eta_b, psi_re, psi_im]. Caller supplies four dim-sized
+/// work vectors plus the usual Woodbury scratch in `scratch`; returns -1 on
+/// invalid input. The caller integrates this density over its spatial grid.
+fn noema_phi_kinetic_density(field: *f64, dim: i64, rank: i64, u: *f64, b: *f64, grad_re: *f64, grad_im: *f64, scratch: *f64) -> f64 {
+    if dim <= 0 or dim > NPHI_D_MAX or rank <= 0 or rank > NPHI_R_MAX { return -1.0 }
+    if nphi_geo_valid(field[0], dim, rank, u) == 0 or nphi_finite(field[1]) == 0 or nphi_finite(field[2]) == 0 or nphi_finite(field[3]) == 0 { return -1.0 }
+    let p_re = scratch
+    let p_im = @ptr_add(scratch as *u8, dim * 8) as *f64
+    let w_re = @ptr_add(scratch as *u8, dim * 16) as *f64
+    let w_im = @ptr_add(scratch as *u8, dim * 24) as *f64
+    let solve = @ptr_add(scratch as *u8, dim * 32) as *f64
+    var i: i64 = 0
+    while i < dim {
+        if nphi_finite(b[i]) == 0 or nphi_finite(grad_re[i]) == 0 or nphi_finite(grad_im[i]) == 0 { return -1.0 }
+        // (∇ - i η_b b) (psi_re + i psi_im)
+        p_re[i] = grad_re[i] + field[1] * b[i] * field[3]
+        p_im[i] = grad_im[i] - field[1] * b[i] * field[2]
+        i = i + 1
+    }
+    if noema_phi_inverse_apply(field[0], dim, rank, u, p_re, w_re, solve) == 0 { return -1.0 }
+    if noema_phi_inverse_apply(field[0], dim, rank, u, p_im, w_im, solve) == 0 { return -1.0 }
+    var density: f64 = 0.0
+    i = 0
+    while i < dim { density = density + 0.5 * (p_re[i] * w_re[i] + p_im[i] * w_im[i]) i = i + 1 }
+    if density < 0.0 and density > 0.0 - 1.0e-10 { density = 0.0 }
+    if density < 0.0 or nphi_finite(density) == 0 { return -1.0 }
+    return density
+}
+
+/// Pointwise bundle-gluing penalty κ|Ψ_a - exp(iφ)Ψ_b|² from §4.1.
+fn noema_phi_bridge_energy(a_re: f64, a_im: f64, b_re: f64, b_im: f64, phase: f64, kappa: f64) -> f64 {
+    if kappa < 0.0 or nphi_finite(a_re) == 0 or nphi_finite(a_im) == 0 or nphi_finite(b_re) == 0 or nphi_finite(b_im) == 0 or nphi_finite(phase) == 0 { return -1.0 }
+    let c = @cos(phase)
+    let s = @sin(phase)
+    let dr = a_re - (c * b_re - s * b_im)
+    let di = a_im - (s * b_re + c * b_im)
+    return kappa * (dr * dr + di * di)
+}
+
+/// Form one mode-composed geometry from a common base plus five mode deltas.
+/// weights[5] are nonnegative and sum to one. Base and each mode slice are
+/// [sigma, U(rank*dim), b(dim)]; out has the same layout. Returns 0 if invalid.
+fn noema_phi_mix_geometry(weights: *f64, base: *f64, deltas: *f64, dim: i64, rank: i64, out: *f64) -> i64 {
+    if dim <= 0 or dim > NPHI_D_MAX or rank <= 0 or rank > NPHI_R_MAX { return 0 }
+    var sum: f64 = 0.0
+    var m: i64 = 0
+    while m < 5 {
+        if nphi_finite(weights[m]) == 0 or weights[m] < 0.0 { return 0 }
+        sum = sum + weights[m]
+        m = m + 1
+    }
+    if @fabs(sum - 1.0) > 1.0e-9 { return 0 }
+    let width = 1 + rank * dim + dim
+    var i: i64 = 0
+    while i < width {
+        if nphi_finite(base[i]) == 0 { return 0 }
+        var value = base[i]
+        m = 0
+        while m < 5 {
+            let delta = deltas[m * width + i]
+            if nphi_finite(delta) == 0 { return 0 }
+            value = value + weights[m] * delta
+            m = m + 1
+        }
+        if nphi_finite(value) == 0 { return 0 }
+        out[i] = value
+        i = i + 1
+    }
+    if out[0] < NPHI_SIGMA_MIN or out[0] > NPHI_SIGMA_MAX { return 0 }
+    i = 1
+    while i < 1 + rank * dim { if @fabs(out[i]) > NPHI_U_MAX { return 0 } i = i + 1 }
+    return 1
+}
+
+/// Logistic and De-Morgan abstention gate from §4.1. Inputs are the measured
+/// output amplitude and contradiction score; they must already be calibrated.
+fn noema_phi_abstention_gate(a_max: f64, a_conf: f64, c_contradiction: f64, c_threshold: f64, tau_a: f64, tau_c: f64) -> f64 {
+    if nphi_finite(a_max) == 0 or nphi_finite(a_conf) == 0 or nphi_finite(c_contradiction) == 0 or nphi_finite(c_threshold) == 0 or tau_a <= 0.0 or tau_c <= 0.0 { return 0.0 }
+    let sa = 1.0 / (1.0 + nphi_exp(0.0 - (a_max - a_conf) / tau_a))
+    let sc = 1.0 / (1.0 + nphi_exp(0.0 - (c_threshold - c_contradiction) / tau_c))
+    return 1.0 - sa * sc
+}
+
+fn nphi_log(x: f64) -> f64 {
+    if x <= 0.0 or nphi_finite(x) == 0 { return 0.0 }
+    var y = x
+    var k: i64 = 0
+    while y >= 2.0 { y = y * 0.5 k = k + 1 }
+    while y < 1.0 { y = y * 2.0 k = k - 1 }
+    let z = (y - 1.0) / (y + 1.0)
+    let z2 = z * z
+    var term = z
+    var sum: f64 = 0.0
+    var n: i64 = 0
+    while n < 24 { sum = sum + term / (2 * n + 1) as f64 term = term * z2 n = n + 1 }
+    return 2.0 * sum + k as f64 * 0.6931471805599453
+}
+
+/// Discrete quadrature of the Yamabe geometry regularizer across samples.
+/// geometry packs each sample's U(rank*dim) followed by b(dim); params are
+/// [k_sigma,k_0,k_u,k_b]. grad_sigma_sq contains |∇sigma|² per sample.
+fn noema_phi_yamabe_energy(sample_count: i64, sigma: *f64, grad_sigma_sq: *f64, geometry: *f64, dim: i64, rank: i64, params: *f64) -> f64 {
+    if sample_count < 0 or sample_count > NPHI_VALID_MAX or dim <= 0 or dim > NPHI_D_MAX or rank <= 0 or rank > NPHI_R_MAX { return -1.0 }
+    var p: i64 = 0
+    while p < 4 { if nphi_finite(params[p]) == 0 or params[p] < 0.0 { return -1.0 } p = p + 1 }
+    let width = rank * dim + dim
+    var total: f64 = 0.0
+    var i: i64 = 0
+    while i < sample_count {
+        if nphi_finite(sigma[i]) == 0 or nphi_finite(grad_sigma_sq[i]) == 0 or grad_sigma_sq[i] < 0.0 { return -1.0 }
+        total = total + params[0] / 2.0 * grad_sigma_sq[i] + params[1] / 2.0 * sigma[i] * sigma[i]
+        var j: i64 = 0
+        while j < width {
+            let value = geometry[i * width + j]
+            if nphi_finite(value) == 0 { return -1.0 }
+            if j < rank * dim { total = total + params[2] / 2.0 * value * value }
+            else { total = total + params[3] / 2.0 * value * value }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return if nphi_finite(total) == 1 { total } else { -1.0 }
+}
+
+/// Global discrete penalty terms from §4.1: syntax charges, complex keyword
+/// phase-lock deviations, and negative bounded-context mutual information.
+/// `context` = [z_re,z_im,E_psi,sigma_noise,epsilon,lambda]. Returns their sum.
+fn noema_phi_global_energy_terms(charges: *f64, charge_count: i64, lambda_syntax: f64, keywords: *f64, keyword_count: i64, gamma_lock: f64, context: *f64) -> f64 {
+    if charge_count < 0 or charge_count > NPHI_VALID_MAX or keyword_count < 0 or keyword_count > NPHI_VALID_MAX or nphi_finite(lambda_syntax) == 0 or nphi_finite(gamma_lock) == 0 or lambda_syntax < 0.0 or gamma_lock < 0.0 { return -1.0 }
+    var energy: f64 = 0.0
+    var i: i64 = 0
+    while i < charge_count { if nphi_finite(charges[i]) == 0 { return -1.0 } energy = energy + lambda_syntax / 2.0 * charges[i] * charges[i] i = i + 1 }
+    var mean_re: f64 = 0.0
+    var mean_im: f64 = 0.0
+    i = 0
+    while i < keyword_count {
+        if nphi_finite(keywords[i * 2]) == 0 or nphi_finite(keywords[i * 2 + 1]) == 0 { return -1.0 }
+        mean_re = mean_re + keywords[i * 2]
+        mean_im = mean_im + keywords[i * 2 + 1]
+        i = i + 1
+    }
+    if keyword_count > 0 { mean_re = mean_re / keyword_count as f64 mean_im = mean_im / keyword_count as f64 }
+    i = 0
+    while i < keyword_count {
+        let dr = keywords[i * 2] - mean_re
+        let di = keywords[i * 2 + 1] - mean_im
+        energy = energy + gamma_lock / 2.0 * (dr * dr + di * di)
+        i = i + 1
+    }
+    var c: i64 = 0
+    while c < 6 { if nphi_finite(context[c]) == 0 { return -1.0 } c = c + 1 }
+    if context[2] < 0.0 or context[3] < 0.0 or context[4] <= 0.0 or context[5] < 0.0 { return -1.0 }
+    let denominator = context[3] * context[3] * context[2] + context[4]
+    let signal = (context[0] * context[0] + context[1] * context[1]) / denominator
+    if nphi_finite(signal) == 0 or signal < 0.0 { return -1.0 }
+    energy = energy - context[5] / 2.0 * nphi_log(1.0 + signal)
+    return if nphi_finite(energy) == 1 { energy } else { -1.0 }
+}
+
+/// Discrete pointwise subset of §4's free-energy density. `state` is
+/// [psi_re, psi_im, abstain_re, abstain_im, source_re, source_im]. `params` is
+/// [a4,a6,A0,eta_c,lambda_v,mu_reverse,lambda_symbol,lambda_protection,
+/// protection_unverified,abstain_gate,lambda_abstain]. `validity` has packed
+/// [unit_re,unit_im,weight] rows. Outputs V_top, V_validation, V_symbol,
+/// V_protection, V_abstention, source_work, total. Spatial integration,
+/// bridges/syntax/keyword/context and Yamabe regularization remain separate.
+fn noema_phi_local_energy(state: *f64, params: *f64, valid_count: i64, validity: *f64, out: *f64) -> i64 {
+    if valid_count < 0 or valid_count > NPHI_VALID_MAX or (params[8] != 0.0 and params[8] != 1.0) { return 0 }
+    var i: i64 = 0
+    while i < 6 { if nphi_finite(state[i]) == 0 { return 0 } i = i + 1 }
+    i = 0
+    while i < 11 { if nphi_finite(params[i]) == 0 { return 0 } i = i + 1 }
+    if params[1] <= 0.0 or params[4] < 0.0 or params[5] < 0.0 or params[6] < 0.0 or params[7] < 0.0 or params[9] < 0.0 or params[9] > 1.0 or params[10] < 0.0 { return 0 }
+    let psi_re = state[0]
+    let psi_im = state[1]
+    let r2 = psi_re * psi_re + psi_im * psi_im
+    let r4 = r2 * r2
+    let r6 = r4 * r2
+    let re_psi4 = psi_re * psi_re * psi_re * psi_re - 6.0 * psi_re * psi_re * psi_im * psi_im + psi_im * psi_im * psi_im * psi_im
+    let denom = 1.0 + r2
+    let top = params[0] / 4.0 * (r2 - params[2] * params[2]) * (r2 - params[2] * params[2]) + params[1] / 6.0 * r6 - params[3] / 4.0 * re_psi4 / (denom * denom)
+    var validation: f64 = 0.0
+    i = 0
+    while i < valid_count {
+        let vr = validity[i * 3]
+        let vi = validity[i * 3 + 1]
+        let weight = validity[i * 3 + 2]
+        if nphi_finite(vr) == 0 or nphi_finite(vi) == 0 or nphi_finite(weight) == 0 { return 0 }
+        let unit_norm = vr * vr + vi * vi
+        if weight < 0.0 or @fabs(unit_norm - 1.0) > 1.0e-6 { return 0 }
+        let r = psi_re * vr + psi_im * vi
+        let si = psi_re * vi - psi_im * vr
+        let wrong = @max(0.0, 0.0 - r)
+        validation = validation + weight * (si * si + params[5] * wrong * wrong)
+        i = i + 1
+    }
+    validation = params[4] / 2.0 * validation
+    let symbol = params[6] / 4.0 * (r4 - re_psi4) / (denom * denom)
+    let protection = params[7] / 2.0 * params[8] * r2
+    let dr = psi_re - state[2]
+    let di = psi_im - state[3]
+    let abstention = params[10] / 2.0 * params[9] * (dr * dr + di * di)
+    let source = 0.0 - 2.0 * (psi_re * state[4] + psi_im * state[5])
+    out[0] = top
+    out[1] = validation
+    out[2] = symbol
+    out[3] = protection
+    out[4] = abstention
+    out[5] = source
+    out[6] = top + validation + symbol + protection + abstention + source
+    return 1
+}

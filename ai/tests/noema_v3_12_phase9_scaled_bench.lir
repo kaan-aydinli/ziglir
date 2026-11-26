@@ -1,0 +1,57 @@
+// NOEMA v3 Phase 9 Differential Test:
+//   - Fail-closed load of scaled multi-shard NPG-v3 checkpoint (`noema_v3_scaled.npg3`, 12,404 params)
+//   - Evaluation on `<veriayrimi>`-packed cluster-disjoint `corpus_v3_multishard/test_soa`
+//   - Shard document-count verification across `train_shard_0` (8), `train_shard_1` (8), `test_soa` (4)
+//   - Valid UTF-8 weight-driven continuation from scaled checkpoint
+
+import "../src/noema_v3/noema_v3_scale_mt.lir"
+
+fn main() -> i64 {
+    let ckpt = "ai/noema_v3/checkpoints/noema_v3_scaled.npg3"
+    let sh0 = "ai/noema_v3/corpus_v3_multishard/train_shard_0"
+    let sh1 = "ai/noema_v3/corpus_v3_multishard/train_shard_1"
+    let test_sh = "ai/noema_v3/corpus_v3_multishard/test_soa"
+
+    let nd0 = nv3_soa_peek_num_docs(sh0)
+    let nd1 = nv3_soa_peek_num_docs(sh1)
+    let ndt = nv3_soa_peek_num_docs(test_sh)
+    let shards_ok = if nd0 == 8 and nd1 == 8 and ndt == 4 { 1 } else { 0 }
+
+    let tr = nv3_trainer_create(Nv3TrainerCfg {
+        d_model: 16, d_k: 8, d_h: 28, conv_k: 4,
+        coarse_ckpt: 8, fine_ckpt: 4, use_fp32_ckpt: 1, seed: 1
+    })
+    let load_ok = nv3_trainer_load_npg(tr, ckpt)
+    let meta_ok = if load_ok == 1 and tr.total_params == 12404 and tr.step_box[0] == 20 { 1 } else { 0 }
+
+    let bpb_box = @malloc(8) as *f64
+    let ece = nv3_trainer_eval_soa_ece(tr, test_sh, 10, bpb_box)
+    let bpb = bpb_box[0]
+    @free(bpb_box as *u8)
+    let eval_ok = if bpb > 1.0 and bpb < 6.05 and ece >= 0.0 and ece < 0.25 { 1 } else { 0 }
+
+    let prompt = "Karadeniz kiyi ikliminde "
+    let provs = @malloc(32 * 8) as *i64
+    var i: i64 = 0
+    while i < 32 { provs[i] = NOEMA_V3_PROV_USER_INPUT i = i + 1 }
+    let gen_u8 = @malloc(16)
+    let gmet = @malloc(24) as *f64
+    let glen = nv3_trainer_generate_utf8_valid(tr, prompt as *u8, provs, @string_len(prompt), 16, gen_u8, gmet)
+    let gen_ok = if glen >= 8 and glen <= 16 and gmet[0] > 0.0 { 1 } else { 0 }
+
+    @println("P9_MULTISHARD_VERIAYRIMI_COUNTS=" + @int_to_string(shards_ok))
+    @println("P9_SCALED_NPG3_LOAD=" + @int_to_string(meta_ok))
+    @println("P9_HELDOUT_BPB_ECE=" + @int_to_string(eval_ok))
+    @println("P9_SCALED_UTF8_GEN=" + @int_to_string(gen_ok))
+
+    @free(provs as *u8)
+    @free(gen_u8)
+    @free(gmet as *u8)
+    nv3_trainer_free(tr)
+
+    if shards_ok == 1 and meta_ok == 1 and eval_ok == 1 and gen_ok == 1 {
+        @println("ALL_PASS")
+        return 0
+    }
+    return 1
+}

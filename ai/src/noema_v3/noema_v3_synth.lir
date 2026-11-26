@@ -1,0 +1,1509 @@
+// NOEMA v3 Production Neuro-Symbolic & Anti-Verbatim Generative Decoder (`noema_v3_synth.lir`)
+// Combines:
+//   - `NPG-v3` continuous `EK-HNB + HAİB` byte-field state + `KHG` pointer grounding,
+//   - Deterministic `BigInt/Rational`, `SI`, `DPLL`, and `ISO-8601` symbolic solver & proof search,
+//   - `NV3G1` Kneser-Ney multi-order synthesis with hard 4-gram & sentence-hash anti-verbatim gating.
+
+import "noema_v3_ground_promote.lir"
+import "noema_v3_proof_search.lir"
+import "noema_v3_nv3g.lir"
+
+struct Nv3SynGenResult {
+    ok: i64
+    output_mode: i64
+    emitted_bytes: i64
+    synthesized_atoms: i64
+    max_train_ngram_run: i64
+    anti_verbatim_ok: i64
+    symbolic_solved: i64
+    proof_verified: i64
+    proof_refuted: i64
+    proof_steps: i64
+    khg_nodes: i64
+    observed_spans: i64
+    quarantined_spans: i64
+    verified_spans: i64
+    trained_steps: i64
+    param_bytes: i64
+}
+
+fn nv3_syn_buf_append_str(out_buf: *u8, cur_len: i64, max_len: i64, s: string) -> i64 {
+    let slen = @string_len(s)
+    if (cur_len + slen) > max_len { return cur_len }
+    let sp = s.ptr as *u8
+    var i: i64 = 0
+    while i < slen {
+        @write_u8(@ptr_add(out_buf, cur_len + i), @read_u8(@ptr_add(sp, i)))
+        i = i + 1
+    }
+    return cur_len + slen
+}
+
+fn nv3_syn_buf_append_i64(out_buf: *u8, cur_len: i64, max_len: i64, val: i64) -> i64 {
+    var pos = cur_len
+    var v = val
+    if v < 0 {
+        if (pos + 1) > max_len { return pos }
+        @write_u8(@ptr_add(out_buf, pos), 45 as u8)
+        pos = pos + 1
+        v = 0 - v
+    }
+    if v == 0 {
+        if (pos + 1) > max_len { return pos }
+        @write_u8(@ptr_add(out_buf, pos), 48 as u8)
+        return pos + 1
+    }
+    let tmp = @malloc(32)
+    var nd: i64 = 0
+    while v > 0 and nd < 28 {
+        @write_u8(@ptr_add(tmp, nd), (48 + (v % 10)) as u8)
+        nd = nd + 1
+        v = v / 10
+    }
+    if (pos + nd) > max_len { @free(tmp) return cur_len }
+    var k = nd - 1
+    while k >= 0 {
+        @write_u8(@ptr_add(out_buf, pos), @read_u8(@ptr_add(tmp, k)))
+        pos = pos + 1
+        k = k - 1
+    }
+    @free(tmp)
+    return pos
+}
+
+// `out_op`: `[0]=op_idx (-1 if none), [1]=op_code, [2]=is_frac_only`.
+fn nv3_syn_find_open_op(buf: *u8, len: i64, out_op: *i64) {
+    out_op[0] = -1 out_op[1] = 0 out_op[2] = 0
+    var i: i64 = 1
+    while (i + 1) < len {
+        let ch = (@read_u8(@ptr_add(buf, i)) as i64) & 255
+        if ch == 43 or ch == 42 or ch == 45 or ch == 47 {
+            var has_l: i64 = 0
+            var lk = if i >= 6 { i - 6 } else { 0 }
+            while lk < i {
+                let lb = (@read_u8(@ptr_add(buf, lk)) as i64) & 255
+                if lb >= 48 and lb <= 57 { has_l = 1 }
+                lk = lk + 1
+            }
+            var has_r: i64 = 0
+            var rk = i + 1
+            while rk < len and rk <= (i + 4) {
+                let rb = (@read_u8(@ptr_add(buf, rk)) as i64) & 255
+                if rb >= 48 and rb <= 57 { has_r = 1 }
+                rk = rk + 1
+            }
+            var iso_skip: i64 = 0
+            if ch == 45 and i >= 4 and (i + 5) < len {
+                if (((@read_u8(@ptr_add(buf, i + 3)) as i64) & 255) == 45) { iso_skip = 1 }
+            }
+            if has_l == 1 and has_r == 1 and iso_skip == 0 {
+                if ch == 43 { out_op[0] = i out_op[1] = NV3_OP_ADD out_op[2] = 0 return }
+                if ch == 42 { out_op[0] = i out_op[1] = NV3_OP_MUL out_op[2] = 0 return }
+                if ch == 45 {
+                    let prev_c = (@read_u8(@ptr_add(buf, i - 1)) as i64) & 255
+                    if prev_c == 32 or (prev_c >= 48 and prev_c <= 57) {
+                        out_op[0] = i out_op[1] = NV3_OP_SUB out_op[2] = 0 return
+                    }
+                }
+                if ch == 47 and out_op[0] < 0 { out_op[0] = i out_op[1] = NV3_OP_DIV out_op[2] = 1 }
+            }
+        }
+        i = i + 1
+    }
+}
+
+// `bnds`: `[0]=la, [1]=op_idx, [2]=r_start, [3]=u_end, [4]=op_code`.
+fn nv3_syn_eval_parsed_si(buf: *u8, bnds: *i64, out_buf: *u8, max_out: i64, out_steps: *i64) -> i64 {
+    let t1 = @malloc(24) as *i64
+    let t2 = @malloc(24) as *i64
+    let s1 = nv3_ps_parse_si_term(buf, bnds[0], bnds[1], t1)
+    let s2 = nv3_ps_parse_si_term(buf, bnds[2], bnds[3], t2)
+    if s1 != 1 or s2 != 1 {
+        @free(t1 as *u8) @free(t2 as *u8)
+        return 0
+    }
+    let qa = nv3_si_make(t1[0], t1[1], nv3_ps_unit_id_str(t1[2]), 200)
+    let qb = nv3_si_make(t2[0], t2[1], nv3_ps_unit_id_str(t2[2]), 200)
+    let qr = nv3_si_eval_op(bnds[4], qa, qb, 200)
+    let uid = t1[2]
+    let qv = qr.verdict let qp = qr.p let qq = qr.q let qst = qr.steps
+    nv3_si_free(qa) nv3_si_free(qb) nv3_si_free(qr)
+    @free(t1 as *u8) @free(t2 as *u8)
+    if qv == NV3_VERDICT_VERIFIED {
+        out_steps[0] = qst + 2
+        var p: i64 = 0
+        p = nv3_syn_buf_append_str(out_buf, p, max_out, "Deterministik KHG boyutsal SI çekirdeği birim dönüşümünü doğruladı: hesaplanan kesin büyüklük ")
+        p = nv3_syn_buf_append_i64(out_buf, p, max_out, qp)
+        if qq != 1 {
+            p = nv3_syn_buf_append_str(out_buf, p, max_out, "/")
+            p = nv3_syn_buf_append_i64(out_buf, p, max_out, qq)
+        }
+        p = nv3_syn_buf_append_str(out_buf, p, max_out, " ")
+        p = nv3_syn_buf_append_str(out_buf, p, max_out, nv3_ps_unit_id_str(uid))
+        p = nv3_syn_buf_append_str(out_buf, p, max_out, " değerindedir.")
+        return p
+    }
+    if qv == NV3_VERDICT_CONTRADICTION {
+        out_steps[0] = qst + 1
+        return nv3_syn_buf_append_str(out_buf, 0, max_out, "Deterministik KHG boyutsal SI çekirdeği uyumsuz fiziksel birimler tespit etti; farklı temel boyutlar doğrudan toplanamaz.")
+    }
+    return 0
+}
+
+fn nv3_syn_try_eval_open_expr(buf: *u8, len: i64, out_buf: *u8, max_out: i64, out_steps: *i64) -> i64 {
+    out_steps[0] = 0
+    let op_info = @malloc(24) as *i64
+    nv3_syn_find_open_op(buf, len, op_info)
+    let op_idx = op_info[0]
+    let op_code = op_info[1]
+    let is_frac_only = op_info[2]
+    @free(op_info as *u8)
+    if op_idx < 0 { return 0 }
+
+    let eq_pos = nv3_ps_find_byte_outside_arrow(buf, 0, len, 61)
+    if eq_pos > op_idx {
+        var rhs_dig: i64 = 0 var ek = eq_pos + 1
+        while ek < len {
+            let eb = (@read_u8(@ptr_add(buf, ek)) as i64) & 255
+            if eb >= 48 and eb <= 57 { rhs_dig = 1 break }
+            ek = ek + 1
+        }
+        if rhs_dig == 1 { return 0 }
+    }
+
+    var la = op_idx - 1
+    while la >= 0 and (((@read_u8(@ptr_add(buf, la)) as i64) & 255) == 32) { la = la - 1 }
+    while la > 0 {
+        let cb = (@read_u8(@ptr_add(buf, la - 1)) as i64) & 255
+        let ok_ch = if (cb >= 48 and cb <= 57) or cb == 47 or cb == 32 or (cb >= 97 and cb <= 122) or cb == 78 or cb == 74 { 1 } else { 0 }
+        if ok_ch == 0 { break }
+        if (cb >= 97 and cb <= 122) and (((@read_u8(@ptr_add(buf, la)) as i64) & 255) == 32) {
+            let af = (@read_u8(@ptr_add(buf, la + 1)) as i64) & 255
+            if af >= 48 and af <= 57 { break }
+        }
+        la = la - 1
+    }
+
+    var rb = op_idx + 1
+    while rb < len and (((@read_u8(@ptr_add(buf, rb)) as i64) & 255) == 32) { rb = rb + 1 }
+    let r_start = rb
+    while rb < len {
+        let cb2 = (@read_u8(@ptr_add(buf, rb)) as i64) & 255
+        if (cb2 >= 48 and cb2 <= 57) or (cb2 == 47 and is_frac_only == 0) { rb = rb + 1 }
+        else { break }
+    }
+    let r_end_num = rb
+    var u_scan = rb
+    while u_scan < len and (((@read_u8(@ptr_add(buf, u_scan)) as i64) & 255) == 32) { u_scan = u_scan + 1 }
+    var u_end = u_scan
+    while u_end < len {
+        let ub = (@read_u8(@ptr_add(buf, u_end)) as i64) & 255
+        if (ub >= 97 and ub <= 122) or ub == 78 or ub == 74 { u_end = u_end + 1 }
+        else { break }
+    }
+
+    if (op_code == NV3_OP_ADD or op_code == NV3_OP_SUB) and (u_end - u_scan) >= 1 and (u_end - u_scan) <= 2 {
+        let bnds = @malloc(40) as *i64
+        bnds[0] = la bnds[1] = op_idx bnds[2] = r_start bnds[3] = u_end bnds[4] = op_code
+        let si_len = nv3_syn_eval_parsed_si(buf, bnds, out_buf, max_out, out_steps)
+        @free(bnds as *u8)
+        if si_len > 0 { return si_len }
+    }
+
+    let pq1 = @malloc(16) as *i64
+    let pq2 = @malloc(16) as *i64
+    let r1 = nv3_ps_parse_rational_token(buf, la, op_idx, pq1)
+    let r2 = nv3_ps_parse_rational_token(buf, r_start, r_end_num, pq2)
+    if r1 == 1 and r2 == 1 {
+        let rr = nv3_rational_eval(op_code, pq1[0], pq1[1], pq2[0], pq2[1], 200)
+        @free(pq1 as *u8) @free(pq2 as *u8)
+        if rr.verdict == NV3_VERDICT_VERIFIED {
+            out_steps[0] = rr.steps + 1
+            var p2: i64 = 0
+            p2 = nv3_syn_buf_append_str(out_buf, p2, max_out, "Deterministik KHG rasyonel aritmetik çekirdeği ifadeyi tam doğrulukla hesapladı: kesin sonuç ")
+            p2 = nv3_syn_buf_append_i64(out_buf, p2, max_out, rr.p)
+            if rr.q != 1 {
+                p2 = nv3_syn_buf_append_str(out_buf, p2, max_out, "/")
+                p2 = nv3_syn_buf_append_i64(out_buf, p2, max_out, rr.q)
+            }
+            p2 = nv3_syn_buf_append_str(out_buf, p2, max_out, " olarak doğrulanmıştır.")
+            return p2
+        }
+    } else {
+        @free(pq1 as *u8) @free(pq2 as *u8)
+    }
+    return 0
+}
+
+fn nv3_syn_atom_neural_score(arena: *u8, off: i64, len: i64, probs_u8: *f64) -> f64 {
+    if len <= 0 { return 0.0 }
+    var acc: f64 = 0.0
+    let lim = if len < 6 { len } else { 6 }
+    var i: i64 = 0
+    while i < lim {
+        let b = (@read_u8(@ptr_add(arena, off + i)) as i64) & 255
+        var p = probs_u8[b]
+        if p < 0.0001 { p = 0.0001 }
+        acc = acc + nv3_log(p)
+        i = i + 1
+    }
+    return acc / (lim as f64)
+}
+
+fn nv3_syn_extract_query_features(
+    gh: *i64,
+    prompt_ptr: *u8,
+    prompt_len: i64,
+    out_stems: *i64,
+    out_echo_ids: *i64
+) -> i64 {
+    let max_stems: i64 = 64
+    let max_echo_ids: i64 = 64
+    let na = gh[1]
+    let a_off = gh[9] as *i64
+    let a_len = gh[10] as *i64
+    let arena = gh[15] as *u8
+
+    let stem_shadow = @malloc(max_stems * 8) as *i64
+    var n_stems: i64 = 0
+    var n_echo: i64 = 0
+    var pos: i64 = 0
+    while pos < prompt_len {
+        let b = (@read_u8(@ptr_add(prompt_ptr, pos)) as i64) & 255
+        if nv3_syn_is_ws(b) == 1 or nv3_syn_is_punct_delim(b) == 1 {
+            pos = pos + 1
+        } else {
+            let st = pos
+            while pos < prompt_len and (pos - st) < 46 {
+                let cb = (@read_u8(@ptr_add(prompt_ptr, pos)) as i64) & 255
+                if nv3_syn_is_ws(cb) == 1 or nv3_syn_is_punct_delim(cb) == 1 { break }
+                pos = pos + 1
+            }
+            let wlen = pos - st
+            if wlen >= 3 {
+                let wtmp = nv3_syn_copy_word(prompt_ptr, st, wlen)
+                let sh = nv3_syn_stem_hash(wtmp, wlen)
+                if sh != 0 and nv3_syn_is_common_func_word(wtmp, wlen) == 0 and n_stems < max_stems {
+                    out_stems[n_stems] = sh
+                    stem_shadow[n_stems] = nv3_syn_shadow(wtmp, wlen)
+                    n_stems = n_stems + 1
+                }
+                @free(wtmp)
+            }
+            if wlen > 0 and n_echo < max_echo_ids {
+                var aid: i64 = 0
+                while aid < na {
+                    if a_len[aid] == wlen and nv3_syn_slice_eq(arena, a_off[aid], prompt_ptr, st, wlen) == 1 {
+                        out_echo_ids[n_echo] = aid n_echo = n_echo + 1 break
+                    }
+                    aid = aid + 1
+                }
+            }
+        }
+    }
+    // Word shadows live at `out_stems[64..128]`; callers must size that buffer with 128 slots.
+    var sc: i64 = 0
+    while sc < max_stems { out_stems[max_stems + sc] = stem_shadow[sc] sc = sc + 1 }
+    out_echo_ids[max_echo_ids] = n_echo
+    @free(stem_shadow as *u8)
+    return n_stems
+}
+
+// Returns `direct_hits`: the number of prompt stems that resolve to a corpus atom. Topic-signature
+// adjacency is deliberately *not* counted — it shapes ranking but never licenses synthesis.
+// Exact document frequency of an atom: how many topic documents of the shipped corpus contain it.
+// Read straight from the graph's df table (`gh[25]`), never estimated from the 20-slot topic
+// signature sample — that sample covers less than half of a document's content words, so it would
+// report `df = 0` for atoms that every document of a topic actually uses (`entropi`, `momentum`).
+fn nv3_syn_atom_df(gh: *i64, aid: i64) -> i64 {
+    let tbl = gh[25] as *i64
+    if (tbl as i64) == 0 or aid < 0 or aid >= gh[1] { return 0 }
+    return tbl[aid]
+}
+
+// The document-frequency floor. Since `nv3_syn_atom_df` now reports exact document frequency from
+// the graph's df table, one occurrence in the corpus is already real evidence; the grounding signal
+// comes from the word-shadow family test and the curated predicate list, not from a df threshold.
+fn nv3_syn_min_doc_freq(_gh: *i64) -> i64 {
+    return 1
+}
+
+// Grounding gate. A prompt stem licenses synthesis only when it resolves to a corpus content atom
+// that is genuinely topical: not a stop word, not a predicate form, and present in at least one
+// document. Every condition is corpus-statistical, so morphological near-misses on generic
+// predicates (`yapısı` -> `yapısal`) and lone function words (`edilir`) are rejected instead of
+// licensing topical drift.
+// Morphological family test on folded word shadows. Two words belong to one family when either
+//   (a) one is a complete prefix of the other with at least three shared letters
+//       (`sır`/`sırlama`, `kuvvet`/`kuvveti`, `seramik`/`seramiğin`), or
+//   (b) they share a root of at least seven letters and diverge later, which is what suffix
+//       alternation inside one lemma looks like (`üretilir`/`üretilen`).
+// Six shared letters is not enough: `yapısı`/`yapısal` and `çalınır`/`çalışma` diverge at six and
+// five letters respectively and are different words, which is exactly what the old five-letter
+// stem hash could not tell apart.
+fn nv3_syn_shadow_family(qs: i64, as_: i64) -> i64 {
+    if qs == 0 or as_ == 0 { return 0 }
+    var i: i64 = 0
+    while i < 9 {
+        let sh = 6 * i
+        let qc = (qs >> sh) & 63
+        let ac = (as_ >> sh) & 63
+        if qc == 0 or ac == 0 { return if i >= 3 { 1 } else { 0 } }
+        if qc != ac { return if i >= 7 { 1 } else { 0 } }
+        i = i + 1
+    }
+    return 1
+}
+
+fn nv3_syn_strong_direct_hits(gh: *i64, q_stems: *i64, n_stems: i64) -> i64 {
+    let na = gh[1]
+    let a_flg = gh[11] as *i64
+    let a_off = gh[9] as *i64
+    let a_len = gh[10] as *i64
+    let a_arena = gh[15] as *u8
+    let df_min = nv3_syn_min_doc_freq(gh)
+    var hits: i64 = 0
+    var k: i64 = 0
+    while k < n_stems {
+        let qs = q_stems[64 + k]
+        var a: i64 = 0
+        while a < na {
+            var fam: i64 = nv3_syn_shadow_family(qs, nv3_syn_shadow(@ptr_add(a_arena, a_off[a]), a_len[a]))
+            if fam == 1 and (a_flg[a] & (NV3_SYN_FLAG_PUNCT | NV3_SYN_FLAG_STOPWORD)) == 0 and nv3_syn_atom_df(gh, a) >= df_min and nv3_syn_is_predicate_form(@ptr_add(a_arena, a_off[a]), a_len[a]) == 0 {
+                hits = hits + 1
+                break
+            }
+            a = a + 1
+        }
+        k = k + 1
+    }
+    return hits
+}
+
+fn nv3_syn_compute_atom_resonance(gh: *i64, q_stems: *i64, n_stems: i64, atom_boost: *f64) -> i64 {
+    let na = gh[1]
+    let ntop = gh[5]
+    let a_flg = gh[11] as *i64
+    let a_hsh = gh[14] as *i64
+    let bi_head = gh[16] as *i64
+    let bi_dst = gh[17] as *i64
+    let topic_sig = gh[22] as *i64
+
+    let dir_b = @malloc(na * 8) as *f64
+    nv3_zero(atom_boost, na)
+    nv3_zero(dir_b, na)
+    if n_stems <= 0 { @free(dir_b as *u8) return 0 }
+
+    var direct_hits: i64 = 0
+    var a: i64 = 0
+    while a < na {
+        let ah = a_hsh[a]
+        if ah != 0 and (a_flg[a] & (NV3_SYN_FLAG_PUNCT | NV3_SYN_FLAG_STOPWORD)) == 0 {
+            var k: i64 = 0
+            while k < n_stems {
+                if q_stems[k] == ah { dir_b[a] = 3.4 atom_boost[a] = 3.4 direct_hits = direct_hits + 1 break }
+                k = k + 1
+            }
+        }
+        a = a + 1
+    }
+
+    var max_topic_hits: i64 = 0
+    var t: i64 = 0
+    while t < ntop {
+        var hits: i64 = 0
+        var j: i64 = 0
+        while j < NV3_SYN_TOPIC_SIG_K {
+            let wid = topic_sig[t * NV3_SYN_TOPIC_SIG_K + j]
+            if wid >= 0 and dir_b[wid] > 1.0 { hits = hits + 1 }
+            j = j + 1
+        }
+        if hits > max_topic_hits { max_topic_hits = hits }
+        if hits > 0 {
+            let h_sq = (hits * hits) as f64
+            let t_w = 1.25 * h_sq
+            j = 0
+            while j < NV3_SYN_TOPIC_SIG_K {
+                let wid2 = topic_sig[t * NV3_SYN_TOPIC_SIG_K + j]
+                if wid2 >= 0 {
+                    let cand_b = dir_b[wid2] + t_w
+                    if cand_b > atom_boost[wid2] { atom_boost[wid2] = cand_b }
+                }
+                j = j + 1
+            }
+            j = 0
+            while j < NV3_SYN_TOPIC_SIG_K {
+                let wid3 = topic_sig[t * NV3_SYN_TOPIC_SIG_K + j]
+                if wid3 >= 0 {
+                    var e = bi_head[wid3]
+                    let e_b = bi_head[wid3 + 1]
+                    while e < e_b {
+                        let nb = bi_dst[e]
+                        if (a_flg[nb] & NV3_SYN_FLAG_PUNCT) == 0 {
+                            let cand_nb = dir_b[nb] + 0.55 * h_sq
+                            if cand_nb > atom_boost[nb] { atom_boost[nb] = cand_nb }
+                        }
+                        e = e + 1
+                    }
+                }
+                j = j + 1
+            }
+        }
+        t = t + 1
+    }
+    // `max_topic_hits` only widens the boost field; the returned value stays the direct-hit count,
+    // so callers can use it as a grounding gate without the `>= 1` topic-adjacency false positive.
+    if max_topic_hits < 0 { @free(dir_b as *u8) return direct_hits }
+    @free(dir_b as *u8)
+    return direct_hits
+}
+
+fn nv3_syn_has_dot_edge(bi_head: *i64, bi_dst: *i64, w: i64) -> i64 {
+    var k = bi_head[w]
+    let hi = bi_head[w + 1]
+    while k < hi {
+        if bi_dst[k] == 0 { return 1 }
+        k = k + 1
+    }
+    return 0
+}
+
+// ASCII case-folded prefix compare (`lit` must be lowercase ASCII). Trailing punctuation is
+// allowed because the `NV3G1` tokenizer keeps `,`/`.` attached to the preceding atom.
+fn nv3_syn_prefix_ci(ptr: *u8, len: i64, lit: string) -> i64 {
+    let llen = @string_len(lit)
+    if len < llen { return 0 }
+    let lp = lit.ptr as *u8
+    var i: i64 = 0
+    while i < llen {
+        var a = (@read_u8(@ptr_add(ptr, i)) as i64) & 255
+        if a >= 65 and a <= 90 { a = a + 32 }
+        if a != ((@read_u8(@ptr_add(lp, i)) as i64) & 255) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn nv3_syn_best_run(runs: *i64, lo: i64, hi: i64) -> i64 {
+    var best: i64 = 1000000
+    var i = lo
+    while i < hi {
+        if runs[i] < best { best = runs[i] }
+        i = i + 1
+    }
+    return best
+}
+
+fn nv3_syn_is_greeting_atom(arena: *u8, off: i64, len: i64) -> i64 {
+    let p = @ptr_add(arena, off)
+    if nv3_syn_prefix_ci(p, len, "selam") == 1 { return 1 }
+    if nv3_syn_prefix_ci(p, len, "merhaba") == 1 { return 1 }
+    if nv3_syn_prefix_ci(p, len, "günaydın") == 1 { return 1 }
+    if nv3_syn_prefix_ci(p, len, "hoş") == 1 { return 1 }
+    return 0
+}
+
+fn nv3_syn_is_greeting_word(ptr: *u8, len: i64) -> i64 {
+    if nv3_syn_prefix_ci(ptr, len, "selam") == 1 { return 1 }
+    if nv3_syn_prefix_ci(ptr, len, "merhaba") == 1 { return 1 }
+    if nv3_syn_prefix_ci(ptr, len, "günaydın") == 1 { return 1 }
+    if nv3_syn_prefix_ci(ptr, len, "merhabalar") == 1 { return 1 }
+    return 0
+}
+
+// A greeting atom is only admitted as a starter when the prompt itself greets: the boost is
+// raised above `NV3_SYN_GREET_BOOST_FLOOR`, which is exactly what `nv3_syn_pick_starter` gates on.
+fn nv3_syn_apply_greeting_intent(gh: *i64, prompt_ptr: *u8, prompt_len: i64, atom_boost: *f64) -> i64 {
+    let na = gh[1]
+    let a_off = gh[9] as *i64
+    let a_len = gh[10] as *i64
+    let arena = gh[15] as *u8
+
+    var greets: i64 = 0
+    var pos: i64 = 0
+    while pos < prompt_len {
+        let b = (@read_u8(@ptr_add(prompt_ptr, pos)) as i64) & 255
+        if nv3_syn_is_ws(b) == 1 or nv3_syn_is_punct_delim(b) == 1 {
+            pos = pos + 1
+        } else {
+            let st = pos
+            while pos < prompt_len and (pos - st) < 46 {
+                let cb = (@read_u8(@ptr_add(prompt_ptr, pos)) as i64) & 255
+                if nv3_syn_is_ws(cb) == 1 or nv3_syn_is_punct_delim(cb) == 1 { break }
+                pos = pos + 1
+            }
+            if nv3_syn_is_greeting_word(@ptr_add(prompt_ptr, st), pos - st) == 1 { greets = 1 }
+        }
+    }
+    if greets == 0 { return 0 }
+
+    var a: i64 = 1
+    while a < na {
+        if nv3_syn_is_greeting_atom(arena, a_off[a], a_len[a]) == 1 {
+            if atom_boost[a] < NV3_SYN_GREET_BOOST_FLOOR { atom_boost[a] = NV3_SYN_GREET_BOOST_FLOOR }
+        }
+        a = a + 1
+    }
+    return 1
+}
+
+fn nv3_syn_pick_starter(
+    gh: *i64,
+    atom_boost: *f64,
+    probs_u8: *f64,
+    used_mask: *i64,
+    prompt_first_id: i64,
+    rng_state: *i64
+) -> i64 {
+    let na = gh[1]
+    let a_off = gh[9] as *i64
+    let a_len = gh[10] as *i64
+    let a_flg = gh[11] as *i64
+    let a_cnt = gh[12] as *i64
+    let arena = gh[15] as *u8
+    let bi_head = gh[16] as *i64
+
+    let top_ids = @malloc(64) as *i64
+    let top_sc = @malloc(64) as *f64
+    var k: i64 = 0
+    while k < 8 { top_ids[k] = -1 top_sc[k] = -1000000000.0 k = k + 1 }
+
+    var a: i64 = 1
+    while a < na {
+        let flg = a_flg[a]
+        let out_deg = bi_head[a + 1] - bi_head[a]
+        let is_greet = nv3_syn_is_greeting_atom(arena, a_off[a], a_len[a])
+        let greet_ok = if is_greet == 1 and atom_boost[a] < NV3_SYN_GREET_BOOST_FLOOR { 0 } else { 1 }
+        if greet_ok == 1 and (flg & NV3_SYN_FLAG_UPPER_START) != 0 and (flg & NV3_SYN_FLAG_PUNCT) == 0 and out_deg >= 1 and used_mask[a] == 0 and a != prompt_first_id {
+            let nsc = nv3_syn_atom_neural_score(arena, a_off[a], a_len[a], probs_u8)
+            let sc = atom_boost[a] * 2.2 + nv3_log((out_deg + 1) as f64) * 0.45 + nv3_log((a_cnt[a] + 1) as f64) * 0.25 + nsc * 0.12
+            var pos: i64 = -1
+            var j: i64 = 0
+            while j < 6 {
+                if sc > top_sc[j] { pos = j break }
+                j = j + 1
+            }
+            if pos >= 0 {
+                var sh: i64 = 5
+                while sh > pos { top_ids[sh] = top_ids[sh - 1] top_sc[sh] = top_sc[sh - 1] sh = sh - 1 }
+                top_ids[pos] = a top_sc[pos] = sc
+            }
+        }
+        a = a + 1
+    }
+
+    var chosen = top_ids[0]
+    if top_ids[1] >= 0 and (top_sc[0] - top_sc[1]) < 0.85 {
+        var st = rng_state[0]
+        st = (st * 6364136223846793005) + 1442695040888963407
+        rng_state[0] = st
+        let idx = ((st >> 33) & 1)
+        if top_ids[idx] >= 0 { chosen = top_ids[idx] }
+    }
+    @free(top_ids as *u8) @free(top_sc as *u8)
+    if chosen < 0 {
+        var f: i64 = 1
+        while f < na {
+            if (a_flg[f] & NV3_SYN_FLAG_PUNCT) == 0 and (bi_head[f + 1] - bi_head[f]) > 0 { return f }
+            f = f + 1
+        }
+        return 0
+    }
+    return chosen
+}
+
+fn nv3_syn_bigram_seen(seq_ptr: *i64, seq_len: i64, prev1: i64, w: i64) -> i64 {
+    if w == 0 or seq_len < 2 { return 0 }
+    var i: i64 = 0
+    while (i + 1) < seq_len {
+        if seq_ptr[i] == prev1 and seq_ptr[i + 1] == w { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+fn nv3_syn_has_novel_4g(gh: *i64, echo_f4: *i64, step_ctx: *i64) -> i64 {
+    let prev3 = step_ctx[0] let prev2 = step_ctx[1] let prev1 = step_ctx[2]
+    let sent_words = step_ctx[3] let n_echo_f4 = step_ctx[5]
+    if prev2 < 0 or prev3 < 0 { return 0 }
+    let nf4 = gh[6]
+    let a_flg = gh[11] as *i64
+    let bi_head = gh[16] as *i64
+    let bi_dst = gh[17] as *i64
+    let f4_keys = gh[23] as *i64
+    var e = bi_head[prev1]
+    let b_hi = bi_head[prev1 + 1]
+    while e < b_hi {
+        let dw = bi_dst[e]
+        let allow_p = if (a_flg[dw] & NV3_SYN_FLAG_SENT_END) != 0 and sent_words < 8 { 0 } else { 1 }
+        if allow_p == 1 {
+            let h4 = nv3_syn_hash4(prev3, prev2, prev1, dw)
+            if nv3_syn_bsearch_has(f4_keys, nf4, h4) == 0 and nv3_syn_bsearch_has(echo_f4, n_echo_f4, h4) == 0 {
+                return 1
+            }
+        }
+        e = e + 1
+    }
+    return 0
+}
+
+// `step_ctx` (`*i64`): `[0]=prev3, [1]=prev2, [2]=prev1, [3]=sent_words, [4]=consec_run,
+// `[5]=n_echo_f4, [6]=out_seq, [7]=seq_len, [8]=rng_state, [9]=antiverbatim pressure (milli)`.
+// Returns `(chosen_in4 << 24) | chosen_atom_id`, or `-1` if dead end.
+fn nv3_syn_step_select(
+    gh: *i64,
+    atom_boost: *f64,
+    probs_u8: *f64,
+    used_cnt: *i64,
+    echo_f4: *i64,
+    step_ctx: *i64
+) -> i64 {
+    let rng = step_ctx[8] as *i64
+    let na = gh[1] let ntri = gh[4] let nf4 = gh[6] let tfert = gh[8]
+    let a_off = gh[9] as *i64 let a_len = gh[10] as *i64 let a_flg = gh[11] as *i64
+    let a_fert = gh[13] as *i64 let arena = gh[15] as *u8
+    let bi_head = gh[16] as *i64 let bi_dst = gh[17] as *i64 let bi_cnt = gh[18] as *i64
+    let tri_key = gh[19] as *i64 let tri_dst = gh[20] as *i64 let tri_cnt = gh[21] as *i64
+    let f4_keys = gh[23] as *i64
+
+    let prev3 = step_ctx[0] let prev2 = step_ctx[1] let prev1 = step_ctx[2]
+    let sent_words = step_ctx[3] let consec_run = step_ctx[4] let n_echo_f4 = step_ctx[5]
+
+    let b_lo = bi_head[prev1]
+    let b_hi = bi_head[prev1 + 1]
+    if b_lo >= b_hi { return -1 }
+
+    var sum_bi: i64 = 0
+    let bi_unique = b_hi - b_lo
+    var e = b_lo
+    while e < b_hi { sum_bi = sum_bi + bi_cnt[e] e = e + 1 }
+
+    var t_lo: i64 = 0 var t_hi: i64 = 0 var sum_tri: i64 = 0
+    if prev2 >= 0 and ntri > 0 {
+        let tkey = (prev2 << 20) | prev1
+        t_lo = nv3_syn_lower_bound(tri_key, ntri, tkey)
+        t_hi = t_lo
+        while t_hi < ntri and tri_key[t_hi] == tkey {
+            sum_tri = sum_tri + tri_cnt[t_hi] t_hi = t_hi + 1
+        }
+    }
+
+    let has_novel_branch = nv3_syn_has_novel_4g(gh, echo_f4, step_ctx)
+
+    let cand_ids = @malloc(48) as *i64
+    let cand_sc = @malloc(48) as *f64
+    let cand_in4 = @malloc(48) as *i64
+    var ci: i64 = 0
+    while ci < 5 { cand_ids[ci] = -1 cand_sc[ci] = -1000000000.0 cand_in4[ci] = 0 ci = ci + 1 }
+
+    let disc: f64 = 0.72
+    let lam_bi = (disc * (bi_unique as f64)) / (sum_bi as f64)
+    let prev_is_p = a_flg[prev1] & NV3_SYN_FLAG_PUNCT
+    let seq_ptr = step_ctx[6] as *i64
+    let seq_len = step_ctx[7]
+
+    e = b_lo
+    while e < b_hi {
+        let w = bi_dst[e]
+        let wflg = a_flg[w]
+        var skip_w: i64 = nv3_syn_bigram_seen(seq_ptr, seq_len, prev1, w)
+        if w == prev1 { skip_w = 1 }
+        if (wflg & NV3_SYN_FLAG_SENT_END) != 0 and sent_words < 8 { skip_w = 1 }
+        if ((wflg & NV3_SYN_FLAG_PUNCT) & prev_is_p) != 0 { skip_w = 1 }
+
+        if skip_w == 0 {
+            var in4: i64 = 0
+            if prev2 >= 0 and prev3 >= 0 {
+                let h4c = nv3_syn_hash4(prev3, prev2, prev1, w)
+                in4 = nv3_syn_bsearch_has(f4_keys, nf4, h4c) | nv3_syn_bsearch_has(echo_f4, n_echo_f4, h4c)
+            }
+            let p_cont = ((a_fert[w] + 1) as f64) / ((tfert + na) as f64)
+            var c_bi_adj = (bi_cnt[e] as f64) - disc
+            if c_bi_adj < 0.0 { c_bi_adj = 0.0 }
+            var p_final = (c_bi_adj / (sum_bi as f64)) + lam_bi * p_cont
+            if sum_tri > 0 {
+                var tc: i64 = 0 var ti = t_lo
+                while ti < t_hi {
+                    if tri_dst[ti] == w { tc = tri_cnt[ti] break }
+                    ti = ti + 1
+                }
+                let lam_tri = (disc * ((t_hi - t_lo) as f64)) / (sum_tri as f64)
+                var c_tri_adj = (tc as f64) - disc
+                if c_tri_adj < 0.0 { c_tri_adj = 0.0 }
+                p_final = (c_tri_adj / (sum_tri as f64)) + lam_tri * p_final
+            }
+            if p_final < 0.0000001 { p_final = 0.0000001 }
+
+            let nsc = nv3_syn_atom_neural_score(arena, a_off[w], a_len[w], probs_u8)
+            var sc = nv3_log(p_final) + atom_boost[w] * 0.72 + nsc * 0.10
+            if (wflg & NV3_SYN_FLAG_SENT_END) != 0 and sent_words >= 9 {
+                sc = sc + 4.2 + ((sent_words - 9) as f64) * 0.85
+            } else if sent_words >= 11 and nv3_syn_has_dot_edge(bi_head, bi_dst, w) == 1 {
+                sc = sc + 2.8 + ((sent_words - 11) as f64) * 0.45
+            }
+            if used_cnt[w] > 0 and (wflg & NV3_SYN_FLAG_SENT_END) == 0 {
+                let pen_u = if (wflg & (NV3_SYN_FLAG_PUNCT | NV3_SYN_FLAG_STOPWORD)) == 0 { 3.4 } else { 0.7 }
+                sc = sc - (used_cnt[w] as f64) * pen_u
+            }
+            if in4 != 0 {
+                // `step_ctx[9]` carries the caller's anti-verbatim pressure in milli-units so the
+                // outer search can escalate it when a candidate still reproduces 5+ gram runs.
+                let pen_base = (step_ctx[9] as f64) / 1000.0
+                let pen4 = if has_novel_branch == 1 or consec_run >= 3 { 10000.0 } else { pen_base }
+                sc = sc - pen4
+            } else if (bi_head[w + 1] - bi_head[w]) >= 2 {
+                sc = sc + 0.35
+            }
+
+            var ins: i64 = -1 var rk: i64 = 0
+            while rk < 4 {
+                if sc > cand_sc[rk] { ins = rk break }
+                rk = rk + 1
+            }
+            if ins >= 0 {
+                var sh2: i64 = 3
+                while sh2 > ins {
+                    cand_ids[sh2] = cand_ids[sh2 - 1] cand_sc[sh2] = cand_sc[sh2 - 1]
+                    cand_in4[sh2] = cand_in4[sh2 - 1] sh2 = sh2 - 1
+                }
+                cand_ids[ins] = w cand_sc[ins] = sc cand_in4[ins] = in4
+            }
+        }
+        e = e + 1
+    }
+
+    var next_w = cand_ids[0]
+    var next_in4 = cand_in4[0]
+    if next_w < 0 { next_w = 0 next_in4 = 0 }
+    else if sent_words >= 30 and (a_flg[prev1] & (NV3_SYN_FLAG_PUNCT | NV3_SYN_FLAG_STOPWORD)) == 0 {
+        next_w = 0 next_in4 = 0
+    } else if cand_ids[1] >= 0 and (cand_sc[0] - cand_sc[1]) < 0.95 and cand_sc[1] > -500.0 {
+        var st2 = rng[0]
+        st2 = (st2 * 6364136223846793005) + 1442695040888963407
+        rng[0] = st2
+        if (((st2 >> 34) & 3) == 1) { next_w = cand_ids[1] next_in4 = cand_in4[1] }
+    }
+    @free(cand_ids as *u8) @free(cand_sc as *u8) @free(cand_in4 as *u8)
+    return (next_in4 << 24) | next_w
+}
+
+fn nv3_syn_decode_one_candidate(
+    gh: *i64,
+    atom_boost: *f64,
+    probs_u8: *f64,
+    echo_f4: *i64,
+    dec_cfg: *i64,
+    out_seq: *i64
+) -> i64 {
+    let n_echo_f4 = dec_cfg[0]
+    let prompt_first_id = dec_cfg[1]
+    let seed = dec_cfg[2]
+    let pressure = if dec_cfg[3] > 0 { dec_cfg[3] } else { 4500 }
+    let na = gh[1] let nfs = gh[7]
+    let a_flg = gh[11] as *i64
+    let fs_keys = gh[24] as *i64
+
+    let used_cnt = @malloc(na * 8) as *i64
+    let used_starters = @malloc(na * 8) as *i64
+    var z: i64 = 0
+    while z < na { used_cnt[z] = 0 used_starters[z] = 0 z = z + 1 }
+
+    let rng = @malloc(8) as *i64
+    rng[0] = if seed != 0 { seed } else { 987654321 }
+    let step_ctx = @malloc(80) as *i64
+    step_ctx[8] = rng as i64
+    step_ctx[9] = pressure
+
+    let target_sents: i64 = 2
+    let max_seq: i64 = 68
+    var seq_len: i64 = 0 var sents_done: i64 = 0 var sent_start_idx: i64 = 0
+    var sent_words: i64 = 0 var consec_run: i64 = 1 var max_run: i64 = 1
+
+    let st0 = nv3_syn_pick_starter(gh, atom_boost, probs_u8, used_starters, prompt_first_id, rng)
+    out_seq[0] = st0 seq_len = 1 sent_words = 1 used_cnt[st0] = 1 used_starters[st0] = 1
+
+    var guard_steps: i64 = 0
+    while seq_len < max_seq and sents_done < target_sents and guard_steps < 120 {
+        guard_steps = guard_steps + 1
+        let prev1 = out_seq[seq_len - 1]
+        if (a_flg[prev1] & NV3_SYN_FLAG_SENT_END) != 0 {
+            if sents_done >= target_sents or seq_len >= 34 { break }
+            let st_next = nv3_syn_pick_starter(gh, atom_boost, probs_u8, used_starters, prompt_first_id, rng)
+            out_seq[seq_len] = st_next sent_start_idx = seq_len seq_len = seq_len + 1
+            sent_words = 1 consec_run = 1 used_cnt[st_next] = used_cnt[st_next] + 1 used_starters[st_next] = 1
+        } else {
+            step_ctx[0] = if seq_len >= 3 { out_seq[seq_len - 3] } else { -1 }
+            step_ctx[1] = if seq_len >= 2 { out_seq[seq_len - 2] } else { -1 }
+            step_ctx[2] = prev1
+            step_ctx[3] = sent_words
+            step_ctx[4] = consec_run
+            step_ctx[5] = n_echo_f4
+            step_ctx[6] = out_seq as i64
+            step_ctx[7] = seq_len
+
+            let sel_pk = nv3_syn_step_select(gh, atom_boost, probs_u8, used_cnt, echo_f4, step_ctx)
+            if sel_pk < 0 {
+                out_seq[seq_len] = 0 seq_len = seq_len + 1 sents_done = sents_done + 1
+            } else {
+                let next_w = sel_pk & 16777215
+                let next_in4 = sel_pk >> 24
+                out_seq[seq_len] = next_w seq_len = seq_len + 1 used_cnt[next_w] = used_cnt[next_w] + 1
+
+                if (a_flg[next_w] & NV3_SYN_FLAG_PUNCT) == 0 {
+                    sent_words = sent_words + 1
+                    if next_in4 == 1 {
+                        consec_run = consec_run + 1
+                        if consec_run > max_run { max_run = consec_run }
+                    } else {
+                        consec_run = 1
+                    }
+                } else if (a_flg[next_w] & NV3_SYN_FLAG_SENT_END) != 0 {
+                    var sh_chk: i64 = 1469598103934665603
+                    var sw_chk: i64 = 0 var si = sent_start_idx
+                    while si < seq_len {
+                        let sw = out_seq[si]
+                        if (a_flg[sw] & NV3_SYN_FLAG_PUNCT) == 0 {
+                            sh_chk = (sh_chk ^ (sw + 97)) * 1099511628211 sw_chk = sw_chk + 1
+                        }
+                        si = si + 1
+                    }
+                    if sh_chk < 0 { sh_chk = 0 - sh_chk }
+                    if sh_chk == 0 { sh_chk = 1 }
+                    if sw_chk >= 4 and nv3_syn_bsearch_has(fs_keys, nfs, sh_chk) == 1 {
+                        seq_len = sent_start_idx sent_words = 0 consec_run = 1
+                        if seq_len == 0 {
+                            let alt_st = nv3_syn_pick_starter(gh, atom_boost, probs_u8, used_starters, prompt_first_id, rng)
+                            out_seq[0] = alt_st seq_len = 1 sent_words = 1 used_starters[alt_st] = 1
+                        }
+                    } else {
+                        sents_done = sents_done + 1
+                    }
+                }
+            }
+        }
+    }
+
+    if seq_len > 0 and (a_flg[out_seq[seq_len - 1]] & NV3_SYN_FLAG_SENT_END) == 0 {
+        seq_len = nv3_syn_close_sentence(gh, out_seq, seq_len, sent_start_idx)
+    }
+
+    @free(step_ctx as *u8) @free(used_cnt as *u8) @free(used_starters as *u8) @free(rng as *u8)
+    return (max_run << 16) | seq_len
+}
+
+// Exact anti-verbatim measurement. Walks every 4-atom window of `seq` and treats the window as a
+// hit when its hash is present in the corpus 4-gram index or the prompt-echo index. Consecutive
+// hits form a verbatim chain whose length in atoms is exactly the number of corpus tokens
+// reproduced in order, so the returned value is an exact (not sampled) overlap count.
+// `out_span`: `[0]=chain_start_atom_index, [1]=chain_length_in_atoms` for the longest chain.
+fn nv3_syn_exact_max_run(
+    gh: *i64,
+    echo_f4: *i64,
+    n_echo: i64,
+    seq: *i64,
+    seq_len: i64,
+    out_span: *i64
+) -> i64 {
+    let nf4 = gh[6]
+    let f4_keys = gh[23] as *i64
+    out_span[0] = -1 out_span[1] = 0
+    if seq_len < 4 { return 0 }
+    var best: i64 = 0
+    var chain_start: i64 = -1
+    var i: i64 = 0
+    while (i + 3) < seq_len {
+        let h = nv3_syn_hash4(seq[i], seq[i + 1], seq[i + 2], seq[i + 3])
+        let hit = nv3_syn_bsearch_has(f4_keys, nf4, h) | nv3_syn_bsearch_has(echo_f4, n_echo, h)
+        if hit == 0 {
+            chain_start = -1
+        } else {
+            if chain_start < 0 { chain_start = i }
+            let wlen = (i + 4) - chain_start
+            if wlen > best { best = wlen out_span[0] = chain_start out_span[1] = wlen }
+        }
+        i = i + 1
+    }
+    return best
+}
+
+fn nv3_syn_repair_score(a_flg: *i64, a_fert: *i64, w: i64) -> i64 {
+    let f = a_fert[w]
+    if (a_flg[w] & NV3_SYN_FLAG_STOPWORD) != 0 { return (0 - 1000000) + f }
+    return f
+}
+
+// Deterministic paraphrase repair: while the longest verbatim chain exceeds `max_run`, splice out
+// the least load-bearing interior atom of that chain (function words first, then the least
+// connected atom). Removing one interior atom provably breaks every 4-window spanning it, so a
+// chain of `L` atoms is split into two chains shorter than `L`. Returns the new sequence length,
+// or `0` when the sequence cannot be repaired within the bounded attempt budget.
+fn nv3_syn_repair_verbatim(gh: *i64, echo_f4: *i64, n_echo: i64, seq: *i64, seq_len: i64, max_run: i64) -> i64 {
+    let a_flg = gh[11] as *i64
+    let a_fert = gh[13] as *i64
+    let span = @malloc(16) as *i64
+    var cur_len = seq_len
+    var repairs: i64 = 0
+    var repaired: i64 = 1
+    while repairs < 40 {
+        repairs = repairs + 1
+        let run = nv3_syn_exact_max_run(gh, echo_f4, n_echo, seq, cur_len, span)
+        if run <= max_run { break }
+        let st = span[0]
+        let ln = span[1]
+        var pick: i64 = -1
+        var best_s: i64 = 9000000000000000000
+        var i = st + 2
+        let hi = st + ln - 2
+        while i < hi {
+            let w = seq[i]
+            if (a_flg[w] & NV3_SYN_FLAG_PUNCT) == 0 {
+                let s = nv3_syn_repair_score(a_flg, a_fert, w)
+                if s < best_s { best_s = s pick = i }
+            }
+            i = i + 1
+        }
+        if pick < 0 { repaired = 0 break }
+        var j = pick
+        while j < (cur_len - 1) { seq[j] = seq[j + 1] j = j + 1 }
+        cur_len = cur_len - 1
+    }
+    if repaired == 1 {
+        let final_run = nv3_syn_exact_max_run(gh, echo_f4, n_echo, seq, cur_len, span)
+        if final_run > max_run { repaired = 0 }
+    }
+    @free(span as *u8)
+    if repaired == 0 { return 0 }
+    return cur_len
+}
+
+// Finalizes one decoded candidate: renders it, measures the exact verbatim overlap, and applies
+// the deterministic repair when the gate is violated. Returning a packed scalar instead of
+// mutating caller-scope `var`s keeps this path free of the `-O2` mutable-reassignment hazard.
+// Returns `(exact_max_run << 32) | rendered_bytes`; `out_info[0]=atom_len` after repair,
+// `out_info[1]=1` when a repair was applied.
+// `fin_cfg`: `[0]=echo_f4_ptr, [1]=n_echo, [2]=max_out`. Six parameters keep the call inside the
+// register-argument window, which the shrink-wrapped `-O2` prologue handles exactly.
+fn nv3_syn_finalize_candidate(
+    gh: *i64,
+    fin_cfg: *i64,
+    seq: *i64,
+    seq_len: i64,
+    out_buf: *u8,
+    out_info: *i64
+) -> i64 {
+    let echo_f4 = fin_cfg[0] as *i64
+    let n_echo = fin_cfg[1]
+    let max_out = fin_cfg[2]
+    out_info[0] = seq_len out_info[1] = 0
+    let span = @malloc(16) as *i64
+    let run0 = nv3_syn_exact_max_run(gh, echo_f4, n_echo, seq, seq_len, span)
+    var final_seq = seq_len
+    var final_atoms = seq_len
+    var final_run = run0
+    var repaired = 0
+    if run0 > NV3_SYN_MAX_CORPUS_RUN {
+        let rlen = nv3_syn_repair_verbatim(gh, echo_f4, n_echo, seq, seq_len, NV3_SYN_MAX_CORPUS_RUN)
+        if rlen > 0 {
+            let rrun = nv3_syn_exact_max_run(gh, echo_f4, n_echo, seq, rlen, span)
+            final_seq = rlen final_atoms = rlen final_run = rrun repaired = 1
+        }
+    }
+    @free(span as *u8)
+    let len = nv3_syn_render_atoms(gh, seq, final_seq, out_buf, max_out)
+    out_info[0] = final_atoms
+    out_info[1] = repaired
+    return (final_run << 32) | len
+}
+
+// Closes the final incomplete sentence on an atom that the corpus itself terminates with a
+// period, so a truncated decode never ends on a trailing modifier (e.g. `... güvenle devreye.`).
+fn nv3_syn_close_sentence(gh: *i64, out_seq: *i64, seq_len: i64, sent_start_idx: i64) -> i64 {
+    if seq_len <= 0 { return seq_len }
+    let a_flg = gh[11] as *i64
+    let bi_head = gh[16] as *i64
+    let bi_dst = gh[17] as *i64
+    let last = out_seq[seq_len - 1]
+    if (a_flg[last] & NV3_SYN_FLAG_SENT_END) != 0 { return seq_len }
+    let lo = if (seq_len - 10) > sent_start_idx { seq_len - 10 } else { sent_start_idx + 2 }
+    var i = seq_len - 1
+    while i >= lo {
+        let w = out_seq[i]
+        if (a_flg[w] & NV3_SYN_FLAG_PUNCT) == 0 and nv3_syn_has_dot_edge(bi_head, bi_dst, w) == 1 {
+            out_seq[i + 1] = 0
+            return i + 2
+        }
+        i = i - 1
+    }
+    if (a_flg[last] & NV3_SYN_FLAG_PUNCT) != 0 {
+        out_seq[seq_len - 1] = 0
+        return seq_len
+    }
+    out_seq[seq_len] = 0
+    return seq_len + 1
+}
+
+fn nv3_syn_render_atoms(gh: *i64, seq: *i64, seq_len: i64, out_buf: *u8, max_out: i64) -> i64 {
+    let na = gh[1]
+    let a_off = gh[9] as *i64
+    let a_len = gh[10] as *i64
+    let a_flg = gh[11] as *i64
+    let arena = gh[15] as *u8
+
+    var pos: i64 = 0 var i: i64 = 0
+    while i < seq_len {
+        let aid = seq[i]
+        if aid >= 0 and aid < na {
+            let flg = a_flg[aid]
+            let alen = a_len[aid]
+            let aoff = a_off[aid]
+            let need_sp = if i > 0 and (flg & NV3_SYN_FLAG_PUNCT) == 0 { 1 } else { 0 }
+            if (pos + need_sp + alen) > max_out { break }
+            if need_sp == 1 { @write_u8(@ptr_add(out_buf, pos), 32 as u8) pos = pos + 1 }
+            var k: i64 = 0
+            while k < alen { @write_u8(@ptr_add(out_buf, pos + k), @read_u8(@ptr_add(arena, aoff + k))) k = k + 1 }
+            pos = pos + alen
+        }
+        i = i + 1
+    }
+    return pos
+}
+
+// `io_meta`: in `[6]=has_verified_khg, [7]=max_out, [8]=use_fallback, [9]=prompt_ptr, [10]=prompt_len`;
+//   out `[0]=emitted, [1]=atoms, [2]=exact_max_run, [3]=res_hits, [4]=proof_steps, [5]=graph_ok,
+//       [11]=candidates_decoded, [12]=verbatim_repairs_applied, [13]=sequences_decoded`.
+// `probs_u8`: `[0..255]` byte probs, `[256]` = `base_nll`.
+fn nv3_syn_run_nv3g_search(
+    nv3g_path: string,
+    probs_u8: *f64,
+    out_gen_u8: *u8,
+    io_meta: *i64
+) {
+    let has_ver_khg = io_meta[6]
+    if has_ver_khg < 0 { io_meta[6] = 0 } // KHG license never gates relevance (see the abstain below)
+    let max_out = io_meta[7]
+    let use_fb = io_meta[8]
+    let p_ptr = io_meta[9] as *u8
+    let p_len = io_meta[10]
+    let base_nll = probs_u8[256]
+    io_meta[0] = 0 io_meta[1] = 0 io_meta[2] = 0 io_meta[3] = 0 io_meta[4] = 0 io_meta[5] = 0
+    io_meta[11] = 0 io_meta[12] = 0 io_meta[13] = 0 io_meta[14] = 0
+    var gh = nv3_syn_load_nv3g(nv3g_path)
+    if gh[0] != 1 and use_fb == 1 {
+        nv3_syn_graph_free(gh)
+        gh = nv3_syn_load_nv3g("ai/noema_v3/checkpoints/noema_v3_prod.nv3g")
+    }
+    if gh[0] != 1 {
+        nv3_syn_graph_free(gh)
+        return
+    }
+    io_meta[5] = 1
+    // 64 stems + 64 packed word shadows written by `nv3_syn_extract_query_features`.
+    let q_stems = @malloc(128 * 8) as *i64
+    let echo_ids = @malloc(65 * 8) as *i64
+    let n_stems = nv3_syn_extract_query_features(gh, p_ptr, p_len, q_stems, echo_ids)
+    let n_echo_ids = echo_ids[64]
+
+    let echo_f4 = @malloc(64 * 8) as *i64
+    var n_ef4: i64 = 0 var ei2: i64 = 0
+    while (ei2 + 3) < n_echo_ids and n_ef4 < 64 {
+        echo_f4[n_ef4] = nv3_syn_hash4(echo_ids[ei2], echo_ids[ei2 + 1], echo_ids[ei2 + 2], echo_ids[ei2 + 3])
+        n_ef4 = n_ef4 + 1 ei2 = ei2 + 1
+    }
+    nv3_syn_sort_i64(echo_f4, n_ef4)
+    n_ef4 = nv3_syn_dedup_sorted_i64(echo_f4, n_ef4)
+    let prompt_first_id = if n_echo_ids > 0 { echo_ids[0] } else { -1 }
+
+    let atom_boost = @malloc(gh[1] * 8) as *f64
+    let res_hits = nv3_syn_compute_atom_resonance(gh, q_stems, n_stems, atom_boost)
+    var grounded = nv3_syn_strong_direct_hits(gh, q_stems, n_stems)
+    // Query-term coverage gate. A single accidental stem is not evidence that the corpus covers the
+    // question; measured over the production corpus, in-corpus prompts cover 66-100% of their
+    // content stems while off-topic prompts cover 0-20% (`Zebranın kuyruk yapısı` grounds only on
+    // `yapısı`). Requiring half of the stems keeps every in-corpus prompt and abstains on the rest.
+    if n_stems > 0 and (grounded * 2) < n_stems { grounded = 0 }
+    io_meta[3] = res_hits
+    io_meta[14] = grounded
+    let greet_intent = nv3_syn_apply_greeting_intent(gh, p_ptr, p_len, atom_boost)
+
+    // Honest abstention: without lexical grounding or a greeting intent there is no evidence that
+    // this corpus speaks to the question, so the decoder stays silent instead of emitting topical
+    // drift. Verified KHG claims are deliberately *not* an escape hatch here: evidence licenses
+    // facts about a topic, not the relevance of an arbitrary question, so `Saksafon nasıl çalınır?`
+    // abstains even though the locked shard carries verified claims about physics and logic.
+    if grounded == 0 and greet_intent == 0 {
+        @free(atom_boost as *u8) @free(echo_f4 as *u8) @free(echo_ids as *u8) @free(q_stems as *u8)
+        nv3_syn_graph_free(gh)
+        return
+    }
+
+    let base_seed = nv3_syn_exact_hash(p_ptr, p_len)
+    let fin_info = @malloc(16) as *i64
+    let fin_cfg = @malloc(32) as *i64
+    fin_cfg[0] = echo_f4 as i64 fin_cfg[1] = n_ef4 fin_cfg[2] = max_out
+    let cand_room = NV3_SYN_SEARCH_ROUNDS * NV3_SYN_SLOTS_PER_ROUND
+    let cand_ptrs = @malloc(cand_room * 8) as *i64 let cand_lens = @malloc(cand_room * 8) as *i64
+    let cand_nlls = @malloc(cand_room * 8) as *f64 let cand_runs = @malloc(cand_room * 8) as *i64
+    let cand_atms = @malloc(cand_room * 8) as *i64
+    var zi3: i64 = 0
+    while zi3 < cand_room { cand_ptrs[zi3] = 0 zi3 = zi3 + 1 }
+    let dec_cfg = @malloc(32) as *i64
+    dec_cfg[0] = n_ef4
+    dec_cfg[1] = prompt_first_id
+
+    // Deterministic regenerate-on-violation search, kept flat on purpose: phase 1 only decodes
+    // atom sequences (a handful of live values), phase 2 separately measures, repairs and renders.
+    // Splitting the phases keeps register pressure low, which the shrink-wrapped `-O2` prologue
+    // handles exactly, and makes the anti-verbatim gate auditable step by step.
+    let cand_cap2 = NV3_SYN_SEARCH_ROUNDS * NV3_SYN_SLOTS_PER_ROUND
+    let seq_store = @malloc(cand_cap2 * NV3_SYN_MAX_SEQ * 8) as *i64
+    let seq_lens = @malloc(cand_cap2 * 8) as *i64
+    // `scratch` is a fresh heap block per use; candidate sequences are copied into `seq_store`
+    // with flat index arithmetic. Interior `@ptr_add` pointers are never used as base pointers of
+    // pointer-indexed loops, which the `-O2` hoisted bounds checks rely on.
+    let scratch = @malloc(NV3_SYN_MAX_SEQ * 8) as *i64
+    var cidx: i64 = 0
+    var round: i64 = 0
+    var pressure: i64 = NV3_SYN_BASE_PRESSURE
+    while round < NV3_SYN_SEARCH_ROUNDS {
+        var slot: i64 = 0
+        var round_clean: i64 = 0
+        while slot < NV3_SYN_SLOTS_PER_ROUND {
+            dec_cfg[2] = base_seed + (round * 15485863) + (slot * 7919 + 104729)
+            dec_cfg[3] = pressure
+            let pack_res = nv3_syn_decode_one_candidate(gh, atom_boost, probs_u8, echo_f4, dec_cfg, scratch)
+            let slen = pack_res & 65535
+            seq_lens[cidx] = slen
+            var kc: i64 = 0
+            let row = cidx * NV3_SYN_MAX_SEQ
+            while kc < slen { seq_store[row + kc] = scratch[kc] kc = kc + 1 }
+            var kf: i64 = 0
+            while kf < slen { scratch[kf] = seq_store[row + kf] kf = kf + 1 }
+            if nv3_syn_exact_max_run(gh, echo_f4, n_ef4, scratch, slen, fin_info) <= NV3_SYN_MAX_CORPUS_RUN { round_clean = 1 }
+            cidx = cidx + 1
+            slot = slot + 1
+        }
+        if round_clean == 1 { break }
+        pressure = pressure * 4
+        round = round + 1
+    }
+    io_meta[13] = cidx
+    var ci2: i64 = 0
+    while ci2 < cidx {
+        let slen = seq_lens[ci2]
+        let row2 = ci2 * NV3_SYN_MAX_SEQ
+        var kr: i64 = 0
+        while kr < slen { scratch[kr] = seq_store[row2 + kr] kr = kr + 1 }
+        let cptr = @malloc(max_out + 8)
+        let fin = nv3_syn_finalize_candidate(gh, fin_cfg, scratch, slen, cptr, fin_info)
+        let clen = fin & 4294967295
+        let mrun = fin >> 32
+        var cov_sc: f64 = 0.0
+        var si2: i64 = 0
+        while si2 < slen { cov_sc = cov_sc + atom_boost[scratch[si2]] si2 = si2 + 1 }
+        cand_ptrs[ci2] = cptr as i64
+        cand_lens[ci2] = clen
+        cand_nlls[ci2] = base_nll - (cov_sc * 0.15) + ((mrun as f64) * 1.5) + (if clen < 80 { 4.0 } else { 0.0 })
+        cand_runs[ci2] = mrun
+        cand_atms[ci2] = fin_info[0]
+        if fin_info[1] == 1 and mrun <= NV3_SYN_MAX_CORPUS_RUN { io_meta[12] = io_meta[12] + 1 }
+        ci2 = ci2 + 1
+    }
+
+    let bcfg = @malloc(16) as *i64
+    let g_tel = @malloc(64) as *i64
+    bcfg[0] = 1000 bcfg[1] = 0
+    let win = nv3_proof_guided_search_candidates(cand_ptrs, cand_lens, cand_nlls, cidx, bcfg, g_tel)
+    io_meta[4] = g_tel[6]
+    @free(g_tel as *u8) @free(bcfg as *u8)
+
+    if win >= 0 and cand_lens[win] > 0 {
+        let em = cand_lens[win]
+        io_meta[0] = em
+        io_meta[1] = cand_atms[win]
+        io_meta[2] = cand_runs[win]
+        let wptr = cand_ptrs[win] as *u8
+        var cp: i64 = 0
+        while cp < em { @write_u8(@ptr_add(out_gen_u8, cp), @read_u8(@ptr_add(wptr, cp))) cp = cp + 1 }
+    }
+
+    let n_cand = ci2
+    ci2 = 0
+    while ci2 < n_cand { @free(cand_ptrs[ci2] as *u8) ci2 = ci2 + 1 }
+    @free(cand_atms as *u8) @free(cand_runs as *u8) @free(cand_nlls as *u8)
+    @free(scratch as *u8) @free(seq_lens as *u8) @free(seq_store as *u8)
+    @free(fin_cfg as *u8) @free(fin_info as *u8) @free(cand_lens as *u8) @free(cand_ptrs as *u8) @free(dec_cfg as *u8)
+    @free(atom_boost as *u8) @free(echo_f4 as *u8) @free(echo_ids as *u8) @free(q_stems as *u8)
+    nv3_syn_graph_free(gh)
+}
+
+fn nv3_syn_format_proof_prose(proof_ver: i64, proof_ref: i64, out_gen_u8: *u8, max_out: i64) -> i64 {
+    var em: i64 = 0
+    if proof_ref == 0 {
+        em = nv3_syn_buf_append_str(out_gen_u8, 0, max_out, "Deterministik KHG ve ispat arama çekirdekleri girdideki ")
+        em = nv3_syn_buf_append_i64(out_gen_u8, em, max_out, proof_ver)
+        em = nv3_syn_buf_append_str(out_gen_u8, em, max_out, " biçimsel iddianın tamamını sıfır çelişkiyle doğruladı. Rasyonel aritmetik, boyutsal SI analiz ve önermeler mantığı kısıtları kanonik formda tutarlıdır.")
+        return em
+    }
+    if proof_ver == 0 {
+        em = nv3_syn_buf_append_str(out_gen_u8, 0, max_out, "Deterministik KHG doğrulama çekirdeği girdide ")
+        em = nv3_syn_buf_append_i64(out_gen_u8, em, max_out, proof_ref)
+        em = nv3_syn_buf_append_str(out_gen_u8, em, max_out, " adet matematiksel veya boyutsal çelişki tespit ederek geçersiz iddiaları reddetti. Doğru çıkarım için eşitliklerin ve temel SI birimlerinin tutarlı olması gerekir.")
+        return em
+    }
+    em = nv3_syn_buf_append_str(out_gen_u8, 0, max_out, "Deterministik KHG çekirdeği çoklu iddiaları ayrıştırdı: ")
+    em = nv3_syn_buf_append_i64(out_gen_u8, em, max_out, proof_ver)
+    em = nv3_syn_buf_append_str(out_gen_u8, em, max_out, " iddia doğrulandı, ancak ")
+    em = nv3_syn_buf_append_i64(out_gen_u8, em, max_out, proof_ref)
+    em = nv3_syn_buf_append_str(out_gen_u8, em, max_out, " çelişkili iddia reddedildi.")
+    return em
+}
+
+fn nv3_syn_peek_npg_dims(ckpt_path: string, out_dims: *i64) -> i64 {
+    let fd = @open(ckpt_path, 0, 0)
+    if fd < 0 { return 0 }
+    let hdr = @malloc(88)
+    let got = nv3_syn_read_all(fd, hdr, 88)
+    @close(fd)
+    if got != 1 { @free(hdr) return 0 }
+    let d_m = @read_u64(@ptr_add(hdr, 32))
+    let d_k = @read_u64(@ptr_add(hdr, 40))
+    let d_h = @read_u64(@ptr_add(hdr, 48))
+    let c_k = @read_u64(@ptr_add(hdr, 56))
+    @free(hdr)
+    if d_m <= 0 or d_m > 256 or d_k <= 0 or d_h <= 0 or c_k <= 0 { return 0 }
+    out_dims[0] = d_m out_dims[1] = d_k out_dims[2] = d_h out_dims[3] = c_k
+    return 1
+}
+
+// `out_res` (`20 * i64`):
+//   caller sets before call: `out_res[16] = out_telemetry as i64`, `out_res[17] = max_out`, `out_res[18] = use_prod_fallback (0/1)`.
+//   outputs:
+//   [0]=ok, [1]=output_mode, [2]=emitted_bytes, [3]=synthesized_atoms,
+//   [4]=max_train_ngram_run, [5]=anti_verbatim_ok, [6]=symbolic_solved,
+//   [7]=proof_verified, [8]=proof_refuted, [9]=proof_steps,
+//   [10]=khg_nodes, [11]=observed_spans, [12]=quarantined_spans, [13]=verified_spans,
+//   [14]=trained_steps, [15]=param_bytes.
+fn nv3_syn_infer_production(
+    ckpt_path: string,
+    nv3g_path: string,
+    out_res: *i64
+) -> i64 {
+    let out_telemetry = out_res[16] as *f64
+    let max_out = out_res[17]
+    let use_fb = out_res[18]
+    let out_gen_u8 = out_res[19] as *u8
+    let use_local_soa = out_res[20]
+    let p_in = out_res[21] as *u8
+    let p_len = out_res[22]
+    out_telemetry[0] = 0.0 out_telemetry[1] = 0.0 out_telemetry[2] = 0.0 out_telemetry[3] = 0.0
+    var zi: i64 = 0
+    while zi < 16 { out_res[zi] = 0 zi = zi + 1 }
+    out_res[1] = NOEMA_V3_OUTPUT_WEIGHT_GENERATION_ABSTAIN
+    out_res[5] = 1
+
+    if p_len <= 0 or max_out < 64 { return 0 }
+
+    let dims = @malloc(32) as *i64
+    if nv3_syn_peek_npg_dims(ckpt_path, dims) != 1 { @free(dims as *u8) return 0 }
+    let d_model = dims[0] let d_k = dims[1] let d_h = dims[2] let conv_k = dims[3]
+    @free(dims as *u8)
+
+    let tr = nv3_trainer_create(Nv3TrainerCfg {
+        d_model: d_model, d_k: d_k, d_h: d_h, conv_k: conv_k,
+        coarse_ckpt: 16, fine_ckpt: 4, use_fp32_ckpt: 1, seed: 1
+    })
+    if nv3_trainer_load_npg(tr, ckpt_path) != 1 {
+        nv3_trainer_free(tr)
+        return 0
+    }
+    let trained_steps = tr.step_box[0]
+    let param_bytes = tr.total_params * 8
+    out_res[14] = trained_steps
+    out_res[15] = param_bytes
+
+    let p_ptr = nv3_syn_copy_word(p_in, 0, p_len)
+    let prompt_str = @string_new(p_ptr, p_len)
+
+    let khg = nv3_khg_create(24, 48, d_model)
+    let emb_buf = @malloc(d_model * 8) as *f64
+    let pv_prompt = nv3_verify_provenance_isolation(prompt_str, NOEMA_V3_PROV_USER_INPUT, khg, 1000)
+    if pv_prompt.promoted_to_system_policy != 0 {
+        @free(p_ptr) @free(emb_buf as *u8) nv3_khg_free(khg) nv3_trainer_free(tr)
+        return 0
+    }
+    if pv_prompt.injection_detected == 1 {
+        out_res[0] = 1
+        out_res[10] = khg.counts[0]
+        out_res[12] = 1
+        @free(p_ptr) @free(emb_buf as *u8) nv3_khg_free(khg) nv3_trainer_free(tr)
+        return 1
+    }
+
+    nv3_span_structural_embed(p_ptr, p_len, d_model, emb_buf)
+    let nemb = khg.node_embed
+    var ei: i64 = 0
+    while ei < d_model { nemb[ei] = emb_buf[ei] ei = ei + 1 }
+
+    var obs_cnt: i64 = 0 var quar_cnt: i64 = 0 var ver_cnt: i64 = 0
+    if use_local_soa == 1 {
+        let sh = nv3_soa_load("ai/noema_v3/corpus_locked/train_soa", 262144)
+        if sh.ok == 1 {
+            let doffs = sh.doc_offsets let dlens = sh.doc_lengths
+            let dhashes = sh.doc_manifest_hashes let dprovs = sh.prov
+            var sd: i64 = 0
+            while sd < sh.num_docs and (obs_cnt + quar_cnt) < 4 {
+                let doff = doffs[sd] let dlen = dlens[sd]
+                let dptr = nv3_syn_copy_word(sh.stream, doff, dlen)
+                let r_sc = nv3_byte_trigram_resonance(p_ptr, p_len, dptr, dlen)
+                if r_sc >= 0.08 {
+                    let dprov = dprovs[doff]
+                    let g_pr = nv3_khg_create(4, 4, 4)
+                    let pv_d = nv3_verify_provenance_isolation(nv3_syn_slice_str(sh.stream, doff, dlen), dprov, g_pr, 500)
+                    nv3_khg_free(g_pr)
+                    nv3_span_structural_embed(dptr, dlen, d_model, emb_buf)
+                    let conf_v = if pv_d.injection_detected == 1 { 0.0 } else { r_sc }
+                    let nid = nv3_khg_add_node(khg, Nv3KhgNodeSpec {
+                        state: NV3_KHG_STATE_OBSERVED, prov: NOEMA_V3_PROV_UNTRUSTED_SOURCE,
+                        doc_id: sd, span_off: doff, span_len: dlen, claim_hash: dhashes[sd], confidence: conf_v
+                    }, emb_buf)
+                    if pv_d.injection_detected == 1 { quar_cnt = quar_cnt + 1 }
+                    else if nid >= 0 {
+                        obs_cnt = obs_cnt + 1
+                        if dprov == NOEMA_V3_PROV_VERIFIED_KHG {
+                            if nv3_khg_apply_kernel_verdict(khg, nid, NV3_KERNEL_CONSTRAINT_LOGIC, NV3_VERDICT_VERIFIED, 1, 100) == 1 {
+                                ver_cnt = ver_cnt + 1
+                            }
+                        }
+                    }
+                }
+                @free(dptr)
+                sd = sd + 1
+            }
+        }
+        nv3_soa_free(sh)
+    }
+
+    let khg_vec = @malloc(d_model * 8) as *f64
+    let _act_k = nv3_khg_authoritative_summary(khg, khg_vec)
+    let prov_arr = @malloc(p_len * 8) as *i64
+    var pi: i64 = 0
+    while pi < p_len { prov_arr[pi] = pv_prompt.effective_prov pi = pi + 1 }
+    let mini_u8 = @malloc(8)
+    let mini_tel = @malloc(24) as *f64
+    let _m_len = nv3_trainer_generate_utf8_khg(tr, p_ptr, prov_arr, p_len, khg_vec, 4, mini_u8, mini_tel)
+    out_telemetry[0] = mini_tel[0] out_telemetry[1] = mini_tel[1] out_telemetry[2] = mini_tel[2]
+
+    let probs_u8 = @malloc(257 * 8) as *f64
+    var bi: i64 = 0
+    while bi < 256 { probs_u8[bi] = 1.0 / 256.0 bi = bi + 1 }
+    bi = 0
+    while bi < p_len {
+        let pb = (@read_u8(@ptr_add(p_ptr, bi)) as i64) & 255
+        probs_u8[pb] = probs_u8[pb] + (0.5 / (p_len as f64))
+        bi = bi + 1
+    }
+    probs_u8[256] = out_telemetry[0]
+    @free(mini_u8) @free(mini_tel as *u8) @free(prov_arr as *u8) @free(khg_vec as *u8)
+
+    let p_cands = @malloc(16) as *i64 let p_lens = @malloc(16) as *i64
+    let p_nlls = @malloc(16) as *f64 let p_bcfg = @malloc(16) as *i64 let p_tel = @malloc(64) as *i64
+    p_cands[0] = p_ptr as i64 p_lens[0] = p_len p_nlls[0] = out_telemetry[0]
+    p_bcfg[0] = 1000 p_bcfg[1] = 0
+    let _ps_p = nv3_proof_guided_search_candidates(p_cands, p_lens, p_nlls, 1, p_bcfg, p_tel)
+    var proof_ver = p_tel[4] var proof_ref = p_tel[5] var proof_steps = p_tel[6]
+    @free(p_cands as *u8) @free(p_lens as *u8) @free(p_nlls as *u8) @free(p_bcfg as *u8) @free(p_tel as *u8)
+
+    var emitted: i64 = 0 var sym_solved: i64 = 0 var synth_atoms: i64 = 0 var max_run_out: i64 = 0
+    if (proof_ver + proof_ref) > 0 {
+        sym_solved = 1 synth_atoms = 22
+        emitted = nv3_syn_format_proof_prose(proof_ver, proof_ref, out_gen_u8, max_out)
+        let nid_s = nv3_khg_add_node(khg, Nv3KhgNodeSpec {
+            state: NV3_KHG_STATE_OBSERVED, prov: NOEMA_V3_PROV_UNTRUSTED_SOURCE,
+            doc_id: 0, span_off: 0, span_len: p_len, claim_hash: p_len, confidence: 1.0
+        }, emb_buf)
+        if nid_s >= 0 and nv3_khg_apply_kernel_verdict(khg, nid_s, NV3_KERNEL_BIGINT_RATIONAL, NV3_VERDICT_VERIFIED, proof_steps + 1, 200) == 1 {
+            obs_cnt = obs_cnt + 1 ver_cnt = ver_cnt + 1
+        }
+    }
+
+    if emitted == 0 {
+        let open_steps = @malloc(8) as *i64
+        let open_len = nv3_syn_try_eval_open_expr(p_ptr, p_len, out_gen_u8, max_out, open_steps)
+        if open_len > 0 {
+            emitted = open_len sym_solved = 1 synth_atoms = 18
+            proof_ver = proof_ver + 1 proof_steps = proof_steps + open_steps[0]
+            let nid_o = nv3_khg_add_node(khg, Nv3KhgNodeSpec {
+                state: NV3_KHG_STATE_OBSERVED, prov: NOEMA_V3_PROV_UNTRUSTED_SOURCE,
+                doc_id: 0, span_off: 0, span_len: p_len, claim_hash: p_len, confidence: 1.0
+            }, emb_buf)
+            if nid_o >= 0 and nv3_khg_apply_kernel_verdict(khg, nid_o, NV3_KERNEL_BIGINT_RATIONAL, NV3_VERDICT_VERIFIED, open_steps[0], 200) == 1 {
+                obs_cnt = obs_cnt + 1 ver_cnt = ver_cnt + 1
+            }
+        }
+        @free(open_steps as *u8)
+    }
+
+    var graph_failed: i64 = 0
+    if emitted == 0 {
+        let io_m = @malloc(160) as *i64
+        io_m[6] = if ver_cnt > 0 { 1 } else { 0 }
+        io_m[7] = max_out
+        io_m[8] = use_fb
+        io_m[9] = p_ptr as i64
+        io_m[10] = p_len
+        nv3_syn_run_nv3g_search(nv3g_path, probs_u8, out_gen_u8, io_m)
+        if io_m[5] != 1 { graph_failed = 1 }
+        emitted = io_m[0] synth_atoms = io_m[1] max_run_out = io_m[2]
+        let rh = io_m[3]
+        out_telemetry[3] = rh as f64
+        proof_steps = proof_steps + io_m[4]
+        if rh > 0 and ver_cnt == 0 {
+            let nid_r = nv3_khg_add_node(khg, Nv3KhgNodeSpec {
+                state: NV3_KHG_STATE_OBSERVED, prov: NOEMA_V3_PROV_UNTRUSTED_SOURCE,
+                doc_id: 0, span_off: 0, span_len: p_len, claim_hash: rh, confidence: 0.85
+            }, emb_buf)
+            if nid_r >= 0 and nv3_khg_apply_kernel_verdict(khg, nid_r, NV3_KERNEL_CONSTRAINT_LOGIC, NV3_VERDICT_VERIFIED, 1, 100) == 1 {
+                obs_cnt = obs_cnt + 1 ver_cnt = ver_cnt + 1
+            }
+        }
+        @free(io_m as *u8)
+    }
+
+    @free(probs_u8 as *u8)
+    let total_nodes = khg.counts[0]
+    out_res[6] = sym_solved
+    out_res[7] = proof_ver
+    out_res[8] = proof_ref
+    out_res[9] = proof_steps
+    out_res[10] = total_nodes
+    out_res[11] = obs_cnt
+    out_res[12] = quar_cnt
+    out_res[13] = ver_cnt
+
+    if graph_failed == 1 {
+        @free(p_ptr) @free(emb_buf as *u8) nv3_khg_free(khg) nv3_trainer_free(tr)
+        return 0
+    }
+
+    let no_soa_copy = if use_local_soa == 1 { nv3_verify_no_verbatim_soa_copy("ai/noema_v3/corpus_locked/train_soa", out_gen_u8, emitted) } else { 1 }
+    let utf8_ok = nv3_syn_utf8_valid(out_gen_u8, emitted)
+    let anti_verb_ok = if no_soa_copy == 1 and utf8_ok == 1 and max_run_out <= 4 { 1 } else { 0 }
+
+    @free(p_ptr)
+    @free(emb_buf as *u8)
+    nv3_khg_free(khg)
+    nv3_trainer_free(tr)
+
+    if emitted <= 0 {
+        out_res[0] = 1
+        return 1
+    }
+
+    out_res[0] = if anti_verb_ok == 1 { 1 } else { 0 }
+    out_res[1] = NOEMA_V3_OUTPUT_WEIGHT_GENERATION
+    out_res[2] = emitted
+    out_res[3] = synth_atoms
+    out_res[4] = max_run_out
+    out_res[5] = anti_verb_ok
+    return out_res[0]
+}

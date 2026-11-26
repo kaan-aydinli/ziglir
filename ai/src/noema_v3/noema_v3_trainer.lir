@@ -1,0 +1,680 @@
+// NOEMA v3 Phase 2: Pure-LIR SoA Streaming Trainer, Evaluator, Checkpoint Bridge,
+// and Exact-Causality Weight-Driven UTF-8 Generator.
+
+import "noema_v3_preopt.lir"
+import "noema_v3_checkpoint.lir"
+
+struct Nv3TrainerCfg {
+    d_model: i64
+    d_k: i64
+    d_h: i64
+    conv_k: i64
+    coarse_ckpt: i64
+    fine_ckpt: i64
+    use_fp32_ckpt: i64
+    seed: i64
+}
+
+struct Nv3EkHnbTrainer {
+    d_model: i64
+    d_k: i64
+    d_h: i64
+    conv_k: i64
+    coarse_ckpt: i64
+    fine_ckpt: i64
+    use_fp32_ckpt: i64
+    total_params: i64
+    step_box: *i64
+    params: *f64
+    grads: *f64
+    offs: *i64
+    m_buf: *f64
+    v_buf: *f64
+}
+
+struct Nv3TrainerMetrics {
+    ok: i64
+    error_code: i64
+    output_mode: i64
+    read_docs: i64
+    accepted_docs: i64
+    rejected_docs: i64
+    byte_steps: i64
+    patch_folds: i64
+    event_folds: i64
+    loss_nats: f64
+    bpb: f64
+}
+
+fn nv3_trainer_create(tcfg: Nv3TrainerCfg) -> Nv3EkHnbTrainer {
+    let cfg = Nv3EkHnbConfig {
+        d_model: tcfg.d_model, d_k: tcfg.d_k, d_h: tcfg.d_h, conv_k: tcfg.conv_k,
+        coarse_ckpt: tcfg.coarse_ckpt, fine_ckpt: tcfg.fine_ckpt, use_fp32_ckpt: tcfg.use_fp32_ckpt
+    }
+    let m = nv3_ek_hnb_create(cfg, tcfg.seed)
+    let step_box = @malloc(8) as *i64
+    step_box[0] = 0
+    let m_buf = @malloc(m.total_params * 8) as *f64
+    let v_buf = @malloc(m.total_params * 8) as *f64
+    nv3_zero(m_buf, m.total_params)
+    nv3_zero(v_buf, m.total_params)
+
+    return Nv3EkHnbTrainer {
+        d_model: tcfg.d_model, d_k: tcfg.d_k, d_h: tcfg.conv_k + (tcfg.d_h - tcfg.conv_k),
+        conv_k: tcfg.conv_k, coarse_ckpt: tcfg.coarse_ckpt, fine_ckpt: tcfg.fine_ckpt,
+        use_fp32_ckpt: tcfg.use_fp32_ckpt, total_params: m.total_params,
+        step_box: step_box, params: m.params, grads: m.grads, offs: m.offs,
+        m_buf: m_buf, v_buf: v_buf
+    }
+}
+
+fn nv3_trainer_free(tr: Nv3EkHnbTrainer) {
+    @free(tr.step_box as *u8)
+    @free(tr.params as *u8)
+    @free(tr.grads as *u8)
+    @free(tr.offs as *u8)
+    @free(tr.m_buf as *u8)
+    @free(tr.v_buf as *u8)
+}
+
+fn nv3_apply_mat_slice(tr: Nv3EkHnbTrainer, sl: i64, rows: i64, cols: i64, prev_step: i64, lr: f64, cscale: f64) {
+    let off = tr.offs[sl]
+    let w = @ptr_add(tr.params as *u8, off * 8) as *f64
+    let g = @ptr_add(tr.grads as *u8, off * 8) as *f64
+    let opt = Nv3PreOptMatrix {
+        w: w,
+        mom: @ptr_add(tr.m_buf as *u8, off * 8) as *f64,
+        rows: rows, cols: cols, beta: 0.9, weight_decay: 0.001, ns_steps: 4,
+        step: prev_step, rejected: 0
+    }
+    let _ok = nv3_preopt_matrix_step(opt, g, lr, cscale)
+}
+
+fn nv3_apply_diag_slice(tr: Nv3EkHnbTrainer, sl: i64, len_n: i64, prev_step: i64, lr: f64, wd: f64, cscale: f64) {
+    let off = tr.offs[sl]
+    let w = @ptr_add(tr.params as *u8, off * 8) as *f64
+    let g = @ptr_add(tr.grads as *u8, off * 8) as *f64
+    let opt = Nv3PreOptDiag {
+        w: w,
+        m: @ptr_add(tr.m_buf as *u8, off * 8) as *f64,
+        v: @ptr_add(tr.v_buf as *u8, off * 8) as *f64,
+        len: len_n, beta1: 0.9, beta2: 0.98, eps: 0.00000001, weight_decay: wd,
+        step: prev_step, rejected: 0
+    }
+    let _ok = nv3_preopt_diag_step(opt, g, lr, cscale)
+}
+
+// Apply LIR-PreOpt across all 30 model slices after fail-closed global norm clipping.
+fn nv3_trainer_apply_grads(tr: Nv3EkHnbTrainer, lr: f64, max_grad_norm: f64) -> i64 {
+    if nv3_all_finite(tr.grads, tr.total_params) == 0 {
+        nv3_zero(tr.grads, tr.total_params)
+        return 0
+    }
+    let gnorm_sq = nv3_norm_sq(tr.grads, tr.total_params)
+    let cscale = nv3_preopt_clip_scale(gnorm_sq, max_grad_norm)
+    if cscale < 0.0 {
+        nv3_zero(tr.grads, tr.total_params)
+        return 0
+    }
+
+    let prev_step = tr.step_box[0]
+    let sb = tr.step_box
+    sb[0] = prev_step + 1
+    let d = tr.d_model
+    let dk = tr.d_k
+    let dh = tr.d_h
+    let ck = tr.conv_k
+
+    // 1D / embedding / router slices via diagonal second-moment LIR-PreOpt
+    nv3_apply_diag_slice(tr, NV3_SL_EMB_BYTE, NV3_VOCAB_UTF8 * d, prev_step, lr, 0.001, cscale)
+    nv3_apply_diag_slice(tr, NV3_SL_EMB_PROV, NV3_NUM_PROV * d, prev_step, lr, 0.001, cscale)
+    nv3_apply_diag_slice(tr, NV3_SL_CONV_W, d * ck, prev_step, lr, 0.001, cscale)
+    nv3_apply_diag_slice(tr, NV3_SL_CONV_B, d, prev_step, lr, 0.0, cscale)
+    nv3_apply_diag_slice(tr, NV3_SL_RMS0_G, d, prev_step, lr, 0.0, cscale)
+    nv3_apply_diag_slice(tr, NV3_SL_ROUTER_SC, 12, prev_step, lr, 0.0, cscale)
+    nv3_apply_diag_slice(tr, NV3_SL_ROUTER_U1, d, prev_step, lr, 0.001, cscale)
+    nv3_apply_diag_slice(tr, NV3_SL_ROUTER_U2, d, prev_step, lr, 0.001, cscale)
+    nv3_apply_diag_slice(tr, NV3_SL_RMS1_G, d, prev_step, lr, 0.0, cscale)
+    nv3_apply_diag_slice(tr, NV3_SL_SW_BG, dh, prev_step, lr, 0.0, cscale)
+    nv3_apply_diag_slice(tr, NV3_SL_SW_BU, dh, prev_step, lr, 0.0, cscale)
+    nv3_apply_diag_slice(tr, NV3_SL_SW_BO, d, prev_step, lr, 0.0, cscale)
+    nv3_apply_diag_slice(tr, NV3_SL_HEAD_B, NV3_VOCAB_UTF8, prev_step, lr, 0.0, cscale)
+
+    // 2D projection matrices via Newton-Schulz orthogonalized LIR-PreOpt
+    nv3_apply_mat_slice(tr, NV3_SL_L0_WK, d, dk, prev_step, lr, cscale)
+    nv3_apply_mat_slice(tr, NV3_SL_L0_WV, d, d, prev_step, lr, cscale)
+    nv3_apply_mat_slice(tr, NV3_SL_L0_WQ, d, dk, prev_step, lr, cscale)
+    nv3_apply_mat_slice(tr, NV3_SL_L1_WK, d, dk, prev_step, lr, cscale)
+    nv3_apply_mat_slice(tr, NV3_SL_L1_WV, d, d, prev_step, lr, cscale)
+    nv3_apply_mat_slice(tr, NV3_SL_L1_WQ, d, dk, prev_step, lr, cscale)
+    nv3_apply_mat_slice(tr, NV3_SL_L2_WK, d, dk, prev_step, lr, cscale)
+    nv3_apply_mat_slice(tr, NV3_SL_L2_WV, d, d, prev_step, lr, cscale)
+    nv3_apply_mat_slice(tr, NV3_SL_L2_WQ, d, dk, prev_step, lr, cscale)
+    nv3_apply_mat_slice(tr, NV3_SL_REV_WK, d, dk, prev_step, lr, cscale)
+    nv3_apply_mat_slice(tr, NV3_SL_REV_WV, d, d, prev_step, lr, cscale)
+    nv3_apply_mat_slice(tr, NV3_SL_REV_WQ, d, dk, prev_step, lr, cscale)
+    nv3_apply_mat_slice(tr, NV3_SL_REV_WOUT, d, d, prev_step, lr, cscale)
+    nv3_apply_mat_slice(tr, NV3_SL_SW_WG, d, dh, prev_step, lr, cscale)
+    nv3_apply_mat_slice(tr, NV3_SL_SW_WU, d, dh, prev_step, lr, cscale)
+    nv3_apply_mat_slice(tr, NV3_SL_SW_WO, dh, d, prev_step, lr, cscale)
+    nv3_apply_mat_slice(tr, NV3_SL_HEAD_W, d, NV3_VOCAB_UTF8, prev_step, lr, cscale)
+    return 1
+}
+
+fn nv3_metrics_fail(err: i64, r_docs: i64, a_docs: i64, rej_docs: i64) -> Nv3TrainerMetrics {
+    return Nv3TrainerMetrics {
+        ok: 0, error_code: err, output_mode: NOEMA_V3_OUTPUT_WEIGHT_GENERATION_ABSTAIN,
+        read_docs: r_docs, accepted_docs: a_docs, rejected_docs: rej_docs,
+        byte_steps: 0, patch_folds: 0, event_folds: 0, loss_nats: 0.0, bpb: 0.0
+    }
+}
+
+// Run forward (do_train == 0) or forward+backward+PreOpt step (do_train == 1) on a SoA shard directory.
+// Cross-document target transitions (where reset[t+1] != 0) receive exact loss_weight = 0.0.
+fn nv3_trainer_run_soa(tr: Nv3EkHnbTrainer, shard_dir: string, do_train: i64,
+                       lr: f64, max_grad_norm: f64) -> Nv3TrainerMetrics {
+    let shard = nv3_soa_load(shard_dir, 1048576)
+    if shard.ok == 0 {
+        let mfail = nv3_metrics_fail(shard.error_code, shard.read_docs, shard.accepted_docs, shard.rejected_docs)
+        nv3_soa_free(shard)
+        return mfail
+    }
+    let n = shard.num_bytes
+    if n < 2 {
+        let mfail2 = nv3_metrics_fail(20, shard.read_docs, shard.accepted_docs, shard.rejected_docs)
+        nv3_soa_free(shard)
+        return mfail2
+    }
+
+    let t_len = n - 1
+    let in_b = @malloc(t_len * 8) as *i64
+    let tgt_b = @malloc(t_len * 8) as *i64
+    let lw = @malloc(t_len * 8) as *f64
+    let logits = @malloc(t_len * NV3_VOCAB_UTF8 * 8) as *f64
+
+    var t: i64 = 0
+    while t < t_len {
+        in_b[t] = (@read_u8(@ptr_add(shard.stream, t)) as i64) & 255
+        tgt_b[t] = (@read_u8(@ptr_add(shard.stream, t + 1)) as i64) & 255
+        // Never predict across a document reset boundary
+        if shard.reset[t + 1] != 0 {
+            lw[t] = 0.0
+        } else {
+            lw[t] = shard.weights[t + 1]
+        }
+        t = t + 1
+    }
+
+    let mcfg = Nv3EkHnbConfig {
+        d_model: tr.d_model, d_k: tr.d_k, d_h: tr.d_h, conv_k: tr.conv_k,
+        coarse_ckpt: tr.coarse_ckpt, fine_ckpt: tr.fine_ckpt, use_fp32_ckpt: tr.use_fp32_ckpt
+    }
+    let m = Nv3EkHnbModel {
+        cfg: mcfg, total_params: tr.total_params, step_count: tr.step_box[0],
+        params: tr.params, grads: tr.grads, offs: tr.offs
+    }
+    let batch = Nv3EkHnbBatch {
+        t_len: t_len, prompt_len: 0,
+        in_bytes: in_b, prov_seq: shard.prov, reset_seq: shard.reset,
+        tgt_bytes: tgt_b, loss_weights: lw, logits_out: logits
+    }
+    let st = nv3_ek_hnb_fwd_bwd(m, batch, do_train)
+
+    var step_ok = st.ok
+    if do_train != 0 and step_ok == 1 {
+        step_ok = nv3_trainer_apply_grads(tr, lr, max_grad_norm)
+    }
+
+    let r_docs = shard.read_docs
+    let a_docs = shard.accepted_docs
+    let rj_docs = shard.rejected_docs
+    nv3_soa_free(shard)
+    @free(in_b as *u8) @free(tgt_b as *u8) @free(lw as *u8) @free(logits as *u8)
+
+    if step_ok == 0 {
+        return nv3_metrics_fail(21, r_docs, a_docs, rj_docs)
+    }
+    return Nv3TrainerMetrics {
+        ok: 1, error_code: 0, output_mode: NOEMA_V3_OUTPUT_WEIGHT_GENERATION,
+        read_docs: r_docs, accepted_docs: a_docs, rejected_docs: rj_docs,
+        byte_steps: st.byte_steps, patch_folds: st.patch_folds, event_folds: st.event_folds,
+        loss_nats: st.loss_nats, bpb: st.bpb
+    }
+}
+
+fn nv3_trainer_save_npg(tr: Nv3EkHnbTrainer, path: string, dtype_code: i64) -> i64 {
+    let mv = Nv3NpgModelView {
+        d_model: tr.d_model, d_k: tr.d_k, d_h: tr.d_h, conv_k: tr.conv_k,
+        total_params: tr.total_params, params: tr.params
+    }
+    return nv3_npg_v3_save(path, mv, tr.step_box[0], dtype_code)
+}
+
+fn nv3_trainer_load_npg(tr: Nv3EkHnbTrainer, path: string) -> i64 {
+    let mv = Nv3NpgModelView {
+        d_model: tr.d_model, d_k: tr.d_k, d_h: tr.d_h, conv_k: tr.conv_k,
+        total_params: tr.total_params, params: tr.params
+    }
+    let res = nv3_npg_v3_load_into(path, mv)
+    if res.ok == 0 { return 0 }
+    let sb = tr.step_box
+    sb[0] = res.step_count
+    return 1
+}
+
+// Pure weight-driven raw UTF-8 generation (NOEMA_V3_MODE_WEIGHT_GENERATION).
+// Enforces Exact Causality Rule: prompt_len stays strictly fixed to the input prompt;
+// generated bytes are appended causally and NEVER seen by the reverse-prompt head.
+fn nv3_trainer_generate_utf8(tr: Nv3EkHnbTrainer, prompt_u8: *u8, prompt_provs: *i64,
+                             prompt_len: i64, gen_len: i64, out_u8: *u8) -> i64 {
+    if prompt_len <= 0 or gen_len <= 0 { return 0 }
+    let max_t = prompt_len + gen_len
+    let in_b = @malloc(max_t * 8) as *i64
+    let prov_s = @malloc(max_t * 8) as *i64
+    let rst_s = @malloc(max_t * 8) as *i64
+    let dummy_tgt = @malloc(max_t * 8) as *i64
+    let dummy_lw = @malloc(max_t * 8) as *f64
+    let logits = @malloc(max_t * NV3_VOCAB_UTF8 * 8) as *f64
+
+    var p: i64 = 0
+    while p < prompt_len {
+        if nv3_provenance_tag_valid(prompt_provs[p]) == 0 {
+            @free(in_b as *u8) @free(prov_s as *u8) @free(rst_s as *u8)
+            @free(dummy_tgt as *u8) @free(dummy_lw as *u8) @free(logits as *u8)
+            return 0
+        }
+        in_b[p] = (@read_u8(@ptr_add(prompt_u8, p)) as i64) & 255
+        prov_s[p] = prompt_provs[p]
+        rst_s[p] = if p == 0 { 1 } else { 0 }
+        dummy_tgt[p] = 0
+        dummy_lw[p] = 0.0
+        p = p + 1
+    }
+
+    let mcfg = Nv3EkHnbConfig {
+        d_model: tr.d_model, d_k: tr.d_k, d_h: tr.d_h, conv_k: tr.conv_k,
+        coarse_ckpt: tr.coarse_ckpt, fine_ckpt: tr.fine_ckpt, use_fp32_ckpt: tr.use_fp32_ckpt
+    }
+    let m = Nv3EkHnbModel {
+        cfg: mcfg, total_params: tr.total_params, step_count: tr.step_box[0],
+        params: tr.params, grads: tr.grads, offs: tr.offs
+    }
+    var g: i64 = 0
+    while g < gen_len {
+        let cur_len = prompt_len + g
+        let batch = Nv3EkHnbBatch {
+            t_len: cur_len,
+            prompt_len: prompt_len,
+            in_bytes: in_b, prov_seq: prov_s, reset_seq: rst_s,
+            tgt_bytes: dummy_tgt, loss_weights: dummy_lw, logits_out: logits
+        }
+        let st = nv3_ek_hnb_fwd_bwd(m, batch, 0)
+        if st.ok == 0 {
+            @free(in_b as *u8) @free(prov_s as *u8) @free(rst_s as *u8)
+            @free(dummy_tgt as *u8) @free(dummy_lw as *u8) @free(logits as *u8)
+            return 0
+        }
+        let last_logits = @ptr_add(logits as *u8, (cur_len - 1) * NV3_VOCAB_UTF8 * 8) as *f64
+        var best_b: i64 = 0
+        var best_v = last_logits[0]
+        var c: i64 = 1
+        while c < NV3_VOCAB_UTF8 {
+            if last_logits[c] > best_v {
+                best_v = last_logits[c]
+                best_b = c
+            }
+            c = c + 1
+        }
+        @write_u8(@ptr_add(out_u8, g), best_b as u8)
+        in_b[cur_len] = best_b
+        prov_s[cur_len] = NOEMA_V3_PROV_HYPOTHESIS
+        rst_s[cur_len] = 0
+        dummy_tgt[cur_len] = 0
+        dummy_lw[cur_len] = 0.0
+        g = g + 1
+    }
+
+    @free(in_b as *u8) @free(prov_s as *u8) @free(rst_s as *u8)
+    @free(dummy_tgt as *u8) @free(dummy_lw as *u8) @free(logits as *u8)
+    return NOEMA_V3_OUTPUT_WEIGHT_GENERATION
+}
+
+// Empirical held-out bpb + Expected Calibration Error (ECE) over a locked NV3D v3 SoA shard.
+// Evaluates actual softmax top-1 byte probability vs empirical byte accuracy across all scored positions.
+fn nv3_trainer_eval_soa_ece(tr: Nv3EkHnbTrainer, soa_dir: string, num_bins: i64, out_bpb: *f64) -> f64 {
+    out_bpb[0] = 999.0
+    if num_bins <= 0 or num_bins > 64 { return 1.0 }
+
+    let sh = nv3_soa_load(soa_dir, 262144)
+    if sh.ok == 0 or sh.num_bytes < 2 {
+        nv3_soa_free(sh)
+        return 1.0
+    }
+
+    let t_len = sh.num_bytes - 1
+    let in_b = @malloc(t_len * 8) as *i64
+    let tgt_b = @malloc(t_len * 8) as *i64
+    let prov_s = @malloc(t_len * 8) as *i64
+    let rst_s = @malloc(t_len * 8) as *i64
+    let loss_w = @malloc(t_len * 8) as *f64
+    let logits = @malloc(t_len * NV3_VOCAB_UTF8 * 8) as *f64
+
+    var t: i64 = 0
+    while t < t_len {
+        in_b[t] = (@read_u8(@ptr_add(sh.stream, t)) as i64) & 255
+        tgt_b[t] = (@read_u8(@ptr_add(sh.stream, t + 1)) as i64) & 255
+        prov_s[t] = sh.prov[t]
+        rst_s[t] = sh.reset[t]
+        loss_w[t] = if sh.reset[t + 1] == 1 { 0.0 } else { sh.weights[t + 1] }
+        t = t + 1
+    }
+
+    let mcfg = Nv3EkHnbConfig {
+        d_model: tr.d_model, d_k: tr.d_k, d_h: tr.d_h, conv_k: tr.conv_k,
+        coarse_ckpt: tr.coarse_ckpt, fine_ckpt: tr.fine_ckpt, use_fp32_ckpt: tr.use_fp32_ckpt
+    }
+    let m = Nv3EkHnbModel {
+        cfg: mcfg, total_params: tr.total_params, step_count: tr.step_box[0],
+        params: tr.params, grads: tr.grads, offs: tr.offs
+    }
+    let batch = Nv3EkHnbBatch {
+        t_len: t_len, prompt_len: 0,
+        in_bytes: in_b, prov_seq: prov_s, reset_seq: rst_s,
+        tgt_bytes: tgt_b, loss_weights: loss_w, logits_out: logits
+    }
+    let st = nv3_ek_hnb_fwd_bwd(m, batch, 0)
+    if st.ok == 0 or nv3_is_finite(st.bpb) == 0 {
+        @free(in_b as *u8) @free(tgt_b as *u8) @free(prov_s as *u8)
+        @free(rst_s as *u8) @free(loss_w as *u8) @free(logits as *u8)
+        nv3_soa_free(sh)
+        return 1.0
+    }
+    out_bpb[0] = st.bpb
+
+    let bin_cnt = @malloc(num_bins * 8) as *i64
+    let bin_conf = @malloc(num_bins * 8) as *f64
+    let bin_acc = @malloc(num_bins * 8) as *f64
+    var b: i64 = 0
+    while b < num_bins {
+        bin_cnt[b] = 0 bin_conf[b] = 0.0 bin_acc[b] = 0.0
+        b = b + 1
+    }
+
+    var n_scored: i64 = 0
+    var ti: i64 = 0
+    while ti < t_len {
+        if loss_w[ti] > 0.0 {
+            let row = @ptr_add(logits as *u8, ti * NV3_VOCAB_UTF8 * 8) as *f64
+            var max_v = row[0]
+            var best_c: i64 = 0
+            var c: i64 = 1
+            while c < NV3_VOCAB_UTF8 {
+                if row[c] > max_v {
+                    max_v = row[c]
+                    best_c = c
+                }
+                c = c + 1
+            }
+            var z_sum: f64 = 0.0
+            var c2: i64 = 0
+            while c2 < NV3_VOCAB_UTF8 {
+                z_sum = z_sum + nv3_exp(row[c2] - max_v)
+                c2 = c2 + 1
+            }
+            let p_max = if z_sum > 0.0 { 1.0 / z_sum } else { 0.0 }
+            let hit = if best_c == tgt_b[ti] { 1.0 } else { 0.0 }
+            var bi = (p_max * (num_bins as f64)) as i64
+            if bi >= num_bins { bi = num_bins - 1 }
+            if bi < 0 { bi = 0 }
+            bin_cnt[bi] = bin_cnt[bi] + 1
+            bin_conf[bi] = bin_conf[bi] + p_max
+            bin_acc[bi] = bin_acc[bi] + hit
+            n_scored = n_scored + 1
+        }
+        ti = ti + 1
+    }
+
+    var ece: f64 = 1.0
+    if n_scored > 0 {
+        ece = 0.0
+        let nf = n_scored as f64
+        var m_i: i64 = 0
+        while m_i < num_bins {
+            if bin_cnt[m_i] > 0 {
+                let cf = bin_cnt[m_i] as f64
+                ece = ece + (cf / nf) * nv3_abs((bin_acc[m_i] / cf) - (bin_conf[m_i] / cf))
+            }
+            m_i = m_i + 1
+        }
+    }
+
+    @free(bin_cnt as *u8) @free(bin_conf as *u8) @free(bin_acc as *u8)
+    @free(in_b as *u8) @free(tgt_b as *u8) @free(prov_s as *u8)
+    @free(rst_s as *u8) @free(loss_w as *u8) @free(logits as *u8)
+    nv3_soa_free(sh)
+    return ece
+}
+
+// RFC-3629 UTF-8 byte-validity state constraint over raw bytes 0..255 (zero vocabulary/tokenizer).
+fn nv3_utf8_byte_valid_next(rem_cont: i64, first_lead: i64, rem_budget: i64, b: i64) -> i64 {
+    if rem_cont > 0 {
+        if first_lead == 224 { return if b >= 160 and b <= 191 { 1 } else { 0 } }
+        if first_lead == 237 { return if b >= 128 and b <= 159 { 1 } else { 0 } }
+        if first_lead == 240 { return if b >= 144 and b <= 191 { 1 } else { 0 } }
+        if first_lead == 244 { return if b >= 128 and b <= 143 { 1 } else { 0 } }
+        return if b >= 128 and b <= 191 { 1 } else { 0 }
+    }
+    if b == 10 or (b >= 32 and b <= 126) { return 1 }
+    if b >= 194 and b <= 223 { return if rem_budget >= 2 { 1 } else { 0 } }
+    if b >= 224 and b <= 239 { return if rem_budget >= 3 { 1 } else { 0 } }
+    if b >= 240 and b <= 244 { return if rem_budget >= 4 { 1 } else { 0 } }
+    return 0
+}
+
+// Weight-driven valid-UTF-8 byte generator conditioned on optional KHG summary vector `khg_vec` (len = tr.d_model):
+//   By exact linearity of head_w, injecting `0.25 * khg_vec` into top residual `tout` equals adding
+//   `0.25 * (head_w @ khg_vec)` to raw byte logits. Zero stored span bytes are ever copied.
+//   out_metrics[0] = mean negative log-likelihood (free energy, nats/byte)
+//   out_metrics[1] = normalized predictive entropy in [0, 1] (surprise gate)
+//   out_metrics[2] = mean selected-byte probability in [0, 1]
+fn nv3_trainer_generate_utf8_khg(
+    tr: Nv3EkHnbTrainer,
+    prompt_u8: *u8,
+    prompt_provs: *i64,
+    prompt_len: i64,
+    khg_vec: *f64,
+    max_gen_len: i64,
+    out_u8: *u8,
+    out_metrics: *f64
+) -> i64 {
+    out_metrics[0] = 0.0
+    out_metrics[1] = 0.0
+    out_metrics[2] = 0.0
+    if prompt_len <= 0 or max_gen_len <= 0 { return 0 }
+
+    let max_t = prompt_len + max_gen_len
+    let in_b = @malloc(max_t * 8) as *i64
+    let prov_s = @malloc(max_t * 8) as *i64
+    let rst_s = @malloc(max_t * 8) as *i64
+    let dummy_tgt = @malloc(max_t * 8) as *i64
+    let dummy_lw = @malloc(max_t * 8) as *f64
+    let logits = @malloc(max_t * NV3_VOCAB_UTF8 * 8) as *f64
+
+    var p: i64 = 0
+    while p < prompt_len {
+        if nv3_provenance_tag_valid(prompt_provs[p]) == 0 {
+            @free(in_b as *u8) @free(prov_s as *u8) @free(rst_s as *u8)
+            @free(dummy_tgt as *u8) @free(dummy_lw as *u8) @free(logits as *u8)
+            return 0
+        }
+        in_b[p] = (@read_u8(@ptr_add(prompt_u8, p)) as i64) & 255
+        prov_s[p] = prompt_provs[p]
+        rst_s[p] = if p == 0 { 1 } else { 0 }
+        dummy_tgt[p] = 0
+        dummy_lw[p] = 0.0
+        p = p + 1
+    }
+
+    let mcfg = Nv3EkHnbConfig {
+        d_model: tr.d_model, d_k: tr.d_k, d_h: tr.d_h, conv_k: tr.conv_k,
+        coarse_ckpt: tr.coarse_ckpt, fine_ckpt: tr.fine_ckpt, use_fp32_ckpt: tr.use_fp32_ckpt
+    }
+    let m = Nv3EkHnbModel {
+        cfg: mcfg, total_params: tr.total_params, step_count: tr.step_box[0],
+        params: tr.params, grads: tr.grads, offs: tr.offs
+    }
+
+    let khg_logits = @malloc(NV3_VOCAB_UTF8 * 8) as *f64
+    nv3_zero(khg_logits, NV3_VOCAB_UTF8)
+    if khg_vec != 0 as *f64 {
+        let zero_b = @malloc(NV3_VOCAB_UTF8 * 8) as *f64
+        nv3_zero(zero_b, NV3_VOCAB_UTF8)
+        let head_w = @ptr_add(tr.params as *u8, tr.offs[NV3_SL_HEAD_W] * 8) as *f64
+        nv3_linear_forward(khg_vec, head_w, zero_b, khg_logits, tr.d_model, NV3_VOCAB_UTF8)
+        @free(zero_b as *u8)
+    }
+
+    var rem_cont: i64 = 0
+    var first_lead: i64 = 0
+    var nll_sum: f64 = 0.0
+    var ent_sum: f64 = 0.0
+    var prob_sum: f64 = 0.0
+    var g: i64 = 0
+
+    while g < max_gen_len {
+        let cur_len = prompt_len + g
+        let batch = Nv3EkHnbBatch {
+            t_len: cur_len, prompt_len: prompt_len,
+            in_bytes: in_b, prov_seq: prov_s, reset_seq: rst_s,
+            tgt_bytes: dummy_tgt, loss_weights: dummy_lw, logits_out: logits
+        }
+        let st = nv3_ek_hnb_fwd_bwd(m, batch, 0)
+        if st.ok == 0 {
+            @free(khg_logits as *u8)
+            @free(in_b as *u8) @free(prov_s as *u8) @free(rst_s as *u8)
+            @free(dummy_tgt as *u8) @free(dummy_lw as *u8) @free(logits as *u8)
+            return 0
+        }
+
+        let row = @ptr_add(logits as *u8, (cur_len - 1) * NV3_VOCAB_UTF8 * 8) as *f64
+        if khg_vec != 0 as *f64 {
+            var kc: i64 = 0
+            while kc < NV3_VOCAB_UTF8 {
+                row[kc] = row[kc] + 0.25 * khg_logits[kc]
+                kc = kc + 1
+            }
+        }
+        let rem_budget = max_gen_len - g
+
+        // Find highest-logit valid UTF-8 byte (with mild repetition penalty on immediate 2-byte repeat)
+        var best_b: i64 = 32
+        var best_v: f64 = -1000000000.0
+        var raw_max = row[0]
+        var c: i64 = 0
+        while c < NV3_VOCAB_UTF8 {
+            if row[c] > raw_max { raw_max = row[c] }
+            if nv3_utf8_byte_valid_next(rem_cont, first_lead, rem_budget, c) == 1 {
+                var score = row[c]
+                if rem_cont == 0 and g >= 1 {
+                    let prev1 = (@read_u8(@ptr_add(out_u8, g - 1)) as i64) & 255
+                    if c == prev1 {
+                        score = score - 1.0
+                    }
+                    var bg_cnt: i64 = 0
+                    var k_bg: i64 = 1
+                    while k_bg < g {
+                        let a0 = (@read_u8(@ptr_add(out_u8, k_bg - 1)) as i64) & 255
+                        let a1 = (@read_u8(@ptr_add(out_u8, k_bg)) as i64) & 255
+                        if a0 == prev1 and a1 == c { bg_cnt = bg_cnt + 1 }
+                        k_bg = k_bg + 1
+                    }
+                    score = score - 0.85 * (bg_cnt as f64)
+                }
+                if score > best_v {
+                    best_v = score
+                    best_b = c
+                }
+            }
+            c = c + 1
+        }
+
+        // Compute exact full-distribution probability & Shannon entropy (normalized by ln(256))
+        var z_sum: f64 = 0.0
+        var c2: i64 = 0
+        while c2 < NV3_VOCAB_UTF8 {
+            z_sum = z_sum + nv3_exp(row[c2] - raw_max)
+            c2 = c2 + 1
+        }
+        let log_z = raw_max + nv3_log(z_sum)
+        let p_sel = nv3_exp(row[best_b] - log_z)
+        var h_nats: f64 = 0.0
+        var c3: i64 = 0
+        while c3 < NV3_VOCAB_UTF8 {
+            let pc = nv3_exp(row[c3] - log_z)
+            if pc > 0.000000000001 {
+                h_nats = h_nats - pc * (row[c3] - log_z)
+            }
+            c3 = c3 + 1
+        }
+        nll_sum = nll_sum + (log_z - row[best_b])
+        ent_sum = ent_sum + (h_nats / 5.545177444479562)
+        prob_sum = prob_sum + p_sel
+
+        @write_u8(@ptr_add(out_u8, g), best_b as u8)
+        in_b[cur_len] = best_b
+        prov_s[cur_len] = NOEMA_V3_PROV_HYPOTHESIS
+        rst_s[cur_len] = 0
+        dummy_tgt[cur_len] = 0
+        dummy_lw[cur_len] = 0.0
+
+        // Advance UTF-8 continuation state
+        if rem_cont > 0 {
+            rem_cont = rem_cont - 1
+            first_lead = 0
+        } else {
+            if best_b >= 194 and best_b <= 223 {
+                rem_cont = 1
+                first_lead = best_b
+            } else {
+                if best_b >= 224 and best_b <= 239 {
+                    rem_cont = 2
+                    first_lead = best_b
+                } else {
+                    if best_b >= 240 and best_b <= 244 {
+                        rem_cont = 3
+                        first_lead = best_b
+                    }
+                }
+            }
+        }
+
+        g = g + 1
+        if rem_cont == 0 and best_b == 10 and g >= 8 {
+            break
+        }
+    }
+
+    if g > 0 {
+        let gf = g as f64
+        out_metrics[0] = nll_sum / gf
+        out_metrics[1] = ent_sum / gf
+        out_metrics[2] = prob_sum / gf
+    }
+
+    @free(khg_logits as *u8)
+    @free(in_b as *u8) @free(prov_s as *u8) @free(rst_s as *u8)
+    @free(dummy_tgt as *u8) @free(dummy_lw as *u8) @free(logits as *u8)
+    return g
+}
+
+fn nv3_trainer_generate_utf8_valid(
+    tr: Nv3EkHnbTrainer,
+    prompt_u8: *u8,
+    prompt_provs: *i64,
+    prompt_len: i64,
+    max_gen_len: i64,
+    out_u8: *u8,
+    out_metrics: *f64
+) -> i64 {
+    return nv3_trainer_generate_utf8_khg(tr, prompt_u8, prompt_provs, prompt_len, 0 as *f64, max_gen_len, out_u8, out_metrics)
+}

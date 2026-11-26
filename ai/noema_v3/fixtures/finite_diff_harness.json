@@ -1,0 +1,37 @@
+{
+  "version": "0.1.0-phase0",
+  "name": "central_finite_difference_gradient_check",
+  "description": "Every hand-written LIR backward kernel must pass central finite-difference check before any training run.",
+  "threshold": {
+    "max_relative_error": 1e-5,
+    "comparison": "abs(analytic - numeric) / max(1e-12, abs(analytic) + abs(numeric)) <= 1e-5"
+  },
+  "harness_contract": {
+    "epsilon": 1e-4,
+    "epsilon_policy": "use smaller epsilon for fp32-sensitive kernels only when numerically justified; report epsilon used",
+    "dtype": "fp32_for_check",
+    "fixtures": "small deterministic tensors with fixed seeds",
+    "required_kernels_phase1": [
+      "rmsnorm",
+      "swiglu",
+      "causal_depthwise_conv1d",
+      "householder_delta_write",
+      "householder_delta_read",
+      "softmax_cross_entropy",
+      "l2norm"
+    ],
+    "report_fields": [
+      "kernel",
+      "parameter",
+      "analytic_grad",
+      "numeric_grad",
+      "relative_error",
+      "epsilon",
+      "pass"
+    ]
+  },
+  "gate": {
+    "must_pass_before_training_run": true,
+    "failure_action": "BLOCK_TRAINING"
+  }
+}
