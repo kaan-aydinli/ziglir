@@ -2581,6 +2581,32 @@ fn localConstantFoldAndLVN(f: *IRFn) bool {
 
                     if (s2_k) {
                         const bv = const_val[inst.src2];
+                        // Boolean round-trip elimination. IRGen materialises a
+                        // short-circuited `and`/`or` operand as a 0/1 value and then
+                        // re-tests it: `v = cmp_* a, b; w = cmp_ne v, 0`. A compare
+                        // result is already 0 or 1, so `cmp_ne v, 0 == v` and
+                        // `cmp_eq v, 0 == !v`. Folding these away exposes the original
+                        // compare directly to its consumer, so sinkCompareToConsumer can
+                        // fuse it into a jcc/cmov instead of materialising setcc+movzbq
+                        // (a ~9-instruction saving per compound loop-condition test).
+                        // Only folds when src1's most recent definition in THIS block is
+                        // a compare, which guarantees the 0/1 invariant; the rewrite is
+                        // value-exact and cannot observe a redefinition (def_inst tracks
+                        // the latest def as the block is scanned).
+                        if ((inst.op == .cmp_ne or inst.op == .cmp_eq) and bv == 0 and
+                            inst.src1 > 0 and inst.src1 < MAX_TRACKED_VREGS and def_gen[inst.src1] == cur_gen)
+                        {
+                            const dii = def_inst[inst.src1];
+                            if (dii < b.inst_count and b.insts[dii].dest == inst.src1 and isCmpOp(b.insts[dii].op)) {
+                                if (inst.op == .cmp_ne) {
+                                    inst.* = .{ .op = .copy, .dest = inst.dest, .src1 = inst.src1 };
+                                } else {
+                                    inst.* = .{ .op = .logic_not, .dest = inst.dest, .src1 = inst.src1 };
+                                }
+                                changed = true;
+                                continue;
+                            }
+                        }
                         if ((inst.op == .add or inst.op == .sub or inst.op == .bit_or or inst.op == .bit_xor or inst.op == .shl or inst.op == .shr or inst.op == .ushr) and bv == 0) {
                             inst.* = .{ .op = .copy, .dest = inst.dest, .src1 = inst.src1 };
                             changed = true;
