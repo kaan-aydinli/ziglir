@@ -1,4 +1,41 @@
-// Structural verifier for the bootstrap IR. Reject malformed IR before machine-code emission.
+// Structural + value-flow verifier for the bootstrap IR. Reject malformed IR
+// before machine-code emission.
+//
+// Beyond the original structural checks (ranges, capacities, phi placement,
+// branch targets), this verifier enforces the value-flow invariants whose
+// absence caused the six hand-found wrong-answer bugs of 2026-11
+// (docs/STATUS.md:84-88, docs/CRITICAL_ISSUES_6.md issue #6):
+//
+//   1. def-before-use inside a block: an operand must be defined by an
+//      earlier instruction of the same block, or be "must-defined" at block
+//      entry (see 2),
+//   2. must-reach analysis over the CFG: a vreg is must-defined at the entry
+//      of block B when EVERY control-flow path from the function entry to B
+//      passes through a block that defines it (or defines it in B itself
+//      before the use). This is the precise notion of "the definition
+//      dominates the use" for the IR shapes this pipeline actually produces:
+//        - In SSA IR (pre-optimization, phis present) each vreg has one
+//          definition, and must-reach is exactly strict dominance of that
+//          definition's block — the classic SSA validity rule.
+//        - Post-destructSSA IR is deliberately NOT in SSA form: a phi is
+//          resolved by letting each predecessor define the same vreg
+//          (e.g. v25 = const in B1, v25 = copy in B2, `cond_jump v25` in the
+//          merge B3). A pure single-def dominance check rejects that legal
+//          shape; must-reach accepts it because every path into B3 passes a
+//          definition, while still rejecting any path that arrives with the
+//          vreg never assigned — the silent-wrong-answer class (the VM reads
+//          a zero-initialised register, backends read stale garbage).
+//   3. phi integrity: a phi's predecessor list must be a bijection with the
+//      block's real reachable CFG predecessors, and every incoming value must
+//      be must-defined at the EXIT of its predecessor block,
+//   4. reachable branch targets must be valid block indices (pre-existing).
+//
+// The CFG analysis here is deliberately self-contained: the verifier must not
+// depend on ir_opt.zig, the very component whose passes it audits.
+// Unreachable blocks are exempt from the value-flow checks (dead code is the
+// optimizer's business), but everything a reachable execution can touch is
+// checked.
+const std = @import("std");
 const ir = @import("ir.zig");
 
 pub const VerifyError = error{
@@ -21,6 +58,14 @@ pub const VerifyError = error{
     StackFrameTooLarge,
     MidBlockTerminator,
     MalformedPhi,
+    /// An operand is used earlier in its own block than it is defined.
+    UseBeforeDef,
+    /// Some execution path reaches the use without ever passing a definition
+    /// of the operand (the generalized "definition does not dominate use").
+    NonDominatingDef,
+    /// A phi's phi_blocks/args lists do not match the block's real reachable
+    /// CFG predecessor set one-for-one (missing, foreign, or duplicate pred).
+    PhiPredecessorMismatch,
 };
 
 fn validRange(source: []const u8, start: u32, len: u32) bool {
@@ -136,6 +181,269 @@ pub fn verify(module: *const ir.IRModule, source: []const u8) VerifyError!void {
                     else => {
                         if (inst.arg_count > inst.args.len) return error.InvalidCallArgumentCount;
                     },
+                }
+            }
+        }
+
+        // Value-flow semantics: def-before-use, must-reach definitions, and
+        // the phi <-> CFG predecessor bijection. Runs only after the
+        // structural checks above so block/instruction/vreg ranges are known
+        // to be sane.
+        try verifyCfgSemantics(function);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// CFG / must-reach value-flow analysis (self-contained; see header comment)
+// ────────────────────────────────────────────────────────────────────────────
+
+const MAX_PREDS: usize = 32;
+const MAX_VREG_WORDS: usize = (65536 + 63) / 64;
+
+/// Per-call scratch. verify() runs synchronously inside the single-threaded
+/// compiler driver, mirroring the static scratch ir_opt.zig already uses.
+/// 2 x 192 x 1024 x 8B = 3 MiB of virtual reserve, lazily touched only up to
+/// (block_count x ceil(vreg_count/64)) per function.
+const cfg_scratch = struct {
+    /// DEFS[b]: the set of vregs defined by any instruction of block b. A
+    /// block is straight-line (MidBlockTerminator is rejected above), so
+    /// every one of its defs has executed by the time it exits.
+    var defs: [ir.MAX_BLOCKS_PER_FN][MAX_VREG_WORDS]u64 = undefined;
+    /// IN[b]: the set of vregs must-defined at ENTRY of b on every path from
+    /// the function entry. Fixed point of IN[b] = AND_p (IN[p] | DEFS[p]).
+    var in_set: [ir.MAX_BLOCKS_PER_FN][MAX_VREG_WORDS]u64 = undefined;
+};
+
+/// Successors implied by a block's terminator. Mirrors the execution model of
+/// every backend: a cond_jump whose arms are equal is a single edge.
+fn succsOf(b: *const ir.IRBlock, out: *[2]u16) usize {
+    if (b.inst_count == 0) return 0;
+    const term = b.insts[b.inst_count - 1];
+    switch (term.op) {
+        .jump => {
+            out[0] = term.target_block;
+            return 1;
+        },
+        .cond_jump => {
+            out[0] = term.target_block;
+            if (term.alt_block != term.target_block) {
+                out[1] = term.alt_block;
+                return 2;
+            }
+            return 1;
+        },
+        else => return 0,
+    }
+}
+
+fn definedInBlockBefore(f: *const ir.IRFn, bi: usize, v: u16, idx: usize) bool {
+    for (f.blocks[bi].insts[0..idx]) |*inst| {
+        if (inst.dest == v) return true;
+    }
+    return false;
+}
+
+fn definedInBlockFrom(f: *const ir.IRFn, bi: usize, v: u16, idx: usize) bool {
+    for (f.blocks[bi].insts[idx..f.blocks[bi].inst_count]) |*inst| {
+        if (inst.dest == v) return true;
+    }
+    return false;
+}
+
+fn verifyCfgSemantics(f: *const ir.IRFn) VerifyError!void {
+    const n: usize = f.block_count;
+    if (n == 0 or n > ir.MAX_BLOCKS_PER_FN) return; // structural checks own these
+    const words: usize = (@as(usize, f.vreg_count) + 63) / 64;
+    if (words == 0 or words > MAX_VREG_WORDS) return; // vreg_count==0 is rejected structurally
+
+    // ── Predecessors ──
+    var pred_cnt: [ir.MAX_BLOCKS_PER_FN]u16 = .{0} ** ir.MAX_BLOCKS_PER_FN;
+    var preds: [ir.MAX_BLOCKS_PER_FN][MAX_PREDS]u16 = undefined;
+    var pred_ovf: [ir.MAX_BLOCKS_PER_FN]bool = .{false} ** ir.MAX_BLOCKS_PER_FN;
+    for (0..n) |bi| {
+        var succs: [2]u16 = undefined;
+        const sc = succsOf(&f.blocks[bi], &succs);
+        for (succs[0..sc]) |s| {
+            if (s >= n) continue; // InvalidBranchTarget is the structural pass's job
+            if (pred_cnt[s] < MAX_PREDS) {
+                preds[s][pred_cnt[s]] = @intCast(bi);
+                pred_cnt[s] += 1;
+            } else {
+                pred_ovf[s] = true;
+            }
+        }
+    }
+
+    // ── Reachability + reverse post-order (iterative post-order DFS from B0) ──
+    var reachable: [ir.MAX_BLOCKS_PER_FN]bool = .{false} ** ir.MAX_BLOCKS_PER_FN;
+    var rpo: [ir.MAX_BLOCKS_PER_FN]u16 = undefined;
+    var rpo_len: usize = 0;
+    {
+        var post: [ir.MAX_BLOCKS_PER_FN]u16 = undefined;
+        var post_len: usize = 0;
+        var stack_blk: [ir.MAX_BLOCKS_PER_FN]u16 = undefined;
+        var stack_si: [ir.MAX_BLOCKS_PER_FN]u8 = undefined;
+        reachable[0] = true;
+        stack_blk[0] = 0;
+        stack_si[0] = 0;
+        var sp: usize = 1;
+        while (sp > 0) {
+            const cur = stack_blk[sp - 1];
+            const si = stack_si[sp - 1];
+            var succs: [2]u16 = undefined;
+            const sc = succsOf(&f.blocks[cur], &succs);
+            if (si < sc) {
+                stack_si[sp - 1] = si + 1;
+                const nxt = succs[si];
+                if (nxt < n and !reachable[nxt]) {
+                    reachable[nxt] = true;
+                    stack_blk[sp] = nxt;
+                    stack_si[sp] = 0;
+                    sp += 1;
+                }
+            } else {
+                sp -= 1;
+                post[post_len] = @intCast(cur);
+                post_len += 1;
+            }
+        }
+        rpo_len = post_len;
+        for (0..post_len) |i| {
+            rpo[i] = post[post_len - 1 - i];
+        }
+    }
+
+    // ── DEFS bitsets over reachable blocks ──
+    for (0..n) |bi| {
+        const dst = cfg_scratch.defs[bi][0..words];
+        @memset(dst, 0);
+        if (!reachable[bi]) continue;
+        for (f.blocks[bi].insts[0..f.blocks[bi].inst_count]) |*inst| {
+            if (inst.dest != 0) {
+                dst[inst.dest >> 6] |= @as(u64, 1) << @intCast(inst.dest & 63);
+            }
+        }
+    }
+
+    // ── Must-reach fixed point: IN[b] = AND over reachable preds p of
+    //    (IN[p] | DEFS[p]); IN[entry] = 0. Starts optimistic (all-ones) for
+    //    reachable non-entry blocks and shrinks monotonically, so iterating
+    //    in RPO converges in a handful of rounds. ──
+    for (0..n) |bi| {
+        const dst = cfg_scratch.in_set[bi][0..words];
+        if (reachable[bi] and bi != 0) {
+            @memset(dst, ~@as(u64, 0));
+        } else {
+            @memset(dst, 0);
+        }
+    }
+    {
+        var tmp: [MAX_VREG_WORDS]u64 = undefined;
+        var changed = true;
+        while (changed) {
+            changed = false;
+            for (rpo[1..rpo_len]) |b_u16| {
+                const b: usize = b_u16;
+                @memset(tmp[0..words], ~@as(u64, 0));
+                var any_pred = false;
+                for (preds[b][0..pred_cnt[b]]) |p| {
+                    if (!reachable[p]) continue;
+                    any_pred = true;
+                    for (0..words) |w| {
+                        tmp[w] &= cfg_scratch.in_set[p][w] | cfg_scratch.defs[p][w];
+                    }
+                }
+                if (!any_pred) continue; // unreachable in practice for reachable b != 0
+                for (0..words) |w| {
+                    if (cfg_scratch.in_set[b][w] != tmp[w]) {
+                        cfg_scratch.in_set[b][w] = tmp[w];
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    const mustDefinedAtEntry = struct {
+        fn call(b: usize, v: u16) bool {
+            return cfg_scratch.in_set[b][v >> 6] & (@as(u64, 1) << @intCast(v & 63)) != 0;
+        }
+    }.call;
+
+    const mustDefinedAtExit = struct {
+        fn call(p: usize, v: u16) bool {
+            const bit = @as(u64, 1) << @intCast(v & 63);
+            return (cfg_scratch.in_set[p][v >> 6] | cfg_scratch.defs[p][v >> 6]) & bit != 0;
+        }
+    }.call;
+
+    // ── Operand checks ──
+    for (0..n) |bi| {
+        if (!reachable[bi]) continue; // dead code: optimizer's business, not a value-flow bug
+        const blk = &f.blocks[bi];
+
+        // Count reachable predecessors (an unreachable pred can never execute
+        // into this block, so phis must not be required to list it).
+        var rp: usize = 0;
+        for (preds[bi][0..pred_cnt[bi]]) |p| {
+            if (reachable[p]) rp += 1;
+        }
+
+        for (blk.insts[0..blk.inst_count], 0..) |*inst, idx| {
+            if (inst.op == .phi) {
+                // A phi's incoming-edge list must be a bijection with the real
+                // reachable predecessor set: every pred exactly once. The VM
+                // and every backend resolve phi operands by matching the
+                // runtime predecessor against phi_blocks and silently fall
+                // back to 0 when it is absent — a missing entry is a silent
+                // wrong answer, not a cosmetic defect.
+                if (pred_ovf[bi]) return error.PhiPredecessorMismatch;
+                if (inst.arg_count != rp) return error.PhiPredecessorMismatch;
+                var seen_mask: u32 = 0;
+                for (0..inst.arg_count) |k| {
+                    const pb = inst.phi_blocks[k];
+                    // Locate pb among this block's reachable preds; positions
+                    // are numbered over reachable preds only so seen_mask and
+                    // full_mask agree.
+                    var pos: ?usize = null;
+                    var ri: usize = 0;
+                    for (preds[bi][0..pred_cnt[bi]]) |p| {
+                        if (!reachable[p]) continue;
+                        if (p == pb) {
+                            pos = ri;
+                            break;
+                        }
+                        ri += 1;
+                    }
+                    const pos_v = pos orelse return error.PhiPredecessorMismatch; // foreign pred
+                    const bit: u32 = @as(u32, 1) << @intCast(pos_v);
+                    if (seen_mask & bit != 0) return error.PhiPredecessorMismatch; // duplicate
+                    seen_mask |= bit;
+                    // The incoming value must be must-defined at the EXIT of
+                    // its predecessor. args[k] == 0 is the established "no
+                    // store on this path" convention mem2reg emits; it
+                    // evaluates as 0 by design, not by accident.
+                    const v = inst.args[k];
+                    if (v == 0) continue;
+                    if (!mustDefinedAtExit(pb, v)) return error.NonDominatingDef;
+                }
+                // rp == arg_count <= 8 here, so the full mask fits u32.
+                const full_mask: u32 = (@as(u32, 1) << @intCast(rp)) - 1;
+                if (seen_mask != full_mask) return error.PhiPredecessorMismatch; // missing pred
+            } else {
+                for ([_]u16{ inst.src1, inst.src2 }) |v| {
+                    if (v == 0) continue; // 0 is the "no operand" convention
+                    if (definedInBlockBefore(f, bi, v, idx)) continue;
+                    if (mustDefinedAtEntry(bi, v)) continue;
+                    if (definedInBlockFrom(f, bi, v, idx)) return error.UseBeforeDef;
+                    return error.NonDominatingDef;
+                }
+                for (inst.args[0..inst.arg_count]) |v| {
+                    if (v == 0) continue;
+                    if (definedInBlockBefore(f, bi, v, idx)) continue;
+                    if (mustDefinedAtEntry(bi, v)) continue;
+                    if (definedInBlockFrom(f, bi, v, idx)) return error.UseBeforeDef;
+                    return error.NonDominatingDef;
                 }
             }
         }

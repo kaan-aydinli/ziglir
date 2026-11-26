@@ -1211,11 +1211,37 @@ fn ifConversion(f: *IRFn) bool {
         const needed = (b_then.inst_count - 1) + (b_else.inst_count - 1) + phi_count + 1;
         if (b_cond.inst_count - 1 + needed >= MAX_INSTS_PER_BLOCK) continue;
 
-        // Find insertion position so compare instructions stay adjacent to select
+        // Find insertion position so compare instructions stay adjacent to select.
+        // Moving the branch bodies *above* a producer instruction (cmp, or the
+        // bit_and feeding it) is only legal when none of the moved instructions
+        // read what that producer defines — otherwise the bodies would use a
+        // vreg before it is defined in the merged block. This actually fired on
+        // `int_to_hex`: the bodies computed `digit + 48` / `digit + 87` while
+        // `digit = value & 15` sat in the tail, producing a use-before-def that
+        // silently evaluated against a stale/zero register (caught by the IR
+        // verifier's must-reach dataflow check).
+        const then_body = b_then.insts[0 .. b_then.inst_count - 1];
+        const else_body = b_else.insts[0 .. b_else.inst_count - 1];
+        const tailDestReadByBody = struct {
+            fn check(inst: IRInst, moved_a: []const IRInst, moved_b: []const IRInst) bool {
+                if (inst.dest == 0) return false;
+                for (moved_a) |mi_inst| {
+                    if (instReadsVreg(mi_inst, inst.dest)) return true;
+                }
+                for (moved_b) |mi_inst| {
+                    if (instReadsVreg(mi_inst, inst.dest)) return true;
+                }
+                return false;
+            }
+        }.check;
         var insert_pos: usize = b_cond.inst_count - 1;
-        if (insert_pos >= 1 and b_cond.insts[insert_pos - 1].dest == term.src1 and isCmpOp(b_cond.insts[insert_pos - 1].op)) {
+        if (insert_pos >= 1 and b_cond.insts[insert_pos - 1].dest == term.src1 and isCmpOp(b_cond.insts[insert_pos - 1].op) and
+            !tailDestReadByBody(b_cond.insts[insert_pos - 1], then_body, else_body))
+        {
             insert_pos -= 1;
-            if (insert_pos >= 1 and b_cond.insts[insert_pos - 1].dest == b_cond.insts[insert_pos].src1 and b_cond.insts[insert_pos - 1].op == .bit_and) {
+            if (insert_pos >= 1 and b_cond.insts[insert_pos - 1].dest == b_cond.insts[insert_pos].src1 and b_cond.insts[insert_pos - 1].op == .bit_and and
+                !tailDestReadByBody(b_cond.insts[insert_pos - 1], then_body, else_body))
+            {
                 insert_pos -= 1;
             }
         }

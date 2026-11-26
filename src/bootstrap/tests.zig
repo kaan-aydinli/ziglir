@@ -802,6 +802,245 @@ test "IR verifier rejects stack frames above backend safety limit" {
     try std.testing.expectError(error.StackFrameTooLarge, ir_verify.verify(module, "fn"));
 }
 
+// ── Regression tests for docs/CRITICAL_ISSUES_6.md issue #6 ────────────────
+// Hand-built IR modules for the value-flow bug classes that caused the six
+// wrong-answer bugs of 2026-11 (docs/STATUS.md:84-88):
+//   A: same-block use before def,
+//   B: use in a merge block whose only def does not dominate it,
+//   C: phi whose predecessor list does not match the real CFG preds.
+// Before the verifier hardening all three passed verify(), and module B
+// executed in the VM as a silent wrong answer (0 from a zero-initialised
+// vreg). Each must now be rejected with a precise error, and well-formed
+// SSA / post-SSA modules must still be accepted.
+
+fn pocModuleA() !*ir_mod.IRModule {
+    const module = try std.testing.allocator.create(ir_mod.IRModule);
+    errdefer std.testing.allocator.destroy(module);
+    module.init();
+    module.fn_count = 1;
+    ir_mod.IRModule.initFnSlot(&module.fns[0], 0, 4, 0, 0, 0);
+    const f = &module.fns[0];
+    f.vreg_count = 3;
+    f.block_count = 1;
+    f.blocks[0].label = 0;
+    f.blocks[0].inst_count = 3;
+    f.blocks[0].insts[0] = .{ .op = .copy, .dest = 2, .src1 = 1 }; // uses v1 BEFORE its def
+    f.blocks[0].insts[1] = .{ .op = .const_int, .dest = 1, .imm = 5 };
+    f.blocks[0].insts[2] = .{ .op = .ret, .src1 = 2 };
+    return module;
+}
+
+fn pocModuleB(take_defined_path: bool) !*ir_mod.IRModule {
+    const module = try std.testing.allocator.create(ir_mod.IRModule);
+    errdefer std.testing.allocator.destroy(module);
+    module.init();
+    module.fn_count = 1;
+    ir_mod.IRModule.initFnSlot(&module.fns[0], 0, 4, 0, 0, 0);
+    const f = &module.fns[0];
+    f.vreg_count = 3;
+    f.block_count = 4;
+    // B0: v1 = 1|0; if v1 goto B1 else B2
+    f.blocks[0].inst_count = 2;
+    f.blocks[0].insts[0] = .{ .op = .const_int, .dest = 1, .imm = @intFromBool(take_defined_path) };
+    f.blocks[0].insts[1] = .{ .op = .cond_jump, .src1 = 1, .target_block = 1, .alt_block = 2 };
+    // B1: v2 = 10; goto B3
+    f.blocks[1].inst_count = 2;
+    f.blocks[1].insts[0] = .{ .op = .const_int, .dest = 2, .imm = 10 };
+    f.blocks[1].insts[1] = .{ .op = .jump, .target_block = 3 };
+    // B2: goto B3 (v2 NEVER defined on this path)
+    f.blocks[2].inst_count = 1;
+    f.blocks[2].insts[0] = .{ .op = .jump, .target_block = 3 };
+    // B3: return v2 — v2's only def (B1) does not dominate B3
+    f.blocks[3].inst_count = 1;
+    f.blocks[3].insts[0] = .{ .op = .ret, .src1 = 2 };
+    return module;
+}
+
+fn pocModuleC() !*ir_mod.IRModule {
+    const module = try std.testing.allocator.create(ir_mod.IRModule);
+    errdefer std.testing.allocator.destroy(module);
+    module.init();
+    module.fn_count = 1;
+    ir_mod.IRModule.initFnSlot(&module.fns[0], 0, 4, 0, 0, 0);
+    const f = &module.fns[0];
+    f.vreg_count = 4;
+    f.block_count = 3;
+    // B0: v1 = 1; if v1 goto B1 else B2  → preds(B2) = {B0, B1}
+    f.blocks[0].inst_count = 2;
+    f.blocks[0].insts[0] = .{ .op = .const_int, .dest = 1, .imm = 0 };
+    f.blocks[0].insts[1] = .{ .op = .cond_jump, .src1 = 1, .target_block = 1, .alt_block = 2 };
+    // B1: goto B2
+    f.blocks[1].inst_count = 1;
+    f.blocks[1].insts[0] = .{ .op = .jump, .target_block = 2 };
+    // B2: v3 = phi(v1 from B0) — MISSING the B1 entry entirely
+    f.blocks[2].inst_count = 2;
+    f.blocks[2].insts[0] = .{ .op = .phi, .dest = 3, .arg_count = 1, .args = .{1} ** 8, .phi_blocks = .{0} ** 8 };
+    f.blocks[2].insts[1] = .{ .op = .ret, .src1 = 3 };
+    return module;
+}
+
+test "IR verifier rejects same-block use before def" {
+    const module = try pocModuleA();
+    defer std.testing.allocator.destroy(module);
+    try std.testing.expectError(error.UseBeforeDef, ir_verify.verify(module, "main"));
+}
+
+test "IR verifier rejects uses whose definition does not dominate them" {
+    const module = try pocModuleB(false);
+    defer std.testing.allocator.destroy(module);
+    try std.testing.expectError(error.NonDominatingDef, ir_verify.verify(module, "main"));
+
+    // Why this matters: if such IR ever reaches the VM (the verifier is the
+    // gate that must stop it), the undefined path executes as a silent wrong
+    // answer instead of failing — this is the 2026-11 wrong-answer bug class.
+    const ir_vm_mod = @import("ir_vm.zig");
+    const res = try ir_vm_mod.execute(std.testing.allocator, module, "main", &[_][]const u8{}, false);
+    try std.testing.expect(!res.trapped);
+    try std.testing.expectEqual(@as(i64, 0), res.exit_code); // silently 0, not an error
+}
+
+test "IR verifier rejects phi predecessor mismatches" {
+    // Missing predecessor (preds(B2) = {B0, B1}, phi lists only B0).
+    {
+        const module = try pocModuleC();
+        defer std.testing.allocator.destroy(module);
+        try std.testing.expectError(error.PhiPredecessorMismatch, ir_verify.verify(module, "main"));
+    }
+    // Foreign predecessor (phi lists B1 twice; B0 missing).
+    {
+        const module = try pocModuleC();
+        defer std.testing.allocator.destroy(module);
+        module.fns[0].blocks[2].insts[0] = .{ .op = .phi, .dest = 3, .arg_count = 2, .args = .{ 1, 1, 0, 0, 0, 0, 0, 0 }, .phi_blocks = .{ 1, 1, 0, 0, 0, 0, 0, 0 } };
+        try std.testing.expectError(error.PhiPredecessorMismatch, ir_verify.verify(module, "main"));
+    }
+    // Incoming value defined only in the merge block itself (does not
+    // dominate the incoming edge).
+    {
+        const module = try pocModuleC();
+        defer std.testing.allocator.destroy(module);
+        // v3 = phi(v1 from B0, v1 from B1) — well-formed edge list, but add a
+        // second phi whose incoming vreg is defined only in B2 after the phi.
+        module.fns[0].vreg_count = 5;
+        module.fns[0].blocks[2].inst_count = 4;
+        module.fns[0].blocks[2].insts[0] = .{ .op = .phi, .dest = 3, .arg_count = 2, .args = .{ 1, 1, 0, 0, 0, 0, 0, 0 }, .phi_blocks = .{ 0, 1, 0, 0, 0, 0, 0, 0 } };
+        module.fns[0].blocks[2].insts[1] = .{ .op = .phi, .dest = 4, .arg_count = 2, .args = .{ 3, 3, 0, 0, 0, 0, 0, 0 }, .phi_blocks = .{ 0, 1, 0, 0, 0, 0, 0, 0 } };
+        module.fns[0].blocks[2].insts[2] = .{ .op = .copy, .dest = 3, .src1 = 4 }; // redefine v3 in B2
+        module.fns[0].blocks[2].insts[3] = .{ .op = .ret, .src1 = 4 };
+        // phi v4's incoming v3 on edges B0/B1: v3 is defined in B0? No — v3's
+        // defs are both in B2 (the phi itself + the copy). Neither dominates
+        // B0/B1, so this must be rejected.
+        try std.testing.expectError(error.NonDominatingDef, ir_verify.verify(module, "main"));
+    }
+}
+
+test "IR verifier accepts well-formed SSA, post-SSA redefinition and dead code" {
+    // Correct SSA diamond: phi at the merge with one entry per pred, every
+    // incoming value defined in its predecessor; the VM computes the right
+    // answer (20 via the B2 path).
+    {
+        const module = try std.testing.allocator.create(ir_mod.IRModule);
+        defer std.testing.allocator.destroy(module);
+        module.init();
+        module.fn_count = 1;
+        ir_mod.IRModule.initFnSlot(&module.fns[0], 0, 4, 0, 0, 0);
+        const f = &module.fns[0];
+        f.vreg_count = 6;
+        f.block_count = 4;
+        f.blocks[0].inst_count = 2;
+        f.blocks[0].insts[0] = .{ .op = .const_int, .dest = 1, .imm = 0 };
+        f.blocks[0].insts[1] = .{ .op = .cond_jump, .src1 = 1, .target_block = 1, .alt_block = 2 };
+        f.blocks[1].inst_count = 2;
+        f.blocks[1].insts[0] = .{ .op = .const_int, .dest = 2, .imm = 10 };
+        f.blocks[1].insts[1] = .{ .op = .jump, .target_block = 3 };
+        f.blocks[2].inst_count = 2;
+        f.blocks[2].insts[0] = .{ .op = .const_int, .dest = 5, .imm = 20 };
+        f.blocks[2].insts[1] = .{ .op = .jump, .target_block = 3 };
+        f.blocks[3].inst_count = 2;
+        f.blocks[3].insts[0] = .{ .op = .phi, .dest = 4, .arg_count = 2, .args = .{ 2, 5, 0, 0, 0, 0, 0, 0 }, .phi_blocks = .{ 1, 2, 0, 0, 0, 0, 0, 0 } };
+        f.blocks[3].insts[1] = .{ .op = .ret, .src1 = 4 };
+        try ir_verify.verify(module, "main");
+        const ir_vm_mod = @import("ir_vm.zig");
+        const res = try ir_vm_mod.execute(std.testing.allocator, module, "main", &[_][]const u8{}, false);
+        try std.testing.expect(!res.trapped);
+        try std.testing.expectEqual(@as(i64, 20), res.exit_code);
+    }
+    // Post-SSA (destructSSA output shape): a vreg defined in the entry block
+    // and *redefined* on one path; the merge-block use is fed by the
+    // dominating entry def, which is legal non-SSA IR. Plus an unreachable
+    // block whose nonsense use must be ignored (dead code is exempt).
+    {
+        const module = try std.testing.allocator.create(ir_mod.IRModule);
+        defer std.testing.allocator.destroy(module);
+        module.init();
+        module.fn_count = 1;
+        ir_mod.IRModule.initFnSlot(&module.fns[0], 0, 4, 0, 0, 0);
+        const f = &module.fns[0];
+        f.vreg_count = 4;
+        f.block_count = 4;
+        f.blocks[0].inst_count = 3;
+        f.blocks[0].insts[0] = .{ .op = .const_int, .dest = 1, .imm = 0 };
+        f.blocks[0].insts[1] = .{ .op = .const_int, .dest = 2, .imm = 7 }; // dominating def of v2
+        f.blocks[0].insts[2] = .{ .op = .cond_jump, .src1 = 1, .target_block = 1, .alt_block = 2 };
+        f.blocks[1].inst_count = 2;
+        f.blocks[1].insts[0] = .{ .op = .const_int, .dest = 2, .imm = 9 }; // redefinition on one path
+        f.blocks[1].insts[1] = .{ .op = .jump, .target_block = 2 };
+        f.blocks[2].inst_count = 1;
+        f.blocks[2].insts[0] = .{ .op = .ret, .src1 = 2 };
+        f.blocks[3].inst_count = 1;
+        f.blocks[3].insts[0] = .{ .op = .ret, .src1 = 3 }; // unreachable: v3 never defined anywhere
+        try ir_verify.verify(module, "main");
+    }
+}
+
+test "Optimizer regression: if-conversion must not move branch bodies above the producer they read" {
+    // The hidden SSA bug the Issue #6 dataflow verifier exposed. ifConversion
+    // lowers its insertion point below the condition `cmp` (and below the
+    // `bit_and` feeding it) so the compare stays adjacent to the synthesized
+    // `select`, but it used to do that without checking whether the moved
+    // branch bodies read vregs defined by those very tail instructions.
+    // For `let rem = v & 15; if rem < 10 { 48 + rem } else { 87 + rem }` it
+    // emitted `add rem,48` / `add rem,87` BEFORE `rem = v & 15`: a
+    // use-before-def that silently evaluated against a stale register. The
+    // verifier now rejects that shape, so a successful -O2 compile of this
+    // source plus the exact output is the regression check.
+    // The shape matters: inside a loop, LICM/LVN hoist the comparison
+    // constants into the preheader, leaving `rem = x & 15`, `cmp`, `cond_jump`
+    // adjacent at the end of the header — exactly the pattern whose tail the
+    // buggy insertion-point logic moved the branch bodies above.
+    const src =
+        \\fn sum_hex(v: i64) -> i64 {
+        \\    var acc: i64 = 0
+        \\    var x = v
+        \\    while x != 0 {
+        \\        let rem = x & 15
+        \\        let c = if rem < 10 { 48 + rem } else { 87 + rem }
+        \\        acc = acc + c
+        \\        x = x >> 4
+        \\    }
+        \\    return acc
+        \\}
+        \\fn main() -> i64 {
+        \\    printInt(sum_hex(255))
+        \\    printInt(sum_hex(7))
+        \\    return 0
+        \\}
+    ;
+    const elf = try compileSourceWithOpt(src, .O2);
+    defer std.testing.allocator.free(elf);
+    const res = try runElfCapture(std.testing.allocator, elf, "ifconv_nibble");
+    defer std.testing.allocator.free(res.stdout);
+    try std.testing.expectEqual(@as(u8, 0), res.exit_code);
+    try std.testing.expectEqualStrings("204\n55\n", res.stdout);
+
+    // Same answer from the unoptimized pipeline: -O0 and -O2 must agree.
+    const elf0 = try compileSourceWithOpt(src, .O0);
+    defer std.testing.allocator.free(elf0);
+    const res0 = try runElfCapture(std.testing.allocator, elf0, "ifconv_nibble_o0");
+    defer std.testing.allocator.free(res0.stdout);
+    try std.testing.expectEqual(@as(u8, 0), res0.exit_code);
+    try std.testing.expectEqualStrings("204\n55\n", res0.stdout);
+}
+
 
 
 
