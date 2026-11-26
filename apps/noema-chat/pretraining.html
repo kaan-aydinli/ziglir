@@ -56,7 +56,7 @@
           </div>
 
           <div class="grid-2">
-            <div style="display:flex;flex-direction:column;gap:18px">
+            <div class="stack">
               <section class="card">
                 <div class="section-head"><span class="section-title">1 · Korpus yükle</span><span class="pill" id="upload-state" data-tone="info"><i></i><span>bekliyor</span></span></div>
 
@@ -71,14 +71,14 @@
                   <div class="hint" id="file-hint">henüz dosya seçilmedi</div>
                 </div>
 
-                <div id="upload-progress" hidden style="margin-top:14px">
+                <div id="upload-progress" class="mt-14" hidden>
                   <div class="progress-head"><strong id="upload-name">—</strong><span id="upload-pct">%0</span></div>
                   <div class="track" id="upload-track"><i></i></div>
-                  <div class="progress-head" style="margin-top:7px;margin-bottom:0"><span class="mono" style="font-size:10px;color:var(--ink-faint)" id="upload-bytes">0 B</span><span class="mono" style="font-size:10px;color:var(--ink-faint)" id="upload-status"></span></div>
+                  <div class="progress-head progress-head-tight"><span class="mono hint-sm" id="upload-bytes">0 B</span><span class="mono hint-sm" id="upload-status"></span></div>
                 </div>
 
-                <div style="display:flex;gap:8px;margin-top:14px">
-                  <button class="btn btn-primary" id="start-button" type="button" disabled style="flex:1">
+                <div class="btn-row">
+                  <button class="btn btn-primary btn-grow" id="start-button" type="button" disabled>
                     <svg viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
                     Eğitimi başlat
                   </button>
@@ -97,7 +97,7 @@
                   <span class="stage-chip" data-stage="audit"><i></i>denetim</span>
                   <span class="stage-chip" data-stage="publish"><i></i>yayın</span>
                 </div>
-                <div class="kv" style="margin-top:14px">
+                <div class="kv kv-lg">
                   <dt>sürüm</dt><dd id="train-version">—</dd>
                   <dt>konu</dt><dd id="train-topics">—</dd>
                   <dt>kaynak</dt><dd id="train-source">—</dd>
@@ -105,10 +105,10 @@
                   <dt>geçen</dt><dd id="train-elapsed">—</dd>
                   <dt>kalan</dt><dd id="train-eta">—</dd>
                 </div>
-                <div id="train-error" hidden style="margin-top:12px;padding:10px 12px;border:1px solid rgba(255,138,138,.3);background:rgba(255,138,138,.05);border-radius:8px;font-size:12px;color:#ffd9d9"></div>
+                <div class="alert alert-bad mt-12" id="train-error" hidden></div>
                 <div class="result-grid" id="train-result" hidden></div>
-                <div style="display:flex;gap:8px;margin-top:14px" id="train-actions" hidden>
-                  <a class="btn btn-primary" id="goto-chat" href="/" style="flex:1">Modele sor</a>
+                <div class="btn-row" id="train-actions" hidden>
+                  <a class="btn btn-primary btn-grow" id="goto-chat" href="/">Modele sor</a>
                 </div>
               </section>
 
@@ -120,7 +120,7 @@
               </section>
             </div>
 
-            <aside style="display:flex;flex-direction:column;gap:18px">
+            <aside class="stack">
               <section class="card">
                 <div class="section-head"><span class="section-title">Korpus biçimi</span></div>
                 <pre class="code-block"><span class="cm"># konu 1</span>
@@ -132,7 +132,7 @@ pişirilmesiyle elde edilir.
 <span class="cm"># konu 2</span>
 Mermer, kireç taşının
 başkalaşımıyla oluşur.</pre>
-                <div class="rule-list" style="margin-top:14px">
+                <div class="rule-list mt-14">
                   <div class="rule"><span class="n">1</span><span>Her konu en az bir <b>tam cümle</b> içermeli; cümle sonu noktalama korpusun kendisinden gelir.</span></div>
                   <div class="rule"><span class="n">2</span><span>Konular <b>&lt;veriayrimi&gt;</b> satırıyla ayrılır. Tek konu reddedilir.</span></div>
                   <div class="rule"><span class="n">3</span><span>Bir konu en fazla <b>64 kB</b> olabilir; dosya UTF-8 olmalıdır.</span></div>

@@ -23,8 +23,8 @@
   /* ink */
   --ink: #eef1f8;
   --ink-soft: #b7bfd2;
-  --ink-mute: #7f889f;
-  --ink-faint: #5c6478;
+  --ink-mute: #9aa3b8;
+  --ink-faint: #7c8499;
 
   /* accents: one primary, three signal colours used only to encode state */
   --accent: #5eead4;
@@ -47,6 +47,7 @@
   --shadow-2: 0 10px 30px -12px rgba(0, 0, 0, .6);
 
   --rail-w: 68px;
+  --rail-h-mobile: 58px;
   --ease: cubic-bezier(.22, .61, .36, 1);
 }
 
@@ -72,9 +73,85 @@ body {
 }
 
 button, input, textarea, select { font: inherit; color: inherit; }
+
+/* A keyboard user must always be able to see where they are. `:focus-visible` keeps the ring off
+   for mouse clicks while showing it for tab navigation. The composer textarea needs its own
+   treatment because its parent already carries the border. */
+:where(a, button, input, textarea, select, summary):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+.composer textarea:focus-visible {
+  outline: 2px solid var(--accent-line);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
 button { cursor: pointer; }
 a { color: var(--info); text-decoration: none; }
 a:hover { text-decoration: underline; }
+
+/* =====================================================================================
+   utilities
+   -------------------------------------------------------------------------------------
+   The markup uses the `hidden` attribute for progressive disclosure; without an explicit rule
+   the browser default (`display:none`) is overridden by any component `display` (`.btn` is
+   inline-flex, `.result-grid` is grid), leaving "hidden" panels visible. This one rule fixes
+   that class of bug for every current and future component.
+   ===================================================================================== */
+
+[hidden] { display: none !important; }
+
+/* The JS toggles this class to hide the welcome block and the "thinking" row. It has to be a
+   rule: without it `classList.add('hidden')` does nothing and the intro stays on screen behind
+   the first message. */
+.hidden { display: none !important; }
+/* belt and braces: a component that sets its own display must not out-rank `[hidden]` either */
+.thinking.hidden { display: none !important; }
+
+.stack { display: flex; flex-direction: column; gap: 18px; }
+.btn-row { display: flex; gap: 8px; margin-top: 14px; }
+.btn-block { width: 100%; }
+.btn-grow { flex: 1; }
+.btn-sm { padding: 5px 10px; font-size: 11px; border-radius: 7px; }
+.btn-row > .btn { flex: 0 1 auto; }
+.btn-row > .btn-grow { flex: 1 1 auto; max-width: 320px; }
+.mt-12 { margin-top: 12px; }
+.mt-14 { margin-top: 14px; }
+.kv-gap { margin-top: 11px; }
+.kv-lg { margin-top: 14px; }
+.note-gap { margin-top: 12px; }
+.hint-sm { font-size: 10px; color: var(--ink-faint); }
+.progress-head-tight { margin-top: 7px; margin-bottom: 0; }
+.is-bad { color: var(--bad) !important; }
+.over { color: var(--bad); }
+.model-mark-lg { width: 34px; height: 34px; }
+.stat-value-sm { font-size: 12px; }
+
+.alert {
+  padding: 10px 12px;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.55;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--ink-soft);
+}
+.alert-bad { border-color: rgba(255, 138, 138, .32); background: rgba(255, 138, 138, .06); color: #ffd9d9; }
+
+/* =====================================================================================
+   bars
+   -------------------------------------------------------------------------------------
+   Fill width travels as `--fill`, set from JS through CSSStyleDeclaration. The page runs under
+   `style-src 'self'`, which silently blocks `element.style.width = ...`; custom properties are
+   permitted and keep the geometry out of the markup.
+   ===================================================================================== */
+
+.bar > i,
+.track > i {
+  width: var(--fill, 0%);
+  background: var(--fill-tone, currentColor);
+}
 
 .sr-only {
   position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
@@ -160,14 +237,27 @@ a:hover { text-decoration: underline; }
 .rail-health[data-state="up"] { background: var(--good); box-shadow: 0 0 0 3px rgba(110, 231, 168, .13); }
 .rail-health[data-state="down"] { background: var(--bad); box-shadow: 0 0 0 3px rgba(255, 138, 138, .13); }
 .rail-health-label {
-  font: 8.5px var(--mono);
+  font: 9.5px var(--mono);
   letter-spacing: .1em;
   color: var(--ink-faint);
   writing-mode: vertical-rl;
   text-orientation: mixed;
+  font-size: 9.5px;
 }
 
+/* `.main` is a flex column, which makes `.topbar` a flex item: a sticky flex item only sticks
+   inside its own line box, so it scrolls away and then comes back as the page bottoms out,
+   landing on top of the content. Stretching the item to the container height is what lets
+   `position: sticky` behave like a normal page-level sticky bar. */
 .main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.main > .topbar { align-self: stretch; }
+.main:has(> .page) > .topbar { position: static; }
+
+/* On narrow screens the chat shell becomes a normally-scrolling document (see the 820px block),
+   so a sticky bar there only steals space from the first cards. */
+@media (max-width: 1080px) {
+  .main > .topbar { position: static; }
+}
 
 /* =====================================================================================
    top bar
@@ -304,7 +394,7 @@ a:hover { text-decoration: underline; }
   min-width: 0;
 }
 .stat-label {
-  font: 9px var(--mono);
+  font: 9.5px var(--mono);
   letter-spacing: .1em;
   text-transform: uppercase;
   color: var(--ink-faint);
@@ -324,7 +414,7 @@ a:hover { text-decoration: underline; }
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  font: 9.5px var(--mono);
+  font: 10px var(--mono);
   letter-spacing: .06em;
   padding: 3px 8px;
   border-radius: 999px;
@@ -347,7 +437,7 @@ a:hover { text-decoration: underline; }
   margin: 0 0 12px;
 }
 .section-title {
-  font: 9.5px var(--mono);
+  font: 10px var(--mono);
   letter-spacing: .13em;
   text-transform: uppercase;
   color: var(--ink-faint);
@@ -372,7 +462,11 @@ a:hover { text-decoration: underline; }
 
 /* a thin, purely-CSS bar. width is set by JS from real values. */
 .bar { height: 3px; border-radius: 2px; background: var(--surface-3); overflow: hidden; }
-.bar > i { display: block; height: 100%; width: 0; border-radius: 2px; background: var(--accent); transition: width .3s var(--ease); }
+.bar > i {
+  display: block; height: 100%; border-radius: 2px;
+  background: var(--accent);
+  transition: width .3s var(--ease);
+}
 .bar[data-tone="warn"] > i { background: var(--warn); }
 .bar[data-tone="bad"] > i { background: var(--bad); }
 
@@ -463,7 +557,7 @@ a:hover { text-decoration: underline; }
 .starter b { font-size: 12.5px; font-weight: 600; }
 .starter small { font-size: 10.5px; color: var(--ink-mute); line-height: 1.45; }
 .starter .starter-kind {
-  font: 8.5px var(--mono);
+  font: 9.5px var(--mono);
   letter-spacing: .1em;
   text-transform: uppercase;
   color: var(--ink-faint);
@@ -547,7 +641,7 @@ a:hover { text-decoration: underline; }
   padding: 3px 6px;
   font-variant-numeric: tabular-nums;
 }
-.receipt span b { color: var(--ink-soft); font-weight: 600; }
+.receipt span b { color: var(--ink-soft); font-weight: 600; margin-left: 5px; }
 .receipt span[data-tone="good"] { color: var(--good); border-color: rgba(110, 231, 168, .22); }
 .receipt span[data-tone="warn"] { color: var(--warn); border-color: rgba(245, 194, 107, .22); }
 .receipt span[data-tone="info"] { color: var(--info); border-color: rgba(138, 180, 255, .22); }
@@ -631,6 +725,8 @@ a:hover { text-decoration: underline; }
   max-height: 132px;
   padding: 2px 0;
   display: block;
+  /* Autosize: JS measures the scroll height and writes `--rows-h`; the box grows with it. */
+  height: var(--rows-h, 24px);
 }
 .composer textarea::placeholder { color: var(--ink-faint); }
 .composer-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 6px; }
@@ -735,10 +831,10 @@ a:hover { text-decoration: underline; }
 }
 .verify-row .v-name { color: var(--ink-soft); display: flex; align-items: center; gap: 7px; min-width: 0; }
 .verify-row .v-name i {
-  width: 13px; height: 13px;
+  width: 14px; height: 14px;
   border-radius: 50%;
   display: grid; place-items: center;
-  font-size: 8px;
+  font-size: 9.5px;
   flex: none;
   border: 1px solid var(--line-strong);
   color: var(--ink-faint);
@@ -774,8 +870,20 @@ a:hover { text-decoration: underline; }
    documents / pretraining page
    ===================================================================================== */
 
-.page { flex: 1; overflow-y: auto; }
-.wrap { max-width: 1180px; margin: 0 auto; padding: 28px clamp(16px, 3vw, 34px) 60px; }
+/* No nested scroll container. `.page` used to scroll on its own, which detached the sticky
+   topbar from the document scroller and let the bar paint over content at certain scroll
+   offsets; the document is the single scroller now. */
+.page { flex: 1; }
+/* The topbar is sticky, so the first focusable element inside the page must never be able to
+   end up beneath it. `scroll-margin` keeps anchor/focus scrolling clear of the bar, and the
+   generous bottom padding makes sure the last element can always be scrolled into free space. */
+.wrap {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 28px clamp(16px, 3vw, 34px) 100px;
+}
+.page :is(a, button, input, textarea, select, summary) { scroll-margin-block: 24px; }
+.page { scroll-padding-top: 24px; }
 
 .page-head { margin-bottom: 26px; }
 .page-head h1 { margin: 0 0 8px; font-size: clamp(22px, 2.6vw, 30px); letter-spacing: -.035em; font-weight: 640; }
@@ -818,13 +926,13 @@ a:hover { text-decoration: underline; }
 
 /* upload + training progress */
 .track { height: 5px; border-radius: 3px; background: var(--surface-3); overflow: hidden; }
-.track > i { display: block; height: 100%; width: 0; background: var(--accent); border-radius: 3px; transition: width .25s var(--ease); }
+.track > i { display: block; height: 100%; background: var(--accent); border-radius: 3px; transition: width .25s var(--ease); }
 .track[data-tone="warn"] > i { background: var(--warn); }
 .track[data-tone="bad"] > i { background: var(--bad); }
 
-.progress-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 9px; }
-.progress-head strong { font-size: 12.5px; font-weight: 600; }
-.progress-head span { font: 10px var(--mono); color: var(--ink-mute); font-variant-numeric: tabular-nums; }
+.progress-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 9px; min-width: 0; }
+.progress-head strong { font-size: 12.5px; font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.progress-head span { font: 10px var(--mono); color: var(--ink-mute); font-variant-numeric: tabular-nums; flex: none; }
 
 .stages { display: flex; gap: 6px; margin-top: 14px; flex-wrap: wrap; }
 .stage-chip {
@@ -985,30 +1093,56 @@ dialog::backdrop { background: rgba(4, 6, 12, .72); }
     left: 0;
     right: 0;
     width: 100%;
-    height: 56px;
+    height: var(--rail-h-mobile);
     flex-direction: row;
     justify-content: center;
     border-right: 0;
     border-top: 1px solid var(--line);
     padding: 0 10px;
     z-index: 30;
+    /* keep the bar clear of iOS home-indicator gestures */
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    height: calc(var(--rail-h-mobile) + env(safe-area-inset-bottom, 0px));
   }
   .rail-brand, .rail-spacer, .rail-health-label { display: none; }
+  .rail-btn { width: 44px; height: 44px; } /* 44px = accessible touch target */
   .rail-foot { padding: 0; margin-left: 8px; }
-  .main { padding-bottom: 56px; }
+  /* The rail is fixed, so the page needs room for it *and* a margin: without this the composer
+     sits underneath it and the send button becomes untappable. */
+  .main { padding-bottom: calc(var(--rail-h-mobile) + env(safe-area-inset-bottom, 0px)); }
   .topbar { height: auto; padding: 10px 14px; flex-wrap: wrap; gap: 10px; }
   .topbar-id .tag { display: none; }
   .select-wrap select { max-width: 150px; }
   .chat-col { min-height: auto; }
   .conversation { max-height: none; }
-  .composer-wrap { position: static; background: none; }
+  /* The rail is fixed to the viewport bottom, so the composer is pinned *above* it rather than
+     at `bottom: 0` (which would park it underneath and make send untappable). A solid backdrop
+     keeps the message list from showing through while it is pinned. */
+  .composer-wrap {
+    position: sticky;
+    bottom: calc(var(--rail-h-mobile) + env(safe-area-inset-bottom, 0px));
+    background: var(--bg);
+    padding: 10px 0 10px;
+    margin-top: auto;
+    z-index: 5;
+  }
+  .composer-wrap::before {
+    content: "";
+    position: absolute;
+    left: 0; right: 0; top: -14px;
+    height: 14px;
+    background: linear-gradient(to top, var(--bg), transparent);
+    pointer-events: none;
+  }
   .nav-tabs { order: 3; }
   .starters { grid-template-columns: 1fr; }
+  .inspector { padding-bottom: calc(24px + var(--rail-h-mobile)); }
 }
 
 @media (max-width: 520px) {
   .topbar-actions { width: 100%; justify-content: space-between; }
   .metrics { grid-template-columns: 1fr; }
+  .disclaimer { font-size: 10.5px; }
 }
 
 /* print — a report should be printable without the chrome */

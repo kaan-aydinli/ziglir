@@ -980,7 +980,12 @@ const server = http.createServer(async (req, res) => {
       'cache-control': 'no-cache',
       'x-content-type-options': 'nosniff',
       'x-frame-options': 'SAMEORIGIN',
-      'content-security-policy': "default-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'self'",
+      // `style-src 'self'` is deliberately strict: it rejects inline `style=` attributes *and*
+      // silently ignores `element.style.prop = ...` (see setFill in app.js). Bar geometry and
+      // textarea autosize therefore travel as custom properties set through CSSStyleDeclaration,
+      // which this policy permits. Keep it that way — loosening to 'unsafe-inline' would let any
+      // injected attribute through.
+      'content-security-policy': "default-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'self'; frame-ancestors 'self'",
     });
     if (req.method === 'HEAD') return res.end();
     return res.end(data);

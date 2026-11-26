@@ -97,7 +97,7 @@
             </section>
             <div class="stream" id="stream"></div>
             <div class="thinking hidden" id="thinking">
-              <span class="msg-avatar" style="background:var(--accent-dim);border:1px solid var(--accent-line);color:var(--accent);font-size:11px;font-weight:800;display:grid;place-items:center;border-radius:7px">N</span>
+              <span class="msg-avatar">N</span>
               <span class="dots"><i></i><i></i><i></i></span>
               <span id="thinking-label">LIR ağırlık grafiği çalışıyor</span>
             </div>
@@ -152,7 +152,7 @@
                 <span class="stat-value" id="m-ngram">—</span>
                 <div class="bar" id="m-ngram-bar"><i></i></div>
               </div>
-              <div class="metric wide"><span class="stat-label">Çıktı modu</span><span class="stat-value" id="m-mode" style="font-size:12px">—</span></div>
+              <div class="metric wide"><span class="stat-label">Çıktı modu</span><span class="stat-value stat-value-sm" id="m-mode">—</span></div>
             </div>
           </div>
 
@@ -186,7 +186,7 @@
                 <span class="gauge-val" id="g-cache-v">—</span>
               </div>
             </div>
-            <div class="kv" style="margin-top:11px">
+            <div class="kv kv-gap">
               <dt>istek</dt><dd id="t-req">—</dd>
               <dt>önbellek</dt><dd id="t-hit">—</dd>
               <dt>ort. CPU</dt><dd id="t-cpu">—</dd>
@@ -207,7 +207,7 @@
   <dialog id="about-dialog">
     <div class="dialog-body">
       <div class="dialog-top">
-        <div class="model-mark" style="width:34px;height:34px">N</div>
+        <div class="model-mark model-mark-lg">N</div>
         <button class="icon-btn" id="close-dialog" aria-label="Kapat">
           <svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg>
         </button>
@@ -222,7 +222,7 @@
         enjeksiyonunu izlemez. <b>Yapar:</b> korpustaki kavramlardan yeni cümleler sentezler,
         ürettiği her yanıtı 4-gram indeksine karşı doğrular ve kararını ölçümle birlikte raporlar.
       </p>
-      <button class="btn btn-primary" id="done-dialog" style="width:100%">Anladım</button>
+      <button class="btn btn-primary btn-block" id="done-dialog">Anladım</button>
     </div>
   </dialog>
 </body>

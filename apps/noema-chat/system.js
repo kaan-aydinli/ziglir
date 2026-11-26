@@ -43,10 +43,13 @@ function rows(tbodyId, pairs) {
   }
 }
 
+// See app.js `setFill`: `style-src 'self'` blocks `element.style.x = ...` silently, so bar
+// geometry is carried as a custom property that the stylesheet turns into a width.
 function setBar(id, ratio, tone) {
   const bar = $(`#${id}`);
   const pct = Math.max(0, Math.min(100, (Number(ratio) || 0) * 100));
-  bar.querySelector('i').style.width = `${pct}%`;
+  const fill = bar.querySelector('i');
+  if (fill) fill.style.setProperty('--fill', `${pct}%`);
   if (tone) bar.dataset.tone = tone; else delete bar.dataset.tone;
 }
 
@@ -177,8 +180,8 @@ function renderTelemetry(t) {
   setBar('b-cache', cacheRatio, null);
   $('#m-cache').textContent = `${fmtInt(inference.cacheSize)} / ${fmtInt(inference.cacheLimit)} kayıt`;
 
-  setBar('b-hitrate', inference.cacheHitPercent / 100, inference.cacheHitPercent > 50 ? 'good' : null);
-  document.querySelector('#b-hitrate').querySelector('i').style.background = 'var(--good)';
+  setBar('b-hitrate', inference.cacheHitPercent / 100, null);
+  document.querySelector('#b-hitrate').querySelector('i').style.setProperty('--fill-tone', 'var(--good)');
   $('#m-hitrate').textContent = `%${inference.cacheHitPercent} · ${fmtInt(inference.cacheHits)} istek`;
 
   $('#live-tick').querySelector('span').textContent = fmtInt(inference.requests);

@@ -132,6 +132,11 @@ jobs:
       - name: NOEMA v3 chat server smoke test
         run: python3 ai/noema_v3/server_smoke.py
 
+      # Measures the rendered UI in a real browser (CSP interactions, contrast, occlusion).
+      # Reports SKIP when no Chromium is available instead of failing a run it could not measure.
+      - name: NOEMA v3 UI audit
+        run: python3 ai/noema_v3/ui_audit.py
+
       - name: Browser Wasm host conformance and execution
         run: python3 tests/browser_test.py ./zig-out/bin/lir
 

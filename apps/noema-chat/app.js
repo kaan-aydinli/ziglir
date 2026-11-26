@@ -60,7 +60,8 @@ function el(tag, className, text) {
 }
 
 function receiptItem(label, value, tone = null) {
-  const span = el('span', null, `${label} `);
+  // No trailing space in the label: the value element supplies its own leading gap via CSS.
+  const span = el('span', null, label);
   const b = el('b', null, String(value));
   span.append(b);
   if (tone) span.dataset.tone = tone;
@@ -238,8 +239,11 @@ function updateInspector(metrics) {
   const ngram = Number(metrics.maxCorpusNgramRun) || 0;
   $('#m-ngram').textContent = `${ngram} / 4`;
   const bar = $('#m-ngram-bar');
-  bar.querySelector('i').style.width = `${Math.min(100, (ngram / 4) * 100)}%`;
-  bar.dataset.tone = ngram > 4 ? 'bad' : ngram === 4 ? 'warn' : '';
+  setFill(bar, Math.min(100, (ngram / 4) * 100));
+  // `delete` rather than `= ''` so `[data-tone=""]` never matches a selector.
+  if (ngram > 4) bar.dataset.tone = 'bad';
+  else if (ngram === 4) bar.dataset.tone = 'warn';
+  else delete bar.dataset.tone;
 
   if (!isV3) return;
 
@@ -266,7 +270,7 @@ function resetInspector() {
   for (const id of ['m-bytes', 'm-atoms', 'm-mode', 'm-ngram']) $(`#${id}`).textContent = DASH;
   $('#m-latency').innerHTML = `${DASH}<small>ms</small>`;
   $('#m-cpu').innerHTML = `${DASH}<small>ms</small>`;
-  $('#m-ngram-bar').querySelector('i').style.width = '0';
+  setFill($('#m-ngram-bar'), 0);
   for (const row of document.querySelectorAll('#verify-list .verify-row')) {
     row.dataset.state = '';
     const mark = row.querySelector('.v-name i');
@@ -283,10 +287,24 @@ function resetInspector() {
 // live telemetry
 // ---------------------------------------------------------------------------------------------
 
+/**
+ * Set a bar's fill width.
+ *
+ * The page is served under `Content-Security-Policy: style-src 'self'`, which blocks *every*
+ * inline style — including assignments to `element.style`, which fail silently (the property reads
+ * back unchanged and nothing renders). Setting a custom property through CSSStyleDeclaration is
+ * allowed and carries no console error, so bar geometry travels as `--fill` and the stylesheet
+ * turns it into a width.
+ */
+function setFill(bar, percent) {
+  const fill = bar?.querySelector('i');
+  if (fill) fill.style.setProperty('--fill', `${Math.max(0, Math.min(100, percent))}%`);
+}
+
 function setBar(id, value, max, tone) {
   const bar = $(`#${id}`);
   const pct = max > 0 ? Math.max(0, Math.min(100, (value / max) * 100)) : 0;
-  bar.querySelector('i').style.width = `${pct}%`;
+  setFill(bar, pct);
   if (tone) bar.dataset.tone = tone; else delete bar.dataset.tone;
 }
 
@@ -379,8 +397,10 @@ async function submitMessage(raw) {
     // Show the model's own wall clock, not the round-trip time: network overhead and JSON
     // serialisation are visible as the difference if anyone cares to look.
     metrics.latencyMs = metrics.cached ? 0 : (metrics.latencyMs ?? Math.round(performance.now() - started));
-    updateInspector(metrics);
     appendModel(metrics, result.model);
+    // Paint the inspector *after* the message so the panel always describes the reply that was
+    // just appended, never a later background poll.
+    updateInspector(metrics);
     dom.cacheHint.hidden = !metrics.cached;
     if (metrics.cached) dom.cacheHint.textContent = '· önbellekten';
     else dom.cacheHint.hidden = true;
@@ -403,14 +423,14 @@ function scrollToEnd() {
 }
 
 function resizeInput() {
-  dom.input.style.height = 'auto';
-  dom.input.style.height = `${Math.min(dom.input.scrollHeight, 132)}px`;
+  // Autosize through a custom property for the same CSP reason as `setFill`.
+  dom.input.style.setProperty('--rows-h', `${Math.min(dom.input.scrollHeight, 132)}px`);
 }
 
 function updateByteCount() {
   const bytes = encoder.encode(dom.input.value).length;
   dom.byteCount.textContent = `${fmtInt(bytes)} / 2048 bayt`;
-  dom.byteCount.style.color = bytes > 2048 ? 'var(--bad)' : '';
+  dom.byteCount.classList.toggle('over', bytes > 2048);
 }
 
 // ---------------------------------------------------------------------------------------------

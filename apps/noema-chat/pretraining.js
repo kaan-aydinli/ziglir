@@ -63,6 +63,15 @@ const fmtTime = seconds => {
   return `${Math.floor(s / 60)} dk ${s % 60} sn`;
 };
 
+/**
+ * Set a progress track's fill width. Under `style-src 'self'` assignments to `element.style`
+ * are blocked silently, so the value travels as a custom property the stylesheet consumes.
+ */
+function setFill(track, percent) {
+  const fill = track?.querySelector('i');
+  if (fill) fill.style.setProperty('--fill', `${Math.max(0, Math.min(100, percent))}%`);
+}
+
 // ---------------------------------------------------------------------------------------------
 // validation (mirrors the server's rules so the user learns about a problem before uploading)
 // ---------------------------------------------------------------------------------------------
@@ -104,10 +113,10 @@ async function chooseFile(file) {
   const info = await inspectFile(file);
   if (info.error) {
     dom.fileHint.textContent = info.error;
-    dom.fileHint.style.color = 'var(--bad)';
+    dom.fileHint.classList.add('is-bad');
     return;
   }
-  dom.fileHint.style.color = '';
+  dom.fileHint.classList.remove('is-bad');
   dom.fileHint.textContent = `${file.name} · ${fmtBytes(info.bytes)} · ${fmtInt(info.topics)} konu · ${fmtInt(info.lines)} satır`;
   currentFile = file;
   dom.start.disabled = false;
@@ -120,7 +129,7 @@ async function chooseFile(file) {
 function setUploadUI(loaded, total) {
   const pct = total > 0 ? Math.min(100, Math.floor((loaded / total) * 100)) : 0;
   dom.uploadPct.textContent = `%${pct}`;
-  dom.uploadTrack.querySelector('i').style.width = `${pct}%`;
+  setFill(dom.uploadTrack, pct);
   dom.uploadBytes.textContent = `${fmtBytes(loaded)} / ${fmtBytes(total)}`;
 }
 
@@ -242,7 +251,7 @@ function renderSummary(summary) {
 function applyStatus(data) {
   const percent = Math.max(0, Math.min(100, data.percent || 0));
   dom.trainPct.textContent = `%${percent}`;
-  dom.trainTrack.querySelector('i').style.width = `${percent}%`;
+  setFill(dom.trainTrack, percent);
   dom.trainStage.textContent = data.status === 'completed'
     ? 'Eğitim tamamlandı'
     : data.status === 'failed'
@@ -336,8 +345,7 @@ async function loadModels() {
       size.textContent = `${fmtBytes(model.checkpointBytes)} + ${fmtBytes(model.graphBytes)}`;
       const link = document.createElement('a');
       link.className = 'btn btn-ghost';
-      link.style.padding = '5px 10px';
-      link.style.fontSize = '11px';
+      link.classList.add('btn-sm');
       link.href = `/?model=${encodeURIComponent(model.selector)}`;
       link.textContent = 'Sor';
       item.append(id, size, link);
