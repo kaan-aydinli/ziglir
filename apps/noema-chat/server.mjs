@@ -3,8 +3,7 @@ import { spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
-import { createWriteStream } from 'node:fs';
-import { open as openFile, readFile, readdir, rename, stat, statfs, symlink, unlink, writeFile } from 'node:fs/promises';
+import { readFile, readdir, rm, stat, statfs, unlink, writeFile } from 'node:fs/promises';
 import { freemem } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -13,425 +12,144 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '../..');
 const port = Number(process.env.PORT || 4173);
 const lir = process.env.LIR_BIN || path.join(root, 'zig-out/bin/lir');
-const backend = path.join(root, 'ai/chat_site_backend.lir');
-const uploadTrainer = path.join(root, 'ai/train_noema_chat_upload.lir');
-const targetRecordBytes = 1024 * 1024;
+const BACKEND_NATIVE = process.env.NOEMA_V3_BACKEND_BIN || path.join(root, 'zig-out/bin/noema_v3_chat_backend');
+const BACKEND_LIR = path.join(root, 'ai/noema_v3_chat_backend.lir');
+const TRAINER_NATIVE = process.env.NOEMA_V3_TRAINER_BIN || path.join(root, 'zig-out/bin/noema_v3_upload_trainer');
+const TRAINER_LIR = path.join(root, 'ai/noema_v3_upload_trainer.lir');
+// Phase 0 isolation: the legacy exemplar-retrieval backend is retained for the
+// `fresh`/`trained`/`uploaded` NOEMA-Phi selectors. It must *never* be reported as NOEMA v3 weight
+// generation, which is why its output mode is a separate contract literal.
+const LEGACY_BACKEND_LIR = path.join(root, 'ai/chat_site_backend.lir');
+const LEGACY_OUTPUT_MODE = 'legacy_retrieval_exemplar';
+
+const checkpointsDir = path.join(root, 'ai/noema_v3/checkpoints');
+const bridgeCorpus = path.join(root, 'ai/noema_v3/prod_bridge_scaffold.tr.txt');
+const userShardDir = path.join(root, 'ai/noema_v3/corpus_user');
+
+const maxCorpusRun = 4;
 const diskReserveBytes = 256 * 1024 * 1024;
-const estimatedBytesPerExemplar = 8192;
-const trainingTimeoutMs = Number(process.env.TRAIN_TIMEOUT_MS || 0); // zero means no artificial time cap
+const uploadTmp = '/tmp/noema-chat-v3-upload.tr.txt';
+const progressFile = '/tmp/noema-chat-v3-progress.bin';
+const requestTimeoutMs = Number(process.env.CHAT_TIMEOUT_MS || 30000);
+const trainingTimeoutMs = Number(process.env.TRAIN_TIMEOUT_MS || 0);
 if (!Number.isSafeInteger(trainingTimeoutMs) || trainingTimeoutMs < 0) throw new Error('TRAIN_TIMEOUT_MS must be zero or a positive safe integer');
-const uploadNbin = '/tmp/noema-chat-upload.nbin';
-const uploadMeta = '/tmp/noema-chat-upload-meta.bin';
-const uploadCheckpointTmp = '/tmp/noema-chat-upload.nps';
-const progressFile = '/tmp/noema-chat-upload-progress.bin';
-const trainingDirectory = path.join(root, 'ai/noema-training');
-const modelFiles = {
-  trained: path.join(trainingDirectory, 'pretrain_large_latest.nps'),
-  trainedLegacy: path.join(trainingDirectory, 'pretrain_large.nps'),
-  uploadedLatest: path.join(trainingDirectory, 'user_pretrain_latest.nps'),
-  fresh: path.join(root, 'ai/src/noema_pretrain.lir'),
-};
+
 let trainingJob = null;
 let trainingReserved = false;
 
-async function findUploadedVersions() {
-  const names = await readdir(trainingDirectory).catch(() => []);
+// ---------------------------------------------------------------------------------------------
+// artifact discovery
+// ---------------------------------------------------------------------------------------------
+
+async function listFiles(dir, pattern) {
+  const names = await readdir(dir).catch(() => []);
   return names.flatMap(name => {
-    const match = /^user_pretrain_v(\d+)\.nps$/.exec(name);
-    return match ? [{ version: Number(match[1]), fileName: name, filePath: path.join(trainingDirectory, name) }] : [];
+    const match = pattern.exec(name);
+    return match ? [{ name, version: Number(match[1]) }] : [];
   }).sort((a, b) => b.version - a.version);
 }
 
-async function findIncludedVersions() {
-  const names = await readdir(trainingDirectory).catch(() => []);
-  return names.flatMap(name => {
-    const match = /^pretrain_large_v(\d+)\.nps$/.exec(name);
-    return match ? [{ version: Number(match[1]), fileName: name, filePath: path.join(trainingDirectory, name) }] : [];
-  }).sort((a, b) => b.version - a.version);
+async function fileSize(filePath) {
+  try {
+    const info = await stat(filePath);
+    return info.size;
+  } catch {
+    return 0;
+  }
 }
+
+const BASE_MODELS = [
+  {
+    id: 'noema_v3',
+    selector: 'noema_v3',
+    label: 'NOEMA v3 · üretim tabanı',
+    sampling: { temperature: 0, determinism: 'byte-identical' },
+    npg: () => path.join(checkpointsDir, 'noema_v3_promoted.npg3'),
+    nv3g: () => path.join(checkpointsDir, 'noema_v3_prod.nv3g'),
+  },
+  {
+    id: 'noema_v3_scaled',
+    selector: 'noema_v3_scaled',
+    label: 'NOEMA v3 · ölçekli çoklu-shard',
+    sampling: { temperature: 0, determinism: 'byte-identical' },
+    npg: () => path.join(checkpointsDir, 'noema_v3_scaled.npg3'),
+    nv3g: () => path.join(checkpointsDir, 'noema_v3_prod.nv3g'),
+  },
+];
+
+async function listUserModels() {
+  const pairs = await listFiles(checkpointsDir, /^user_v3_(?:v(\d+))\.nv3g$/);
+  return pairs.flatMap(({ name, version }) => {
+    const stem = name.replace(/\.nv3g$/, '');
+    return [{
+      id: name.replace(/\.nv3g$/, ''),
+      selector: `noema_v3_user:${stem}`,
+      label: `NOEMA v3 · yüklenen veri v${String(version).padStart(3, '0')}`,
+      sampling: { temperature: 0, determinism: 'byte-identical' },
+      npg: () => path.join(checkpointsDir, `${stem}.npg3`),
+      nv3g: () => path.join(checkpointsDir, name),
+      version,
+    }];
+  });
+}
+
+const LEGACY_MODELS = [
+  { id: 'fresh', selector: 'legacy:fresh', label: 'NOEMA-Φ · eğitimsiz başlangıç' },
+  { id: 'trained', selector: 'legacy:trained', label: 'NOEMA-Φ · eğitilmiş büyük checkpoint' },
+  { id: 'uploaded', selector: 'legacy:uploaded', label: 'NOEMA-Φ · yüklenen veri checkpoint\'i' },
+];
 
 async function describeModels() {
-  const versions = await findUploadedVersions();
-  const latest = versions[0] || null;
-  const includedVersions = await findIncludedVersions();
-  const included = includedVersions[0] || null;
-  const trainedPath = included?.filePath || modelFiles.trainedLegacy;
-  const paths = [
-    ['trained', trainedPath, included ? `NOEMA-Phi · trained corpus v${String(included.version).padStart(3, '0')}` : 'NOEMA-Phi · trained corpus checkpoint'],
-    ['uploaded', latest?.filePath || path.join(trainingDirectory, 'user_pretrain_v001.nps'), latest ? `NOEMA-Phi · TXT checkpoint v${String(latest.version).padStart(3, '0')}` : 'NOEMA-Phi · no TXT checkpoint trained yet'],
-    ['fresh', modelFiles.fresh, 'NOEMA-Phi · untrained baseline'],
-  ];
-  return Promise.all(paths.map(async ([id, filePath, description]) => {
-    let fileStat = null;
-    try { fileStat = await stat(filePath); } catch {}
+  const users = await listUserModels();
+  const models = [...BASE_MODELS, ...users];
+  return Promise.all(models.map(async model => {
+    const npgPath = model.npg();
+    const nv3gPath = model.nv3g();
+    const [npgBytes, nv3gBytes] = await Promise.all([fileSize(npgPath), fileSize(nv3gPath)]);
     return {
-      id,
-      description,
-      version: id === 'uploaded' ? latest?.version ?? null : id === 'trained' ? included?.version ?? null : null,
-      fileName: path.basename(filePath),
-      filePath: path.relative(root, filePath).split(path.sep).join('/'),
-      modifiedDate: fileStat ? fileStat.mtime.toISOString().slice(0, 10) : null,
-      available: id === 'fresh' ? Boolean(fileStat) : Boolean(fileStat && fileStat.size > 0),
-      fileBytes: id !== 'fresh' && fileStat ? fileStat.size : 0,
+      id: model.id,
+      selector: model.selector,
+      label: model.label,
+      available: npgBytes > 0 && nv3gBytes > 0,
+      checkpointBytes: npgBytes,
+      graphBytes: nv3gBytes,
+      checkpointPath: path.relative(root, npgPath).split(path.sep).join('/'),
+      fileName: path.basename(npgPath),
+      graphFileName: path.basename(nv3gPath),
+      graphPath: path.relative(root, nv3gPath).split(path.sep).join('/'),
+      sampling: model.sampling,
+      maxCorpusRun,
     };
-  }));
-}
-
-class UploadError extends Error {
-  constructor(message, status = 400) { super(message); this.status = status; }
-}
-
-async function writeStreamChunk(stream, chunk) {
-  if (!chunk.length) return;
-  if (!stream.write(chunk)) await once(stream, 'drain');
-}
-
-async function prepareUploadedCorpus(req) {
-  const output = createWriteStream(uploadNbin, { flags: 'w' });
-  const decoder = new TextDecoder('utf-8', { fatal: true });
-  let sourceBytes = 0;
-  let payloadBytes = 0;
-  let records = 0;
-  let lineParts = [];
-  let lineLength = 0;
-  let topicParts = [];
-  let topicLength = 0;
-  let batchParts = [];
-  let batchLength = 0;
-  let lastDiskCheck = 0;
-
-  const availableTmpBytes = async () => {
-    const fs = await statfs('/tmp');
-    return BigInt(fs.bavail) * BigInt(fs.bsize);
-  };
-  const ensureDiskReserve = async (extra = 0n) => {
-    const free = await availableTmpBytes();
-    if (free < BigInt(diskReserveBytes) + extra) {
-      throw new UploadError(`Yükleme için yeterli disk alanı kalmadı (${free} bayt boş).`, 507);
-    }
-  };
-
-  const addLineBytes = bytes => {
-    lineLength += bytes.length;
-    if (!Number.isSafeInteger(lineLength)) throw new UploadError('Satır uzunluğu sayı aralığını aştı.', 413);
-    if (bytes.length) lineParts.push(Buffer.from(bytes));
-  };
-
-  const flushRecord = async () => {
-    if (!batchLength) return;
-    const record = Buffer.concat(batchParts, batchLength);
-    const header = Buffer.alloc(10);
-    header.writeBigUInt64LE(BigInt(record.length), 0);
-    header[8] = 0;
-    header[9] = 0;
-    await writeStreamChunk(output, header);
-    await writeStreamChunk(output, record);
-    records += 1;
-    batchParts = [];
-    batchLength = 0;
-  };
-
-  const addToBatch = async bytes => {
-    let offset = 0;
-    while (offset < bytes.length) {
-      if (batchLength === targetRecordBytes) await flushRecord();
-      const count = Math.min(targetRecordBytes - batchLength, bytes.length - offset);
-      batchParts.push(bytes.subarray(offset, offset + count));
-      batchLength += count;
-      offset += count;
-      if (batchLength === targetRecordBytes) await flushRecord();
-    }
-  };
-
-  const finishTopic = async () => {
-    if (topicLength) {
-      const content = Buffer.concat(topicParts, topicLength);
-      const hasContent = content.some(value => value !== 9 && value !== 10 && value !== 13 && value !== 32);
-      if (hasContent) {
-        // Preserve all topic bytes; only the standalone delimiter is framing.
-        await addToBatch(content);
-        payloadBytes += content.length;
-      }
-    }
-    topicParts = [];
-    topicLength = 0;
-  };
-
-  const finishLine = async (terminatedByNewline) => {
-    const line = lineLength ? Buffer.concat(lineParts, lineLength) : Buffer.alloc(0);
-    const comparableLength = line.length && line[line.length - 1] === 13 ? line.length - 1 : line.length;
-    const separator = comparableLength === 3 && line[0] === 45 && line[1] === 45 && line[2] === 45;
-    if (separator) {
-      await finishTopic();
-    } else {
-      const extra = line.length + (terminatedByNewline ? 1 : 0);
-      if (!Number.isSafeInteger(topicLength + extra)) throw new UploadError('Konu uzunluğu sayı aralığını aştı.', 413);
-      if (topicLength > 0 && topicLength + extra > targetRecordBytes) await finishTopic();
-      if (line.length) topicParts.push(line);
-      if (terminatedByNewline) topicParts.push(Buffer.from([10]));
-      topicLength += extra;
-    }
-    lineParts = [];
-    lineLength = 0;
-  };
-
-  try {
-    await ensureDiskReserve(64n * 1024n * 1024n);
-    for await (const chunk of req) {
-      if (!Number.isSafeInteger(sourceBytes + chunk.length)) {
-        throw new UploadError('Dosya boyutu geçerli sayı aralığını aştı.', 413);
-      }
-      sourceBytes += chunk.length;
-      if (sourceBytes - lastDiskCheck >= 64 * 1024 * 1024) {
-        await ensureDiskReserve(64n * 1024n * 1024n);
-        lastDiskCheck = sourceBytes;
-      }
-      if (chunk.includes(0)) throw new UploadError('TXT dosyası NUL karakteri içeremez.');
-      try { decoder.decode(chunk, { stream: true }); }
-      catch { throw new UploadError('Dosya geçerli UTF-8 metin değil.'); }
-      let start = 0;
-      while (start < chunk.length) {
-        const newline = chunk.indexOf(10, start);
-        if (newline < 0) {
-          addLineBytes(chunk.subarray(start));
-          break;
-        }
-        addLineBytes(chunk.subarray(start, newline));
-        await finishLine(true);
-        start = newline + 1;
-      }
-    }
-    try { decoder.decode(); }
-    catch { throw new UploadError('Dosya geçerli UTF-8 metin değil.'); }
-    if (lineLength > 0) await finishLine(false);
-    await finishTopic(false);
-    await flushRecord();
-    if (!sourceBytes || !records) throw new UploadError('TXT dosyasında eğitilecek konu bulunamadı.');
-    const modelStateEstimate = BigInt(records) * BigInt(estimatedBytesPerExemplar);
-    await ensureDiskReserve(modelStateEstimate);
-    const memoryReserve = 128n * 1024n * 1024n + BigInt(targetRecordBytes) * 2n;
-    if (BigInt(freemem()) < modelStateEstimate + memoryReserve) {
-      throw new UploadError('Bu veri kümesi için kullanılabilir bellek yetersiz.', 507);
-    }
-    output.end();
-    await once(output, 'finish');
-    return { sourceBytes, payloadBytes, records };
-  } catch (error) {
-    output.destroy();
-    await unlink(uploadNbin).catch(() => {});
-    throw error;
-  }
-}
-
-function currentProgress() {
-  const job = trainingJob;
-  if (!job) return null;
-  let processed = job.processed;
-  let total = job.total;
-  let payloadBytes = job.processedBytes;
-  try {
-    const frame = readFileSync(progressFile);
-    if (frame.length === 24) {
-      processed = Number(frame.readBigUInt64LE(0));
-      total = Number(frame.readBigUInt64LE(8));
-      payloadBytes = Number(frame.readBigUInt64LE(16));
-      job.processed = processed;
-      job.total = total;
-      job.processedBytes = payloadBytes;
-    }
-  } catch {}
-  const elapsedSeconds = Math.max(0, (Date.now() - job.startedAt) / 1000);
-  const percent = total > 0 ? Math.min(100, Math.floor(processed / total * 100)) : 0;
-  const estimatedRemainingSeconds = processed > 0 && total > processed
-    ? Math.max(0, Math.ceil(elapsedSeconds / processed * (total - processed)))
-    : job.status === 'completed' ? 0 : null;
-  return {
-    jobId: job.id,
-    status: job.status,
-    version: job.version,
-    percent: job.status === 'completed' ? 100 : percent,
-    processed,
-    total,
-    payloadBytes,
-    sourceBytes: job.sourceBytes,
-    elapsedSeconds: Number(elapsedSeconds.toFixed(1)),
-    estimatedRemainingSeconds,
-    error: job.error || null,
-  };
-}
-
-function send(res, status, data, type = 'application/json; charset=utf-8') {
-  res.writeHead(status, {
-    'content-type': type,
-    'cache-control': 'no-store',
-    'x-content-type-options': 'nosniff',
-    'referrer-policy': 'no-referrer',
-  });
-  res.end(data);
-}
-
-function jsonResponse(res, status, data) {
-  return send(res, status, JSON.stringify(data));
-}
-
-async function syncPath(pathname, flags = 'r') {
-  const handle = await openFile(pathname, flags);
-  try { await handle.sync(); }
-  finally { await handle.close(); }
-}
-
-async function startTraining(req, fileName, res) {
-  if (trainingReserved) {
-    req.resume();
-    return jsonResponse(res, 409, { ok: false, error: 'Bir veri kümesi yükleniyor veya eğitim sürüyor.' });
-  }
-  if (!fileName || !fileName.toLowerCase().endsWith('.txt')) {
-    req.resume();
-    return jsonResponse(res, 400, { ok: false, error: 'Yalnızca .txt dosyası yükleyin.' });
-  }
-  const safeFileName = path.basename(fileName);
-  trainingReserved = true;
-  await Promise.all([uploadNbin, uploadMeta, uploadCheckpointTmp, progressFile].map(file => unlink(file).catch(() => {})));
-  let corpus;
-  try {
-    corpus = await prepareUploadedCorpus(req);
-  } catch (error) {
-    trainingReserved = false;
-    const status = error instanceof UploadError ? error.status : 500;
-    return jsonResponse(res, status, { ok: false, error: error.message || 'TXT yüklenemedi.' });
-  }
-
-  const previousVersions = await findUploadedVersions();
-  const nextVersion = (previousVersions[0]?.version || 0) + 1;
-  const meta = Buffer.alloc(16);
-  meta.writeBigUInt64LE(BigInt(corpus.records), 0);
-  meta.writeBigUInt64LE(BigInt(corpus.payloadBytes), 8);
-  const progress = Buffer.alloc(24);
-  progress.writeBigUInt64LE(0n, 0);
-  progress.writeBigUInt64LE(BigInt(corpus.records), 8);
-  progress.writeBigUInt64LE(0n, 16);
-  try { await Promise.all([writeFile(uploadMeta, meta), writeFile(progressFile, progress)]); }
-  catch (error) {
-    trainingReserved = false;
-    await unlink(uploadNbin).catch(() => {});
-    return jsonResponse(res, 500, { ok: false, error: error.message || 'Eğitim dosyaları hazırlanamadı.' });
-  }
-
-  const job = {
-    id: randomUUID(),
-    fileName: safeFileName,
-    version: nextVersion,
-    status: 'running',
-    processed: 0,
-    total: corpus.records,
-    processedBytes: 0,
-    sourceBytes: corpus.sourceBytes,
-    payloadBytes: corpus.payloadBytes,
-    startedAt: Date.now(),
-    error: null,
-  };
-  trainingJob = job;
-  const child = spawn(lir, ['run', uploadTrainer, '--backend=native'], {
-    cwd: root,
-    stdio: ['ignore', 'ignore', 'pipe'],
-    env: { ...process.env },
-  });
-  let stderr = '';
-  child.stderr.setEncoding('utf8');
-  child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-8000); });
-  const timeout = trainingTimeoutMs > 0 ? setTimeout(() => child.kill('SIGKILL'), trainingTimeoutMs) : null;
-  child.on('error', error => {
-    if (timeout) clearTimeout(timeout);
-    job.status = 'failed';
-    job.error = error.message;
-    job.finishedAt = Date.now();
-    trainingReserved = false;
-  });
-  child.on('close', async code => {
-    if (timeout) clearTimeout(timeout);
-    try {
-      if (code !== 0) throw new Error(stderr.trim() || `LIR eğitim süreci ${code} koduyla bitti.`);
-      await syncPath(uploadCheckpointTmp);
-      const result = await stat(uploadCheckpointTmp);
-      if (!result.size) throw new Error('Eğitim checkpoint dosyası boş.');
-      const versionName = `user_pretrain_v${String(job.version).padStart(3, '0')}.nps`;
-      const versionPath = path.join(trainingDirectory, versionName);
-      try {
-        await stat(versionPath);
-        throw new Error(`Model sürümü ${versionName} zaten var; güvenlik için üzerine yazılmadı.`);
-      } catch (error) {
-        if (error.code !== 'ENOENT') throw error;
-      }
-      await rename(uploadCheckpointTmp, versionPath);
-      await syncPath(trainingDirectory);
-      const latestAliasTmp = `${modelFiles.uploadedLatest}.${job.id}.tmp`;
-      await unlink(latestAliasTmp).catch(() => {});
-      await symlink(versionName, latestAliasTmp);
-      await rename(latestAliasTmp, modelFiles.uploadedLatest);
-      await syncPath(trainingDirectory);
-      job.versionFile = versionName;
-      job.status = 'completed';
-    } catch (error) {
-      job.status = 'failed';
-      job.error = error.message;
-    }
-    job.finishedAt = Date.now();
-    await Promise.all([unlink(uploadNbin).catch(() => {}), unlink(uploadMeta).catch(() => {})]);
-    trainingReserved = false;
-  });
-  return jsonResponse(res, 202, {
-    ok: true,
-    jobId: job.id,
-    total: corpus.records,
-    sourceBytes: corpus.sourceBytes,
-    payloadBytes: corpus.payloadBytes,
-    fileName: safeFileName,
-    version: job.version,
+  })).then(async rows => {
+    // Legacy NOEMA-Φ selectors are listed after the v3 models so the UI keeps their historical
+    // ids, and are marked with `outputMode` so a client can never confuse them with v3.
+    const legacy = LEGACY_MODELS.map(model => ({
+      id: model.id,
+      selector: model.selector,
+      label: model.label,
+      available: true,
+      legacy: true,
+      outputMode: LEGACY_OUTPUT_MODE,
+      maxCorpusRun: 0,
+    }));
+    return [...rows, ...legacy];
   });
 }
 
-const mime = {
-  '.html': 'text/html; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.js': 'text/javascript; charset=utf-8',
-};
-
-function parseMetrics(output) {
-  const lines = output.trim().split(/\r?\n/).filter(Boolean);
-  if (lines.shift() !== 'NOEMA_RESULT_V2') throw new Error('Beklenmeyen LIR çıktısı');
-  const values = Object.fromEntries(lines.map(line => {
-    const split = line.indexOf('=');
-    return split < 0 ? [line, ''] : [line.slice(0, split), line.slice(split + 1)];
-  }));
-  if (values.ok !== '1') throw new Error(values.error || 'LIR işlemi başarısız');
-  const number = key => {
-    const n = Number(values[key]);
-    if (!Number.isFinite(n)) throw new Error(`Geçersiz model ölçümü: ${key}`);
-    return n;
-  };
-  const generatedHex = values.generated_hex || '';
-  if (generatedHex.length % 2 || !/^[0-9a-f]*$/i.test(generatedHex)) throw new Error('Modelin bayt çıktısı bozuk');
-  return {
-    modelId: values.model_id,
-    trainingRecords: number('training_records'),
-    trainingBytes: number('training_bytes'),
-    trainingDoPerturbations: number('training_do_perturbations'),
-    spectralStage: number('spectral_stage'),
-    inputBytes: number('input_bytes'),
-    freeEnergy: number('inference_free_energy'),
-    surpriseGate: number('inference_surprise_gate'),
-    retrievalSimilarity: number('retrieval_similarity'),
-    storedExemplars: number('stored_exemplars'),
-    memoryCapacity: number('memory_capacity'),
-    generatedBytes: number('generated_bytes'),
-    generatedHex,
-    outputMode: 'learned_raw_byte_excerpt',
-  };
+async function resolveSelector(selector) {
+  const models = await describeModels();
+  const found = models.find(model => model.selector === selector || model.id === selector);
+  if (!found || !found.available) return null;
+  return found;
 }
 
-function runLir(modelId, prompt) {
+// ---------------------------------------------------------------------------------------------
+// LIR execution
+// ---------------------------------------------------------------------------------------------
+
+function spawnCapture(command, args, { input, timeoutMs } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(lir, ['run', backend, '--backend=native'], {
+    const child = spawn(command, args, {
       cwd: root,
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env },
@@ -439,111 +157,580 @@ function runLir(modelId, prompt) {
     let stdout = '';
     let stderr = '';
     let settled = false;
-    const timer = setTimeout(() => {
-      child.kill('SIGKILL');
-      if (!settled) {
-        settled = true;
-        reject(new Error('LIR isteği zaman aşımına uğradı'));
-      }
-    }, 15000);
+    const timer = timeoutMs
+      ? setTimeout(() => {
+        child.kill('SIGKILL');
+        if (!settled) {
+          settled = true;
+          reject(new Error(`LIR süreci ${timeoutMs}ms içinde yanıt vermedi.`));
+        }
+      }, timeoutMs)
+      : null;
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
     child.stdout.on('data', chunk => { stdout += chunk; });
     child.stderr.on('data', chunk => { stderr += chunk; });
     child.on('error', error => {
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
       if (!settled) { settled = true; reject(error); }
     });
     child.on('close', code => {
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
       if (settled) return;
       settled = true;
       if (code !== 0) return reject(new Error(stderr.trim() || `LIR çıkış kodu ${code}`));
-      try { resolve(parseMetrics(stdout)); }
-      catch (error) { reject(new Error(`${error.message}${stderr ? `: ${stderr.trim()}` : ''}`)); }
+      resolve({ stdout, stderr });
     });
     child.stdin.on('error', () => {});
-    child.stdin.end(`${modelId}\n${prompt}`, 'utf8');
+    child.stdin.end(input ?? '', 'utf8');
   });
 }
 
-async function readBody(req) {
+async function runLegacyChat(kind, prompt) {
+  const input = `${kind}\n${prompt}`;
+  const run = await spawnCapture(lir, ['run', '--backend=vm', LEGACY_BACKEND_LIR], { input, timeoutMs: requestTimeoutMs });
+  const values = parseLegacyEnvelope(run.stdout, run.stderr);
+  return values;
+}
+
+function parseLegacyEnvelope(stdout, stderr = '') {
+  const lines = stdout.trim().split(/\r?\n/).filter(Boolean);
+  if (!lines.length || lines[0] !== 'NOEMA_RESULT_V2') throw new Error(`Beklenmeyen LIR çıktısı: ${stderr.trim() || stdout.slice(0, 200)}`);
+  const values = {};
+  for (const line of lines.slice(1)) {
+    const at = line.indexOf('=');
+    if (at > 0) values[line.slice(0, at)] = line.slice(at + 1);
+  }
+  if (values.ok !== '1') throw new Error(values.error || 'LIR işlemi başarısız');
+  // Fail closed: the legacy path may only ever report its own mode.
+  if (values.output_mode !== LEGACY_OUTPUT_MODE) throw new Error(`Legacy izolasyon ihlali: output_mode=${values.output_mode}`);
+  const hex = values.generated_hex || '';
+  if (hex.length % 2 !== 0 || !/^[0-9a-f]*$/i.test(hex)) throw new Error('Modelin bayt çıktısı bozuk');
+  const num = key => {
+    const parsed = Number(values[key] ?? 0);
+    return Number.isFinite(parsed) ? parsed : 0;
+  };
+  const text = hex ? Buffer.from(hex, 'hex').toString('utf8') : '';
+  return {
+    modelId: values.model_id,
+    outputMode: LEGACY_OUTPUT_MODE,
+    abstained: !text,
+    reply: text,
+    retrievalSimilarity: Number(values.retrieval_similarity ?? 0),
+    generatedBytes: num('generated_bytes'),
+    generatedHex: hex,
+    trainingRecords: num('training_records'),
+    trainingBytes: num('training_bytes'),
+    trainingDoPerturbations: num('training_do_perturbations'),
+    spectralStage: num('spectral_stage'),
+    inputBytes: num('input_bytes'),
+    freeEnergy: Number(values.inference_free_energy ?? 0),
+    surpriseGate: Number(values.inference_surprise_gate ?? 0),
+    storedExemplars: num('stored_exemplars'),
+    memoryCapacity: num('memory_capacity'),
+    khgObservedSpans: 0,
+    khgVerifiedSpans: 0,
+    proofVerifiedClaims: 0,
+    proofRefutedClaims: 0,
+  };
+}
+
+// Bare legacy ids (`fresh`, `trained`, `uploaded`) are accepted for historical clients that predate
+// the explicit `legacy:` prefix; they are normalised to the prefixed form before routing.
+function normalizeSelector(selector) {
+  const bare = LEGACY_MODELS.find(model => model.id === selector);
+  return bare ? bare.selector : selector;
+}
+
+async function runChat(rawSelector, prompt) {
+  const selector = normalizeSelector(rawSelector);
+  if (selector.startsWith('legacy:')) {
+    const kind = selector.slice('legacy:'.length);
+    if (!['fresh', 'trained', 'uploaded', 'candidate'].includes(kind)) {
+      throw Object.assign(new Error('Bilinmeyen legacy model seçici.'), { status: 400 });
+    }
+    const envelope = await runLegacyChat(kind, prompt);
+    const model = { id: kind, selector, label: `NOEMA-Φ · ${kind}`, checkpointPath: 'ai/noema-training/*.nps', graphPath: '—' };
+    return { model, envelope };
+  }
+  const model = await resolveSelector(selector);
+  if (!model) throw Object.assign(new Error('Seçilen NOEMA v3 modeli hazır değil.'), { status: 400 });
+  const npg = path.join(root, model.checkpointPath);
+  const nv3g = path.join(root, model.graphPath);
+  const input = `${selector}\n${prompt}`;
+  let result;
+  if (await fileSize(BACKEND_NATIVE)) {
+    result = await spawnCapture(BACKEND_NATIVE, [npg, nv3g], { input, timeoutMs: requestTimeoutMs });
+  } else {
+    result = await spawnCapture(lir, ['run', '--backend=vm', BACKEND_LIR, npg, nv3g], { input, timeoutMs: requestTimeoutMs });
+  }
+  return { model, envelope: parseEnvelope(result.stdout, result.stderr) };
+}
+
+function parseEnvelope(stdout, stderr = '') {
+  const lines = stdout.trim().split(/\r?\n/).filter(Boolean);
+  if (!lines.length || lines[0] !== 'NOEMA_RESULT_V2') throw new Error(`Beklenmeyen LIR çıktısı: ${stderr.trim() || stdout.slice(0, 200)}`);
+  const values = {};
+  for (const line of lines.slice(1)) {
+    const at = line.indexOf('=');
+    if (at > 0) values[line.slice(0, at)] = line.slice(at + 1);
+  }
+  if (values.ok !== '1') throw new Error(values.error || 'LIR işlemi başarısız');
+  const num = key => {
+    const parsed = Number(values[key]);
+    if (!Number.isFinite(parsed)) throw new Error(`Geçersiz model ölçümü: ${key}`);
+    return parsed;
+  };
+  const optNum = key => (values[key] === undefined || values[key] === '' ? 0 : num(key));
+  const hex = values.generated_hex || '';
+  if (hex.length % 2 !== 0 || !/^[0-9a-f]*$/i.test(hex)) throw new Error('Modelin bayt çıktısı bozuk');
+  const outputMode = values.output_mode || '';
+  if (!['noema_v3_weight_generation', 'noema_v3_weight_generation_abstain'].includes(outputMode)) {
+    throw new Error(`NOEMA v3 izolasyon ihlali: beklenmeyen output_mode=${outputMode}`);
+  }
+  const text = hex ? Buffer.from(hex, 'hex').toString('utf8') : '';
+  if (text.includes('\uFFFD')) throw new Error('Modelin bayt çıktısı geçerli UTF-8 değil');
+  return {
+    modelId: values.model_id,
+    outputMode,
+    abstained: outputMode === 'noema_v3_weight_generation_abstain',
+    reply: text,
+    antiVerbatimVerified: optNum('anti_verbatim_verified'),
+    maxCorpusNgramRun: optNum('max_corpus_ngram_run'),
+    synthesizedAtoms: optNum('synthesized_atoms'),
+    khgObservedSpans: optNum('khg_observed_spans'),
+    khgQuarantinedSpans: optNum('khg_quarantined_spans'),
+    khgVerifiedSpans: optNum('khg_verified_spans'),
+    proofVerifiedClaims: optNum('proof_verified_claims'),
+    proofRefutedClaims: optNum('proof_refuted_claims'),
+    proofStepsUsed: optNum('proof_steps_used'),
+    symbolicSolved: optNum('symbolic_solved'),
+    noSpanCopyVerified: optNum('no_span_copy_verified'),
+    trainingRecords: optNum('training_records'),
+    trainingBytes: optNum('training_bytes'),
+    trainingDoPerturbations: optNum('training_do_perturbations'),
+    spectralStage: optNum('spectral_stage'),
+    inputBytes: optNum('input_bytes'),
+    freeEnergy: optNum('inference_free_energy'),
+    surpriseGate: optNum('inference_surprise_gate'),
+    semanticMarginMilli: optNum('semantic_margin_milli'),
+    corpusTopics: optNum('corpus_topics'),
+    forbidden4Grams: optNum('forbidden_4grams'),
+    generatedBytes: optNum('generated_bytes'),
+    storedExemplars: optNum('stored_exemplars'),
+    memoryCapacity: optNum('memory_capacity'),
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
+// upload validation and training
+// ---------------------------------------------------------------------------------------------
+
+class UploadError extends Error {
+  constructor(message, status = 400) { super(message); this.status = status; }
+}
+
+const delimiter = Buffer.from('<veriayrimi>', 'utf8');
+
+async function writeChunk(stream, chunk) {
+  if (!chunk.length) return;
+  if (!stream.write(chunk)) await once(stream, 'drain');
+}
+
+/**
+ * Streams the uploaded TXT into a normalized `<veriayrimi>` payload.
+ * Validation is strict and fail-closed: NUL bytes, invalid UTF-8, oversized segments, empty
+ * corpora and segments that are only whitespace are rejected before any training starts.
+ */
+async function prepareUploadedCorpus(req) {
+  const { createWriteStream } = await import('node:fs');
+  const output = createWriteStream(uploadTmp, { flags: 'w' });
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  let sourceBytes = 0;
+  let payloadBytes = 0;
+  let topics = 0;
+  let lineParts = [];
+  let lineLength = 0;
+  let topicParts = [];
+  let topicLength = 0;
+  let lastDiskCheck = 0;
+  const maxTopicBytes = 64 * 1024;
+
+  const ensureDisk = async () => {
+    const info = await statfs('/tmp');
+    const free = BigInt(info.bavail) * BigInt(info.bsize);
+    if (free < BigInt(diskReserveBytes)) throw new UploadError('Yükleme için yeterli disk alanı kalmadı.', 507);
+  };
+
+  const appendTopic = async (slice, trailingNewline) => {
+    const extra = slice.length + (trailingNewline ? 1 : 0);
+    if (!extra) return;
+    if (topicLength + extra > maxTopicBytes) throw new UploadError('Tek bir konu 64 kB sınırını aşıyor.', 413);
+    if (slice.length) topicParts.push(Buffer.from(slice));
+    if (trailingNewline) topicParts.push(Buffer.from([10]));
+    topicLength += extra;
+  };
+
+  const finishTopic = async () => {
+    const content = topicLength ? Buffer.concat(topicParts, topicLength) : Buffer.alloc(0);
+    const hasContent = content.some(byte => byte !== 9 && byte !== 10 && byte !== 13 && byte !== 32);
+    if (hasContent) {
+      if (topics > 0) await writeChunk(output, Buffer.from('\n<veriayrimi>\n', 'utf8'));
+      await writeChunk(output, content);
+      payloadBytes += content.length;
+      topics += 1;
+    }
+    topicParts = [];
+    topicLength = 0;
+  };
+
+  const finishLine = async terminated => {
+    const line = lineLength ? Buffer.concat(lineParts, lineLength) : Buffer.alloc(0);
+    const comparable = line.length && line[line.length - 1] === 13 ? line.length - 1 : line.length;
+    if (comparable === delimiter.length && line.subarray(0, comparable).equals(delimiter)) {
+      await finishTopic();
+    } else {
+      let pos = 0;
+      let at = line.indexOf(delimiter, pos);
+      if (at < 0) {
+        await appendTopic(line, terminated);
+      } else {
+        while (at >= 0) {
+          if (at > pos) await appendTopic(line.subarray(pos, at), false);
+          await finishTopic();
+          pos = at + delimiter.length;
+          at = line.indexOf(delimiter, pos);
+        }
+        if (pos < line.length || terminated) await appendTopic(line.subarray(pos), terminated);
+      }
+    }
+    lineParts = [];
+    lineLength = 0;
+  };
+
+  try {
+    await ensureDisk();
+    for await (const chunk of req) {
+      sourceBytes += chunk.length;
+      if (sourceBytes - lastDiskCheck >= 64 * 1024 * 1024) {
+        await ensureDisk();
+        lastDiskCheck = sourceBytes;
+      }
+      if (chunk.includes(0)) throw new UploadError('TXT dosyası NUL karakteri içeremez.');
+      try { decoder.decode(chunk, { stream: true }); } catch { throw new UploadError('Dosya geçerli UTF-8 metin değil.'); }
+      let start = 0;
+      while (start < chunk.length) {
+        const newline = chunk.indexOf(10, start);
+        if (newline < 0) {
+          lineLength += chunk.length - start;
+          lineParts.push(Buffer.from(chunk.subarray(start)));
+          break;
+        }
+        lineLength += newline - start;
+        if (newline > start) lineParts.push(Buffer.from(chunk.subarray(start, newline)));
+        await finishLine(true);
+        start = newline + 1;
+      }
+    }
+    try { decoder.decode(); } catch { throw new UploadError('Dosya geçerli UTF-8 metin değil.'); }
+    if (lineLength > 0) await finishLine(false);
+    await finishTopic();
+    if (!sourceBytes || !topics) throw new UploadError('TXT dosyasında `<veriayrimi>` ile ayrılmış konu bulunamadı.');
+    if (topics < 2) throw new UploadError('Eğitim için en az 2 konu gerekir; tek konu ile anti-verbatim grafiği kurulamaz.');
+    const memEstimate = 256n * 1024n * 1024n + BigInt(payloadBytes) * 8n;
+    if (BigInt(freemem()) < memEstimate) throw new UploadError('Bu veri kümesi için kullanılabilir bellek yetersiz.', 507);
+    output.end();
+    await once(output, 'finish');
+    return { sourceBytes, payloadBytes, topics };
+  } catch (error) {
+    output.destroy();
+    await unlink(uploadTmp).catch(() => {});
+    throw error;
+  }
+}
+
+async function nextUserVersion() {
+  const existing = await listFiles(checkpointsDir, /^user_v3_v(\d+)\.nv3g$/);
+  return (existing[0]?.version || 0) + 1;
+}
+
+function currentProgress() {
+  const job = trainingJob;
+  if (!job) return null;
+  let stage = job.stage;
+  try {
+    const frame = readFileSync(progressFile);
+    if (frame.length === 24) {
+      stage = Number(frame.readBigUInt64LE(0));
+      job.stageTotal = Number(frame.readBigUInt64LE(8));
+      job.stage = stage;
+      job.bytesDone = Number(frame.readBigUInt64LE(16));
+    }
+  } catch {}
+  const elapsedSeconds = Math.max(0, (Date.now() - job.startedAt) / 1000);
+  const total = job.stageTotal || 100;
+  const percent = job.status === 'completed'
+    ? 100
+    : Math.max(0, Math.min(99, Math.floor((stage / total) * 100)));
+  const estimatedRemainingSeconds = percent > 0 && percent < 100
+    ? Math.max(0, Math.ceil(elapsedSeconds / percent * (100 - percent)))
+    : job.status === 'completed' ? 0 : null;
+  return {
+    jobId: job.id,
+    status: job.status,
+    version: job.version,
+    stage,
+    stageTotal: total,
+    percent,
+    topics: job.topics,
+    payloadBytes: job.payloadBytes,
+    sourceBytes: job.sourceBytes,
+    elapsedSeconds: Number(elapsedSeconds.toFixed(1)),
+    estimatedRemainingSeconds,
+    error: job.error || null,
+  };
+}
+
+async function runTrainingJob(corpusPath, version, job) {
+  const stem = `user_v3_v${String(version).padStart(3, '0')}`;
+  const npgOut = path.join(checkpointsDir, `${stem}.npg3`);
+  const nv3gOut = path.join(checkpointsDir, `${stem}.nv3g`);
+  const shardOut = path.join(userShardDir, stem);
+  const stdin = `${corpusPath}\n${bridgeCorpus}\n${npgOut}\n${nv3gOut}\n${progressFile}\n${shardOut}\n`;
+  job.stage = 0;
+  job.stageTotal = 100;
+  let stdout = '';
+  if (await fileSize(TRAINER_NATIVE)) {
+    stdout = (await spawnCapture(TRAINER_NATIVE, [], { input: stdin, timeoutMs: trainingTimeoutMs || undefined })).stdout;
+  } else {
+    stdout = (await spawnCapture(lir, ['run', '--backend=vm', TRAINER_LIR], { input: stdin, timeoutMs: trainingTimeoutMs || undefined })).stdout;
+  }
+  const values = Object.fromEntries(stdout.trim().split(/\r?\n/).slice(1).map(line => {
+    const at = line.indexOf('=');
+    return at > 0 ? [line.slice(0, at), line.slice(at + 1)] : [line, ''];
+  }));
+  if (values.ok !== '1') throw new Error(values.error || 'Eğitim süreci başarısız oldu.');
+  if (values.anti_verbatim_audit_ok !== '1') throw new Error('Eğitim sonrası anti-verbatim denetimi başarısız; checkpoint yayınlanmadı.');
+  const sizes = await Promise.all([fileSize(npgOut), fileSize(nv3gOut)]);
+  if (!sizes[0] || !sizes[1]) throw new Error('Eğitim checkpoint çıktıları boş.');
+  job.summary = {
+    topics: Number(values.topics || 0),
+    atoms: Number(values.atoms || 0),
+    forbidden4Grams: Number(values.forbidden_4grams || 0),
+    forbiddenSentences: Number(values.forbidden_sentences || 0),
+    npgSteps: Number(values.npg_steps || 0),
+    soaDocs: Number(values.soa_docs || 0),
+    probeEmittedBytes: Number(values.probe_emitted_bytes || 0),
+  };
+  return { stem, npgOut, nv3gOut, shardOut };
+}
+
+async function startTraining(req, fileName, res) {
+  if (trainingReserved) {
+    req.resume();
+    return jsonResponse(res, 409, { ok: false, error: 'Bir veri kümesi zaten eğitiliyor.' });
+  }
+  if (!fileName || !fileName.toLowerCase().endsWith('.txt')) {
+    req.resume();
+    return jsonResponse(res, 400, { ok: false, error: 'Yalnızca .txt dosyası yükleyin.' });
+  }
+  const safeFileName = path.basename(fileName);
+  trainingReserved = true;
+  await Promise.all([uploadTmp, progressFile].map(file => unlink(file).catch(() => {})));
+  let corpus;
+  try {
+    corpus = await prepareUploadedCorpus(req);
+  } catch (error) {
+    trainingReserved = false;
+    return jsonResponse(res, error instanceof UploadError ? error.status : 500, { ok: false, error: error.message || 'TXT yüklenemedi.' });
+  }
+
+  const version = await nextUserVersion();
+  await writeFile(progressFile, Buffer.alloc(24));
+  const job = {
+    id: randomUUID(),
+    fileName: safeFileName,
+    version,
+    status: 'running',
+    stage: 0,
+    stageTotal: 100,
+    topics: corpus.topics,
+    payloadBytes: corpus.payloadBytes,
+    sourceBytes: corpus.sourceBytes,
+    startedAt: Date.now(),
+    error: null,
+    summary: null,
+  };
+  trainingJob = job;
+  runTrainingJob(uploadTmp, version, job).then(async result => {
+    job.stem = result.stem;
+    job.status = 'completed';
+    job.finishedAt = Date.now();
+    await unlink(uploadTmp).catch(() => {});
+  }).catch(async error => {
+    job.status = 'failed';
+    job.error = error.message || 'Eğitim başarısız.';
+    job.finishedAt = Date.now();
+    // Fail closed: a partially written checkpoint must never be selectable.
+    const stem = `user_v3_v${String(version).padStart(3, '0')}`;
+    await Promise.all([
+      rm(path.join(checkpointsDir, `${stem}.npg3`), { force: true }),
+      rm(path.join(checkpointsDir, `${stem}.nv3g`), { force: true }),
+      rm(path.join(userShardDir, stem), { force: true, recursive: true }),
+      unlink(uploadTmp).catch(() => {}),
+    ]);
+  }).finally(() => {
+    trainingReserved = false;
+  });
+
+  return jsonResponse(res, 202, {
+    ok: true,
+    jobId: job.id,
+    version,
+    topics: corpus.topics,
+    sourceBytes: corpus.sourceBytes,
+    payloadBytes: corpus.payloadBytes,
+    fileName: safeFileName,
+  });
+}
+
+// ---------------------------------------------------------------------------------------------
+// HTTP plumbing
+// ---------------------------------------------------------------------------------------------
+
+function send(res, status, body, type = 'application/json; charset=utf-8') {
+  res.writeHead(status, {
+    'content-type': type,
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
+    'referrer-policy': 'no-referrer',
+    'x-frame-options': 'SAMEORIGIN',
+  });
+  res.end(body);
+}
+
+const jsonResponse = (res, status, data) => send(res, status, JSON.stringify(data));
+
+async function readJsonBody(req, limit = 64 * 1024) {
   const chunks = [];
   let size = 0;
   for await (const chunk of req) {
     size += chunk.length;
-    if (!Number.isSafeInteger(size)) throw new Error('İstek boyutu sayı aralığını aştı.');
+    if (size > limit) throw Object.assign(new Error('İstek gövdesi çok büyük.'), { status: 413 });
     chunks.push(chunk);
   }
-  return JSON.parse(Buffer.concat(chunks, size).toString('utf8'));
+  if (!size) return {};
+  try {
+    return JSON.parse(Buffer.concat(chunks, size).toString('utf8'));
+  } catch {
+    throw Object.assign(new Error('Geçersiz JSON gövdesi.'), { status: 400 });
+  }
+}
+
+const mime = {
+  '.html': 'text/html; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+};
+
+async function healthPayload() {
+  const models = await describeModels();
+  return {
+    ok: true,
+    engine: 'LIR · pure-LIR NOEMA v3',
+    runtime: await fileSize(BACKEND_NATIVE) ? 'native-x86_64-o2' : 'vm',
+    trainer: await fileSize(TRAINER_NATIVE) ? 'native-x86_64-o2' : 'vm',
+    maxCorpusRun,
+    outputModes: ['noema_v3_weight_generation', 'noema_v3_weight_generation_abstain'],
+    // Clients switch on this contract instead of sniffing strings: every v3 reply carries one of
+    // `outputModes`, while the isolated legacy exemplar path may only ever carry `legacy_mode`.
+    output_mode_contract: {
+      version: 2,
+      v3: ['noema_v3_weight_generation', 'noema_v3_weight_generation_abstain'],
+      legacy_mode: LEGACY_OUTPUT_MODE,
+      legacy_selectors: LEGACY_MODELS.map(model => model.selector),
+    },
+    guarantees: {
+      antiVerbatim: 'No response may reproduce more than 4 consecutive corpus atoms; violations are repaired or abstained.',
+      grounding: 'Synthesis requires a topical content stem, a KHG-verified claim, or prompt-intent greeting.',
+      abstention: 'Zero bytes are emitted when evidence is insufficient or a prompt-injection is detected.',
+      determinism: 'Identical prompt + checkpoint => byte-identical response.',
+    },
+    models,
+  };
 }
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || '/', 'http://localhost');
-  if (req.method === 'GET' && url.pathname === '/api/health') {
-    return jsonResponse(res, 200, {
-      ok: true,
-      engine: 'LIR / NOEMA-Phi',
-      inference: 'learned_raw_byte_excerpt',
-      models: await describeModels(),
-    });
-  }
-  if (req.method === 'POST' && url.pathname === '/api/train') {
-    let fileName = '';
-    try { fileName = decodeURIComponent(req.headers['x-file-name'] || ''); }
-    catch { req.resume(); return jsonResponse(res, 400, { ok: false, error: 'Dosya adı geçersiz.' }); }
-    return startTraining(req, fileName, res);
-  }
-  if (req.method === 'GET' && url.pathname === '/api/train/status') {
-    if (!trainingJob || url.searchParams.get('jobId') !== trainingJob.id) {
-      return jsonResponse(res, 404, { ok: false, error: 'Eğitim işi bulunamadı.' });
-    }
-    const progress = currentProgress();
-    const model = trainingJob.status === 'completed'
-      ? (await describeModels()).find(item => item.id === 'uploaded')
-      : null;
-    return jsonResponse(res, 200, { ok: true, ...progress, model });
-  }
-  if (req.method === 'POST' && url.pathname === '/api/chat') {
-    try {
-      const body = await readBody(req);
-      if (typeof body.message !== 'string' || !body.message.trim()) {
-        return jsonResponse(res, 400, { error: 'Bir mesaj yazın.' });
-      }
-      const requestedModel = ['trained', 'uploaded', 'fresh'].includes(body.modelId) ? body.modelId : 'trained';
-      const model = (await describeModels()).find(item => item.id === requestedModel);
-      if (!model?.available) return jsonResponse(res, 400, { error: 'Seçilen model dosyası henüz hazır değil.' });
-      const metrics = await runLir(requestedModel, body.message);
-      return jsonResponse(res, 200, { ok: true, model, metrics });
-    } catch (error) {
-      const status = error instanceof SyntaxError ? 400 : 500;
-      return jsonResponse(res, status, { error: error.message || 'İstek işlenemedi.' });
-    }
-  }
-  if (req.method !== 'GET' && req.method !== 'HEAD') {
-    return jsonResponse(res, 405, { error: 'Method not allowed' });
-  }
-  const route = url.pathname === '/pretraining' ? '/pretraining.html'
-    : url.pathname === '/chat' ? '/index.html'
-      : url.pathname === '/' ? '/index.html' : decodeURIComponent(url.pathname);
-  const safe = path.resolve(here, `.${route}`);
-  if (!safe.startsWith(`${here}${path.sep}`)) return send(res, 404, 'Not found', 'text/plain; charset=utf-8');
   try {
+    if (req.method === 'GET' && url.pathname === '/api/health') {
+      return jsonResponse(res, 200, await healthPayload());
+    }
+    if (req.method === 'GET' && url.pathname === '/api/models') {
+      return jsonResponse(res, 200, { ok: true, models: await describeModels() });
+    }
+    if (req.method === 'POST' && url.pathname === '/api/chat') {
+      const body = await readJsonBody(req);
+      const message = typeof body.message === 'string' ? body.message : '';
+      if (!message.trim()) return jsonResponse(res, 400, { ok: false, error: 'Bir mesaj yazın.' });
+      if (Buffer.byteLength(message, 'utf8') > 2048) return jsonResponse(res, 413, { ok: false, error: 'Mesaj 2048 bayt sınırını aşıyor.' });
+      const selector = typeof body.selector === 'string' ? body.selector : (typeof body.modelId === 'string' ? body.modelId : 'noema_v3');
+      const started = Date.now();
+      const { model, envelope } = await runChat(selector, message);
+      return jsonResponse(res, 200, {
+        ok: true,
+        model: { id: model.id, label: model.label, checkpointPath: model.checkpointPath, graphPath: model.graphPath },
+        metrics: { ...envelope, latencyMs: Date.now() - started },
+      });
+    }
+    if (req.method === 'POST' && url.pathname === '/api/train') {
+      let fileName = '';
+      try { fileName = decodeURIComponent(req.headers['x-file-name'] || ''); } catch {
+        req.resume();
+        return jsonResponse(res, 400, { ok: false, error: 'Dosya adı geçersiz.' });
+      }
+      return await startTraining(req, fileName, res);
+    }
+    if (req.method === 'GET' && url.pathname === '/api/train/status') {
+      if (!trainingJob || url.searchParams.get('jobId') !== trainingJob.id) {
+        return jsonResponse(res, 404, { ok: false, error: 'Eğitim işi bulunamadı.' });
+      }
+      const progress = currentProgress();
+      let model = null;
+      if (trainingJob.status === 'completed') {
+        model = (await describeModels()).find(item => item.id === trainingJob.stem) || null;
+      }
+      return jsonResponse(res, 200, { ok: true, ...progress, summary: trainingJob.summary, model });
+    }
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      return jsonResponse(res, 405, { ok: false, error: 'Method not allowed' });
+    }
+    const route = url.pathname === '/pretraining' ? '/pretraining.html'
+      : url.pathname === '/chat' ? '/index.html'
+        : url.pathname === '/' ? '/index.html' : decodeURIComponent(url.pathname);
+    const safe = path.resolve(here, `.${route}`);
+    if (!safe.startsWith(`${here}${path.sep}`)) return send(res, 404, 'Not found', 'text/plain; charset=utf-8');
     const data = await readFile(safe);
     res.writeHead(200, {
       'content-type': mime[path.extname(safe)] || 'application/octet-stream',
       'cache-control': 'no-cache',
       'x-content-type-options': 'nosniff',
-      'content-security-policy': "default-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self' data:",
+      'x-frame-options': 'SAMEORIGIN',
+      'content-security-policy': "default-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'self'",
     });
     if (req.method === 'HEAD') return res.end();
     return res.end(data);
-  } catch {
-    return send(res, 404, 'Not found', 'text/plain; charset=utf-8');
+  } catch (error) {
+    const status = error.status || 500;
+    return jsonResponse(res, status, { ok: false, error: error.message || 'İstek işlenemedi.' });
   }
 });
 
 server.listen(port, '0.0.0.0', () => {
   console.log(`NOEMA Chat listening on 0.0.0.0:${port}`);
-  console.log(`LIR binary: ${lir}`);
+  console.log(`NOEMA v3 backend: ${BACKEND_NATIVE} (fallback LIR: ${BACKEND_LIR})`);
+  console.log(`NOEMA v3 trainer: ${TRAINER_NATIVE} (fallback LIR: ${TRAINER_LIR})`);
 });

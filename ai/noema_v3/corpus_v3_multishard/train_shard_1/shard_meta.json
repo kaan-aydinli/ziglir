@@ -1,0 +1,27 @@
+{
+  "version": 3,
+  "shard_id": "train_shard_1",
+  "delimiter": "<veriayrimi>",
+  "files": {
+    "stream.bin": {
+      "byte_length": 760,
+      "sha256": "38884344e8cb0fca2d12d267b7961a053c430c60f7edcabbbd87d7fed0a4087b"
+    },
+    "prov.bin": {
+      "byte_length": 760,
+      "sha256": "2ac3dc45d41061fd400e33e2db0f7514340942750b7fb8b6d532683691ef1330"
+    },
+    "reset.bit": {
+      "byte_length": 95,
+      "sha256": "e794bf89c84a9eed77206f96056b08f1d32bb5123c5f8e05bc81b53fe126c392"
+    },
+    "weight.bin": {
+      "byte_length": 3040,
+      "sha256": "83ed6ca54c7d689f680e896bccf48a0b9fe4c8bf3131d2a1f676702ce32b0432"
+    },
+    "docs.idx": {
+      "byte_length": 272,
+      "sha256": "cd36fb0aab2e08498878566af35f7311b14db62d4977b437966f7bd525ae8f37"
+    }
+  }
+}

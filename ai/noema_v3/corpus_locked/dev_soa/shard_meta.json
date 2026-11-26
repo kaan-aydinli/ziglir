@@ -1,0 +1,28 @@
+{
+  "version": "3.0.0",
+  "shard_id": "nv3_locked_dev_v1",
+  "num_docs": 3,
+  "num_bytes": 297,
+  "files": {
+    "stream.bin": {
+      "byte_length": 297,
+      "sha256": "5e4bb1bbeb22ed4c5f2b4d3b3f62d0c8925ef7147f892556aa16e12fe4a1af86"
+    },
+    "prov.bin": {
+      "byte_length": 297,
+      "sha256": "1a32568e9160aa630411061de40867edaefdc52cdf2918ceda1442e141db9b32"
+    },
+    "reset.bit": {
+      "byte_length": 38,
+      "sha256": "a7bd4dc196bfd966e04be81400ddea7dcd205f465416d8310c85f72869bcf76f"
+    },
+    "weight.bin": {
+      "byte_length": 1188,
+      "sha256": "ef37b2bbe591cbd847bb0ae3c6d5b4d74254cc197e58eaca0bffe27d159245b2"
+    },
+    "docs.idx": {
+      "byte_length": 112,
+      "sha256": "62a4eadd602264bcd3c1c1743c6c052f01dc72801f369d6afdd05fb792fc8acc"
+    }
+  }
+}

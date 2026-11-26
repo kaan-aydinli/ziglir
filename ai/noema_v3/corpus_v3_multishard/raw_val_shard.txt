@@ -1,0 +1,10 @@
+Dogu Karadeniz kiyi cografyasinda nemli hava kutleleri ve yagis rejimi orman ekosistemini besler.
+
+<veriayrimi>
+Kanit denetimi ve kalibrasyon olcumu olmadan hicbir model yukseltmesi uretim hattina alinmaz.
+
+<veriayrimi>
+Deterministik ikili kontrol noktalari mimari ozeti ve egitim adim sayisini baslikta dogrular.
+
+<veriayrimi>
+Validation formal check: 2/5 + 3/5 = 1; 3 km = 3000 m.

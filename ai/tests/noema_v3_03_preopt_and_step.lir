@@ -1,0 +1,422 @@
+// NOEMA v3 Phase 1: LIR-PreOpt verification + Raw-UTF-8-byte micro-block training step.
+// Verifies:
+//   1) Newton-Schulz polar orthogonalization on wide [3,5] and tall [5,3] matrices
+//   2) Fail-closed NaN/Inf numerical safety guard (weights & moments untouched)
+//   3) Warmup + cosine LR schedule invariants
+//   4) End-to-end raw-UTF-8-byte (vocab=256, zero tokenizer) causal micro-block
+//      loss/bpb descent with provenance loss masking using hand-written LIR backward + LIR-PreOpt
+
+import "../src/noema_v3/noema_v3_kernels.lir"
+import "../src/noema_v3/noema_v3_preopt.lir"
+
+fn preopt_gate(name: string, cond: i64) -> i64 {
+    print("PREOPT_CHECK test=")
+    print(name)
+    if cond != 0 {
+        println(" pass=1")
+        return 1
+    }
+    println(" pass=0")
+    return 0
+}
+
+fn test_newton_schulz_ortho() -> i64 {
+    let rows: i64 = 3
+    let cols: i64 = 5
+    let n = rows * cols
+    let g_wide = @malloc(n * 8) as *f64
+    let g_tall = @malloc(n * 8) as *f64
+    let o_wide = @malloc(n * 8) as *f64
+    let o_tall = @malloc(n * 8) as *f64
+
+    // Ill-conditioned deterministic matrix (row scales differ by >10x)
+    g_wide[0]=3.0  g_wide[1]=-1.0 g_wide[2]=2.0  g_wide[3]=0.5  g_wide[4]=-1.5
+    g_wide[5]=0.2  g_wide[6]=0.8  g_wide[7]=-0.3 g_wide[8]=0.4  g_wide[9]=0.1
+    g_wide[10]=-0.1 g_wide[11]=0.2 g_wide[12]=0.3 g_wide[13]=-0.5 g_wide[14]=0.2
+
+    nv3_mat_transpose(g_wide, g_tall, rows, cols)
+    nv3_newton_schulz_ortho(g_wide, o_wide, rows, cols, 8)
+    nv3_newton_schulz_ortho(g_tall, o_tall, cols, rows, 8)
+
+    // Check ||O_wide * O_wide^T - I_3||_max < 1e-3 and ||O_tall^T * O_tall - I_3||_max < 1e-3
+    var max_err: f64 = 0.0
+    var i: i64 = 0
+    while i < 3 {
+        var j: i64 = 0
+        while j < 3 {
+            var dot_w: f64 = 0.0
+            var dot_t: f64 = 0.0
+            var k: i64 = 0
+            while k < 5 {
+                dot_w = dot_w + o_wide[i * 5 + k] * o_wide[j * 5 + k]
+                dot_t = dot_t + o_tall[k * 3 + i] * o_tall[k * 3 + j]
+                k = k + 1
+            }
+            let target: f64 = if i == j { 1.0 } else { 0.0 }
+            let ew = nv3_abs(dot_w - target)
+            let et = nv3_abs(dot_t - target)
+            if ew > max_err { max_err = ew }
+            if et > max_err { max_err = et }
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    @free(g_wide as *u8) @free(g_tall as *u8) @free(o_wide as *u8) @free(o_tall as *u8)
+    return preopt_gate("newton_schulz_wide_and_tall_ortho", if max_err < 0.001 { 1 } else { 0 })
+}
+
+fn test_fail_closed_nan_inf() -> i64 {
+    let w_mat = @malloc(6 * 8) as *f64
+    let w_mat_orig = @malloc(6 * 8) as *f64
+    let g_mat = @malloc(6 * 8) as *f64
+    let w_vec = @malloc(4 * 8) as *f64
+    let w_vec_orig = @malloc(4 * 8) as *f64
+    let g_vec = @malloc(4 * 8) as *f64
+
+    var i: i64 = 0
+    while i < 6 {
+        w_mat[i] = (i as f64 + 1.0) * 0.25
+        w_mat_orig[i] = w_mat[i]
+        g_mat[i] = 0.1
+        i = i + 1
+    }
+    i = 0
+    while i < 4 {
+        w_vec[i] = (i as f64 - 1.5) * 0.3
+        w_vec_orig[i] = w_vec[i]
+        g_vec[i] = -0.05
+        i = i + 1
+    }
+
+    let opt_m = nv3_preopt_matrix_init(w_mat, 2, 3, 0.9, 0.01, 5)
+    let opt_d = nv3_preopt_diag_init(w_vec, 4, 0.9, 0.99, 0.00000001, 0.01)
+
+    // Inject NaN (0.0 / 0.0) and Inf (1.0 / 0.0)
+    let zero_v: f64 = 0.0
+    g_mat[2] = zero_v / zero_v
+    g_vec[1] = 1.0 / zero_v
+
+    let r_m = nv3_preopt_matrix_step(opt_m, g_mat, 0.05, 1.0)
+    let r_d = nv3_preopt_diag_step(opt_d, g_vec, 0.05, 1.0)
+    let clip_nan = nv3_preopt_clip_scale(zero_v / zero_v, 1.0)
+
+    var unchanged: i64 = 1
+    i = 0
+    while i < 6 {
+        if w_mat[i] != w_mat_orig[i] or opt_m.mom[i] != 0.0 { unchanged = 0 }
+        i = i + 1
+    }
+    i = 0
+    while i < 4 {
+        if w_vec[i] != w_vec_orig[i] or opt_d.m[i] != 0.0 or opt_d.v[i] != 0.0 { unchanged = 0 }
+        i = i + 1
+    }
+
+    var ok: i64 = 0
+    if r_m == 0 and r_d == 0 and opt_m.rejected == 1 and opt_d.rejected == 1 and clip_nan < 0.0 and unchanged == 1 {
+        ok = 1
+    }
+
+    nv3_preopt_matrix_free(opt_m)
+    nv3_preopt_diag_free(opt_d)
+    @free(w_mat as *u8) @free(w_mat_orig as *u8) @free(g_mat as *u8)
+    @free(w_vec as *u8) @free(w_vec_orig as *u8) @free(g_vec as *u8)
+    return preopt_gate("preopt_fail_closed_nan_inf_guard", ok)
+}
+
+fn test_lr_schedule() -> i64 {
+    let lr0 = nv3_preopt_lr(0, 10, 110, 0.01, 0.001)
+    let lr5 = nv3_preopt_lr(5, 10, 110, 0.01, 0.001)
+    let lr10 = nv3_preopt_lr(10, 10, 110, 0.01, 0.001)
+    let lr60 = nv3_preopt_lr(60, 10, 110, 0.01, 0.001)
+    let lr110 = nv3_preopt_lr(110, 10, 110, 0.01, 0.001)
+
+    var ok: i64 = 0
+    if lr0 == 0.0 and nv3_abs(lr5 - 0.005) < 1.0e-9 and nv3_abs(lr10 - 0.01) < 1.0e-9 and nv3_abs(lr60 - 0.0055) < 1.0e-6 and nv3_abs(lr110 - 0.001) < 1.0e-9 {
+        ok = 1
+    }
+    return preopt_gate("preopt_lr_warmup_cosine_schedule", ok)
+}
+
+// End-to-end raw-UTF-8-byte micro-block training step test (vocab = 256, zero tokenizer).
+fn test_raw_utf8_microblock_training() -> i64 {
+    // Multibyte UTF-8 sequence ("A: kanıt" — 'ı' is 0xC4 0xB1, 9 raw bytes)
+    let text = "A: kanıt"
+    let raw_bytes = text as *u8
+    let seq_len = text.len as i64
+    let t_len = seq_len - 1
+    let vocab: i64 = 256
+    let d_model: i64 = 6
+    let d_h: i64 = 8
+    let kernel: i64 = 3
+
+    let in_bytes = @malloc(t_len * 8) as *i64
+    let tgt_bytes = @malloc(t_len * 8) as *i64
+    let loss_w = @malloc(t_len * 8) as *f64
+    var t: i64 = 0
+    while t < t_len {
+        in_bytes[t] = (@read_u8(@ptr_add(raw_bytes, t)) as i64) & 255
+        tgt_bytes[t] = (@read_u8(@ptr_add(raw_bytes, t + 1)) as i64) & 255
+        // Mask prompt prefix "A: " (first 2 next-byte predictions), train only on answer span
+        loss_w[t] = if t < 2 { 0.0 } else { 1.0 }
+        t = t + 1
+    }
+
+    // Parameters: emb[256, d], conv_w[d, 3], conv_b[d], rms_g[d], swiglu(wg,bg,wu,bu,wo,bo), head_w[d, 256], head_b[256]
+    let emb = @malloc(vocab * d_model * 8) as *f64
+    let conv_w = @malloc(d_model * kernel * 8) as *f64
+    let conv_b = @malloc(d_model * 8) as *f64
+    let rms_g = @malloc(d_model * 8) as *f64
+    let wg = @malloc(d_model * d_h * 8) as *f64
+    let bg = @malloc(d_h * 8) as *f64
+    let wu = @malloc(d_model * d_h * 8) as *f64
+    let bu = @malloc(d_h * 8) as *f64
+    let wo = @malloc(d_h * d_model * 8) as *f64
+    let bo = @malloc(d_model * 8) as *f64
+    let head_w = @malloc(d_model * vocab * 8) as *f64
+    let head_b = @malloc(vocab * 8) as *f64
+
+    // Small deterministic initialization
+    var i: i64 = 0
+    while i < vocab * d_model {
+        emb[i] = (((i * 17 + 5) % 29) as f64 - 14.0) * 0.01
+        head_w[i] = (((i * 13 + 3) % 31) as f64 - 15.0) * 0.01
+        i = i + 1
+    }
+    i = 0
+    while i < d_model * kernel { conv_w[i] = (((i * 7 + 1) % 11) as f64 - 5.0) * 0.05 i = i + 1 }
+    nv3_zero(conv_b, d_model)
+    i = 0
+    while i < d_model { rms_g[i] = 1.0 i = i + 1 }
+    i = 0
+    while i < d_model * d_h {
+        wg[i] = (((i * 11 + 2) % 19) as f64 - 9.0) * 0.02
+        wu[i] = (((i * 19 + 7) % 23) as f64 - 11.0) * 0.02
+        wo[i] = (((i * 23 + 1) % 17) as f64 - 8.0) * 0.02
+        i = i + 1
+    }
+    nv3_zero(bg, d_h)
+    nv3_zero(bu, d_h)
+    nv3_zero(bo, d_model)
+    nv3_zero(head_b, vocab)
+
+    // Activations & gradients
+    let x_seq = @malloc(t_len * d_model * 8) as *f64
+    let conv_out = @malloc(t_len * d_model * 8) as *f64
+    let norm_out = @malloc(t_len * d_model * 8) as *f64
+    let gate_seq = @malloc(t_len * d_h * 8) as *f64
+    let up_seq = @malloc(t_len * d_h * 8) as *f64
+    let hid_seq = @malloc(t_len * d_h * 8) as *f64
+    let mlp_out = @malloc(t_len * d_model * 8) as *f64
+    let logits = @malloc(t_len * vocab * 8) as *f64
+
+    let dlogits = @malloc(t_len * vocab * 8) as *f64
+    let dmlp_out = @malloc(t_len * d_model * 8) as *f64
+    let dnorm_out = @malloc(t_len * d_model * 8) as *f64
+    let dconv_out = @malloc(t_len * d_model * 8) as *f64
+    let dx_seq = @malloc(t_len * d_model * 8) as *f64
+
+    let demb = @malloc(vocab * d_model * 8) as *f64
+    let dconv_w = @malloc(d_model * kernel * 8) as *f64
+    let dconv_b = @malloc(d_model * 8) as *f64
+    let drms_g = @malloc(d_model * 8) as *f64
+    let dwg = @malloc(d_model * d_h * 8) as *f64
+    let dbg = @malloc(d_h * 8) as *f64
+    let dwu = @malloc(d_model * d_h * 8) as *f64
+    let dbu = @malloc(d_h * 8) as *f64
+    let dwo = @malloc(d_h * d_model * 8) as *f64
+    let dbo = @malloc(d_model * 8) as *f64
+    let dhead_w = @malloc(d_model * vocab * 8) as *f64
+    let dhead_b = @malloc(vocab * 8) as *f64
+
+    let s_dx = @malloc(d_model * 8) as *f64
+    let s_dwg = @malloc(d_model * d_h * 8) as *f64
+    let s_dbg = @malloc(d_h * 8) as *f64
+    let s_dwu = @malloc(d_model * d_h * 8) as *f64
+    let s_dbu = @malloc(d_h * 8) as *f64
+    let s_dwo = @malloc(d_h * d_model * 8) as *f64
+    let s_dbo = @malloc(d_model * 8) as *f64
+
+    // LIR-PreOpt optimizers: Newton-Schulz Matrix for 2D projections, Diagonal for 1D/table params
+    let opt_wg = nv3_preopt_matrix_init(wg, d_model, d_h, 0.9, 0.001, 5)
+    let opt_wu = nv3_preopt_matrix_init(wu, d_model, d_h, 0.9, 0.001, 5)
+    let opt_wo = nv3_preopt_matrix_init(wo, d_h, d_model, 0.9, 0.001, 5)
+    let opt_hw = nv3_preopt_matrix_init(head_w, d_model, vocab, 0.9, 0.001, 5)
+    let opt_emb = nv3_preopt_diag_init(emb, vocab * d_model, 0.9, 0.99, 1.0e-8, 0.001)
+    let opt_cw = nv3_preopt_diag_init(conv_w, d_model * kernel, 0.9, 0.99, 1.0e-8, 0.001)
+    let opt_cb = nv3_preopt_diag_init(conv_b, d_model, 0.9, 0.99, 1.0e-8, 0.0)
+    let opt_rg = nv3_preopt_diag_init(rms_g, d_model, 0.9, 0.99, 1.0e-8, 0.0)
+    let opt_hb = nv3_preopt_diag_init(head_b, vocab, 0.9, 0.99, 1.0e-8, 0.0)
+
+    let conv_dims = Nv3ConvDims { t_len: t_len, channels: d_model, kernel: kernel }
+    let sw_dims = Nv3SwiGluDims { in_dim: d_model, h_dim: d_h, out_dim: d_model }
+    let sw_params = Nv3SwiGluParams { wg: wg, bg: bg, wu: wu, bu: bu, wo: wo, bo: bo }
+
+    var bpb_first: f64 = 0.0
+    var bpb_last: f64 = 0.0
+    var masked_grad_max: f64 = 0.0
+
+    var step: i64 = 1
+    while step <= 8 {
+        // 1) Raw UTF-8 byte lookup -> x_seq
+        t = 0
+        while t < t_len {
+            let b_id = in_bytes[t]
+            var c: i64 = 0
+            while c < d_model {
+                x_seq[t * d_model + c] = emb[b_id * d_model + c]
+                c = c + 1
+            }
+            t = t + 1
+        }
+        // 2) CausalDepthwiseConv1D -> RMSNorm -> Residual SwiGLU -> Byte Logits
+        nv3_causal_depthwise_conv1d_forward(x_seq, conv_w, conv_b, conv_out, conv_dims)
+        nv3_rmsnorm_forward(conv_out, rms_g, norm_out, t_len, d_model, 0.00001)
+        t = 0
+        while t < t_len {
+            let nin = @ptr_add(norm_out as *u8, t * d_model * 8) as *f64
+            let gt = @ptr_add(gate_seq as *u8, t * d_h * 8) as *f64
+            let ut = @ptr_add(up_seq as *u8, t * d_h * 8) as *f64
+            let ht = @ptr_add(hid_seq as *u8, t * d_h * 8) as *f64
+            let mout = @ptr_add(mlp_out as *u8, t * d_model * 8) as *f64
+            let sbuf = Nv3SwiGluBuf { gate: gt, up: ut, hidden: ht }
+            nv3_swiglu_forward(nin, sw_params, sbuf, mout, sw_dims)
+            var c: i64 = 0
+            while c < d_model {
+                mout[c] = mout[c] + conv_out[t * d_model + c]
+                c = c + 1
+            }
+            let lout = @ptr_add(logits as *u8, t * vocab * 8) as *f64
+            nv3_linear_forward(mout, head_w, head_b, lout, d_model, vocab)
+            t = t + 1
+        }
+
+        let loss_nats = nv3_softmax_ce_forward(logits, tgt_bytes, loss_w, t_len, vocab)
+        let bpb = nv3_bpb_from_nats(loss_nats, loss_w, t_len)
+        if step == 1 { bpb_first = bpb }
+        bpb_last = bpb
+
+        // Backward pass in pure LIR
+        nv3_softmax_ce_backward(1.0, logits, tgt_bytes, loss_w, dlogits, t_len, vocab)
+        if step == 1 {
+            var mi: i64 = 0
+            while mi < 2 * vocab {
+                let av = nv3_abs(dlogits[mi])
+                if av > masked_grad_max { masked_grad_max = av }
+                mi = mi + 1
+            }
+        }
+
+        nv3_zero(dhead_w, d_model * vocab)
+        nv3_zero(dhead_b, vocab)
+        nv3_zero(dwg, d_model * d_h)
+        nv3_zero(dbg, d_h)
+        nv3_zero(dwu, d_model * d_h)
+        nv3_zero(dbu, d_h)
+        nv3_zero(dwo, d_h * d_model)
+        nv3_zero(dbo, d_model)
+        nv3_zero(demb, vocab * d_model)
+
+        t = 0
+        while t < t_len {
+            let dl_t = @ptr_add(dlogits as *u8, t * vocab * 8) as *f64
+            let mout = @ptr_add(mlp_out as *u8, t * d_model * 8) as *f64
+            let dm_t = @ptr_add(dmlp_out as *u8, t * d_model * 8) as *f64
+            let hgrad = Nv3LinearGrad { dx: dm_t, dw: dhead_w, db: dhead_b }
+            nv3_linear_backward(dl_t, mout, head_w, hgrad, d_model, vocab)
+
+            let nin = @ptr_add(norm_out as *u8, t * d_model * 8) as *f64
+            let gt = @ptr_add(gate_seq as *u8, t * d_h * 8) as *f64
+            let ut = @ptr_add(up_seq as *u8, t * d_h * 8) as *f64
+            let ht = @ptr_add(hid_seq as *u8, t * d_h * 8) as *f64
+            let sbuf = Nv3SwiGluBuf { gate: gt, up: ut, hidden: ht }
+            let sgrad = Nv3SwiGluGrad { dx: s_dx, dwg: s_dwg, dbg: s_dbg, dwu: s_dwu, dbu: s_dbu, dwo: s_dwo, dbo: s_dbo }
+            nv3_swiglu_backward(dm_t, nin, sw_params, sbuf, sgrad, sw_dims)
+
+            let dn_t = @ptr_add(dnorm_out as *u8, t * d_model * 8) as *f64
+            nv3_copy(dn_t, s_dx, d_model)
+            nv3_axpy(dwg, 1.0, s_dwg, d_model * d_h)
+            nv3_axpy(dbg, 1.0, s_dbg, d_h)
+            nv3_axpy(dwu, 1.0, s_dwu, d_model * d_h)
+            nv3_axpy(dbu, 1.0, s_dbu, d_h)
+            nv3_axpy(dwo, 1.0, s_dwo, d_h * d_model)
+            nv3_axpy(dbo, 1.0, s_dbo, d_model)
+            t = t + 1
+        }
+
+        let rgrad = Nv3RmsnormGrad { dx: dconv_out, dgamma: drms_g }
+        nv3_rmsnorm_backward(dnorm_out, conv_out, rms_g, rgrad, t_len, d_model, 0.00001)
+        // Residual branch gradient: dconv_out += dmlp_out
+        nv3_axpy(dconv_out, 1.0, dmlp_out, t_len * d_model)
+
+        let cgrad = Nv3ConvGrad { dx: dx_seq, dw: dconv_w, db: dconv_b }
+        nv3_causal_depthwise_conv1d_backward(dconv_out, x_seq, conv_w, cgrad, conv_dims)
+
+        t = 0
+        while t < t_len {
+            let b_id = in_bytes[t]
+            var c: i64 = 0
+            while c < d_model {
+                demb[b_id * d_model + c] = demb[b_id * d_model + c] + dx_seq[t * d_model + c]
+                c = c + 1
+            }
+            t = t + 1
+        }
+
+        let gnorm2 = nv3_norm_sq(dwg, d_model * d_h) + nv3_norm_sq(dwu, d_model * d_h) + nv3_norm_sq(dwo, d_h * d_model) + nv3_norm_sq(dhead_w, d_model * vocab) + nv3_norm_sq(demb, vocab * d_model)
+        let gscale = nv3_preopt_clip_scale(gnorm2, 5.0)
+        let lr_mat = nv3_preopt_lr(step, 1, 10, 0.85, 0.15)
+        let lr_diag = nv3_preopt_lr(step, 1, 10, 0.25, 0.05)
+
+        let _s1 = nv3_preopt_matrix_step(opt_wg, dwg, lr_mat, gscale)
+        let _s2 = nv3_preopt_matrix_step(opt_wu, dwu, lr_mat, gscale)
+        let _s3 = nv3_preopt_matrix_step(opt_wo, dwo, lr_mat, gscale)
+        let _s4 = nv3_preopt_matrix_step(opt_hw, dhead_w, lr_mat, gscale)
+        let _s5 = nv3_preopt_diag_step(opt_emb, demb, lr_diag, gscale)
+        let _s6 = nv3_preopt_diag_step(opt_cw, dconv_w, lr_diag, gscale)
+        let _s7 = nv3_preopt_diag_step(opt_cb, dconv_b, lr_diag, gscale)
+        let _s8 = nv3_preopt_diag_step(opt_rg, drms_g, lr_diag, gscale)
+        let _s9 = nv3_preopt_diag_step(opt_hb, dhead_b, lr_diag, gscale)
+
+        step = step + 1
+    }
+
+    let ok_mask = preopt_gate("provenance_loss_mask_zero_grad", if masked_grad_max == 0.0 { 1 } else { 0 })
+    var ok_descent_cond: i64 = 0
+    if nv3_is_finite(bpb_first) == 1 and nv3_is_finite(bpb_last) == 1 and bpb_first > 7.5 and bpb_first < 8.5 and bpb_last < bpb_first * 0.45 and opt_hw.rejected == 0 {
+        ok_descent_cond = 1
+    }
+    let ok_descent = preopt_gate("raw_utf8_microblock_bpb_descent", ok_descent_cond)
+
+    nv3_preopt_matrix_free(opt_wg) nv3_preopt_matrix_free(opt_wu) nv3_preopt_matrix_free(opt_wo) nv3_preopt_matrix_free(opt_hw)
+    nv3_preopt_diag_free(opt_emb) nv3_preopt_diag_free(opt_cw) nv3_preopt_diag_free(opt_cb) nv3_preopt_diag_free(opt_rg) nv3_preopt_diag_free(opt_hb)
+
+    @free(in_bytes as *u8) @free(tgt_bytes as *u8) @free(loss_w as *u8)
+    @free(emb as *u8) @free(conv_w as *u8) @free(conv_b as *u8) @free(rms_g as *u8)
+    @free(wg as *u8) @free(bg as *u8) @free(wu as *u8) @free(bu as *u8) @free(wo as *u8) @free(bo as *u8)
+    @free(head_w as *u8) @free(head_b as *u8)
+    @free(x_seq as *u8) @free(conv_out as *u8) @free(norm_out as *u8)
+    @free(gate_seq as *u8) @free(up_seq as *u8) @free(hid_seq as *u8) @free(mlp_out as *u8) @free(logits as *u8)
+    @free(dlogits as *u8) @free(dmlp_out as *u8) @free(dnorm_out as *u8) @free(dconv_out as *u8) @free(dx_seq as *u8)
+    @free(demb as *u8) @free(dconv_w as *u8) @free(dconv_b as *u8) @free(drms_g as *u8)
+    @free(dwg as *u8) @free(dbg as *u8) @free(dwu as *u8) @free(dbu as *u8) @free(dwo as *u8) @free(dbo as *u8)
+    @free(dhead_w as *u8) @free(dhead_b as *u8)
+    @free(s_dx as *u8) @free(s_dwg as *u8) @free(s_dbg as *u8) @free(s_dwu as *u8) @free(s_dbu as *u8) @free(s_dwo as *u8) @free(s_dbo as *u8)
+
+    if ok_mask == 1 and ok_descent == 1 { return 1 }
+    return 0
+}
+
+fn main() -> i64 {
+    let ok1 = test_newton_schulz_ortho()
+    let ok2 = test_fail_closed_nan_inf()
+    let ok3 = test_lr_schedule()
+    let ok4 = test_raw_utf8_microblock_training()
+    if ok1 == 1 and ok2 == 1 and ok3 == 1 and ok4 == 1 {
+        println("ALL_PASS")
+        return 0
+    }
+    println("SOME_FAIL")
+    return 1
+}

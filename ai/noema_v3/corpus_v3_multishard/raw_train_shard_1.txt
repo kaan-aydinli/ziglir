@@ -1,0 +1,22 @@
+Uluslararasi birim sisteminde uzunluk metre, kutle kilogram ve zaman saniye tabaninda boyutsal olarak denetlenir.
+
+<veriayrimi>
+Dimensional SI identity: 2 km + 500 m = 2500 m; 1 h = 3600 s.
+
+<veriayrimi>
+Rasyonel kesir aritmetiginde payda esitleme ve en buyuk ortak bolen sadelestirmesi yuvarlama hatasini onler.
+
+<veriayrimi>
+Arithmetic exactness check: 14 * 15 = 210; 5/12 + 7/12 = 1.
+
+<veriayrimi>
+Derleyici arka uclari ayni ara temsilden yerel makine kodu, sanal makine ve C ciktilari ureterek esdegerlik saglar.
+
+<veriayrimi>
+Cok is parcacikli veri paralel egitimde kanonik indirgeme sirasi tek isciyle deterministik esitlik kurar.
+
+<veriayrimi>
+Zamansal cikarim motoru takvim araliklarinin baslangic ve bitis gunlerini karsilastirarak celiskileri yakalar.
+
+<veriayrimi>
+Chronological interval order: 2025-01-10 < 2025-11-20; P=>Q, Q=>R, P |- R.

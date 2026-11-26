@@ -1,0 +1,65 @@
+// NOEMA v3 Pure-LIR Standalone Inference CLI (Isolated from legacy chat_site_backend.lir)
+// Usage:
+//   lir run ai/noema_v3_infer_cli.lir -- <npg_v3_ckpt_path> <prompt_utf8> <verified_evidence:0|1> <prov:1|2>
+// Fails closed on missing/corrupt checkpoint or legacy .nps file.
+// Reports honest output_mode:
+//   - noema_v3_weight_generation          (when KHG evidence gate verifies support)
+//   - noema_v3_weight_generation_abstain  (when evidence is absent/insufficient or source is untrusted)
+
+import "src/noema_v3/noema_v3_selfplay_gate.lir"
+
+fn print_hex_byte_cli(val: i64) {
+    let digits = "0123456789abcdef"
+    let ptr = digits.ptr as *u8
+    let hi = (val >> 4) & 15
+    let lo = val & 15
+    @write(1, @ptr_add(ptr, hi), 1)
+    @write(1, @ptr_add(ptr, lo), 1)
+}
+
+fn main() -> i64 {
+    let argc = @argc()
+    if argc < 2 {
+        println("NOEMA_V3_RESULT_V1")
+        println("status=fail_closed_missing_checkpoint")
+        println("output_mode=none")
+        return 1
+    }
+
+    let ckpt_path = @argv(1)
+    let prompt_s = if argc >= 3 { @argv(2) } else { "Kanıt:" }
+    let ev_s = if argc >= 4 { @argv(3) } else { "0" }
+    let pv_s = if argc >= 5 { @argv(4) } else { "1" }
+
+    let has_ev = if @string_eq(ev_s, "1") { 1 } else { 0 }
+    let prov = if @string_eq(pv_s, "2") { NOEMA_V3_PROV_UNTRUSTED_SOURCE } else { NOEMA_V3_PROV_USER_INPUT }
+
+    let gen_buf = @malloc(8)
+    let env = nv3_infer_from_npg_with_khg(ckpt_path, prompt_s, prov, has_ev, 8, gen_buf)
+    if env.ok != 1 {
+        @free(gen_buf)
+        println("NOEMA_V3_RESULT_V1")
+        println("status=fail_closed_invalid_npg_v3")
+        println("output_mode=none")
+        return 1
+    }
+
+    let mode_str = if env.output_mode == NOEMA_V3_OUTPUT_WEIGHT_GENERATION {
+        "noema_v3_weight_generation"
+    } else {
+        "noema_v3_weight_generation_abstain"
+    }
+    println("NOEMA_V3_RESULT_V1")
+    println("status=ok")
+    println("output_mode=" + mode_str)
+    println("promoted_to_system_policy=0")
+    print("generated_utf8_hex=")
+    var hi: i64 = 0
+    while hi < env.num_bytes {
+        print_hex_byte_cli((@read_u8(@ptr_add(gen_buf, hi)) as i64) & 255)
+        hi = hi + 1
+    }
+    println("")
+    @free(gen_buf)
+    return 0
+}

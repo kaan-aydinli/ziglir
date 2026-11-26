@@ -31,7 +31,7 @@ does not claim to generate a response.
   document training and inference do not allocate those temporary arrays on the
   heap. The record reader still allocates bounded staging buffers. Documents
   arrive as `(raw_bytes, length, reset_kind)`. The authoring corpus is
-  plain UTF-8 text; a standalone line exactly equal to `---` separates topics.
+  plain UTF-8 text; `<veriayrimi>` separates topics (standalone line or inline).
   The delimiter is framing only and is not passed into the model; all other
   topic bytes are preserved. Each topic is currently packed as a full-reset
   text-domain record, with no tokenization or JSON parsing.
@@ -101,7 +101,7 @@ does not claim to generate a response.
 ## Tests
 
 The authoring corpus is `ai/noema-training/pretrain_corpus.tr.txt`, with a
-standalone `---` line between topics. `ai/train_turkish_corpus.lir` converts
+`<veriayrimi>` delimiter between topics. `ai/train_turkish_corpus.lir` converts
 each topic to a full-reset text-domain `.nbin` record and trains on those
 records. `ai/tests/48_noema_pretrain_plaintext.lir` checks the topic framing on
 native, VM, and C backends. `ai/tests/46_noema_pretrain.lir` checks the arena

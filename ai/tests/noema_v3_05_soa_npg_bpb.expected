@@ -1,0 +1,14 @@
+soa_locked_ingestion_accounting:
+1
+soa_corrupt_fail_closed:
+1
+soa_train_and_heldout_bpb_descent:
+1
+npg_v3_roundtrip_f64_and_f32:
+1
+npg_v3_reject_legacy_nps_and_corruption:
+1
+weight_generation_utf8_mode:
+1
+NOEMA_V3_SOA_NPG_BPB_ALL_PASS:
+1

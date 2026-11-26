@@ -1,0 +1,511 @@
+// NOEMA v3 Phase 7:
+//   1) Zero-Parse Paged Document-Window SoA Streamer (`nv3_soa_stream_window`) — reads only
+//      the requested `[doc_lo .. doc_hi)` byte slice via file descriptors instead of whole-corpus RAM loads.
+//   2) Multi-Threaded Data-Parallel Worker Pool (`@thread_create` + `@thread_join`) with
+//      Canonical Ordered Gradient Reduction (mathematically equivalent to serial single-stream gradients
+//      to < 1e-12 across native, vm, and c).
+//   3) Multi-Shard Scaled Training Driver (`nv3_mt_train_multishard_npg`) + Worker Parity Verifier.
+
+import "noema_v3_trainer.lir"
+
+struct Nv3WinShard {
+    ok: i64
+    error_code: i64
+    num_bytes: i64
+    num_docs: i64
+    accepted_docs: i64
+    rejected_docs: i64
+    stream: *u8
+    prov: *i64
+    reset: *i64
+    weights: *f64
+}
+
+struct Nv3MtStepStats {
+    ok: i64
+    workers_used: i64
+    total_docs: i64
+    byte_steps: i64
+    loss_nats: f64
+    bpb: f64
+}
+
+fn nv3_win_fail(code: i64, rej: i64) -> Nv3WinShard {
+    return Nv3WinShard {
+        ok: 0, error_code: code, num_bytes: 0, num_docs: 0,
+        accepted_docs: 0, rejected_docs: rej,
+        stream: 0 as *u8, prov: 0 as *i64, reset: 0 as *i64, weights: 0 as *f64
+    }
+}
+
+fn nv3_win_free(w: Nv3WinShard) {
+    if (w.stream as i64) != 0 { @free(w.stream) }
+    if (w.prov as i64) != 0 { @free(w.prov as *u8) }
+    if (w.reset as i64) != 0 { @free(w.reset as *u8) }
+    if (w.weights as i64) != 0 { @free(w.weights as *u8) }
+}
+
+// Reads exact `[byte_off .. byte_off + byte_len)` slice from `path` into `dst` using bounded 4 KiB skip pages.
+fn nv3_pread_slice(path: string, byte_off: i64, byte_len: i64, dst: *u8) -> i64 {
+    if byte_off < 0 or byte_len < 0 { return 0 }
+    if byte_len == 0 { return 1 }
+    let fd = @open(path, 0, 0)
+    if fd < 0 { return 0 }
+
+    let skip_buf = @malloc(4096)
+    var skipped: i64 = 0
+    while skipped < byte_off {
+        let want = if (byte_off - skipped) < 4096 { byte_off - skipped } else { 4096 }
+        let got = @read(fd, skip_buf, want)
+        if got <= 0 {
+            @free(skip_buf)
+            @close(fd)
+            return 0
+        }
+        skipped = skipped + got
+    }
+    @free(skip_buf)
+
+    var got_tot: i64 = 0
+    while got_tot < byte_len {
+        let r = @read(fd, @ptr_add(dst, got_tot), byte_len - got_tot)
+        if r <= 0 {
+            @close(fd)
+            return 0
+        }
+        got_tot = got_tot + r
+    }
+    @close(fd)
+    return 1
+}
+
+fn nv3_soa_peek_num_docs(dir_path: string) -> i64 {
+    let hdr = @malloc(16)
+    if nv3_pread_slice(dir_path + "/docs.idx", 0, 16, hdr) != 1 {
+        @free(hdr)
+        return -1
+    }
+    let m0 = (@read_u32(hdr) as i64) & 4294967295
+    let ver = (@read_u32(@ptr_add(hdr, 4)) as i64) & 4294967295
+    let nd = @read_u64(@ptr_add(hdr, 8))
+    @free(hdr)
+    if m0 != NV3_DOCS_MAGIC_LE or ver != NOEMA_V3_SCHEMA_VERSION or nd <= 0 { return -1 }
+    return nd
+}
+
+// Streams ONLY documents `[doc_lo .. doc_hi)` from an NV3D v3 SoA shard directory,
+// verifying FNV-1a64 checksums, provenance bounds, and document-start reset bits fail-closed.
+fn nv3_soa_stream_window(dir_path: string, doc_lo: i64, doc_hi: i64) -> Nv3WinShard {
+    let total_docs = nv3_soa_peek_num_docs(dir_path)
+    if total_docs <= 0 or doc_lo < 0 or doc_hi <= doc_lo or doc_hi > total_docs {
+        return nv3_win_fail(30, 0)
+    }
+    let win_docs = doc_hi - doc_lo
+    let idx_bytes = win_docs * 32
+    let idx_raw = @malloc(idx_bytes)
+    if nv3_pread_slice(dir_path + "/docs.idx", 16 + doc_lo * 32, idx_bytes, idx_raw) != 1 {
+        @free(idx_raw)
+        return nv3_win_fail(31, win_docs)
+    }
+
+    let first_off = @read_u64(idx_raw)
+    var win_bytes: i64 = 0
+    var d: i64 = 0
+    while d < win_docs {
+        let rec = @ptr_add(idx_raw, d * 32)
+        let d_off = @read_u64(rec)
+        let d_len = @read_u64(@ptr_add(rec, 8))
+        if d_off != (first_off + win_bytes) or d_len <= 0 {
+            @free(idx_raw)
+            return nv3_win_fail(32, win_docs - d)
+        }
+        win_bytes = win_bytes + d_len
+        d = d + 1
+    }
+
+    let stream = @malloc(win_bytes)
+    let prov_raw = @malloc(win_bytes)
+    let weight_raw = @malloc(win_bytes * 4)
+    let bit_start_byte = first_off / 8
+    let bit_end_byte = (first_off + win_bytes + 7) / 8
+    let reset_slice_len = bit_end_byte - bit_start_byte
+    let reset_raw = @malloc(reset_slice_len)
+
+    let ok_s = nv3_pread_slice(dir_path + "/stream.bin", first_off, win_bytes, stream)
+    let ok_p = nv3_pread_slice(dir_path + "/prov.bin", first_off, win_bytes, prov_raw)
+    let ok_w = nv3_pread_slice(dir_path + "/weight.bin", first_off * 4, win_bytes * 4, weight_raw)
+    let ok_r = nv3_pread_slice(dir_path + "/reset.bit", bit_start_byte, reset_slice_len, reset_raw)
+
+    if ok_s != 1 or ok_p != 1 or ok_w != 1 or ok_r != 1 {
+        @free(idx_raw) @free(stream) @free(prov_raw) @free(weight_raw) @free(reset_raw)
+        return nv3_win_fail(33, win_docs)
+    }
+
+    let prov_arr = @malloc(win_bytes * 8) as *i64
+    let reset_arr = @malloc(win_bytes * 8) as *i64
+    let weights_arr = @malloc(win_bytes * 8) as *f64
+    nv3_f32_to_f64_buf(weights_arr, weight_raw, win_bytes)
+
+    var byte_ok: i64 = 1
+    var t: i64 = 0
+    while t < win_bytes {
+        let ptag = (@read_u8(@ptr_add(prov_raw, t)) as i64) & 255
+        if ptag < 0 or ptag > NOEMA_V3_PROV_HYPOTHESIS { byte_ok = 0 }
+        prov_arr[t] = ptag
+        let gbit = first_off + t
+        let rbyte = (@read_u8(@ptr_add(reset_raw, (gbit / 8) - bit_start_byte)) as i64) & 255
+        reset_arr[t] = (rbyte >> (7 - (gbit % 8))) & 1
+        if nv3_is_finite(weights_arr[t]) == 0 or weights_arr[t] < 0.0 { byte_ok = 0 }
+        t = t + 1
+    }
+    @free(prov_raw) @free(weight_raw) @free(reset_raw)
+
+    if byte_ok == 0 {
+        @free(idx_raw) @free(stream)
+        @free(prov_arr as *u8) @free(reset_arr as *u8) @free(weights_arr as *u8)
+        return nv3_win_fail(34, win_docs)
+    }
+
+    var accepted: i64 = 0
+    var rejected: i64 = 0
+    d = 0
+    while d < win_docs {
+        let rec = @ptr_add(idx_raw, d * 32)
+        let rel_off = @read_u64(rec) - first_off
+        let ln = @read_u64(@ptr_add(rec, 8))
+        let ck = @read_u64(@ptr_add(rec, 24))
+        let actual_ck = nv3_fnv1a64(@ptr_add(stream, rel_off), ln)
+        if reset_arr[rel_off] == 1 and actual_ck == ck {
+            accepted = accepted + 1
+        } else {
+            rejected = rejected + 1
+        }
+        d = d + 1
+    }
+    @free(idx_raw)
+
+    if rejected > 0 {
+        @free(stream)
+        @free(prov_arr as *u8) @free(reset_arr as *u8) @free(weights_arr as *u8)
+        return nv3_win_fail(35, rejected)
+    }
+
+    return Nv3WinShard {
+        ok: 1, error_code: 0, num_bytes: win_bytes, num_docs: win_docs,
+        accepted_docs: accepted, rejected_docs: 0,
+        stream: stream, prov: prov_arr, reset: reset_arr, weights: weights_arr
+    }
+}
+
+// Worker job layout (`*i64` of 18 slots):
+//   [0]=d_model, [1]=d_k, [2]=d_h, [3]=conv_k, [4]=coarse_ckpt, [5]=fine_ckpt, [6]=use_fp32_ckpt
+//   [7]=total_params, [8]=step_count, [9]=shared_params_ptr, [10]=shared_offs_ptr, [11]=worker_grads_ptr
+//   [12]=soa_dir_ptr, [13]=soa_dir_len, [14]=doc_lo, [15]=doc_hi, [16]=do_bwd, [17]=out_stats_f64_ptr
+fn nv3_dp_worker_main(job_raw: *u8) -> i64 {
+    let jb = job_raw as *i64
+    let d_model = jb[0]
+    let d_k = jb[1]
+    let d_h = jb[2]
+    let conv_k = jb[3]
+    let coarse_ckpt = jb[4]
+    let fine_ckpt = jb[5]
+    let use_fp32 = jb[6]
+    let total_params = jb[7]
+    let step_cnt = jb[8]
+    let params = jb[9] as *f64
+    let offs = jb[10] as *i64
+    let wgrads = jb[11] as *f64
+    let dir_ptr = jb[12] as *u8
+    let dir_len = jb[13]
+    let doc_lo = jb[14]
+    let doc_hi = jb[15]
+    let do_bwd = jb[16]
+    let out_st = jb[17] as *f64
+
+    out_st[0] = 0.0
+    out_st[1] = 0.0
+    out_st[2] = 0.0
+    nv3_zero(wgrads, total_params)
+
+    let dir_s = @string_new(dir_ptr, dir_len)
+    let sh = nv3_soa_stream_window(dir_s, doc_lo, doc_hi)
+    if sh.ok != 1 or sh.num_bytes < 2 {
+        nv3_win_free(sh)
+        return 0
+    }
+
+    let t_len = sh.num_bytes - 1
+    let in_b = @malloc(t_len * 8) as *i64
+    let tgt_b = @malloc(t_len * 8) as *i64
+    let lw = @malloc(t_len * 8) as *f64
+    let logits = @malloc(t_len * NV3_VOCAB_UTF8 * 8) as *f64
+
+    var wsum: f64 = 0.0
+    var t: i64 = 0
+    while t < t_len {
+        in_b[t] = (@read_u8(@ptr_add(sh.stream, t)) as i64) & 255
+        tgt_b[t] = (@read_u8(@ptr_add(sh.stream, t + 1)) as i64) & 255
+        if sh.reset[t + 1] != 0 {
+            lw[t] = 0.0
+        } else {
+            lw[t] = sh.weights[t + 1]
+            wsum = wsum + lw[t]
+        }
+        t = t + 1
+    }
+
+    let m = Nv3EkHnbModel {
+        cfg: Nv3EkHnbConfig {
+            d_model: d_model, d_k: d_k, d_h: d_h, conv_k: conv_k,
+            coarse_ckpt: coarse_ckpt, fine_ckpt: fine_ckpt, use_fp32_ckpt: use_fp32
+        },
+        total_params: total_params,
+        step_count: step_cnt,
+        params: params,
+        grads: wgrads,
+        offs: offs
+    }
+    let st = nv3_ek_hnb_fwd_bwd(m, Nv3EkHnbBatch {
+        t_len: t_len, prompt_len: 0,
+        in_bytes: in_b, prov_seq: sh.prov, reset_seq: sh.reset,
+        tgt_bytes: tgt_b, loss_weights: lw, logits_out: logits
+    }, do_bwd)
+
+    @free(in_b as *u8) @free(tgt_b as *u8) @free(lw as *u8) @free(logits as *u8)
+    nv3_win_free(sh)
+
+    if st.ok != 1 { return 0 }
+    out_st[0] = st.loss_nats
+    out_st[1] = wsum
+    out_st[2] = st.byte_steps as f64
+    return 1
+}
+
+// Runs `num_workers` OS threads in parallel over `soa_dir` document windows `[0..num_docs)`,
+// accumulating unnormalized loss + gradients into `acc_grads` in canonical worker order `0..W-1`.
+// `cfg9`: [0]=d_model,[1]=d_k,[2]=d_h,[3]=conv_k,[4]=coarse,[5]=fine,[6]=fp32,[7]=total_params,[8]=step_cnt
+fn nv3_mt_accumulate_shard_raw(
+    cfg9: *i64,
+    params: *f64,
+    offs: *i64,
+    soa_dir: string,
+    num_workers: i64,
+    do_bwd: i64,
+    acc_grads: *f64,
+    io_totals: *f64
+) -> i64 {
+    let ndocs = nv3_soa_peek_num_docs(soa_dir)
+    if ndocs <= 0 { return 0 }
+    var w_cnt = num_workers
+    if w_cnt < 1 { w_cnt = 1 }
+    if w_cnt > ndocs { w_cnt = ndocs }
+    if w_cnt > 8 { w_cnt = 8 }
+
+    let total_params = cfg9[7]
+    let handles = @malloc(w_cnt * 8) as *i64
+    let jobs = @malloc(w_cnt * 18 * 8) as *i64
+    let wgrads_all = @malloc(w_cnt * total_params * 8) as *f64
+    let wstats_all = @malloc(w_cnt * 3 * 8) as *f64
+
+    var w: i64 = 0
+    while w < w_cnt {
+        let d_lo = (w * ndocs) / w_cnt
+        let d_hi = ((w + 1) * ndocs) / w_cnt
+        let jb = @ptr_add(jobs as *u8, w * 18 * 8) as *i64
+        let wg = @ptr_add(wgrads_all as *u8, w * total_params * 8) as *f64
+        let ws = @ptr_add(wstats_all as *u8, w * 3 * 8) as *f64
+
+        jb[0] = cfg9[0]
+        jb[1] = cfg9[1]
+        jb[2] = cfg9[2]
+        jb[3] = cfg9[3]
+        jb[4] = cfg9[4]
+        jb[5] = cfg9[5]
+        jb[6] = cfg9[6]
+        jb[7] = total_params
+        jb[8] = cfg9[8]
+        jb[9] = params as i64
+        jb[10] = offs as i64
+        jb[11] = wg as i64
+        jb[12] = soa_dir as *u8 as i64
+        jb[13] = @string_len(soa_dir)
+        jb[14] = d_lo
+        jb[15] = d_hi
+        jb[16] = do_bwd
+        jb[17] = ws as i64
+
+        handles[w] = @thread_create("nv3_dp_worker_main", jb as *u8)
+        w = w + 1
+    }
+
+    var all_ok: i64 = 1
+    w = 0
+    while w < w_cnt {
+        let rc = @thread_join(handles[w])
+        if rc != 1 { all_ok = 0 }
+        w = w + 1
+    }
+
+    if all_ok == 1 {
+        w = 0
+        while w < w_cnt {
+            let wg = @ptr_add(wgrads_all as *u8, w * total_params * 8) as *f64
+            let ws = @ptr_add(wstats_all as *u8, w * 3 * 8) as *f64
+            io_totals[0] = io_totals[0] + ws[0]
+            io_totals[1] = io_totals[1] + ws[1]
+            io_totals[2] = io_totals[2] + ws[2]
+            if do_bwd != 0 {
+                var p: i64 = 0
+                while p < total_params {
+                    acc_grads[p] = acc_grads[p] + wg[p]
+                    p = p + 1
+                }
+            }
+            w = w + 1
+        }
+        io_totals[4] = io_totals[4] + (ndocs as f64)
+    }
+
+    @free(handles as *u8)
+    @free(jobs as *u8)
+    @free(wgrads_all as *u8)
+    @free(wstats_all as *u8)
+    return if all_ok == 1 { w_cnt } else { 0 }
+}
+
+// Verifies gradient & loss equivalence between 1-worker serial execution and `num_workers` OS-threaded
+// execution on `soa_dir`. Writes `[0]=loss_diff, [1]=max_grad_diff, [2]=w1_bpb, [3]=wn_bpb` into `out_diff`.
+fn nv3_mt_verify_worker_determinism(
+    soa_dir: string,
+    d_model: i64,
+    d_k: i64,
+    d_h: i64,
+    num_workers: i64,
+    seed: i64,
+    out_diff: *f64
+) -> i64 {
+    let tr = nv3_trainer_create(Nv3TrainerCfg {
+        d_model: d_model, d_k: d_k, d_h: d_h, conv_k: 4,
+        coarse_ckpt: 8, fine_ckpt: 4, use_fp32_ckpt: 0, seed: seed
+    })
+    let cfg9 = @malloc(72) as *i64
+    cfg9[0] = tr.d_model cfg9[1] = tr.d_k cfg9[2] = tr.d_h cfg9[3] = tr.conv_k
+    cfg9[4] = tr.coarse_ckpt cfg9[5] = tr.fine_ckpt cfg9[6] = tr.use_fp32_ckpt
+    cfg9[7] = tr.total_params cfg9[8] = 0
+
+    let g1 = @malloc(tr.total_params * 8) as *f64
+    let gn = @malloc(tr.total_params * 8) as *f64
+    let t1 = @malloc(40) as *f64
+    let tn = @malloc(40) as *f64
+    nv3_zero(g1, tr.total_params) nv3_zero(gn, tr.total_params)
+    nv3_zero(t1, 5) nv3_zero(tn, 5)
+
+    let ok1 = nv3_mt_accumulate_shard_raw(cfg9, tr.params, tr.offs, soa_dir, 1, 1, g1, t1)
+    let okn = nv3_mt_accumulate_shard_raw(cfg9, tr.params, tr.offs, soa_dir, num_workers, 1, gn, tn)
+
+    var max_gdiff: f64 = 0.0
+    var i: i64 = 0
+    while i < tr.total_params {
+        let df = nv3_abs(g1[i] - gn[i])
+        if df > max_gdiff { max_gdiff = df }
+        i = i + 1
+    }
+    let loss_diff = nv3_abs(t1[0] - tn[0])
+    let inv_ln2 = 1.4426950408889634
+    out_diff[0] = loss_diff
+    out_diff[1] = max_gdiff
+    out_diff[2] = if t1[1] > 0.0 { (t1[0] / t1[1]) * inv_ln2 } else { 0.0 }
+    out_diff[3] = if tn[1] > 0.0 { (tn[0] / tn[1]) * inv_ln2 } else { 0.0 }
+
+    @free(cfg9 as *u8) @free(g1 as *u8) @free(gn as *u8) @free(t1 as *u8) @free(tn as *u8)
+    nv3_trainer_free(tr)
+    if ok1 <= 0 or okn <= 0 { return 0 }
+    return 1
+}
+
+// End-to-end Multi-Shard Data-Parallel Scaled Trainer:
+// Streams across `shard_a` and `shard_b` (`shard_b=""` for single shard) using `num_workers` OS threads,
+// trains for `steps` LIR-PreOpt steps, evaluates on `eval_shard`, saves NPG-v3 checkpoint to `out_npg`,
+// and writes `[0]=init_train_bpb, [1]=final_train_bpb, [2]=eval_bpb, [3]=eval_ece, [4]=total_params, [5]=total_docs`
+// into `out_summary`.
+// `dims4`: [0]=d_model, [1]=d_k, [2]=d_h, [3]=seed
+// `sched3`: [0]=steps, [1]=num_workers, [2]=dtype_code
+fn nv3_mt_train_multishard_npg(
+    shard_a: string,
+    shard_b: string,
+    eval_shard: string,
+    out_npg: string,
+    dims4: *i64,
+    sched3: *i64,
+    lr: f64,
+    out_summary: *f64
+) -> i64 {
+    let d_model = dims4[0]
+    let d_k = dims4[1]
+    let d_h = dims4[2]
+    let seed = dims4[3]
+    let steps = sched3[0]
+    let num_workers = sched3[1]
+    let dtype_code = sched3[2]
+
+    let tr = nv3_trainer_create(Nv3TrainerCfg {
+        d_model: d_model, d_k: d_k, d_h: d_h, conv_k: 4,
+        coarse_ckpt: 8, fine_ckpt: 4, use_fp32_ckpt: 1, seed: seed
+    })
+    let cfg9 = @malloc(72) as *i64
+    let totals = @malloc(40) as *f64
+    let inv_ln2 = 1.4426950408889634
+
+    var init_bpb: f64 = 0.0
+    var final_bpb: f64 = 0.0
+    var final_docs: f64 = 0.0
+    var s: i64 = 0
+    while s < steps {
+        cfg9[0] = tr.d_model cfg9[1] = tr.d_k cfg9[2] = tr.d_h cfg9[3] = tr.conv_k
+        cfg9[4] = tr.coarse_ckpt cfg9[5] = tr.fine_ckpt cfg9[6] = tr.use_fp32_ckpt
+        cfg9[7] = tr.total_params cfg9[8] = tr.step_box[0]
+
+        nv3_zero(tr.grads, tr.total_params)
+        nv3_zero(totals, 5)
+
+        let wa = nv3_mt_accumulate_shard_raw(cfg9, tr.params, tr.offs, shard_a, num_workers, 1, tr.grads, totals)
+        if wa <= 0 {
+            @free(cfg9 as *u8) @free(totals as *u8) nv3_trainer_free(tr)
+            return 0
+        }
+        if @string_len(shard_b) > 0 {
+            let wb = nv3_mt_accumulate_shard_raw(cfg9, tr.params, tr.offs, shard_b, num_workers, 1, tr.grads, totals)
+            if wb <= 0 {
+                @free(cfg9 as *u8) @free(totals as *u8) nv3_trainer_free(tr)
+                return 0
+            }
+        }
+        if nv3_trainer_apply_grads(tr, lr, 1.0) != 1 {
+            @free(cfg9 as *u8) @free(totals as *u8) nv3_trainer_free(tr)
+            return 0
+        }
+        let step_bpb = if totals[1] > 0.0 { (totals[0] / totals[1]) * inv_ln2 } else { 0.0 }
+        if s == 0 { init_bpb = step_bpb }
+        final_bpb = step_bpb
+        final_docs = totals[4]
+        s = s + 1
+    }
+
+    let saved = nv3_trainer_save_npg(tr, out_npg, dtype_code)
+    let bpb_box = @malloc(8) as *f64
+    let ece = nv3_trainer_eval_soa_ece(tr, eval_shard, 10, bpb_box)
+    let ev_bpb = bpb_box[0]
+    @free(bpb_box as *u8)
+    out_summary[0] = init_bpb
+    out_summary[1] = final_bpb
+    out_summary[2] = ev_bpb
+    out_summary[3] = ece
+    out_summary[4] = tr.total_params as f64
+    out_summary[5] = final_docs
+
+    @free(cfg9 as *u8)
+    @free(totals as *u8)
+    nv3_trainer_free(tr)
+    if saved != 1 or ev_bpb >= 900.0 { return 0 }
+    return 1
+}

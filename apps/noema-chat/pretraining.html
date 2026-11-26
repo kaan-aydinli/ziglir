@@ -45,10 +45,10 @@
           </div>
           <div class="format-guide">
             <div class="section-label">KONU AYIRMA FORMATI</div>
-            <p>Her konu bloğu eğitim verisi olarak alınır; büyük bloklar yaklaşık 1 MiB’lık kayıtlara bölünür. Ayraç satırda tek başına üç tire olmalı:</p>
+            <p>Her konu bloğu eğitim verisi olarak alınır; büyük bloklar yaklaşık 1 MiB’lık kayıtlara bölünür. Konular arasında ayraç olarak <code>&lt;veriayrimi&gt;</code> kullanılır:</p>
             <pre>Trabzon'un kıyı iklimi ve yağış örüntüleri.
 
----
+&lt;veriayrimi&gt;
 
 Karadeniz bölgesinin coğrafi özellikleri.</pre>
             <small>Boş bloklar atlanır; uzun konular otomatik olarak yaklaşık 1 MiB eğitim parçalarına bölünür. Boyut sistem kaynaklarıyla sınırlıdır.</small>

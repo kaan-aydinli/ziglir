@@ -1,3 +1,8 @@
+// LEGACY / ISOLATED (NOEMA v3 Phase 0): exemplar-retrieval pretrain prototype.
+// This file is NOT NOEMA v3 weight-generation. New work belongs under ai/src/noema_v3/.
+// Do not report this path as noema_v3_weight_generation; output_mode must remain
+// legacy_retrieval_exemplar when served through legacy backends.
+//
 // NOEMA-Phi pretraining and inference prototype, LIR-only model execution.
 // Raw UTF-8 byte streams; no tokenizer, fixed vocabulary, attention/softmax,
 // MLP, backprop tape, or external optimizer. The online core is bounded field
@@ -940,25 +945,47 @@ fn np_pack_topic(fd: i64,bytes: *u8,raw_start: i64,raw_end: i64) -> i64 {
     if has_content==0 { return 0 }
     return noema_pretrain_nbin_write(fd,@ptr_add(bytes,raw_start),raw_end-raw_start,0,0)
 }
+fn np_is_veriayrimi(bytes: *u8, length: i64, pos: i64) -> i64 {
+    if pos < 0 or (pos + 12) > length { return 0 }
+    if ((@read_u8(@ptr_add(bytes, pos)) as i64) & 255) != 60 { return 0 }
+    if ((@read_u8(@ptr_add(bytes, pos + 1)) as i64) & 255) != 118 { return 0 }
+    if ((@read_u8(@ptr_add(bytes, pos + 2)) as i64) & 255) != 101 { return 0 }
+    if ((@read_u8(@ptr_add(bytes, pos + 3)) as i64) & 255) != 114 { return 0 }
+    if ((@read_u8(@ptr_add(bytes, pos + 4)) as i64) & 255) != 105 { return 0 }
+    if ((@read_u8(@ptr_add(bytes, pos + 5)) as i64) & 255) != 97 { return 0 }
+    if ((@read_u8(@ptr_add(bytes, pos + 6)) as i64) & 255) != 121 { return 0 }
+    if ((@read_u8(@ptr_add(bytes, pos + 7)) as i64) & 255) != 114 { return 0 }
+    if ((@read_u8(@ptr_add(bytes, pos + 8)) as i64) & 255) != 105 { return 0 }
+    if ((@read_u8(@ptr_add(bytes, pos + 9)) as i64) & 255) != 109 { return 0 }
+    if ((@read_u8(@ptr_add(bytes, pos + 10)) as i64) & 255) != 105 { return 0 }
+    if ((@read_u8(@ptr_add(bytes, pos + 11)) as i64) & 255) != 62 { return 0 }
+    return 1
+}
 fn noema_pretrain_pack_topics(fd: i64,bytes: *u8,length: i64,payload_bytes: *i64) -> i64 {
     payload_bytes[0]=0
     if length<0 { return -1 }
     var start: i64=0
-    var line: i64=0
+    var pos: i64=0
     var count: i64=0
-    while line<=length {
-        var end=line
-        while end<length and (@read_u8(@ptr_add(bytes,end)) as i64)!=10 { end=end+1 }
-        var physical=end
-        if physical>line and (@read_u8(@ptr_add(bytes,physical-1)) as i64)==13 { physical=physical-1 }
-        let sep=physical-line==3 and (@read_u8(@ptr_add(bytes,line)) as i64)==45 and (@read_u8(@ptr_add(bytes,line+1)) as i64)==45 and (@read_u8(@ptr_add(bytes,line+2)) as i64)==45
-        if sep {
-            let wrote=np_pack_topic(fd,bytes,start,line)
-            if wrote<0 { return -1 }
-            if wrote>0 { count=count+1 payload_bytes[0]=payload_bytes[0]+wrote }
-            start=if end<length { end+1 } else { length }
+    while pos < length {
+        if np_is_veriayrimi(bytes, length, pos) == 1 {
+            let wrote = np_pack_topic(fd, bytes, start, pos)
+            if wrote < 0 { return -1 }
+            if wrote > 0 { count = count + 1 payload_bytes[0] = payload_bytes[0] + wrote }
+            // Omit trailing line-ending when <veriayrimi> stands alone on its line
+            var next_pos = pos + 12
+            if pos == 0 or ((@read_u8(@ptr_add(bytes, pos - 1)) as i64) & 255) == 10 {
+                if next_pos < length and ((@read_u8(@ptr_add(bytes, next_pos)) as i64) & 255) == 10 {
+                    next_pos = next_pos + 1
+                } else if (next_pos + 1) < length and ((@read_u8(@ptr_add(bytes, next_pos)) as i64) & 255) == 13 and ((@read_u8(@ptr_add(bytes, next_pos + 1)) as i64) & 255) == 10 {
+                    next_pos = next_pos + 2
+                }
+            }
+            start = next_pos
+            pos = next_pos
+        } else {
+            pos = pos + 1
         }
-        if end>=length { line=length+1 } else { line=end+1 }
     }
     let last=np_pack_topic(fd,bytes,start,length)
     if last<0 { return -1 }

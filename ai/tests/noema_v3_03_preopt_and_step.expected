@@ -1,0 +1,6 @@
+PREOPT_CHECK test=newton_schulz_wide_and_tall_ortho pass=1
+PREOPT_CHECK test=preopt_fail_closed_nan_inf_guard pass=1
+PREOPT_CHECK test=preopt_lr_warmup_cosine_schedule pass=1
+PREOPT_CHECK test=provenance_loss_mask_zero_grad pass=1
+PREOPT_CHECK test=raw_utf8_microblock_bpb_descent pass=1
+ALL_PASS

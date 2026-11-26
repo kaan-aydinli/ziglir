@@ -1,0 +1,484 @@
+// NOEMA v3 Pure-LIR Generative Corpus Trainer (`ai/noema_v3_upload_trainer.lir`)
+// Trains `NPG-v3` continuous `EK-HNB + HAİB` weights + `NV3G1` Kneser-Ney Anti-Verbatim Graph.
+// Stdin protocol (5 lines):
+//   1: input UTF-8 `.txt` path (`<veriayrimi>` delimited)
+//   2: optional bridge scaffold `.txt` path (or `-`)
+//   3: output `.npg3` checkpoint path (or `-`)
+//   4: output `.nv3g` generative graph path
+//   5: optional 24-byte progress file path (or `-`)
+//   6: optional SoA shard output directory (or `-`); when set, the `<veriayrimi>` payload is also
+//      packed into a `stream.bin/prov.bin/reset.bit/weight.bin/docs.idx` shard with a
+//      `shard_meta.json` manifest so the upload is immediately `manifest_guard.py` compliant.
+
+import "src/noema_v3/noema_v3_synth.lir"
+
+fn nv3_ut_write_progress(path: string, cur: i64, tot: i64, bytes_done: i64) {
+    if @string_len(path) == 0 or @string_eq(path, "-") { return }
+    let fd = @open(path, 577, 420)
+    if fd < 0 { return }
+    let fr = @malloc(24) as *i64
+    fr[0] = cur
+    fr[1] = if tot > 0 { tot } else { 1 }
+    fr[2] = bytes_done
+    let _w = @write(fd, fr as *u8, 24)
+    @free(fr as *u8)
+    @close(fd)
+}
+
+fn nv3_ut_read_file_cap(path: string, max_bytes: i64, out_len: *i64) -> *u8 {
+    out_len[0] = 0
+    if @string_len(path) == 0 or @string_eq(path, "-") { return 0 as *u8 }
+    let fd = @open(path, 0, 0)
+    if fd < 0 { return 0 as *u8 }
+    let buf = @malloc(max_bytes)
+    var used: i64 = 0
+    while used < max_bytes {
+        let chunk = if (max_bytes - used) > 65536 { 65536 } else { max_bytes - used }
+        let got = @read(fd, @ptr_add(buf, used), chunk)
+        if got <= 0 { break }
+        used = used + got
+    }
+    @close(fd)
+    if used <= 0 { @free(buf) return 0 as *u8 }
+    out_len[0] = used
+    return buf
+}
+
+fn nv3_ut_next_line(buf: *u8, pos_box: *i64, total: i64) -> string {
+    let start = pos_box[0]
+    if start >= total { return "" }
+    var p = start
+    while p < total and (((@read_u8(@ptr_add(buf, p)) as i64) & 255) != 10) { p = p + 1 }
+    var end = p
+    if end > start and (((@read_u8(@ptr_add(buf, end - 1)) as i64) & 255) == 13) { end = end - 1 }
+    pos_box[0] = if p < total { p + 1 } else { total }
+    return nv3_syn_slice_str(buf, start, end - start)
+}
+
+// ---- Pure-LIR SHA-256 (FIPS 180-4) ------------------------------------------------------------
+// `manifest_guard.py` verifies `sha256` for every SoA file, so the manifest must carry real digests.
+// The implementation below is dependency-free and 32-bit-lane based, which keeps every temporary
+// inside the i64 register file without relying on unsigned 64-bit wraparound.
+
+
+fn nv3_sha_k_table() -> string {
+    return "428a2f98 71374491 b5c0fbcf e9b5dba5 3956c25b 59f111f1 923f82a4 ab1c5ed5 d807aa98 12835b01 243185be 550c7dc3 72be5d74 80deb1fe 9bdc06a7 c19bf174 e49b69c1 efbe4786 0fc19dc6 240ca1cc 2de92c6f 4a7484aa 5cb0a9dc 76f988da 983e5152 a831c66d b00327c8 bf597fc7 c6e00bf3 d5a79147 06ca6351 14292967 27b70a85 2e1b2138 4d2c6dfc 53380d13 650a7354 766a0abb 81c2c92e 92722c85 a2bfe8a1 a81a664b c24b8b70 c76c51a3 d192e819 d6990624 f40e3585 106aa070 19a4c116 1e376c08 2748774c 34b0bcb5 391c0cb3 4ed8aa4a 5b9cca4f 682e6ff3 748f82ee 78a5636f 84c87814 8cc70208 90befffa a4506ceb bef9a3f7 c67178f2"
+}
+
+fn nv3_sha_hexval(b: i64) -> i64 {
+    if b >= 48 and b <= 57 { return b - 48 }
+    if b >= 97 and b <= 102 { return b - 87 }
+    if b >= 65 and b <= 70 { return b - 55 }
+    return 0
+}
+
+fn nv3_sha_hex8(s: string, idx: i64) -> i64 {
+    let base = idx * 9
+    let sp = s.ptr as *u8
+    var v: i64 = 0
+    var i: i64 = 0
+    while i < 8 {
+        v = (v << 4) | nv3_sha_hexval((@read_u8(@ptr_add(sp, base + i)) as i64) & 255)
+        i = i + 1
+    }
+    return v & 4294967295
+}
+
+fn nv3_sha_rotr(x: i64, n: i64) -> i64 {
+    return ((x >> n) | (x << (32 - n))) & 4294967295
+}
+
+fn nv3_sha_add(x: i64, y: i64) -> i64 {
+    return (x + y) & 4294967295
+}
+
+fn nv3_sha_round(f: *i64, w: *i64, k: i64) {
+    let a = f[0]
+    let b = f[1]
+    let c = f[2]
+    let d = f[3]
+    let e = f[4]
+    let ee = f[5]
+    let g = f[6]
+    let h = f[7]
+    let s1 = nv3_sha_rotr(e, 6) ^ nv3_sha_rotr(e, 11) ^ nv3_sha_rotr(e, 25)
+    let ch = (e & ee) ^ ((e ^ 4294967295) & g)
+    let t1 = nv3_sha_add(nv3_sha_add(nv3_sha_add(h, s1), nv3_sha_add(ch, k)), w[0])
+    let s0 = nv3_sha_rotr(a, 2) ^ nv3_sha_rotr(a, 13) ^ nv3_sha_rotr(a, 22)
+    let maj = (a & b) ^ (a & c) ^ (b & c)
+    let t2 = nv3_sha_add(s0, maj)
+    f[7] = g
+    f[6] = ee
+    f[5] = e
+    f[4] = nv3_sha_add(d, t1)
+    f[3] = c
+    f[2] = b
+    f[1] = a
+    f[0] = nv3_sha_add(t1, t2)
+}
+
+fn nv3_sha_block(st: *i64, buf: *u8, off: i64, w: *i64, f: *i64, cw: *i64) {
+    let kstr = nv3_sha_k_table()
+    var i: i64 = 0
+    while i < 16 {
+        let p = off + (i * 4)
+        let hi = ((@read_u8(@ptr_add(buf, p)) as i64) & 255) << 24
+        let b1 = ((@read_u8(@ptr_add(buf, p + 1)) as i64) & 255) << 16
+        let b2 = ((@read_u8(@ptr_add(buf, p + 2)) as i64) & 255) << 8
+        let b3 = (@read_u8(@ptr_add(buf, p + 3)) as i64) & 255
+        w[i] = (hi | b1 | b2 | b3) & 4294967295
+        i = i + 1
+    }
+    i = 16
+    while i < 64 {
+        let s0 = nv3_sha_rotr(w[i - 15], 7) ^ nv3_sha_rotr(w[i - 15], 18) ^ (w[i - 15] >> 3)
+        let s1 = nv3_sha_rotr(w[i - 2], 17) ^ nv3_sha_rotr(w[i - 2], 19) ^ (w[i - 2] >> 10)
+        let sum = nv3_sha_add(nv3_sha_add(nv3_sha_add(w[i - 16], s0), w[i - 7]), s1)
+        w[i] = sum & 4294967295
+        i = i + 1
+    }
+    i = 0
+    while i < 8 { f[i] = st[i] i = i + 1 }
+    i = 0
+    while i < 64 {
+        cw[0] = w[i]
+        nv3_sha_round(f, cw, nv3_sha_hex8(kstr, i))
+        i = i + 1
+    }
+    i = 0
+    while i < 8 {
+        st[i] = nv3_sha_add(st[i], f[i])
+        i = i + 1
+    }
+}
+
+fn nv3_sha256(buf: *u8, len: i64, out_be: *u8) {
+    let st = @malloc(64) as *i64
+    let w = @malloc(512) as *i64
+    let f = @malloc(64) as *i64
+    let cw = @malloc(8) as *i64
+    st[0] = 1779033703 st[1] = 3144134277 st[2] = 1013904242 st[3] = 2773480762
+    st[4] = 1359893119 st[5] = 2600822924 st[6] = 528734635 st[7] = 1541459225
+    let full = len / 64
+    var b: i64 = 0
+    while b < full {
+        nv3_sha_block(st, buf, b * 64, w, f, cw)
+        b = b + 1
+    }
+    let rem = len - (full * 64)
+    let tail = @malloc(128)
+    @memset(tail, 0, 128)
+    var t: i64 = 0
+    while t < rem {
+        @write_u8(@ptr_add(tail, t), @read_u8(@ptr_add(buf, full * 64 + t)))
+        t = t + 1
+    }
+    @write_u8(@ptr_add(tail, rem), 128 as u8)
+    let bits = len * 8
+    let tail_len = if rem >= 56 { 128 } else { 64 }
+    var k: i64 = 0
+    while k < 8 {
+        @write_u8(@ptr_add(tail, tail_len - 1 - k), ((bits >> (k * 8)) & 255) as u8)
+        k = k + 1
+    }
+    var nb: i64 = 0
+    while nb < (tail_len / 64) {
+        nv3_sha_block(st, tail, nb * 64, w, f, cw)
+        nb = nb + 1
+    }
+    k = 0
+    while k < 8 {
+        var j: i64 = 0
+        while j < 4 {
+            @write_u8(@ptr_add(out_be, k * 4 + j), ((st[k] >> (24 - (j * 8))) & 255) as u8)
+            j = j + 1
+        }
+        k = k + 1
+    }
+    @free(cw as *u8) @free(f as *u8) @free(w as *u8) @free(tail) @free(st as *u8)
+}
+
+fn nv3_ut_put(buf: *u8, pos: *i64, s: string) {
+    let n = @string_len(s)
+    let sp = s.ptr as *u8
+    var i: i64 = 0
+    while i < n {
+        @write_u8(@ptr_add(buf, pos[0] + i), @read_u8(@ptr_add(sp, i)))
+        i = i + 1
+    }
+    pos[0] = pos[0] + n
+}
+
+fn nv3_ut_put_int(buf: *u8, pos: *i64, v: i64) {
+    nv3_ut_put(buf, pos, @int_to_string(v))
+}
+
+fn nv3_ut_put_hex2(buf: *u8, pos: *i64, b: i64) {
+    let digits = "0123456789abcdef"
+    let dp = digits.ptr as *u8
+    @write_u8(@ptr_add(buf, pos[0]), @read_u8(@ptr_add(dp, (b >> 4) & 15)))
+    @write_u8(@ptr_add(buf, pos[0] + 1), @read_u8(@ptr_add(dp, b & 15)))
+    pos[0] = pos[0] + 2
+}
+
+fn nv3_ut_put_hex(buf: *u8, pos: *i64, p: *u8, n: i64) {
+    var i: i64 = 0
+    while i < n {
+        nv3_ut_put_hex2(buf, pos, (@read_u8(@ptr_add(p, i)) as i64) & 255)
+        i = i + 1
+    }
+}
+
+// Writes a `manifest_guard.py`-compatible `shard_meta.json` (`version`, `shard_id`, `files` with
+// `byte_length` + `sha256` for every required SoA file), computed in pure LIR.
+fn nv3_ut_write_shard_meta(dir: string, num_docs: i64) {
+    let n_stream = "stream.bin"
+    let n_prov = "prov.bin"
+    let n_reset = "reset.bit"
+    let n_weight = "weight.bin"
+    let n_docs = "docs.idx"
+    let nb = @malloc(8) as *i64
+    let buf = @malloc(4096)
+    let pos = @malloc(8) as *i64
+    pos[0] = 0
+    nv3_ut_put(buf, pos, "{\n  \"version\": 3,\n  \"shard_id\": \"user_upload\",\n  \"delimiter\": \"<veriayrimi>\",\n  \"num_docs\": ")
+    nv3_ut_put_int(buf, pos, num_docs)
+    nv3_ut_put(buf, pos, ",\n  \"files\": {")
+    var k: i64 = 0
+    while k < 5 {
+        let name = if k == 0 { n_stream } else if k == 1 { n_prov } else if k == 2 { n_reset } else if k == 3 { n_weight } else { n_docs }
+        let path = dir + "/" + name
+        let fb = nv3_ut_read_file_cap(path, 8388608, nb)
+        if (fb as i64) != 0 {
+            nv3_ut_put(buf, pos, if k == 0 { "\n    \"" } else { ",\n    \"" })
+            nv3_ut_put(buf, pos, name)
+            nv3_ut_put(buf, pos, "\": {\"byte_length\": ")
+            nv3_ut_put_int(buf, pos, nb[0])
+            nv3_ut_put(buf, pos, ", \"sha256\": \"")
+            let dig = @malloc(32)
+            nv3_sha256(fb, nb[0], dig)
+            nv3_ut_put_hex(buf, pos, dig, 32)
+            @free(dig)
+            nv3_ut_put(buf, pos, "\"}")
+            @free(fb)
+        }
+        k = k + 1
+    }
+    nv3_ut_put(buf, pos, "\n  }\n}\n")
+    let meta_path = dir + "/shard_meta.json"
+    let fd = @open(meta_path, 577, 420)
+    if fd >= 0 {
+        let _w = @write(fd, buf, pos[0])
+        @close(fd)
+    }
+    @free(pos as *u8)
+    @free(buf)
+    @free(nb as *u8)
+}
+
+fn main() -> i64 {
+    let in_cfg = @malloc(4096)
+    var cn: i64 = 0
+    while cn < 4096 {
+        let g = @read(0, @ptr_add(in_cfg, cn), 4096 - cn)
+        if g <= 0 { break }
+        cn = cn + g
+    }
+    if cn <= 0 {
+        @free(in_cfg)
+        println("NOEMA_TRAIN_V3") println("ok=0") println("error=empty_trainer_config")
+        return 1
+    }
+
+    let pbox = @malloc(8) as *i64
+    pbox[0] = 0
+    let in_txt = nv3_ut_next_line(in_cfg, pbox, cn)
+    let bridge_txt = nv3_ut_next_line(in_cfg, pbox, cn)
+    let out_npg = nv3_ut_next_line(in_cfg, pbox, cn)
+    let out_nv3g = nv3_ut_next_line(in_cfg, pbox, cn)
+    let prog_path = nv3_ut_next_line(in_cfg, pbox, cn)
+    let out_soa = nv3_ut_next_line(in_cfg, pbox, cn)
+    @free(pbox as *u8)
+
+    if @string_len(in_txt) == 0 or @string_len(out_nv3g) == 0 {
+        @free(in_cfg)
+        println("NOEMA_TRAIN_V3") println("ok=0") println("error=missing_paths")
+        return 1
+    }
+
+    let len_box = @malloc(16) as *i64
+    let main_buf = nv3_ut_read_file_cap(in_txt, 4194304, len_box)
+    let main_len = len_box[0]
+    if main_len <= 0 or (main_buf as i64) == 0 {
+        @free(len_box as *u8) @free(in_cfg)
+        println("NOEMA_TRAIN_V3") println("ok=0") println("error=failed_to_read_input_txt")
+        return 1
+    }
+
+    if nv3_syn_utf8_valid(main_buf, main_len) != 1 {
+        @free(main_buf) @free(len_box as *u8) @free(in_cfg)
+        println("NOEMA_TRAIN_V3") println("ok=0") println("error=invalid_utf8_corpus")
+        return 1
+    }
+
+    let total_stages: i64 = 100
+    nv3_ut_write_progress(prog_path, 15, total_stages, main_len / 4)
+
+    let br_buf = nv3_ut_read_file_cap(bridge_txt, 262144, @ptr_add(len_box as *u8, 8) as *i64)
+    let br_len = len_box[1]
+    var comb_len = main_len
+    var comb_buf = main_buf
+    if br_len > 0 and (br_buf as i64) != 0 {
+        let sep = "\n<veriayrimi>\n"
+        let sep_len = @string_len(sep)
+        comb_len = main_len + sep_len + br_len
+        comb_buf = @malloc(comb_len)
+        var i: i64 = 0
+        while i < main_len { @write_u8(@ptr_add(comb_buf, i), @read_u8(@ptr_add(main_buf, i))) i = i + 1 }
+        i = 0
+        while i < sep_len { @write_u8(@ptr_add(comb_buf, main_len + i), @read_u8(@ptr_add(sep.ptr as *u8, i))) i = i + 1 }
+        i = 0
+        while i < br_len { @write_u8(@ptr_add(comb_buf, main_len + sep_len + i), @read_u8(@ptr_add(br_buf, i))) i = i + 1 }
+        @free(br_buf)
+    }
+
+    let gh = nv3_syn_build_from_utf8(comb_buf, comb_len)
+    if comb_buf != main_buf { @free(comb_buf) }
+    if gh[0] != 1 {
+        nv3_syn_graph_free(gh) @free(main_buf) @free(len_box as *u8) @free(in_cfg)
+        println("NOEMA_TRAIN_V3") println("ok=0") println("error=nv3g_graph_build_failed")
+        return 1
+    }
+
+    nv3_ut_write_progress(prog_path, 55, total_stages, main_len / 2)
+
+    if nv3_syn_save_nv3g(gh, out_nv3g) != 1 {
+        nv3_syn_graph_free(gh) @free(main_buf) @free(len_box as *u8) @free(in_cfg)
+        println("NOEMA_TRAIN_V3") println("ok=0") println("error=nv3g_save_failed")
+        return 1
+    }
+
+    // Manifest-guarded SoA shard for the uploaded corpus: the same `<veriayrimi>` payload that
+    // trains the graph is also available as pointer-addressed spans for KHG grounding audits.
+    var soa_docs: i64 = 0
+    if @string_len(out_soa) > 0 and @string_eq(out_soa, "-") == false {
+        let _mk = @mkdir(out_soa, 493)
+        let pay_box = @malloc(8) as *i64
+        soa_docs = nv3_soa_pack_veriayrimi(out_soa, main_buf, main_len, NOEMA_V3_PROV_VERIFIED_KHG, pay_box)
+        @free(pay_box as *u8)
+        if soa_docs > 0 { nv3_ut_write_shard_meta(out_soa, soa_docs) }
+    }
+    nv3_ut_write_progress(prog_path, 92, total_stages, main_len)
+
+    var npg_steps: i64 = 0
+    if @string_len(out_npg) > 0 and @string_eq(out_npg, "-") == false {
+        let tr = nv3_trainer_create(Nv3TrainerCfg {
+            d_model: NV3_P6_D_MODEL, d_k: NV3_P6_D_K, d_h: NV3_P6_D_H, conv_k: NV3_P6_CONV_K,
+            coarse_ckpt: NV3_P6_COARSE_CKPT, fine_ckpt: NV3_P6_FINE_CKPT, use_fp32_ckpt: 1, seed: 42
+        })
+        let _warm = nv3_trainer_load_npg(tr, "ai/noema_v3/checkpoints/noema_v3_promoted.npg3")
+
+        let win_len: i64 = 48
+        let in_b = @malloc(win_len * 8) as *i64
+        let tgt_b = @malloc(win_len * 8) as *i64
+        let prov_w = @malloc(win_len * 8) as *i64
+        let rst_w = @malloc(win_len * 8) as *i64
+        let lw_w = @malloc(win_len * 8) as *f64
+        let logits_w = @malloc(win_len * NV3_VOCAB_UTF8 * 8) as *f64
+
+        let target_steps: i64 = 16
+        var st: i64 = 0
+        while st < target_steps {
+            var w_off: i64 = 0
+            if main_len > (win_len + 4) { w_off = (st * 97) % (main_len - win_len - 1) }
+            let cur_w = if main_len > (w_off + 2) {
+                if (main_len - w_off - 1) < win_len { main_len - w_off - 1 } else { win_len }
+            } else { 0 }
+            if cur_w >= 4 {
+                var wi: i64 = 0
+                while wi < cur_w {
+                    in_b[wi] = (@read_u8(@ptr_add(main_buf, w_off + wi)) as i64) & 255
+                    tgt_b[wi] = (@read_u8(@ptr_add(main_buf, w_off + wi + 1)) as i64) & 255
+                    prov_w[wi] = NOEMA_V3_PROV_VERIFIED_KHG
+                    rst_w[wi] = if wi == 0 { 1 } else { 0 }
+                    lw_w[wi] = 1.0
+                    wi = wi + 1
+                }
+                let mcfg = Nv3EkHnbConfig {
+                    d_model: tr.d_model, d_k: tr.d_k, d_h: tr.d_h, conv_k: tr.conv_k,
+                    coarse_ckpt: tr.coarse_ckpt, fine_ckpt: tr.fine_ckpt, use_fp32_ckpt: tr.use_fp32_ckpt
+                }
+                let m = Nv3EkHnbModel {
+                    cfg: mcfg, total_params: tr.total_params, step_count: tr.step_box[0],
+                    params: tr.params, grads: tr.grads, offs: tr.offs
+                }
+                let batch = Nv3EkHnbBatch {
+                    t_len: cur_w, prompt_len: 0,
+                    in_bytes: in_b, prov_seq: prov_w, reset_seq: rst_w,
+                    tgt_bytes: tgt_b, loss_weights: lw_w, logits_out: logits_w
+                }
+                let fb = nv3_ek_hnb_fwd_bwd(m, batch, 1)
+                if fb.ok == 1 {
+                    let _ap = nv3_trainer_apply_grads(tr, 0.015, 2.0)
+                    npg_steps = npg_steps + 1
+                }
+            }
+            nv3_ut_write_progress(prog_path, 55 + ((st + 1) * 35) / target_steps, total_stages, main_len)
+            st = st + 1
+        }
+        @free(logits_w as *u8) @free(lw_w as *u8) @free(rst_w as *u8)
+        @free(prov_w as *u8) @free(tgt_b as *u8) @free(in_b as *u8)
+
+        if nv3_trainer_save_npg(tr, out_npg, 1) != 1 {
+            nv3_trainer_free(tr) nv3_syn_graph_free(gh) @free(main_buf) @free(len_box as *u8) @free(in_cfg)
+            println("NOEMA_TRAIN_V3") println("ok=0") println("error=npg_save_failed")
+            return 1
+        }
+        nv3_trainer_free(tr)
+    }
+
+    let verify_ckpt = if @string_len(out_npg) > 0 and @string_eq(out_npg, "-") == false {
+        out_npg
+    } else {
+        "ai/noema_v3/checkpoints/noema_v3_promoted.npg3"
+    }
+    var clean_plen = if main_len < 96 { main_len } else { 96 }
+    while clean_plen > 16 {
+        let tb = (@read_u8(@ptr_add(main_buf, clean_plen - 1)) as i64) & 255
+        if tb < 128 { break }
+        clean_plen = clean_plen - 1
+    }
+    let vres = @malloc(256) as *i64
+    let probe_out = @malloc(384)
+    let probe_tel = @malloc(64) as *f64
+    vres[16] = probe_tel as i64
+    vres[17] = 384
+    vres[18] = 0
+    vres[19] = probe_out as i64
+    vres[20] = 0
+    vres[21] = main_buf as i64
+    vres[22] = clean_plen
+    let _vok = nv3_syn_infer_production(verify_ckpt, out_nv3g, vres)
+    let av_ok = vres[5]
+    let p_emit = vres[2]
+
+    @free(probe_tel as *u8) @free(probe_out) @free(vres as *u8)
+    nv3_ut_write_progress(prog_path, total_stages, total_stages, main_len)
+
+    println("NOEMA_TRAIN_V3")
+    println("ok=1")
+    print("topics=") printInt(gh[5])
+    print("atoms=") printInt(gh[1])
+    print("bigrams=") printInt(gh[3])
+    print("trigrams=") printInt(gh[4])
+    print("forbidden_4grams=") printInt(gh[6])
+    print("forbidden_sentences=") printInt(gh[7])
+    print("npg_steps=") printInt(npg_steps)
+    print("anti_verbatim_audit_ok=") printInt(av_ok)
+    print("probe_emitted_bytes=") printInt(p_emit)
+    print("soa_docs=") printInt(soa_docs)
+
+    nv3_syn_graph_free(gh)
+    @free(main_buf) @free(len_box as *u8) @free(in_cfg)
+    return if av_ok == 1 { 0 } else { 1 }
+}

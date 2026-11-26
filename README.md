@@ -159,6 +159,27 @@ python3 tests/browser_test.py ./zig-out/bin/lir
 zig build run -- version
 ```
 
+## NOEMA v3 — a full application written in LIR
+
+`ai/src/noema_v3/` is a production inference stack written entirely in LIR: a corpus trainer
+(`noema_v3_upload_trainer`), an inference binary (`noema_v3_chat_backend`), and an HTTP chat UI
+(`apps/noema-chat/`). It exists both as a working system and as a stress test of the language —
+the graph builder, UTF-8 normaliser and the provenance/synthesis passes are large enough to
+exercise the compiler's register allocation and function limits.
+
+The system is built around four properties that are checked, not asserted:
+
+| Property | Enforcement |
+| --- | --- |
+| Output is never copied from training data | forbidden 4-gram + sentence-hash index, checked on every reply |
+| Unknown topics are refused, not disguised | content-stem coverage gate; zero-byte abstention |
+| Prompt injection cannot reach the generator | needle scan with per-run tick budget; matches quarantined |
+| Claims are traced, not invented | KHG spans + proof counters reported per run |
+
+`python3 ai/noema_v3/phase10_prod_audit.py` runs 35 end-to-end checks against the shipped
+checkpoint, including byte-exact parity across the native, VM and C backends. See
+[apps/noema-chat/README.md](apps/noema-chat/README.md) for the HTTP surface and model layout.
+
 `lir init <name>` creates a **new directory** and refuses existing destinations;
 it never overwrites an existing project. See [Bootstrap review](docs/REVIEW.md)
 for the review scope, regression coverage, and remaining correctness priorities.

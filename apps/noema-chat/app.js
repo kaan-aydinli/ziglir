@@ -43,11 +43,14 @@ function appendModel(metrics, model) {
   avatar.textContent = 'N';
   const body = document.createElement('div');
   body.className = 'message-body';
+  const isV3 = String(metrics.outputMode || '').startsWith('noema_v3_');
   const meta = document.createElement('div');
   meta.className = 'message-meta';
-  const match = metrics.generatedBytes
-    ? ` · eğitim satırı benzerliği ${formatNumber(metrics.retrievalSimilarity, 3)}`
-    : ' · yeterince yakın eğitim satırı yok';
+  const match = isV3
+    ? ` · mod ${metrics.outputMode} · bayt olasılığı ${formatNumber(metrics.retrievalSimilarity, 4)} · KHG gözlem ${metrics.khgObservedSpans} (doğrulanan ${metrics.khgVerifiedSpans}) · saklı örnek 0`
+    : metrics.generatedBytes
+      ? ` · eğitim satırı benzerliği ${formatNumber(metrics.retrievalSimilarity, 3)}`
+      : ' · yeterince yakın eğitim satırı yok';
   meta.textContent = `${model.filePath} · ${formatModelDate(model.modifiedDate)}${match}`;
   const output = document.createElement('div');
   output.className = 'model-output';
@@ -56,7 +59,11 @@ function appendModel(metrics, model) {
   const visible = decoded.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '�');
   const generated = document.createElement('pre');
   generated.className = 'generated-output';
-  generated.textContent = metrics.generatedBytes ? visible : 'Güvenilir bir eğitim satırı eşleşmesi bulunamadı; model yanıt üretmedi.';
+  generated.textContent = metrics.generatedBytes
+    ? visible
+    : isV3
+      ? 'NOEMA v3 KHG kanıt/kaynak kapısı ABSTAIN (çekimser) kararı verdi; güvenilmez veya düşük güvenli iddia üretilmedi.'
+      : 'Güvenilir bir eğitim satırı eşleşmesi bulunamadı; model yanıt üretmedi.';
   const details = document.createElement('details');
   details.className = 'raw-output';
   const summary = document.createElement('summary');
@@ -99,10 +106,34 @@ function updateInspector(metrics) {
   document.querySelector('#metric-records').textContent = metrics.trainingRecords;
   document.querySelector('#metric-training-bytes').textContent = formatNumber(metrics.trainingBytes, 0);
   document.querySelector('#metric-do-count').textContent = metrics.trainingDoPerturbations;
-  document.querySelector('#model-card-title').textContent = metrics.modelId === 'noema_phi_large' ? 'NOEMA-Φ Large' : 'NOEMA-Φ Fresh';
+  const isV3 = String(metrics.outputMode || '').startsWith('noema_v3_');
+  document.querySelector('#metric-output-mode').textContent = metrics.outputMode || '—';
+  document.querySelector('#model-card-title').textContent = isV3
+    ? 'NOEMA v3 · EK-HNB'
+    : metrics.modelId === 'noema_phi_large'
+      ? 'NOEMA-Φ Large'
+      : 'NOEMA-Φ Fresh';
+  const verify = document.querySelector('#v3-verify');
+  verify.hidden = !isV3;
+  if (isV3) {
+    const yesNo = value => (Number(value) === 1 ? 'EVET' : 'HAYIR');
+    document.querySelector('#m-khg-observed').textContent = metrics.khgObservedSpans ?? 0;
+    document.querySelector('#m-khg-verified').textContent = metrics.khgVerifiedSpans ?? 0;
+    document.querySelector('#m-khg-quarantined').textContent = metrics.khgQuarantinedSpans ?? 0;
+    const anti = Number(metrics.antiVerbatimVerified) === 1;
+    document.querySelector('#m-anti-verbatim').textContent = anti ? 'DOĞRULANDI' : 'İHLAL';
+    document.querySelector('#m-anti-verbatim').style.color = anti ? '' : 'var(--danger, #d64545)';
+    document.querySelector('#m-ngram').textContent = metrics.maxCorpusNgramRun ?? 0;
+    document.querySelector('#m-proof').textContent = `${metrics.proofVerifiedClaims ?? 0} / ${metrics.proofRefutedClaims ?? 0}`;
+    document.querySelector('#m-symbolic').textContent = yesNo(metrics.symbolicSolved);
+    document.querySelector('#m-atoms').textContent = metrics.synthesizedAtoms ?? 0;
+    document.querySelector('#verify-state').textContent = metrics.abstained ? 'ÇEKİMSER' : 'GEÇTİ';
+  }
   document.querySelector('#run-state').textContent = 'TAMAMLANDI';
-  document.querySelector('#status-title').textContent = 'Alan işlendi';
-  document.querySelector('#status-copy').textContent = `${metrics.trainingRecords} kayıt · ${metrics.storedExemplars}/${metrics.memoryCapacity} örnek belleği · LIR native retrieval`;
+  document.querySelector('#status-title').textContent = isV3 ? 'NOEMA v3 ağırlık üretimi' : 'Alan işlendi';
+  document.querySelector('#status-copy').textContent = isV3
+    ? `${metrics.trainingRecords} adım · ${metrics.trainingBytes} ağırlık baytı · KHG=${metrics.trainingDoPerturbations} · Kanıt=${metrics.proofVerifiedClaims ?? 0}✓/${metrics.proofRefutedClaims ?? 0}✗ · saklı örnek 0`
+    : `${metrics.trainingRecords} kayıt · ${metrics.storedExemplars}/${metrics.memoryCapacity} örnek belleği · LIR native retrieval`;
   document.querySelector('#connection-label').textContent = 'LIR bağlı';
 }
 
@@ -185,6 +216,7 @@ document.querySelector('#clear-button').addEventListener('click', () => {
   document.querySelector('#stage-meter').style.width = '0';
   document.querySelector('#metric-energy').textContent = '—';
   document.querySelector('#metric-bytes').textContent = '—';
+  document.querySelector('#metric-output-mode').textContent = '—';
   document.querySelector('#run-state').textContent = 'BEKLENİYOR';
   document.querySelector('#status-title').textContent = 'Hazır';
   document.querySelector('#status-copy').textContent = 'LIR backend bağlantısı bekleniyor';

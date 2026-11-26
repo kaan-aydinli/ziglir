@@ -389,7 +389,7 @@ pub const IRInst = struct {
 
 pub const MAX_INSTS_PER_BLOCK: u32 = 384;
 pub const MAX_BLOCKS_PER_FN: u32 = 192;
-pub const MAX_FNS: u32 = 256;
+pub const MAX_FNS: u32 = 320;
 
 /// Basic block: a sequence of instructions ending with a terminator
 pub const IRBlock = struct {

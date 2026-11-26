@@ -15,7 +15,7 @@ const DiagList = diag_mod.DiagList;
 const printErr = util.printErr;
 const printErrUsize = util.printErrUsize;
 
-pub const MAX_AST_NODES: usize = 16384;
+pub const MAX_AST_NODES: usize = 65536;
 pub const MAX_STRUCTS: usize = 256;
 pub const MAX_ENUMS: usize = 128;
 pub const MAX_CONSTS: usize = 256;

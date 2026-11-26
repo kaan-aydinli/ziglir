@@ -1,0 +1,28 @@
+{
+  "version": "3.0.0",
+  "shard_id": "soa_shard_sample_v3",
+  "num_docs": 2,
+  "num_bytes": 42,
+  "files": {
+    "stream.bin": {
+      "byte_length": 42,
+      "sha256": "fc197972bbb8a43d5deff465cb9145c6b0a180929300ef36a5ceafce255fa64b"
+    },
+    "prov.bin": {
+      "byte_length": 42,
+      "sha256": "c42f2427051af14863d3ec563dc4a23b5ef6aa049c86f0b2b6d7d13f0ef8dfdb"
+    },
+    "reset.bit": {
+      "byte_length": 6,
+      "sha256": "508b9931dc81450b0e3f7826a5abe503012a867da2fa1110cfb064b357861fdd"
+    },
+    "weight.bin": {
+      "byte_length": 168,
+      "sha256": "3cfb699f1e30ae7a68cbfff71dda32fa2103726eefc74f96b8b6189c1f908e11"
+    },
+    "docs.idx": {
+      "byte_length": 80,
+      "sha256": "69a50455749b3a2b165dbd26c8fc4c076db281100c58bc902546a120b66553c5"
+    }
+  }
+}

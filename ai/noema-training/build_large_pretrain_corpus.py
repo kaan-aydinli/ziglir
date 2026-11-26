@@ -2,7 +2,7 @@
 """Assemble local documentation into plain-text topic records for LIR pretraining.
 
 This is offline corpus preparation only. It removes Markdown presentation/code
-blocks, groups adjacent prose paragraphs, and writes a standalone '---' line
+blocks, groups adjacent prose paragraphs, and writes a '<veriayrimi>' delimiter
 between topics. No tokens or model-specific labels are created.
 """
 from pathlib import Path
@@ -150,7 +150,7 @@ def main() -> None:
     topics = [topic for topic in topics if topic]
     if not topics:
         raise SystemExit("No prose topics found")
-    OUTPUT.write_text("\n---\n".join(topics), encoding="utf-8")
+    OUTPUT.write_text("\n<veriayrimi>\n".join(topics), encoding="utf-8")
     raw_bytes = sum(len(topic.encode("utf-8")) for topic in topics)
     print(f"topics={len(topics)}")
     print(f"payload_bytes={raw_bytes}")

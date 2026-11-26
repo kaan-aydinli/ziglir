@@ -290,12 +290,28 @@ pub const VMState = struct {
         return vaddr + 8;
     }
 
+    fn findHeapAllocIdx(items: []const HeapAlloc, ptr: u64) ?usize {
+        if (items.len == 0 or ptr < items[0].addr) return null;
+        var lo: usize = 0;
+        var hi: usize = items.len;
+        while (lo + 1 < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (items[mid].addr <= ptr) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        return lo;
+    }
+
     pub fn freeHeap(self: *VMState, ptr: u64) VMError!void {
         if (ptr == 0) return;
         if (ptr < HEAP_BASE or ptr >= 0x8000_0000_0000) return error.MemoryFault;
         self.mem_lock.lock();
         defer self.mem_lock.unlock();
-        for (self.heap_allocs.items) |*ha| {
+        if (findHeapAllocIdx(self.heap_allocs.items, ptr)) |idx| {
+            const ha = &self.heap_allocs.items[idx];
             if (ptr == ha.addr + 8) {
                 if (ha.freed) return error.MemoryFault; // double free
                 const sz: usize = @intCast(std.mem.readInt(u64, ha.data[0..8], .little));
@@ -329,8 +345,9 @@ pub const VMState = struct {
         if (ptr >= HEAP_BASE and ptr < ARRAY_TAG) {
             self.mem_lock.lock();
             defer self.mem_lock.unlock();
-            for (self.heap_allocs.items) |ha| {
-                const sz: usize = @intCast(std.mem.readInt(u64, ha.data[0..8], .little));
+            if (findHeapAllocIdx(self.heap_allocs.items, ptr)) |idx| {
+                const ha = self.heap_allocs.items[idx];
+                const sz: usize = if (ha.freed) (ha.data.len -| 16) else @intCast(std.mem.readInt(u64, ha.data[0..8], .little));
                 const payload_end = ha.addr + 8 + sz;
                 if (ptr >= ha.addr and ptr < payload_end) {
                     if (ha.freed) return error.MemoryFault; // UAF trap
@@ -381,7 +398,7 @@ pub const VMState = struct {
 
     fn readCString(self: *VMState, ptr: u64) VMError![]const u8 {
         if (ptr < 4096 or ptr >= 0x8000_0000_0000) return error.MemoryFault;
-        // Fast path if LIR string (rodata or string_new)
+        // Fast path if LIR string (rodata or string_new / allocLirString)
         if (ptr >= RODATA_BASE and ptr < STACK_BASE) {
             const off: usize = @intCast(ptr - RODATA_BASE);
             if (off < self.rodata.items.len) {
@@ -390,6 +407,25 @@ pub const VMState = struct {
                     return rest[0..nul];
                 }
             }
+        }
+        if (ptr >= HEAP_BASE and ptr < ARRAY_TAG) {
+            self.mem_lock.lock();
+            const maybe_str: ?[]const u8 = blk_hstr: {
+                if (findHeapAllocIdx(self.heap_allocs.items, ptr)) |idx| {
+                    const ha = self.heap_allocs.items[idx];
+                    if (!ha.freed and ptr == ha.addr + 8) {
+                        const hdr_len: usize = @intCast(std.mem.readInt(u64, ha.data[0..8], .little));
+                        if (ha.data.len == 17 + hdr_len and ha.data[8 + hdr_len] == 0) {
+                            const slice = ha.data[8 .. 8 + hdr_len];
+                            if (std.mem.indexOfScalar(u8, slice, 0)) |nul| break :blk_hstr slice[0..nul];
+                            break :blk_hstr slice;
+                        }
+                    }
+                }
+                break :blk_hstr null;
+            };
+            self.mem_lock.unlock();
+            if (maybe_str) |s| return s;
         }
         var len: usize = 0;
         var found_nul = false;
@@ -410,12 +446,12 @@ pub const VMState = struct {
         const p = try self.allocHeap(sz);
         // Overwrite the 8-byte header at p - 8 with exact string byte length
         self.mem_lock.lock();
-        for (self.heap_allocs.items) |ha| {
+        if (findHeapAllocIdx(self.heap_allocs.items, p)) |idx| {
+            const ha = self.heap_allocs.items[idx];
             if (p == ha.addr + 8) {
                 std.mem.writeInt(u64, ha.data[0..8], bytes.len, .little);
                 if (bytes.len > 0) @memcpy(ha.data[8..][0..bytes.len], bytes);
                 ha.data[8 + bytes.len] = 0;
-                break;
             }
         }
         self.mem_lock.unlock();
@@ -1302,10 +1338,20 @@ pub const VMState = struct {
             },
             .call_mkdir => {
                 const p = try self.readCString(vregs[inst.args[0]]);
-                std.fs.cwd().makePath(p) catch {
-                    vregs[inst.dest] = @bitCast(@as(i64, -1));
-                    return;
-                };
+                if (std.fs.path.isAbsolute(p)) {
+                    std.fs.makeDirAbsolute(p) catch |err| switch (err) {
+                        error.PathAlreadyExists => {},
+                        else => {
+                            vregs[inst.dest] = @bitCast(@as(i64, -1));
+                            return;
+                        },
+                    };
+                } else {
+                    std.fs.cwd().makePath(p) catch {
+                        vregs[inst.dest] = @bitCast(@as(i64, -1));
+                        return;
+                    };
+                }
                 vregs[inst.dest] = 0;
             },
             .call_open => {

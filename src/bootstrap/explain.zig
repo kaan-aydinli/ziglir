@@ -664,7 +664,7 @@ const code_help = [_]CodeHelp{
     .{
         .code = "LIR-E5001",
         .title = "Capacity limit reached",
-        .cause = "The program exceeds the bootstrap limits (16384 AST nodes, 512 functions, 256 structs, 128 enums, 64 sources).",
+        .cause = "The program exceeds the bootstrap limits (65536 AST nodes, 512 functions, 256 structs, 128 enums, 64 sources).",
         .fix = "Split the program into modules, or reduce generated code volume. These are fixed compile-time budgets.",
     },
     .{
