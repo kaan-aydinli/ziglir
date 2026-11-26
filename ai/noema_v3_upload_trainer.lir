@@ -11,6 +11,14 @@
 //      `shard_meta.json` manifest so the upload is immediately `manifest_guard.py` compliant.
 
 import "src/noema_v3/noema_v3_synth.lir"
+import "src/noema_v3/noema_v3_stream_ingest.lir"
+
+// Streaming ingest window for the SoA shard fan-out. Peak runtime memory is
+// O(chunk) (measured ~30 MB at 1 MiB, ~22 MB at 256 KiB) and is INDEPENDENT of
+// corpus size, so the trainer no longer caps how much data it can ingest. 1 MiB
+// balances memory against shard count for the server's 64 MiB upload path while
+// streaming arbitrarily large direct-invocation corpora into out_soa/shard_N.
+const NV3_UT_STREAM_CHUNK: i64 = 1048576
 
 fn nv3_ut_write_progress(path: string, cur: i64, tot: i64, bytes_done: i64) {
     if @string_len(path) == 0 or @string_eq(path, "-") { return }
@@ -375,15 +383,39 @@ fn main() -> i64 {
         return 1
     }
 
-    // Manifest-guarded SoA shard for the uploaded corpus: the same `<veriayrimi>` payload that
-    // trains the graph is also available as pointer-addressed spans for KHG grounding audits.
+    // Manifest-guarded SoA shards for the uploaded corpus, written by BOUNDED-MEMORY
+    // STREAMING ingest instead of packing the in-RAM sample. The old path packed only
+    // main_buf, which nv3_ut_read_file_cap SILENTLY truncated to the first 4 MiB -- so
+    // any corpus between 4 MiB and the server's 64 MiB upload cap lost data without an
+    // error. nv3_stream_pack_shards reads the ENTIRE file through a fixed NV3_UT_STREAM_CHUNK
+    // window (O(chunk) memory, independent of corpus size) and fans out to out_soa/shard_N,
+    // the format nv3_mt_train_multishard_npg / nv3_soa_stream_window already consume.
+    // The graph/NPG model still trains on the bounded main_buf sample because the model
+    // itself is fixed-capacity (NV3_SYN_MAX_ATOMS/TOPICS); only the DATA store scales here.
     var soa_docs: i64 = 0
     if @string_len(out_soa) > 0 and @string_eq(out_soa, "-") == false {
         let _mk = @mkdir(out_soa, 493)
-        let pay_box = @malloc(8) as *i64
-        soa_docs = nv3_soa_pack_veriayrimi(out_soa, main_buf, main_len, NOEMA_V3_PROV_VERIFIED_KHG, pay_box)
-        @free(pay_box as *u8)
-        if soa_docs > 0 { nv3_ut_write_shard_meta(out_soa, soa_docs) }
+        let shards_box = @malloc(8) as *i64
+        let bytes_box = @malloc(8) as *i64
+        let streamed = nv3_stream_pack_shards(in_txt, out_soa, NV3_UT_STREAM_CHUNK, NOEMA_V3_PROV_VERIFIED_KHG, shards_box, bytes_box)
+        if streamed < 0 {
+            // Fail closed: a partial/failed ingest is never reported as success.
+            @free(shards_box as *u8) @free(bytes_box as *u8)
+            nv3_syn_graph_free(gh) @free(main_buf) @free(len_box as *u8) @free(in_cfg)
+            println("NOEMA_TRAIN_V3") println("ok=0") println("error=soa_stream_ingest_failed")
+            println("stream_err=" + @int_to_string(0 - streamed))
+            return 1
+        }
+        soa_docs = streamed
+        // Per-shard manifest_guard-compatible shard_meta.json (sha256 + byte_length).
+        var si: i64 = 0
+        while si < shards_box[0] {
+            let sdir = out_soa + "/shard_" + @int_to_string(si)
+            let nd = nv3_stream_shard_num_docs(sdir)
+            if nd > 0 { nv3_ut_write_shard_meta(sdir, nd) }
+            si = si + 1
+        }
+        @free(shards_box as *u8) @free(bytes_box as *u8)
     }
     nv3_ut_write_progress(prog_path, 92, total_stages, main_len)
 

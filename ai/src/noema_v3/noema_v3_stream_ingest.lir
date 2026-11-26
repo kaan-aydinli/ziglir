@@ -40,6 +40,28 @@ const NV3_STREAM_ERR_DOC_TOO_LARGE: i64 = 3
 const NV3_STREAM_ERR_PACK: i64 = 4
 const NV3_STREAM_ERR_BAD_ARG: i64 = 5
 
+// Reads a shard's document count straight from its docs.idx header via @pread,
+// without loading the shard. Self-contained (mirrors nv3_soa_peek_num_docs) so
+// callers that import only this module + soa can enumerate streamed shards.
+// Returns num_docs (> 0), or -1 when the header is missing/invalid.
+fn nv3_stream_shard_num_docs(dir_path: string) -> i64 {
+    let fd = @open(dir_path + "/docs.idx", 0, 0)
+    if fd < 0 { return -1 }
+    let hdr = @malloc(16)
+    let got = @pread(fd, hdr, 16, 0)
+    @close(fd)
+    if got != 16 {
+        @free(hdr)
+        return -1
+    }
+    let m0 = (@read_u32(hdr) as i64) & 4294967295
+    let ver = (@read_u32(@ptr_add(hdr, 4)) as i64) & 4294967295
+    let nd = @read_u64(@ptr_add(hdr, 8))
+    @free(hdr)
+    if m0 != NV3_DOCS_MAGIC_LE or ver != NOEMA_V3_SCHEMA_VERSION or nd <= 0 { return -1 }
+    return nd
+}
+
 // Returns the start offset of the LAST exact 12-byte "<veriayrimi>" delimiter in
 // buf[0..len), or -1 when none is present.
 fn nv3_stream_last_delim(buf: *u8, len: i64) -> i64 {
