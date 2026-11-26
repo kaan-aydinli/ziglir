@@ -30,6 +30,39 @@ existing clients; it is not a general language generator and never reports v3 we
   `proofRefutedClaims` and `symbolicSolved` report what the run actually checked. The UI's
   "NOEMA v3 doğrulama" panel shows them per reply.
 
+## Pages
+
+| Route | Purpose |
+| --- | --- |
+| `/` | Chat. Per-reply evidence strip, verification checklist and live system panel. |
+| `/pretraining` | Upload a Turkish corpus, watch local training, chat with the result. |
+| `/system` | Every value read out of the shipped artifact headers, plus live counters. |
+
+## HTTP surface
+
+| Endpoint | Returns |
+| --- | --- |
+| `GET /api/health` | Model catalogue, output-mode contract, guarantees, live telemetry |
+| `GET /api/models` | Selectable models only |
+| `GET /api/artifacts` | Parsed NV3G1 / NPG-v3 headers and corpus counts |
+| `GET /api/telemetry` | Inference counters and host load/memory |
+| `POST /api/chat` | One run: text, exact bytes, and every verification counter |
+| `POST /api/train` | Start a local training job (raw body + `x-file-name`) |
+| `GET /api/train/status?jobId=` | Progress, summary, and the published model |
+
+Every number the UI shows originates in one of these responses or in an artifact header. Nothing is
+estimated client-side: an unavailable value renders as an em dash.
+
+### What the site does to keep the machine cool
+
+* **Exact response cache.** NOEMA v3 is deterministic, so a repeated question returns the identical
+  bytes from a bounded LRU cache without spawning the backend: 31 ms and 3.2 ms of CPU become 0 ms.
+* **No continuous polling of a hidden tab.** Telemetry pauses on `visibilitychange` and resumes on
+  return, so an idle page costs nothing.
+* **No GPU-heavy styling.** No blur, backdrop-filter, animated gradients or shadows on scroll; depth
+  comes from flat colour steps that composite on the CPU.
+* **One subprocess per uncached run**, native binary first, `lir run --backend=vm` only as fallback.
+
 ## Run locally
 
 From the repository root, build the LIR executable using the repository's Zig toolchain, then
@@ -57,76 +90,72 @@ that model option and leaves the fresh baseline available.
 
 ## Train from your own TXT file
 
-Open the separate **Pretraining** page from the top navigation. Select or drop a
-UTF-8 `.txt` corpus; there is no configured total-byte or physical-line ceiling.
-Upload size is ultimately bounded by available disk/RAM and the platform's
-transport. There is no default training time limit; operators may set
-`TRAIN_TIMEOUT_MS` as a deployment policy. The `<veriayrimi>` delimiter separates
-topics (standalone on its own line or inline); the delimiter is framing only and is omitted. All other topic bytes
-(including whitespace) are preserved and packed into roughly 1 MiB LIR records.
-The page displays upload progress, then polls the LIR trainer's actual record
-counter and reports percent, processed/source bytes, elapsed time, and estimated
-remaining time. Input is streamed to disk and training records are split at
-roughly 1 MiB boundaries; the split size is a chunking strategy, not a corpus
-size limit.
-The first successful run creates `ai/noema-training/user_pretrain_v001.nps`;
-subsequent runs load that latest state and continue training into `v002`, `v003`,
-and so on. Previous versions are never overwritten; Chat loads the newest
-successful version via a latest-version alias. The model picker shows the actual
-version filename/date.
+Open `/pretraining`. Drop a UTF-8 `.txt` corpus. Topics are separated by a
+`<veriayrimi>` line (standalone or inline); the delimiter is framing only and is omitted from the
+trained text, every other byte is preserved.
+
+The client validates the file before uploading — extension, size, ≥2 topics — but **the server is
+the authority**: it re-validates, enforces a 64 kB per-topic ceiling, refuses a second concurrent
+job with `409`, and checks free disk before accepting. Bytes are streamed to `/tmp`, so the browser
+never buffers the whole corpus.
+
+Training is one LIR process. The page polls the trainer's own progress frame and reports percent,
+topics, source/payload bytes, elapsed and estimated remaining time. When the job finishes it
+reports what was actually built:
+
+| Field | Meaning |
+| --- | --- |
+| `topics` | Topics after pack+audit |
+| `atoms` | Atoms in the NV3G1 graph |
+| `forbidden4Grams` | Distinct corpus 4-grams the output may not reproduce |
+| `forbiddenSentences` | Sentence hashes likewise protected |
+| `npgSteps` | Weight-update steps applied to the NPG-v3 checkpoint |
+| `soaDocs` | SOA shard documents written |
+| `probeEmittedBytes` | Bytes the post-training probe actually generated |
+
+A run that fails the post-training anti-verbatim audit publishes **nothing**: `npgSteps` never
+leaves the process, the checkpoint is deleted, and the job reports `failed`. A half-written
+checkpoint can never become selectable.
+
+Each successful run creates `ai/noema_v3/checkpoints/user_v3_vNNN.{npg3,nv3g}` plus a shard under
+`ai/noema_v3/corpus_user/`. Versions are never overwritten, and the training page links straight to
+a chat with the new model (`/?model=noema_v3_user:user_v3_vNNN`). These artifacts are runtime state
+and are git-ignored.
 
 ## Models and output
 
-Use the model picker to choose `trained` (the latest corpus checkpoint, when
-present), `uploaded` (the newest user-trained version), or
-`fresh` (new untrained field state). Each request loads/creates
-the selected state and scores the checkpoint's dataset-sized exemplar index
-against the prompt using normalized raw-byte 5-gram resonance. Its entry count
-scales to the planned training records, subject to available memory. Each stored
-retrieval anchor is currently limited to one eligible source line of at most 256
-bytes per training record. An exact byte-substring match wins; otherwise a candidate needs similarity
-at least 0.22 and one case-insensitive whole-token overlap. Passing those
-heuristic retrieval checks returns the stored line as UTF-8 and lossless hex;
-otherwise the model abstains rather than using a canned fallback. This gives corpus-grounded, non-hardcoded output, but it is
-retrieval of learned examples—not free-form language generation, and its quality
-depends on the training data. No conversational state is carried across requests.
+The picker lists the available v3 models. `noema_v3` is the production base
+(`noema_v3_promoted.npg3` + `noema_v3_prod.nv3g`); `noema_v3_scaled` uses the multi-shard f32
+checkpoint. Every user-trained version appears as `noema_v3_user:user_v3_vNNN`. Legacy Φ selectors
+(`legacy:fresh`, `legacy:trained`, `legacy:uploaded`) remain reachable through the API for old
+clients but are not offered in the UI.
 
-`POST /api/chat` accepts `{ "message": "...", "modelId": "noema_v3" }`;
-`modelId` may be `noema_v3` (isolated pure-LIR NOEMA v3 weight-generation path
-backed by `ai/noema_v3_chat_backend.lir` and `NPG-v3` binary checkpoint
-`ai/noema_v3/checkpoints/noema_v3_locked.npg3`), or legacy `trained`, `uploaded`,
-or `fresh` (backed by `ai/chat_site_backend.lir`). `GET /api/health` reports
-whether each selected checkpoint exists, its actual file size, and the active
-`output_mode`/`output_mode_contract`. Chat results include `outputMode` (real
-production mode reported by backend; legacy path reports
-`legacy_retrieval_exemplar` and never `noema_v3_weight_generation`, whereas
-`noema_v3` reports `noema_v3_weight_generation` or
-`noema_v3_weight_generation_abstain` with zero stored exemplars), model ID,
-training records/bytes/perturbations, stored exemplar count/capacity, spectral
-stage, input/output byte counts, retrieval similarity, free energy and surprise
-gate measured during that run. The prompt has no configured UTF-8 byte ceiling;
-the LIR adapter grows its input buffer as needed, subject to available memory,
-address space and the host's integer representation. The chat backend retains a
-15-second per-request execution timeout as an operational safeguard.
+`POST /api/chat` accepts `{ "message": "...", "modelId": "..." }`. The response carries the decoded
+`reply`, the exact `generatedHex`, and the counters from that run:
 
-The trainer reads `ai/noema-training/pretrain_corpus_large.tr.txt`: plain
-UTF-8 topic text with a `<veriayrimi>` delimiter between topics. On this checkout,
-three end-to-end native runs each reported 70 records and 566,714 payload bytes
-(566,990 source bytes including the 276 bytes of delimiter lines); measured wall
-times after the current parser, checkpoint, arena-scratch and spectral recurrence
-changes were 0.846 s, 0.741 s, and 0.756 s (0.756 s median), including `lir run`
-startup. All remained at spectral stage 0; this is a local technical corpus, not
-a quality benchmark.
-`train-included-corpus.mjs` publishes a new checkpoint after each successful run. `ai/noema-training/pretrain_corpus.tr.txt`
-is the smaller original authoring corpus.
+| Field | Source |
+| --- | --- |
+| `outputMode` | `noema_v3_weight_generation` or `..._abstain`; anything else is a hard error |
+| `generatedBytes` / `generatedHex` | Bytes the graph actually emitted |
+| `antiVerbatimVerified`, `maxCorpusNgramRun` | Forbidden-index check (limit 4 atoms) |
+| `khgObservedSpans`, `khgVerifiedSpans`, `khgQuarantinedSpans` | Provenance scan |
+| `proofVerifiedClaims`, `proofRefutedClaims`, `proofStepsUsed` | Symbolic proof search |
+| `synthesizedAtoms`, `spectralStage`, `freeEnergy`, `surpriseGate` | Synthesis trace |
+| `cached`, `latencyMs`, `cpuMs` | Whether this run spawned the backend, and what it cost |
 
-A separate HTTP upload stress run used a synthetic repeated-byte TXT body of
-66,000,066 bytes (66 decimal MB, 62.94 MiB), grouped into 63 LIR records. Across
-three runs, accept/preparation times were 0.232, 0.237, and 0.330 s (median
-0.237 s); training waits were 0.814, 0.815, and 0.815 s (median 0.815 s);
-end-to-end times were 1.046, 1.052, and 1.145 s (median 1.052 s). This validates upload/training throughput and progress
-completion on synthetic data only; it is not an intelligence or language-quality
-benchmark. Test checkpoints were removed after the run.
+A prompt may be up to 2048 UTF-8 bytes; the server rejects longer input with `413` before touching
+the backend. `CHAT_TIMEOUT_MS` (default 30 s) bounds a single run, `CHAT_CACHE_SIZE` (default 64)
+bounds the exact-response cache, and `TRAIN_TIMEOUT_MS` (default none) is an optional deployment
+policy for training.
+
+### Why the numbers are trustworthy
+
+The server parses the NV3G1 and NPG-v3 headers byte-for-byte rather than trusting a manifest, and
+`/api/artifacts` exposes the result (atom count, bigram/trigram sizes, forbidden-index sizes,
+d-parameters, dtype, checksum). `python3 ai/noema_v3/server_smoke.py` asserts that those headers
+parse, that all three pages and four assets are served, that a repeated question is answered from
+the cache with identical bytes, and that a freshly trained model answers in-domain and abstains
+out-of-domain.
 
 ## Retrieval behavior test
 

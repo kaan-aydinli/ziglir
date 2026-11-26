@@ -3,86 +3,164 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#0b1020">
-  <meta name="description" content="Kendi TXT veri kümenizle NOEMA-Phi pretraining">
-  <title>NOEMA — Pretraining</title>
+  <meta name="theme-color" content="#080a12">
+  <meta name="description" content="NOEMA v3 veri yükleme ve yerel eğitim: kendi Türkçe metninizle model eğitin.">
+  <title>NOEMA — Veri ve Eğitim</title>
   <link rel="stylesheet" href="/style.css">
   <script src="/pretraining.js" defer></script>
 </head>
 <body>
-  <div class="app-shell">
-    <aside class="rail" aria-label="Uygulama gezinmesi">
-      <a class="brand-mark" href="/" aria-label="NOEMA ana sayfa"><span class="brand-glyph">N</span></a>
-      <a class="rail-button" href="/" title="Chat" aria-label="Chat"><svg viewBox="0 0 24 24"><path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5H5l1.6-3.2A7.5 7.5 0 1 1 20 11.5Z"/><path d="M8 11h.01M12 11h.01M16 11h.01"/></svg></a>
-      <a class="rail-button active" href="/pretraining" title="Pretraining" aria-label="Pretraining"><svg viewBox="0 0 24 24"><path d="M4 19V5m0 14h16M8 15l3-4 3 2 5-7"/><circle cx="19" cy="6" r="1"/></svg></a>
-      <div class="rail-spacer"></div><div class="rail-status" title="LIR runtime"></div>
-    </aside>
-    <main class="workspace">
+  <div class="shell">
+    <nav class="rail" aria-label="Ana gezinme">
+      <a class="rail-brand" href="/" aria-label="NOEMA ana sayfa">N</a>
+      <a class="rail-btn" href="/" title="Sohbet" aria-label="Sohbet">
+        <svg viewBox="0 0 24 24"><path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5H5l1.6-3.2A7.5 7.5 0 1 1 20 11.5Z"/><path d="M9 11h.01M13 11h.01"/></svg>
+      </a>
+      <a class="rail-btn" href="/pretraining" aria-current="page" title="Veri ve eğitim" aria-label="Veri ve eğitim">
+        <svg viewBox="0 0 24 24"><path d="M12 3v10M8 9l4 4 4-4"/><path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>
+      </a>
+      <a class="rail-btn" href="/system" title="Sistem" aria-label="Sistem">
+        <svg viewBox="0 0 24 24"><path d="M4 17V9M9 17V5M14 17v-6M19 17V8"/></svg>
+      </a>
+      <div class="rail-spacer"></div>
+      <div class="rail-foot">
+        <span class="rail-health" id="rail-health" data-state="idle" title="Backend durumu"></span>
+        <span class="rail-health-label" id="rail-health-label">BAĞLANIYOR</span>
+      </div>
+    </nav>
+
+    <div class="main">
       <header class="topbar">
-        <div class="topbar-title"><span class="mobile-brand">N</span><div><div class="eyebrow">NOEMA-PHI · TRAINING</div><h1>Pretraining</h1></div></div>
-        <div class="topbar-right"><nav class="page-tabs" aria-label="Sayfalar"><a href="/">Chat</a><a class="selected" href="/pretraining" aria-current="page">Pretraining</a></nav><span class="engine-pill"><i></i><span id="connection-label">LIR engine</span></span></div>
+        <div class="topbar-id">
+          <h1>Veri ve Eğitim</h1>
+          <span class="tag" id="runtime-tag">LIR · eğitim</span>
+        </div>
+        <div class="topbar-actions">
+          <nav class="nav-tabs" aria-label="Sayfalar">
+            <a href="/">Sohbet</a>
+            <a href="/pretraining" aria-current="page">Veri</a>
+            <a href="/system">Sistem</a>
+          </nav>
+        </div>
       </header>
 
-      <div class="pretraining-main">
-        <section class="pretraining-hero">
-          <div class="welcome-kicker"><span></span> LIR NATIVE · LOCAL TRAINING</div>
-          <h2>Kendi verin.<br><em>Kendi model checkpoint’in.</em></h2>
-          <p>Bir UTF-8 TXT veri kümesi yükle. LIR, konuları yaklaşık 1 MiB’lık akış parçalarına bölerek işler; böylece büyük dosyalarda ilerleme daha sık güncellenir. Gerçek kayıt ilerlemesi, işlenen bayt ve tahmini kalan süre burada gösterilir.</p>
-        </section>
-
-        <section class="training-panel upload-panel" aria-labelledby="upload-heading">
-          <div class="training-heading"><div><div class="section-label">VERİ KÜMESİ</div><h2 id="upload-heading">TXT dosyanı seç</h2></div><span class="training-limit">Boyut sınırı yok · kaynaklara bağlı</span></div>
-          <label class="upload-drop" id="upload-drop" for="training-file">
-            <input id="training-file" type="file" accept=".txt,text/plain">
-            <span class="upload-icon">↑</span>
-            <strong id="training-file-name">TXT dosyasını seçmek için tıkla</strong>
-            <small>UTF-8 düz metin · sabit dosya/satır tavanı yok · toplam boyut sistem kaynaklarına bağlı</small>
-          </label>
-          <div class="dataset-facts" id="dataset-facts" hidden>
-            <div><small>DOSYA BOYUTU</small><strong id="dataset-size">—</strong></div>
-            <div><small>TAHMİNİ KONU SAYISI</small><strong id="dataset-topics">Yüklemede hesaplanacak</strong></div>
-            <div><small>YENİ MODEL SÜRÜMÜ</small><strong>user_pretrain_vNNN.nps</strong></div>
+      <main class="page">
+        <div class="wrap">
+          <div class="page-head">
+            <h1>Kendi korpusunuzla model eğitin</h1>
+            <p>
+              Yükleme, konu ayrıştırma, anti-verbatim indeks kurulumu ve ağırlık güncellemesi bu
+              makinede, LIR ile yapılır. Veri dışarı çıkmaz. Eğitim bittiğinde model sohbet
+              sayfasındaki model listesine eklenir ve kendi konularında yanıt verir.
+            </p>
           </div>
-          <div class="format-guide">
-            <div class="section-label">KONU AYIRMA FORMATI</div>
-            <p>Her konu bloğu eğitim verisi olarak alınır; büyük bloklar yaklaşık 1 MiB’lık kayıtlara bölünür. Konular arasında ayraç olarak <code>&lt;veriayrimi&gt;</code> kullanılır:</p>
-            <pre>Trabzon'un kıyı iklimi ve yağış örüntüleri.
 
-&lt;veriayrimi&gt;
+          <div class="grid-2">
+            <div style="display:flex;flex-direction:column;gap:18px">
+              <section class="card">
+                <div class="section-head"><span class="section-title">1 · Korpus yükle</span><span class="pill" id="upload-state" data-tone="info"><i></i><span>bekliyor</span></span></div>
 
-Karadeniz bölgesinin coğrafi özellikleri.</pre>
-            <small>Boş bloklar atlanır; uzun konular otomatik olarak yaklaşık 1 MiB eğitim parçalarına bölünür. Boyut sistem kaynaklarıyla sınırlıdır.</small>
-          </div>
-          <div class="training-actions upload-actions"><button id="training-start" type="button" disabled>Pretraining başlat <span>→</span></button><span id="training-hint">Önce bir .txt dosyası seç</span></div>
-          <div class="upload-progress" id="upload-progress" hidden>
-            <div class="training-progress-top"><span id="upload-status">Dosya yükleniyor</span><span id="upload-percent">0%</span></div>
-            <div class="training-track" role="progressbar" aria-label="Dosya yükleme ilerlemesi" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i id="upload-bar"></i></div>
-            <div class="training-progress-bottom"><span id="upload-bytes">0 / 0 bayt</span><span>Dosya LIR için hazırlanıyor</span></div>
-          </div>
-        </section>
+                <div class="dropzone" id="dropzone" data-drag="false">
+                  <div class="dropzone-icon">
+                    <svg viewBox="0 0 24 24"><path d="M12 16V4M8 8l4-4 4 4"/><path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>
+                  </div>
+                  <h3>TXT dosyasını buraya bırakın</h3>
+                  <p>Konular <code class="mono">&lt;veriayrimi&gt;</code> satırıyla ayrılır. En az iki konu gerekir; aksi hâlde anti-verbatim grafiği kurulamaz.</p>
+                  <button class="btn btn-ghost" id="pick-file" type="button">Dosya seç</button>
+                  <input type="file" id="file-input" accept=".txt,text/plain" hidden>
+                  <div class="hint" id="file-hint">henüz dosya seçilmedi</div>
+                </div>
 
-        <section class="training-panel live-panel" id="training-panel" aria-labelledby="live-heading" hidden>
-          <div class="training-heading"><div><div class="section-label">CANLI EĞİTİM TELEMETRİSİ</div><h2 id="live-heading">Kayıtlar işleniyor</h2></div><span class="training-status-pill" id="training-state-pill">HAZIRLANIYOR</span></div>
-          <div class="training-progress live-progress">
-            <div class="training-progress-top"><span id="training-status">LIR pretraining bekleniyor</span><strong id="training-percent">0%</strong></div>
-            <div class="training-track large-track" role="progressbar" aria-label="Pretraining ilerlemesi" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i id="training-bar"></i></div>
-            <div class="training-progress-bottom"><span id="training-records">0 / 0 kayıt</span><strong id="training-eta">Kalan süre hesaplanıyor</strong></div>
-          </div>
-          <div class="training-stats-grid">
-            <div><small>İŞLENEN CORPUS BAYTI</small><strong id="training-payload">0 B</strong></div>
-            <div><small>KAYNAK DOSYA</small><strong id="training-source">—</strong></div>
-            <div><small>GEÇEN SÜRE</small><strong id="training-elapsed">0 sn</strong></div>
-            <div><small>TAHMİNİ KALAN</small><strong id="training-remaining">Hesaplanıyor</strong></div>
-          </div>
-          <div class="training-result" id="training-result" hidden><span class="result-check">✓</span><div><strong>Checkpoint hazır</strong><p id="training-checkpoint">ai/noema-training/user_pretrain_vNNN.nps</p></div><a href="/">Chat sayfasında dene →</a></div>
-        </section>
+                <div id="upload-progress" hidden style="margin-top:14px">
+                  <div class="progress-head"><strong id="upload-name">—</strong><span id="upload-pct">%0</span></div>
+                  <div class="track" id="upload-track"><i></i></div>
+                  <div class="progress-head" style="margin-top:7px;margin-bottom:0"><span class="mono" style="font-size:10px;color:var(--ink-faint)" id="upload-bytes">0 B</span><span class="mono" style="font-size:10px;color:var(--ink-faint)" id="upload-status"></span></div>
+                </div>
 
-        <section class="training-notes">
-          <div><span class="notes-icon">i</span><div><strong>Şeffaf model notu</strong><p>Bu süreç gerçek LIR eğitimini çalıştırır ve seçilebilir checkpoint kaydeder. Eğitim kayıtlarından sınırlı sayıda satır ve öznitelik çıkarılır; sohbet bunları 5-gram benzerliğiyle arar. Bu, semantik anlayan veya serbest metin üreten bir dil modeli değildir.</p></div></div>
-          <div><span class="notes-icon">↗</span><div><strong>Yükleme ve saklama</strong><p>TXT doğrudan akış halinde sunucuya gönderilir; içerik tarayıcı belleğine bütünüyle alınmaz. İlk eğitim `v001` ile başlar; sonraki eğitimler en son başarılı modeli yükleyip devam ettirerek `v002`, `v003` gibi yeni checkpoint üretir. Önceki sürümler arşivde aynen kalır. Chat en son sürümü kullanır.</p></div></div>
-        </section>
-      </div>
-    </main>
+                <div style="display:flex;gap:8px;margin-top:14px">
+                  <button class="btn btn-primary" id="start-button" type="button" disabled style="flex:1">
+                    <svg viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+                    Eğitimi başlat
+                  </button>
+                  <button class="btn btn-ghost" id="cancel-button" type="button" hidden>İptal</button>
+                </div>
+              </section>
+
+              <section class="card" id="training-panel" hidden>
+                <div class="section-head"><span class="section-title">2 · Yerel eğitim</span><span class="pill" id="train-pill" data-tone="info"><i></i><span>başlıyor</span></span></div>
+                <div class="progress-head"><strong id="train-stage">Hazırlanıyor</strong><span id="train-pct">%0</span></div>
+                <div class="track" id="train-track"><i></i></div>
+                <div class="stages" id="stages">
+                  <span class="stage-chip" data-stage="pack"><i></i>paketleme</span>
+                  <span class="stage-chip" data-stage="npg"><i></i>ağırlık</span>
+                  <span class="stage-chip" data-stage="graph"><i></i>grafik</span>
+                  <span class="stage-chip" data-stage="audit"><i></i>denetim</span>
+                  <span class="stage-chip" data-stage="publish"><i></i>yayın</span>
+                </div>
+                <div class="kv" style="margin-top:14px">
+                  <dt>sürüm</dt><dd id="train-version">—</dd>
+                  <dt>konu</dt><dd id="train-topics">—</dd>
+                  <dt>kaynak</dt><dd id="train-source">—</dd>
+                  <dt>yük</dt><dd id="train-payload">—</dd>
+                  <dt>geçen</dt><dd id="train-elapsed">—</dd>
+                  <dt>kalan</dt><dd id="train-eta">—</dd>
+                </div>
+                <div id="train-error" hidden style="margin-top:12px;padding:10px 12px;border:1px solid rgba(255,138,138,.3);background:rgba(255,138,138,.05);border-radius:8px;font-size:12px;color:#ffd9d9"></div>
+                <div class="result-grid" id="train-result" hidden></div>
+                <div style="display:flex;gap:8px;margin-top:14px" id="train-actions" hidden>
+                  <a class="btn btn-primary" id="goto-chat" href="/" style="flex:1">Modele sor</a>
+                </div>
+              </section>
+
+              <section class="card">
+                <div class="section-head"><span class="section-title">Eğitilmiş modeller</span><span class="pill" id="model-count"><i></i><span>0</span></span></div>
+                <div class="model-list" id="model-list">
+                  <div class="empty">Henüz kendi modelinizi eğitmediniz.<br>Üretim modeli <b>noema_v3</b> her zaman kullanılabilir.</div>
+                </div>
+              </section>
+            </div>
+
+            <aside style="display:flex;flex-direction:column;gap:18px">
+              <section class="card">
+                <div class="section-head"><span class="section-title">Korpus biçimi</span></div>
+                <pre class="code-block"><span class="cm"># konu 1</span>
+Seramik, kilin yüksek sıcaklıkta
+pişirilmesiyle elde edilir.
+
+<span class="dl">&lt;veriayrimi&gt;</span>
+
+<span class="cm"># konu 2</span>
+Mermer, kireç taşının
+başkalaşımıyla oluşur.</pre>
+                <div class="rule-list" style="margin-top:14px">
+                  <div class="rule"><span class="n">1</span><span>Her konu en az bir <b>tam cümle</b> içermeli; cümle sonu noktalama korpusun kendisinden gelir.</span></div>
+                  <div class="rule"><span class="n">2</span><span>Konular <b>&lt;veriayrimi&gt;</b> satırıyla ayrılır. Tek konu reddedilir.</span></div>
+                  <div class="rule"><span class="n">3</span><span>Bir konu en fazla <b>64 kB</b> olabilir; dosya UTF-8 olmalıdır.</span></div>
+                  <div class="rule"><span class="n">4</span><span>Eğitimden sonra model <b>anti-verbatim denetimini</b> geçemezse yayınlanmaz.</span></div>
+                </div>
+              </section>
+
+              <section class="card">
+                <div class="section-head"><span class="section-title">Bu makinede ne olur</span></div>
+                <div class="rule-list">
+                  <div class="rule"><span class="n">→</span><span>Metin <b>dışarı gönderilmez</b>; yükleme yerel sunucuya yapılır.</span></div>
+                  <div class="rule"><span class="n">→</span><span>Eğitim <b>tek iş</b> olarak çalışır; ikinci yükleme 409 ile reddedilir.</span></div>
+                  <div class="rule"><span class="n">→</span><span>Başarısız eğitim <b>checkpoint bırakmaz</b>; yarım dosyalar silinir.</span></div>
+                  <div class="rule"><span class="n">→</span><span>Aynı soru + aynı model = <b>bayt-eşit</b> yanıt; tekrarlar önbellekten döner.</span></div>
+                </div>
+              </section>
+
+              <section class="card">
+                <div class="section-head"><span class="section-title">Üretim korpusu</span></div>
+                <table class="fact-table"><tbody id="prod-corpus-rows">
+                  <tr><td>durum</td><td>okunuyor…</td></tr>
+                </tbody></table>
+              </section>
+            </aside>
+          </div>
+        </div>
+      </main>
+    </div>
   </div>
 </body>
 </html>

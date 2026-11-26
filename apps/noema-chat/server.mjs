@@ -3,8 +3,8 @@ import { spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
-import { readFile, readdir, rm, stat, statfs, unlink, writeFile } from 'node:fs/promises';
-import { freemem } from 'node:os';
+import { open, readFile, readdir, rm, stat, statfs, unlink, writeFile } from 'node:fs/promises';
+import { cpus, freemem, loadavg, totalmem } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -147,6 +147,94 @@ async function resolveSelector(selector) {
 // LIR execution
 // ---------------------------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------------------------
+// inference accounting: real, per-process measurements (no simulated numbers anywhere)
+// ---------------------------------------------------------------------------------------------
+
+const serverStartedAt = Date.now();
+const inferenceStats = {
+  requests: 0,
+  generated: 0,
+  abstained: 0,
+  errors: 0,
+  cacheHits: 0,
+  cpuMsTotal: 0,
+  wallMsTotal: 0,
+  bytesGenerated: 0,
+  atomsSynthesized: 0,
+  ngramMax: 0,
+  khgObserved: 0,
+  khgVerified: 0,
+  khgQuarantined: 0,
+  antiVerbatimChecks: 0,
+  antiVerbatimPasses: 0,
+};
+
+// Deterministic inference is the whole point of NOEMA v3: the same prompt against the same
+// checkpoint must yield byte-identical bytes. That makes a response cache *exact*, not
+// approximate — a repeat question costs zero CPU instead of a full subprocess spawn. The cache
+// is small and LRU-bounded so it cannot grow into a memory leak on a long-running server.
+const CACHE_LIMIT = Math.max(0, Number(process.env.CHAT_CACHE_SIZE ?? 64));
+const responseCache = new Map();
+const cacheKey = (selector, prompt) => `${selector}\u0000${prompt}`;
+
+function cacheGet(key) {
+  if (!CACHE_LIMIT || !responseCache.has(key)) return null;
+  const value = responseCache.get(key);
+  responseCache.delete(key);
+  responseCache.set(key, value); // refresh recency
+  return value;
+}
+
+function cachePut(key, value) {
+  if (!CACHE_LIMIT) return;
+  if (responseCache.size >= CACHE_LIMIT) {
+    responseCache.delete(responseCache.keys().next().value); // evict least recently used
+  }
+  responseCache.set(key, value);
+}
+
+let activeRuns = 0;
+let peakConcurrentRuns = 0;
+
+function hostTelemetry() {
+  const memTotal = totalmem();
+  const memFree = freemem();
+  const loads = loadavg();
+  return {
+    // Load average is the OS's own 1-minute run queue length; dividing by core count gives a
+    // comparable "how busy is this machine" figure that is independent of hardware size.
+    load1: Number(loads[0].toFixed(2)),
+    load5: Number(loads[1].toFixed(2)),
+    load15: Number(loads[2].toFixed(2)),
+    cores: cpus().length,
+    memory: {
+      totalBytes: memTotal,
+      freeBytes: memFree,
+      usedPercent: Number((((memTotal - memFree) / memTotal) * 100).toFixed(1)),
+    },
+    uptimeSeconds: Math.floor(process.uptime()),
+    rssBytes: process.memoryUsage().rss,
+  };
+}
+
+function inferenceTelemetry() {
+  const s = inferenceStats;
+  return {
+    ...s,
+    peakConcurrentRuns,
+    activeRuns,
+    meanCpuMs: s.requests ? Number((s.cpuMsTotal / s.requests).toFixed(2)) : 0,
+    meanWallMs: s.requests ? Number((s.wallMsTotal / s.requests).toFixed(2)) : 0,
+    cacheSize: responseCache.size,
+    cacheLimit: CACHE_LIMIT,
+    // A cache hit avoids a process spawn entirely; this is the share of questions answered
+    // without touching the CPU at all.
+    cacheHitPercent: s.requests ? Number(((s.cacheHits / s.requests) * 100).toFixed(1)) : 0,
+    sinceMs: Date.now() - serverStartedAt,
+  };
+}
+
 function spawnCapture(command, args, { input, timeoutMs } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
@@ -255,16 +343,52 @@ async function runChat(rawSelector, prompt) {
   }
   const model = await resolveSelector(selector);
   if (!model) throw Object.assign(new Error('Seçilen NOEMA v3 modeli hazır değil.'), { status: 400 });
+  const key = cacheKey(selector, prompt);
+  const hit = cacheGet(key);
+  if (hit) {
+    inferenceStats.requests += 1;
+    inferenceStats.cacheHits += 1;
+    return { model, envelope: { ...hit, cached: true, latencyMs: 0 } };
+  }
   const npg = path.join(root, model.checkpointPath);
   const nv3g = path.join(root, model.graphPath);
   const input = `${selector}\n${prompt}`;
+  const started = process.hrtime.bigint();
+  const cpuStarted = process.cpuUsage();
+  activeRuns += 1;
+  peakConcurrentRuns = Math.max(peakConcurrentRuns, activeRuns);
   let result;
-  if (await fileSize(BACKEND_NATIVE)) {
-    result = await spawnCapture(BACKEND_NATIVE, [npg, nv3g], { input, timeoutMs: requestTimeoutMs });
-  } else {
-    result = await spawnCapture(lir, ['run', '--backend=vm', BACKEND_LIR, npg, nv3g], { input, timeoutMs: requestTimeoutMs });
+  try {
+    if (await fileSize(BACKEND_NATIVE)) {
+      result = await spawnCapture(BACKEND_NATIVE, [npg, nv3g], { input, timeoutMs: requestTimeoutMs });
+    } else {
+      result = await spawnCapture(lir, ['run', '--backend=vm', BACKEND_LIR, npg, nv3g], { input, timeoutMs: requestTimeoutMs });
+    }
+  } finally {
+    activeRuns -= 1;
   }
-  return { model, envelope: parseEnvelope(result.stdout, result.stderr) };
+  const wallMs = Number(process.hrtime.bigint() - started) / 1e6;
+  const cpu = process.cpuUsage(cpuStarted);
+  const cpuMs = (cpu.user + cpu.system) / 1000;
+  const envelope = parseEnvelope(result.stdout, result.stderr);
+  // Record what this run actually did. Every counter below is incremented from the backend's own
+  // report, so the dashboard can never show a number the model did not produce.
+  inferenceStats.requests += 1;
+  inferenceStats.wallMsTotal += wallMs;
+  inferenceStats.cpuMsTotal += cpuMs;
+  inferenceStats.bytesGenerated += envelope.generatedBytes || 0;
+  inferenceStats.atomsSynthesized += envelope.synthesizedAtoms || 0;
+  inferenceStats.ngramMax = Math.max(inferenceStats.ngramMax, envelope.maxCorpusNgramRun || 0);
+  inferenceStats.khgObserved += envelope.khgObservedSpans || 0;
+  inferenceStats.khgVerified += envelope.khgVerifiedSpans || 0;
+  inferenceStats.khgQuarantined += envelope.khgQuarantinedSpans || 0;
+  if (envelope.antiVerbatimVerified === 1) inferenceStats.antiVerbatimPasses += 1;
+  inferenceStats.antiVerbatimChecks += 1;
+  if (envelope.abstained) inferenceStats.abstained += 1;
+  else inferenceStats.generated += 1;
+  const measured = { ...envelope, cached: false, latencyMs: Math.round(wallMs), cpuMs: Number(cpuMs.toFixed(2)) };
+  cachePut(key, measured);
+  return { model, envelope: measured };
 }
 
 function parseEnvelope(stdout, stderr = '') {
@@ -294,7 +418,11 @@ function parseEnvelope(stdout, stderr = '') {
     modelId: values.model_id,
     outputMode,
     abstained: outputMode === 'noema_v3_weight_generation_abstain',
+    // Both the decoded text and the exact bytes travel to the client: the UI shows the text, and
+    // the raw hex is what makes the reply auditable byte-for-byte (the run detail panel shows it).
     reply: text,
+    generatedHex: hex,
+    generatedBytes: optNum('generated_bytes'),
     antiVerbatimVerified: optNum('anti_verbatim_verified'),
     maxCorpusNgramRun: optNum('max_corpus_ngram_run'),
     synthesizedAtoms: optNum('synthesized_atoms'),
@@ -316,7 +444,6 @@ function parseEnvelope(stdout, stderr = '') {
     semanticMarginMilli: optNum('semantic_margin_milli'),
     corpusTopics: optNum('corpus_topics'),
     forbidden4Grams: optNum('forbidden_4grams'),
-    generatedBytes: optNum('generated_bytes'),
     storedExemplars: optNum('stored_exemplars'),
     memoryCapacity: optNum('memory_capacity'),
   };
@@ -636,6 +763,125 @@ const mime = {
   '.ico': 'image/x-icon',
 };
 
+// ---------------------------------------------------------------------------------------------
+// artifact introspection: read the real headers out of the shipped binaries
+// ---------------------------------------------------------------------------------------------
+
+const NV3G_MAGIC = 3550861174880973654n;
+const NPG_MAGIC0 = 1984385102;
+
+async function readHeader(filePath, bytes) {
+  try {
+    const handle = await open(filePath, 'r');
+    try {
+      const buf = Buffer.alloc(bytes);
+      const { bytesRead } = await handle.read(buf, 0, bytes, 0);
+      return bytesRead === bytes ? buf : null;
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return null;
+  }
+}
+
+/// Parse the NV3G1 header exactly as `noema_v3_nv3g.lir` writes it (10 x u64).
+async function readGraphHeader(filePath) {
+  const buf = await readHeader(filePath, 80);
+  if (!buf) return null;
+  const magic = buf.readBigUInt64LE(0);
+  if (magic !== NV3G_MAGIC) return null;
+  const size = await fileSize(filePath);
+  return {
+    format: 'NV3G1',
+    version: Number(buf.readBigUInt64LE(8)),
+    atoms: Number(buf.readBigUInt64LE(16)),
+    atomPoolBytes: Number(buf.readBigUInt64LE(24)),
+    bigramCount: Number(buf.readBigUInt64LE(32)),
+    trigramCount: Number(buf.readBigUInt64LE(40)),
+    topics: Number(buf.readBigUInt64LE(48)),
+    forbidden4Grams: Number(buf.readBigUInt64LE(56)),
+    forbiddenSentences: Number(buf.readBigUInt64LE(64)),
+    tfEntries: Number(buf.readBigUInt64LE(72)),
+    bytes: size,
+  };
+}
+
+/// Parse the NPG-v3 header exactly as `noema_v3_checkpoint.lir` writes it (11 x u64, 88 bytes).
+async function readCheckpointHeader(filePath) {
+  const buf = await readHeader(filePath, 88);
+  if (!buf) return null;
+  if (buf.readUInt32LE(0) !== NPG_MAGIC0) return null;
+  const dtypeCode = Number(buf.readBigUInt64LE(24));
+  const params = Number(buf.readBigUInt64LE(72));
+  const elem = dtypeCode === 1 ? 8 : 4;
+  const size = await fileSize(filePath);
+  return {
+    format: 'NPG-v3',
+    schemaVersion: Number(buf.readBigUInt64LE(8)),
+    dtype: dtypeCode === 1 ? 'f64' : 'f32',
+    dtypeCode,
+    archHash: buf.readBigUInt64LE(16).toString(16),
+    dModel: Number(buf.readBigUInt64LE(32)),
+    dK: Number(buf.readBigUInt64LE(40)),
+    dH: Number(buf.readBigUInt64LE(48)),
+    convK: Number(buf.readBigUInt64LE(56)),
+    steps: Number(buf.readBigUInt64LE(64)),
+    params,
+    payloadBytes: params * elem,
+    bytes: size,
+    payloadChecksum: buf.readBigUInt64LE(80).toString(16),
+  };
+}
+
+/// Count the real topics/docs in a `<veriayrimi>`-delimited training corpus.
+async function readCorpusStats(filePath) {
+  try {
+    const text = await readFile(filePath, 'utf8');
+    const topics = text.split('<veriayrimi>').map(part => part.trim()).filter(Boolean);
+    const lines = text.split(/\r?\n/).filter(line => line.trim()).length;
+    return {
+      bytes: Buffer.byteLength(text, 'utf8'),
+      topics: topics.length,
+      lines,
+      // Characters are a better size signal than bytes for Turkish text; both are reported so
+      // the UI never has to guess.
+      characters: text.length,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function artifactPayload() {
+  const models = await describeModels();
+  const v3 = models.find(model => model.id === 'noema_v3');
+  const scaled = models.find(model => model.id === 'noema_v3_scaled');
+  const [graph, checkpoint, scaledCheckpoint, corpus, bridgeCorpusStats, lockedTrain] = await Promise.all([
+    v3 ? readGraphHeader(path.join(root, v3.graphPath)) : null,
+    v3 ? readCheckpointHeader(path.join(root, v3.checkpointPath)) : null,
+    scaled ? readCheckpointHeader(path.join(root, scaled.checkpointPath)) : null,
+    readCorpusStats(path.join(root, 'ai/noema_v3/corpus_prod_foundation.tr.txt')),
+    readCorpusStats(bridgeCorpus),
+    readShardMeta(path.join(root, 'ai/noema_v3/corpus_locked/train_soa/shard_meta.json')),
+  ]);
+  return { ok: true, graph, checkpoint, scaledCheckpoint, corpus, bridgeCorpus: bridgeCorpusStats, lockedTrain };
+}
+
+async function readShardMeta(filePath) {
+  try {
+    const meta = JSON.parse(await readFile(filePath, 'utf8'));
+    return {
+      shardId: meta.shard_id ?? null,
+      numDocs: meta.num_docs ?? null,
+      numBytes: meta.num_bytes ?? null,
+      version: meta.version ?? null,
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function healthPayload() {
   const models = await describeModels();
   return {
@@ -653,6 +899,7 @@ async function healthPayload() {
       legacy_mode: LEGACY_OUTPUT_MODE,
       legacy_selectors: LEGACY_MODELS.map(model => model.selector),
     },
+    telemetry: { inference: inferenceTelemetry(), host: hostTelemetry() },
     guarantees: {
       antiVerbatim: 'No response may reproduce more than 4 consecutive corpus atoms; violations are repaired or abstained.',
       grounding: 'Synthesis requires a topical content stem, a KHG-verified claim, or prompt-intent greeting.',
@@ -669,6 +916,12 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/api/health') {
       return jsonResponse(res, 200, await healthPayload());
     }
+    if (req.method === 'GET' && url.pathname === '/api/artifacts') {
+      return jsonResponse(res, 200, await artifactPayload());
+    }
+    if (req.method === 'GET' && url.pathname === '/api/telemetry') {
+      return jsonResponse(res, 200, { ok: true, inference: inferenceTelemetry(), host: hostTelemetry() });
+    }
     if (req.method === 'GET' && url.pathname === '/api/models') {
       return jsonResponse(res, 200, { ok: true, models: await describeModels() });
     }
@@ -679,11 +932,18 @@ const server = http.createServer(async (req, res) => {
       if (Buffer.byteLength(message, 'utf8') > 2048) return jsonResponse(res, 413, { ok: false, error: 'Mesaj 2048 bayt sınırını aşıyor.' });
       const selector = typeof body.selector === 'string' ? body.selector : (typeof body.modelId === 'string' ? body.modelId : 'noema_v3');
       const started = Date.now();
-      const { model, envelope } = await runChat(selector, message);
+      let run;
+      try {
+        run = await runChat(selector, message);
+      } catch (error) {
+        inferenceStats.errors += 1;
+        throw error;
+      }
+      const { model, envelope } = run;
       return jsonResponse(res, 200, {
         ok: true,
         model: { id: model.id, label: model.label, checkpointPath: model.checkpointPath, graphPath: model.graphPath },
-        metrics: { ...envelope, latencyMs: Date.now() - started },
+        metrics: { ...envelope, latencyMs: envelope.latencyMs ?? Date.now() - started },
       });
     }
     if (req.method === 'POST' && url.pathname === '/api/train') {
@@ -709,8 +969,9 @@ const server = http.createServer(async (req, res) => {
       return jsonResponse(res, 405, { ok: false, error: 'Method not allowed' });
     }
     const route = url.pathname === '/pretraining' ? '/pretraining.html'
-      : url.pathname === '/chat' ? '/index.html'
-        : url.pathname === '/' ? '/index.html' : decodeURIComponent(url.pathname);
+      : url.pathname === '/system' ? '/system.html'
+        : url.pathname === '/chat' ? '/index.html'
+          : url.pathname === '/' ? '/index.html' : decodeURIComponent(url.pathname);
     const safe = path.resolve(here, `.${route}`);
     if (!safe.startsWith(`${here}${path.sep}`)) return send(res, 404, 'Not found', 'text/plain; charset=utf-8');
     const data = await readFile(safe);

@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#080a12">
+  <meta name="description" content="NOEMA v3 sistem durumu: gerçek artefakt başlıkları, canlı telemetri ve doğrulama sözleşmesi.">
+  <title>NOEMA — Sistem</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/system.js" defer></script>
+</head>
+<body>
+  <div class="shell">
+    <nav class="rail" aria-label="Ana gezinme">
+      <a class="rail-brand" href="/" aria-label="NOEMA ana sayfa">N</a>
+      <a class="rail-btn" href="/" title="Sohbet" aria-label="Sohbet">
+        <svg viewBox="0 0 24 24"><path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5H5l1.6-3.2A7.5 7.5 0 1 1 20 11.5Z"/><path d="M9 11h.01M13 11h.01"/></svg>
+      </a>
+      <a class="rail-btn" href="/pretraining" title="Veri ve eğitim" aria-label="Veri ve eğitim">
+        <svg viewBox="0 0 24 24"><path d="M12 3v10M8 9l4 4 4-4"/><path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>
+      </a>
+      <a class="rail-btn" href="/system" aria-current="page" title="Sistem" aria-label="Sistem">
+        <svg viewBox="0 0 24 24"><path d="M4 17V9M9 17V5M14 17v-6M19 17V8"/></svg>
+      </a>
+      <div class="rail-spacer"></div>
+      <div class="rail-foot">
+        <span class="rail-health" id="rail-health" data-state="idle" title="Backend durumu"></span>
+        <span class="rail-health-label" id="rail-health-label">BAĞLANIYOR</span>
+      </div>
+    </nav>
+
+    <div class="main">
+      <header class="topbar">
+        <div class="topbar-id">
+          <h1>Sistem</h1>
+          <span class="tag" id="runtime-tag">LIR · yükleniyor</span>
+        </div>
+        <div class="topbar-actions">
+          <nav class="nav-tabs" aria-label="Sayfalar">
+            <a href="/">Sohbet</a>
+            <a href="/pretraining">Veri</a>
+            <a href="/system" aria-current="page">Sistem</a>
+          </nav>
+          <button class="icon-btn" id="refresh-button" title="Yenile" aria-label="Yenile">
+            <svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 5v6h-6"/></svg>
+          </button>
+        </div>
+      </header>
+
+      <main class="page">
+        <div class="wrap">
+          <div class="page-head">
+            <h1>Gerçek ölçümler, temsili olmayan sayılar</h1>
+            <p>
+              Bu sayfadaki her değer ya bir ikili dosyanın başlığından okunur ya da bu sunucunun
+              canlı sayaçlarından gelir. Bir değer bilinmiyorsa tire olarak görünür.
+            </p>
+          </div>
+
+          <div class="sys-grid">
+            <section class="card col-6">
+              <div class="section-head"><span class="section-title">Ağırlık grafiği · NV3G1</span><span class="pill" id="graph-pill" data-tone="info"><i></i><span>okunuyor</span></span></div>
+              <table class="fact-table"><tbody id="graph-rows">
+                <tr><td>durum</td><td>yükleniyor…</td></tr>
+              </tbody></table>
+            </section>
+
+            <section class="card col-6">
+              <div class="section-head"><span class="section-title">Checkpoint · NPG-v3</span><span class="pill" id="ckpt-pill" data-tone="info"><i></i><span>okunuyor</span></span></div>
+              <table class="fact-table"><tbody id="ckpt-rows">
+                <tr><td>durum</td><td>yükleniyor…</td></tr>
+              </tbody></table>
+            </section>
+
+            <section class="card col-4">
+              <div class="section-head"><span class="section-title">Korpus</span></div>
+              <table class="fact-table"><tbody id="corpus-rows">
+                <tr><td>durum</td><td>yükleniyor…</td></tr>
+              </tbody></table>
+            </section>
+
+            <section class="card col-4">
+              <div class="section-head"><span class="section-title">Çıkarım sayaçları</span></div>
+              <table class="fact-table"><tbody id="infer-rows">
+                <tr><td>durum</td><td>yükleniyor…</td></tr>
+              </tbody></table>
+            </section>
+
+            <section class="card col-4">
+              <div class="section-head"><span class="section-title">Donanım</span></div>
+              <table class="fact-table"><tbody id="host-rows">
+                <tr><td>durum</td><td>yükleniyor…</td></tr>
+              </tbody></table>
+            </section>
+
+            <section class="card col-8">
+              <div class="section-head"><span class="section-title">Doğrulama sözleşmesi</span></div>
+              <div class="verify-list" id="guarantees">
+                <div class="verify-row"><span class="v-name"><i>·</i>yükleniyor</span><span class="v-val">—</span></div>
+              </div>
+            </section>
+
+            <section class="card col-4">
+              <div class="section-head"><span class="section-title">Çıktı modları</span></div>
+              <div class="hexlist" id="modes">
+                <div class="hexrow"><span class="k">yükleniyor</span><span class="v">—</span></div>
+              </div>
+              <p class="mini-note" style="margin-top:12px">
+                <span class="ico">◈</span>
+                <span>v3 modları yalnızca ağırlık üretimidir; eski Φ yolu ayrı bir modda kalır ve
+                asla v3 gibi raporlanmaz.</span>
+              </p>
+            </section>
+
+            <section class="card col-12">
+              <div class="section-head"><span class="section-title">Önbellek ve kaynak kullanımı</span><span class="pill" id="live-tick"><i></i><span>0</span></span></div>
+              <div class="meter-list">
+                <div class="meter">
+                  <div class="meter-top"><span class="stat-label">Sistem yükü (1dk / çekirdek)</span><span class="v" id="m-load">—</span></div>
+                  <div class="bar" id="b-load"><i></i></div>
+                </div>
+                <div class="meter">
+                  <div class="meter-top"><span class="stat-label">Bellek kullanımı</span><span class="v" id="m-mem">—</span></div>
+                  <div class="bar" id="b-mem"><i></i></div>
+                </div>
+                <div class="meter">
+                  <div class="meter-top"><span class="stat-label">Yanıt önbelleği</span><span class="v" id="m-cache">—</span></div>
+                  <div class="bar" id="b-cache"><i></i></div>
+                </div>
+                <div class="meter">
+                  <div class="meter-top"><span class="stat-label">Önbellek isabet oranı</span><span class="v" id="m-hitrate">—</span></div>
+                  <div class="bar" id="b-hitrate"><i></i></div>
+                </div>
+              </div>
+            </section>
+          </div>
+        </div>
+      </main>
+    </div>
+  </div>
+</body>
+</html>
