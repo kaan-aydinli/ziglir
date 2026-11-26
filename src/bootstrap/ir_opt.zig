@@ -3220,6 +3220,7 @@ fn isVoidUnusedDestSafe(op: IROp) bool {
         .call_map_free,
         .call_memcpy,
         .call_memset,
+        .call_sha256,
         .call_print,
         .call_println,
         .call_print_int,

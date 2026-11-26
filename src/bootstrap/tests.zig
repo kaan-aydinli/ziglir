@@ -4725,3 +4725,55 @@ test "heap-internal out-of-chunk loop traps identically at -O0, -O1 and -O2" {
     try std.testing.expectEqual(@as(u8, 0), ok_res.exit_code);
     try std.testing.expectEqualStrings("136\n", ok_res.stdout); // sum(1..16)
 }
+
+// ── @sha256 builtin: native code blob + cross-backend execution ──────────
+// The digest of "abc" is a fixed, independently published constant, so these
+// expected decimal byte values are an oracle that does not share code with the
+// implementation under test.
+const sha256_abc_decimal =
+    "186\n120\n22\n191\n143\n1\n207\n234\n" ++
+    "65\n65\n64\n222\n93\n174\n34\n35\n" ++
+    "176\n3\n97\n163\n150\n23\n122\n156\n" ++
+    "180\n16\n255\n97\n242\n0\n21\n173\n";
+
+const sha256_lir_source =
+    \\fn main() -> i64 {
+    \\    let data = @malloc(3)
+    \\    @write_u8(data, 97 as u8)
+    \\    @write_u8(@ptr_add(data, 1), 98 as u8)
+    \\    @write_u8(@ptr_add(data, 2), 99 as u8)
+    \\    let out = @malloc(32)
+    \\    @sha256(data, 3, out)
+    \\    let mut i = 0
+    \\    while i < 32 {
+    \\        printInt(@read_u8(@ptr_add(out, i)) as i64)
+    \\        i = i + 1
+    \\    }
+    \\    return 0
+    \\}
+;
+
+test "sha256 native code blob regression tests" {
+    _ = @import("sha256_blob.zig");
+}
+
+test "@sha256 native backend produces the correct digest end to end" {
+    const elf = try compileSourceWithOpt(sha256_lir_source, .O2);
+    defer std.testing.allocator.free(elf);
+    const res = try runElfCapture(std.testing.allocator, elf, "sha256_native");
+    defer std.testing.allocator.free(res.stdout);
+    try std.testing.expectEqual(@as(u8, 0), res.exit_code);
+    try std.testing.expectEqualStrings(sha256_abc_decimal, res.stdout);
+}
+
+test "@sha256 vm backend produces the correct digest end to end" {
+    var comp = main.Compiler.initForTarget(sha256_lir_source, "<sha256_vm>", .O2, main.Target.host(), .vm);
+    comp.quiet = true;
+    var vm_res = try comp.runInVM(&[_][]const u8{}, true);
+    // runInVM allocates captured stdout with the page allocator; free with the
+    // same allocator (see driver.runInVM).
+    defer vm_res.deinit(std.heap.page_allocator);
+    try std.testing.expectEqual(@as(i64, 0), vm_res.exit_code);
+    try std.testing.expect(!vm_res.trapped);
+    try std.testing.expectEqualStrings(sha256_abc_decimal, vm_res.stdout);
+}

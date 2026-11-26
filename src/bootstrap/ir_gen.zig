@@ -3477,6 +3477,8 @@ pub const IRGen = struct {
                 .call_memcpy
             else if (eql(name, "@memset"))
                 .call_memset
+            else if (eql(name, "@sha256"))
+                .call_sha256
             else if (eql(name, "@malloc") or eql(name, "@alloc"))
                 .call_malloc
             else if (eql(name, "@free"))

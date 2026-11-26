@@ -909,6 +909,19 @@ pub const VMState = struct {
                 }
                 if (inst.dest != 0) vregs[inst.dest] = vregs[inst.args[0]];
             },
+            .call_sha256 => {
+                // @sha256(data, len, out): out[0..32] = SHA-256(data[0..len]).
+                const n_i: i64 = @bitCast(vregs[inst.args[1]]);
+                if (n_i < 0) return error.Trap;
+                const n: usize = @intCast(n_i);
+                const data = try self.resolveSlice(vregs[inst.args[0]], n, false);
+                const out = try self.resolveSlice(vregs[inst.args[2]], 32, true);
+                var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+                hasher.update(data);
+                var digest: [32]u8 = undefined;
+                hasher.final(&digest);
+                @memcpy(out[0..32], digest[0..]);
+            },
             .call_secure_zero => {
                 const n_i: i64 = @bitCast(vregs[inst.args[1]]);
                 if (n_i < 0) return error.Trap;

@@ -6,6 +6,7 @@
 const std = @import("std");
 const util = @import("util.zig");
 const ir_mod = @import("ir.zig");
+const sha256_blob = @import("sha256_blob.zig");
 
 const IRModule = ir_mod.IRModule;
 const IRFn = ir_mod.IRFn;
@@ -80,6 +81,7 @@ const TargetKind = enum(u8) {
     str_to_float_fn,
     sin_fn,
     cos_fn,
+    sha256_fn,
     map_new_fn,
     map_set_fn,
     map_get_fn,
@@ -211,6 +213,10 @@ pub const IRCodegen = struct {
     str_to_float_offset: u32 = 0,
     sin_offset: u32 = 0,
     cos_offset: u32 = 0,
+    // Offset of the copied SHA-256 machine-code blob in the runtime section,
+    // and the rodata offset of its 64-entry round-constant table K.
+    sha256_offset: u32 = 0,
+    sha256_k_rodata_off: u32 = 0,
     map_new_offset: u32 = 0,
     map_set_offset: u32 = 0,
     map_get_offset: u32 = 0,
@@ -317,6 +323,8 @@ pub const IRCodegen = struct {
         self.str_to_float_offset = 0;
         self.sin_offset = 0;
         self.cos_offset = 0;
+        self.sha256_offset = 0;
+        self.sha256_k_rodata_off = 0;
         self.map_new_offset = 0;
         self.map_set_offset = 0;
         self.map_get_offset = 0;
@@ -795,6 +803,7 @@ pub const IRCodegen = struct {
             .call_syscall,
             .call_memcpy,
             .call_memset,
+            .call_sha256,
             .call_malloc,
             .call_free,
             .call_array_new,
@@ -2129,6 +2138,27 @@ pub const IRCodegen = struct {
             };
         }
         self.fn_count = self.ir.fn_count;
+
+        // Reserve rodata for the SHA-256 round-constant table K (64 x u32,
+        // little-endian), 8-byte aligned, BEFORE any user function is compiled
+        // so @sha256 call sites can emit `lea rcx, [rip + K]`. The blob routine
+        // that consumes it is emitted later with the other runtime routines.
+        {
+            const k_aligned = (@as(usize, self.rodata_len) + 7) & ~@as(usize, 7);
+            while (@as(usize, self.rodata_len) < k_aligned) {
+                self.rodata[self.rodata_len] = 0;
+                self.rodata_len += 1;
+            }
+            self.sha256_k_rodata_off = self.rodata_len;
+            if (@as(usize, self.rodata_len) + 4 * sha256_blob.sha256_k.len > self.rodata.len) {
+                self.overflowed = true;
+            } else {
+                for (sha256_blob.sha256_k) |k| {
+                    std.mem.writeInt(u32, self.rodata[@as(usize, self.rodata_len)..][0..4], k, .little);
+                    self.rodata_len += 4;
+                }
+            }
+        }
 
         self.emitStartStub();
         self.text_user_start = self.code_len;
@@ -4791,6 +4821,26 @@ pub const IRCodegen = struct {
                 self.emit8(0xAA);
                 self.popReg(0);
                 if (inst.dest != 0) self.storeRegToVreg(0, inst.dest);
+            },
+            .call_sha256 => {
+                // @sha256(data, len, out): rdi=data, rsi=len, rdx=out, rcx=&K.
+                self.emitRegArgsLoad(&inst.args, 3);
+                // Reject a negative length (fail closed; no silent wrap).
+                self.emit8(0x48);
+                self.emit8(0x85);
+                self.emit8(0xF6); // test rsi, rsi
+                const sha_nonneg = self.emitJccReloc(0x9, .code_offset, 0, fi); // jns
+                self.emit8(0x0F);
+                self.emit8(0x0B); // ud2
+                self.relocs[sha_nonneg].target_id = self.code_len;
+                // Bounds-check data[0..len] and out[0..32] before the call.
+                self.emitCheckPtrLenRegs(7, 6); // chk_ptr_n(data, len)
+                self.mov64imm(0, 32); // rax = 32
+                self.emitCheckPtrLenRegs(2, 0); // chk_ptr_n(out, 32)
+                // rcx = &K (round constants reserved in rodata during setup).
+                self.leaRipRodataOffset(1, self.sha256_k_rodata_off);
+                self.emitCallReloc(.sha256_fn, 0);
+                // @sha256 returns void; nothing to store.
             },
 
             // ── Strings ──
@@ -10246,6 +10296,14 @@ pub const IRCodegen = struct {
         self.xorReg(0, 0);
         self.emit8(0xC3);
 
+        // ── __lir_sha256(rdi = data, rsi = len, rdx = out, rcx = K) -> void ──
+        // The native backend is freestanding (no libc, no loader), so SHA-256
+        // ships as a precompiled position-independent machine-code blob copied
+        // in verbatim (see sha256_blob.zig). K was reserved in rodata during
+        // compile() setup and is passed in rcx by every call site.
+        self.sha256_offset = self.code_len;
+        for (sha256_blob.sha256_code) |b| self.emit8(b);
+
         // ── __lir_map_new(rdi = flags) -> rax = map_ptr ─────────
         self.map_new_offset = self.code_len;
         self.pushReg(3);
@@ -11187,6 +11245,7 @@ pub const IRCodegen = struct {
             .str_to_float_fn => self.str_to_float_offset,
             .sin_fn => self.sin_offset,
             .cos_fn => self.cos_offset,
+            .sha256_fn => self.sha256_offset,
             .map_new_fn => self.map_new_offset,
             .map_set_fn => self.map_set_offset,
             .map_get_fn => self.map_get_offset,
@@ -11313,6 +11372,7 @@ pub const IRCodegen = struct {
             self.str_to_float_offset = remap(self.relocs[0..self.reloc_count], shrink_flags[0..self.reloc_count], shift_prefix[0..self.reloc_count], self.reloc_count, self.str_to_float_offset);
             self.sin_offset = remap(self.relocs[0..self.reloc_count], shrink_flags[0..self.reloc_count], shift_prefix[0..self.reloc_count], self.reloc_count, self.sin_offset);
             self.cos_offset = remap(self.relocs[0..self.reloc_count], shrink_flags[0..self.reloc_count], shift_prefix[0..self.reloc_count], self.reloc_count, self.cos_offset);
+            self.sha256_offset = remap(self.relocs[0..self.reloc_count], shrink_flags[0..self.reloc_count], shift_prefix[0..self.reloc_count], self.reloc_count, self.sha256_offset);
             self.map_new_offset = remap(self.relocs[0..self.reloc_count], shrink_flags[0..self.reloc_count], shift_prefix[0..self.reloc_count], self.reloc_count, self.map_new_offset);
             self.map_set_offset = remap(self.relocs[0..self.reloc_count], shrink_flags[0..self.reloc_count], shift_prefix[0..self.reloc_count], self.reloc_count, self.map_set_offset);
             self.map_get_offset = remap(self.relocs[0..self.reloc_count], shrink_flags[0..self.reloc_count], shift_prefix[0..self.reloc_count], self.reloc_count, self.map_get_offset);

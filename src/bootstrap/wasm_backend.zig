@@ -17,6 +17,11 @@ pub const WasmError = error{
     MissingMain,
     InvalidFunction,
     OutOfMemory,
+    /// A builtin with no Wasm runtime implementation was used. The Wasm backend
+    /// is freestanding and cannot ship the native SHA-256 code blob; targeting
+    /// Wasm with such a builtin is rejected at compile time rather than silently
+    /// trapping at runtime.
+    UnsupportedBuiltin,
 };
 
 // Wasm type encodings
@@ -1574,6 +1579,10 @@ fn emitUserFn(sec: *Buf, alloc: std.mem.Allocator, module: *const IRModule, sour
                         try b.b(OP_UNREACHABLE);
                     }
                 },
+                // SHA-256 has no freestanding Wasm runtime implementation; the
+                // native code blob cannot be carried into a Wasm module. Reject
+                // at compile time instead of emitting a runtime trap.
+                .call_sha256 => return error.UnsupportedBuiltin,
                 else => try b.b(OP_UNREACHABLE),
             }
         }

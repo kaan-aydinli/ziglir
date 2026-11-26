@@ -144,6 +144,9 @@ pub const IROp = enum {
     call_syscall,
     call_memcpy,
     call_memset,
+    /// @sha256(data: *u8, len: i64, out: *u8) -> void. Writes the 32-byte
+    /// SHA-256 digest of data[0..len] to out[0..32]. args = {data, len, out}.
+    call_sha256,
     call_printptr,
     call_malloc,
     call_free,
@@ -273,6 +276,7 @@ pub const IROp = enum {
             .call_syscall,
             .call_memcpy,
             .call_memset,
+            .call_sha256,
             .call_printptr,
             .call_malloc,
             .call_free,

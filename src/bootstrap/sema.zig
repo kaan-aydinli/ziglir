@@ -356,6 +356,7 @@ pub const builtins = [_]BuiltinSpec{
     .{ .name = "@free", .min_args = 1, .max_args = 1, .ret = .void },
     .{ .name = "@memcpy", .min_args = 3, .max_args = 3, .ret = .ptr },
     .{ .name = "@memset", .min_args = 3, .max_args = 3, .ret = .ptr },
+    .{ .name = "@sha256", .min_args = 3, .max_args = 3, .ret = .void },
     .{ .name = "@ptr_add", .min_args = 2, .max_args = 2, .ret = .ptr },
     .{ .name = "@read_byte", .min_args = 1, .max_args = 1, .ret = SemaType.i64_t },
     .{ .name = "@write_byte", .min_args = 2, .max_args = 2, .ret = .void },
