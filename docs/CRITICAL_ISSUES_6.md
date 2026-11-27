@@ -12,7 +12,7 @@
 | # | Sorun | Kategori | Şiddet | Konum |
 |---|-------|----------|--------|-------|
 | 1 | `LIR_TRAP_CEIL` ortam değişkeni üretilen binary'de heap sınır denetimini tamamen kaldırıyor | Güvenlik / derleyici | **Kritik** | `ir_codegen.zig:6984-7006` |
-| 2 | `-O2` bounds-hoisting: guard yalnızca *taban* işaretçiyi doğruluyor, sonra tüm erişimler `unchecked_access=true` | Doğruluk / bellek güvenliği | **Kritik** | `ir_opt.zig:4616-4860`, `ir_codegen.zig:6732`, `c_backend.zig` |
+| 2 | `-O2` bounds-hoisting: guard yalnızca *taban* işaretçiyi doğruluyor, sonra tüm erişimler `unchecked_access=true` — **ÇÖZÜLDÜ** (`7830359`, `460a603`): guard artık kanıtlanmış erişim *aralığını* doğruluyor, bkz. bölüm sonundaki çözüm durumu | Doğruluk / bellek güvenliği | **Kritik** | `ir_opt.zig:4616-4860`, `ir_codegen.zig:6732`, `c_backend.zig` |
 | 3 | Native canary + heap secret `rdtsc` ile tohumlanıyor; README "CSPRNG (getrandom)" iddia ediyor | Güvenlik / dokümantasyon ihlali | **Yüksek-Kritik** | `ir_codegen.zig:2210-2320`, `ir_codegen.zig:7310` |
 | 4 | IR VM'de adım (step) limiti yok: `steps` sayılıyor ama hiç karşılaştırılmıyor → sonsuz döngü asılı kalıyor | Kullanılabilirlik / DoS | **Yüksek-Kritik** | `ir_vm.zig:43,130,554,1590` |
 | 5 | vreg sayacı `u16` ve `allocVreg` taşmayı kontrol etmiyor; codegen `min(vreg_count+2, MAX_VREGS)` ile sessizce kırpıyor | Doğruluk / sessiz bozuk derleme | **Yüksek** | `ir.zig:412`, `ir_gen.zig:54,148-155`, `ir_codegen.zig:38,2670-2730` |
@@ -101,6 +101,70 @@ Sonuç: **heap içinde ama chunk dışında** bir adrese yapılan erişim, guard
 - Kanıt üretilemeyen durumlarda güvenli fallback: döngü başına **tek** guard değil, her erişimde `chk_ptr_n(ptr, size)` bırakın (zaten deferred-cold-path ile maliyet düşük).
 - `unchecked_access=true` atayan her yol için regresyon testi ekleyin: `tests/backend_test.py` içinde "base heap içinde, offset buffer dışında" fixture'ı ile native/C/VM/WASM dördünde de trap beklendiğini doğrulayın.
 - Issue #6'daki dominance verifier'ı olmadan bu sınıfı kapatmak mümkün değil — ikisi birlikte ele alınmalı.
+
+**Çözüm durumu (2026-11-27, `7830359` + `460a603`) — Option A uygulandı:**
+
+`hoistBoundsChecks` artık *taban* değil **erişim aralığı (span)** kanıtı üretiyor ve
+kanıtlayamadığı hiçbir erişimi `unchecked_access` yapmıyor (hoisting döngü başına değil,
+**erişim başına**: aralığı sınırlandırılamayan adres kendi `chk_ptr_n` denetimini koruyor).
+
+Kanıt: doğal döngü + tek preheader + pozitif sabit adımlı tek canonical IV + **tek çıkış**
+(backedge testi) koşullarında, adresi `base + c*iv + k + ds*d` (c ≥ 0 sabit; `base` ve `d`
+döngü-dışı invariant) biçiminde kanıtlanan her bulk erişim
+
+```
+[ base + c*lo + k + ds*d ,  + c*(hi-lo) + width )
+```
+
+aralığında kalıyor. Pass bu başlangıç adresi ve uzunluğu üretip **tek** `bounds_hoist_guard`'ı
+preheader→header kenarına (header'ın hemen önüne eklenen yeni blok) koyuyor, erişimleri ancak
+ondan sonra işaretliyor. Guard üç backend'de de per-access yolunun memcpy/slice için zaten
+güvendiği doğrulayıcıya iniyor: `__lir_chk_ptr_n(start, len)` (native), `lir_chk_ptr_n` (C),
+`resolveSlice` (VM) — yani aralık **tek bir canlı chunk içinde** ya da işaretçi yönetilen heap
+dışındaysa geçiyor, aksi halde trap. Sınır dışı döngü yine trap ediyor; sadece erişimde değil,
+ilk erişimden önce bir kez. Uzunluk aritmetiği sabitken `@*WithOverflow` ile katlanıyor (taşmada
+döngü tam denetimli kalıyor), runtime'da `@checked_sub/@checked_mul/@checked_add` ile üretiliyor
+(taşmada wrap değil **trap** — fail-closed).
+
+İki düzeltme, rapordaki öngörüye karşı:
+
+1. **Issue #6'nın genel dominance verifier'ı gerekmedi.** Guard'ın üstünlüğü yapısal: doğal
+   döngü + header'ı dominate eden tek preheader + guard bloğunun o kenara eklenmesi, her
+   erişimi dominate etmeyi kendiliğinden garanti ediyor. Genel verifier hâlâ kendi başına açık
+   bir konu (bkz. #6), ama bu sınıfı kapatmak ona bağlı değil.
+2. **`chk_heap{1,4,8}` "sabit boyutlu, değişken span ifade edemez" tespiti guard için
+   geçerli değil:** `__lir_chk_ptr_n` uzunluğu *stack argüman* olarak alıyor, dolayısıyla
+   değişken span'ı hem sabit (immediate) hem runtime (vreg) biçimde ifade edebiliyor.
+
+Ek olarak (`460a603`): guard bir *chunk* özelliği kanıtladığı ve gövde allowlist'i chunk'ı
+geçersiz kılacak her şeyi (call/free/malloc/memcpy/memset/map/chan/IO/return/phi) dışladığı için,
+okuduğu tüm değerler çevreleyen döngüde de invariant ise ve çevreleyen döngüye giriş **koşulsuz
+jump'larla** iç döngünün preheader'ına düşüyorsa, aynı guard çevreleyen döngünün giriş kenarına
+taşınıyor (iç döngünün kendi giriş testi ya koşulsuz ya sabit-true olmalı; aksi halde iç döngü
+hiç çalışmadığı bir koşuda guard yanlış trap üretebilirdi).
+
+Ölçüm (aynı ağaçta pass kapalı build ile interleaved A/B; tüm iş yükleri `expected.txt`
+satırını basmaya devam ediyor, trainer raporu birebir aynı):
+
+| iş yükü | new/nohoist | not |
+|---|---|---|
+| 11_kmeans | **0.462** | 53.29 → 24.64 ms; clang -O2 oranı 5.58 → 3.14 |
+| 02_nbody | 0.918 | |
+| 03_sieve | 0.917 | |
+| 01_matrix_mul | 0.894 | |
+| geomean (11 iş yükü) | **0.9153** | |
+| `run_c.py` geomean LIR/LLVM-C | 1.865 → **1.384** | LIR/gcc 1.462 → 1.097 |
+| NOEMA v3 trainer (581 KB corpus) | 0.50 s → **0.47 s** | |
+
+Doğrulama: `zig build test` (Issue #2'nin pin'li "chunk dışı döngü -O0/-O1/-O2'de aynı şekilde
+trap etmeli" testi ve chunk'a tam sığan kontrol döngüsü dahil) ve `ai/run_tests.py`
+**220/220** (native + VM + C). Ayrıca kanıtlanamayan şekillerin denetimli kaldığını pin'leyen
+test (tanımsız offset / IV'siz gövde / gövdede `call`) değişmeden geçiyor.
+
+Bilinen sınır: erişimi koşullu bir iç blokta olan döngüler (ör. n-body'nin `if a != b` iç
+döngüsü) bilinçli olarak hoist edilmiyor — tek çıkış olsa bile erişim son iterasyonda
+atlanabildiğinden, aralığın buffer'ı aştığı bir programda guard *yanlış trap* üretebilirdi.
+Güvenlik tarafında fail-closed, ama davranış değiştirdiği için kapsam dışı bırakıldı.
 
 ---
 
