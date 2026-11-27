@@ -3184,7 +3184,12 @@ pub const IRCodegen = struct {
                                 computed_r11 = true;
                             }
                             if (computed_r11) {
-                                self.emitPtrTrapN(11, mem_sz);
+                                // A hoisted span guard (see ir_opt.zig
+                                // BOUNDS-HOIST) already proved this access lies
+                                // inside [start, start+len) of one live chunk,
+                                // so the fused form skips its own probe exactly
+                                // like the unfused one below.
+                                if (!next_inst.unchecked_access) self.emitPtrTrapN(11, mem_sz);
                                 if (!is_mem_write) {
                                     const dst_reg: u8 = self.vregPhys(next_inst.dest) orelse 0;
                                     switch (mem_sz) {
@@ -4730,7 +4735,7 @@ pub const IRCodegen = struct {
                     self.loadVregToReg(inst.args[0], 0);
                     break :blk 0;
                 };
-                self.emitPtrTrapN(ptr_reg, 1);
+                if (!inst.unchecked_access) self.emitPtrTrapN(ptr_reg, 1);
                 const dst_reg: u8 = self.vregPhys(inst.dest) orelse 0;
                 self.emitMemLoadByte(dst_reg, ptr_reg);
                 if (inst.dest != 0 and self.vregPhys(inst.dest) == null) self.storeRegToVreg(dst_reg, inst.dest);
@@ -4740,7 +4745,7 @@ pub const IRCodegen = struct {
                     self.loadVregToReg(inst.args[0], 0);
                     break :blk 0;
                 };
-                self.emitPtrTrapN(ptr_reg, 1);
+                if (!inst.unchecked_access) self.emitPtrTrapN(ptr_reg, 1);
                 const val_v = inst.args[1];
                 if (val_v > 0 and val_v < MAX_VREGS and self.vreg_const_known[val_v]) {
                     const imm8: u8 = @truncate(@as(u64, @bitCast(self.vreg_const_imm[val_v])));
@@ -6849,7 +6854,7 @@ pub const IRCodegen = struct {
                     self.loadVregToReg(inst.args[0], 0);
                     break :blk 0;
                 };
-                self.emitPtrTrapN(ptr_reg, 4);
+                if (!inst.unchecked_access) self.emitPtrTrapN(ptr_reg, 4);
                 const dst_reg: u8 = self.vregPhys(inst.dest) orelse 0;
                 self.emitMemLoadU32(dst_reg, ptr_reg);
                 if (inst.dest != 0 and self.vregPhys(inst.dest) == null) self.storeRegToVreg(dst_reg, inst.dest);
@@ -6859,7 +6864,7 @@ pub const IRCodegen = struct {
                     self.loadVregToReg(inst.args[0], 0);
                     break :blk 0;
                 };
-                self.emitPtrTrapN(ptr_reg, 4);
+                if (!inst.unchecked_access) self.emitPtrTrapN(ptr_reg, 4);
                 const val_reg: u8 = self.vregPhys(inst.args[1]) orelse blk_v: {
                     self.loadVregToReg(inst.args[1], 1);
                     break :blk_v 1;
@@ -6908,35 +6913,31 @@ pub const IRCodegen = struct {
             },
 
             .bounds_hoist_guard => {
-                // Döngü tabanı için TEK aralık testi. Tam `emitPtrTrapN`
-                // gövdesi (~40 bayt, 4 global yükleme, 3 dallanma) burada
-                // gereksiz: hoist edilen guard döngü girişinde bir kez
-                // koşar ve zaten serbestçe kullanılan erişimleri korur.
+                // Sound span guard (Issue #2 Option A; see the BOUNDS-HOIST
+                // section of ir_opt.zig). The hoisting pass proved that every
+                // access of the loop this guard protects lies inside
+                // [start, start+len), so one call into the chunk verifier
+                // replaces all of their probes:
                 //
-                // Hafif biçim: 2 global yükleme + 1 dallanma.
+                //   __lir_chk_ptr_n(start, len)
                 //
-                //   if (base < heap_min || base > heap_max) -> trap
-                //
-                // Bu, `-O2`'de kalan en büyük maliyetin kaynağıydı:
-                // hoisting üç iç içe döngünün her birine guard koyuyor ve
-                // her guard tam gövdeyi üretiyordu.
-                const ptr_reg: u8 = self.vregPhys(inst.args[0]) orelse blk: {
-                    self.loadVregToReg(inst.args[0], 0);
-                    break :blk 0;
-                };
-                self.emitCmpRegAbs(ptr_reg, @intCast(DATA_VADDR + 0x88)); // heap_min
-                const jb_trap = self.code_len + 1;
-                self.emit8(0x72); // jb .trap
-                self.emit8(0);
-                self.emitCmpRegAbs(ptr_reg, @intCast(DATA_VADDR + 0x90)); // heap_max
-                const jbe_ok = self.code_len + 1;
-                self.emit8(0x76); // jbe .ok
-                const trap_pos = self.code_len;
-                self.code[jb_trap] = @intCast(trap_pos - (jb_trap + 1));
-                self.emit8(0x0F);
-                self.emit8(0x0B); // ud2
-                const ok_pos = self.code_len;
-                self.code[jbe_ok] = @intCast(ok_pos - (jbe_ok + 1));
+                // It accepts exactly what a per-access check accepts — the
+                // whole range inside one live chunk, or the pointer entirely
+                // outside the managed heap — and traps otherwise, so an
+                // out-of-bounds loop still traps; it just traps once, before
+                // the first access, instead of at the access. The helper takes
+                // both operands on the stack and preserves every GPR, and
+                // rax/rcx are scratch here: the register allocator never
+                // assigns a vreg to them. `arg_count == 2` means the length is
+                // a runtime vreg (a loop bound the compiler could not fold);
+                // otherwise `imm` carries it.
+                self.loadVregToReg(inst.args[0], 0);
+                if (inst.arg_count >= 2) {
+                    self.loadVregToReg(inst.args[1], 1);
+                } else {
+                    self.mov64imm(1, @bitCast(inst.imm));
+                }
+                self.emitCheckPtrLenRegs(0, 1);
             },
 
             .nop, .struct_decl, .module_import => {},

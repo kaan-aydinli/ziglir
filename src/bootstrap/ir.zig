@@ -151,11 +151,15 @@ pub const IROp = enum {
     call_malloc,
     call_free,
     call_ptr_add,
-    // Bounds-hoist guard: args[0] = base ptr vreg. INERT since Issue #2
-    // (docs/CRITICAL_ISSUES_6.md): nothing emits it any more, because the
-    // heap-range test it carried cannot prove that loop-varying accesses stay
-    // inside their chunk. Kept so hand-built IR and the backend handlers stay
-    // well-defined; see the BOUNDS-HOIST section in ir_opt.zig.
+    // Bounds-hoist guard: args[0] = start address vreg; the length is `imm`
+    // when arg_count == 1, or the runtime vreg args[1] when arg_count == 2.
+    // Emitted only by the sound span hoist (Issue #2 Option A, see the
+    // BOUNDS-HOIST section in ir_opt.zig), which proves every access it
+    // unchecks lies inside [start, start+len). Backends lower it to the same
+    // chunk verifier the per-access path uses (__lir_chk_ptr_n / lir_chk_ptr_n
+    // / resolveSlice), so the range is checked once per loop entry instead of
+    // once per access. The old heap-range form it replaces could not prove
+    // that loop-varying accesses stay inside their chunk and is gone.
     bounds_hoist_guard,
     call_read_byte,
     call_write_byte,
@@ -395,10 +399,11 @@ pub const IRInst = struct {
     arg_count: u8 = 0,
     slot: u16 = 0, // stack slot for load_local / store_local / addr_of / alloca
     field_offset: u16 = 0, // for field_access / field_store
-    // When false (always, since Issue #2 disabled bounds-hoisting) the
-    // backends emit the chunk-precise per-access check for bulk reads/writes.
-    // Nothing in the compiler sets this to true any more; the field remains
-    // so the IR layout and backend guards are unchanged. See ir_opt.zig.
+    // When false (the default, and what every pass except bounds-hoisting
+    // leaves it at) the backends emit the chunk-precise per-access check for
+    // bulk reads/writes. The sound span hoist in ir_opt.zig sets it only for
+    // accesses it proved lie inside the [start, start+len) range that a
+    // `bounds_hoist_guard` on the loop's entry edge verifies at runtime.
     unchecked_access: bool = false,
 };
 

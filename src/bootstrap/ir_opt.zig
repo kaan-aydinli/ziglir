@@ -45,11 +45,11 @@ pub fn optimize(module: *IRModule, level: OptLevel) void {
         optimizeFn(module, fi, level);
     }
 
-    // Bounds-check hoisting is a documented no-op since Issue #2 (see the
-    // BOUNDS-HOIST section): the old heap-range guard could not prove that
-    // loop-varying accesses stayed inside their chunk, so -O2 silently
-    // dropped per-access checks it had not earned. The call stays as the
-    // single place a future span-proof implementation plugs back in.
+    // Sound access-span hoisting (Issue #2 Option A). It runs last, on the
+    // final loop shapes, and rewrites only the loops whose accesses it can
+    // bound by one [start, start+len) range that a runtime chunk guard
+    // verifies on the loop's entry edge; everything it cannot prove keeps its
+    // per-access check. See the BOUNDS-HOIST section below.
     if (level == .O2) _ = hoistBoundsChecks(module, null);
 }
 
@@ -4446,40 +4446,90 @@ fn unrollCountedLoops(f: *IRFn) bool {
 
 
 // ════════════════════════════════════════════════════════════════════════════
-// BOUNDS-HOIST — DISABLED (Issue #2 of docs/CRITICAL_ISSUES_6.md): base-in-heap
-// does not prove access-in-chunk.
+// BOUNDS-HOIST — sound access-span hoisting (Issue #2, Option A, of
+// docs/CRITICAL_ISSUES_6.md).
 //
-// What the pass used to do: in a natural loop whose body had no writes except
-// @read_u64/@write_u64 bulk accesses, it emitted one `bounds_hoist_guard` in
-// the preheader and marked every bulk access in the loop `unchecked_access`,
-// so native codegen skipped the per-access `emitPtrTrapN` chunk check.
+// The first version of this pass proved only `heap_min <= base <= heap_max` and
+// then dropped the per-access checks, so the loop-varying addresses
+// `base + i*stride` could walk out of the base chunk and still run unchecked at
+// -O2 — a release-only out-of-bounds read/write. It was disabled for exactly
+// that reason, and the regression tests for its PoC are still pinned below.
 //
-// Why that is unsound: the emitted guard only tested
-//     heap_min <= base <= heap_max
-// — the whole-heap range. The addresses actually dereferenced inside the loop
-// are `base + i*stride + offset` for a loop-varying index, and nothing proved
-// those stayed inside the base pointer's chunk (or that `i*stride` could not
-// overflow). An access that is inside the heap but outside its chunk passed
-// the guard and then ran with no check at all: a silent out-of-bounds
-// read/write that exists only at -O2. PoC (pinned by the regression test
-// "bounds-hoisting stays disabled"): a 64-byte @malloc chunk read through
-// `@read_u64(@ptr_add(buf, i * 8))` for i in 0..15 trapped with SIGILL at
-// -O0/-O1 but silently summed heap garbage at -O2 (exit 0).
+// This version proves a *span* instead of a base, and the guard it emits is the
+// very verifier the per-access path already trusts for memcpy and slice bounds:
 //
-// Re-enabling hoisting (Option A in the report) requires a real access-span
-// proof — loop-invariant base, trip count and stride with overflow-free
-// `span = stride * (trip - 1) + offset + width`, plus a guard that verifies
-// `base .. base+span` lies inside one live chunk at runtime. The fixed-size
-// chunk checks the backends emit (__lir_chk_heap{1,4,8}, lir_chk_ptr_n with a
-// constant n) cannot express a variable span, so no such guard exists today;
-// until it does, every access keeps its own chunk-precise check. That check
-// is cheap on the hot path: two compares against a cached
-// [chunk_start, chunk_end-8] window, with the validator call deferred to a
-// cold path that correct programs never enter.
+//   For a natural loop L entered only through a preheader P that dominates the
+//   header h, with a canonical induction variable `iv` that grows by a positive
+//   constant `step` and keeps the loop alive only while `iv <= hi` (or `< hi`),
+//   every bulk access in L has an address
 //
-// `BoundsHoistStats` and this entry point keep their old shapes so call sites
-// and `explain` output still compile; the tests pin that nothing is ever
-// rewritten, so a future Option A must consciously update them.
+//       base + c*iv + k + ds*d     (c >= 0 and k, ds constants, d and base
+//                                   loop-invariant vregs)
+//
+//   so every byte L can touch through that base lies in
+//
+//       [ start, start + len )   with
+//       start = base + c*lo + k + ds*d
+//       len   = c*(hi - lo) + width
+//
+//   where `lo` is the value `iv` still holds on the edge into the loop. The pass
+//   materialises `start` and `len`, emits ONE `bounds_hoist_guard` on the P->h
+//   edge — in a fresh block, so the guard runs exactly when the loop is entered
+//   and dominates every access — and only then marks the loop's accesses
+//   `unchecked_access`. The guard lowers to `__lir_chk_ptr_n(start, len)`
+//   (native), `lir_chk_ptr_n` (C) and `resolveSlice` (VM), which accept exactly
+//   what a per-access check accepts — the whole range inside one live chunk, or
+//   the pointer entirely outside the managed heap — and trap otherwise. An
+//   out-of-bounds loop therefore still traps; it traps once, before the first
+//   access, instead of at the access.
+//
+// What the analysis insists on before it rewrites anything:
+//   * L is a natural loop (a backedge whose target dominates its source) and P
+//     is its only entry, so the new guard block dominates every block of L. No
+//     general dominance verifier is needed: the guard's placement is structural.
+//   * The body's op set is an allowlist — bulk accesses, @ptr_add, pure
+//     arithmetic/comparison/const/copy and local-slot traffic. Any call,
+//     allocation, free, memcpy/memset, map/channel/IO, deref or field store,
+//     phi or return disqualifies the loop: nothing may invalidate the chunk,
+//     alias the buffer, or produce output before a trap the guard would raise.
+//   * `iv` has exactly two definitions: the init outside L (dominating h) and
+//     one increment in the backedge block, of the form `iv + step` (directly or
+//     through a single-def temporary copied back into `iv`), with `step` a
+//     positive constant, and no access in that block after the increment. So
+//     every access sees an `iv` that passed an `iv <=/< hi` test, and since
+//     `iv` only grows, `lo <= iv <= hi` at every access — including a stale
+//     `iv` reused from an earlier iteration.
+//   * P enters L through the same comparison against the same bound, so
+//     `lo <= hi` holds whenever the guard runs; unconditional entry is accepted
+//     only when `lo <= hi` is a constant fact.
+//   * L has exactly one exit and it is the backedge test, and every proven
+//     group has at least one access in the header. Together those mean the
+//     induction variable really does run up to `hi` and the group's widest
+//     offset is genuinely touched on the last iteration, so a trapping guard is
+//     equivalent to the checked program trapping on that same access. With an
+//     early exit — or a group whose accesses all sit in a conditional inner
+//     block — the loop could stop short of the range its bound describes and
+//     the guard would fault a run that never accessed out of bounds. The body
+//     allowlist (no IO, no free, no return) means nothing observable happens
+//     before that trap either.
+//   * Hoisting is per access, not per loop: an address that cannot be bounded
+//     is left out of every group and simply keeps its own per-access check.
+//   * The guard block is spliced in directly before the header rather than
+//     appended, so its jump stays a forward edge: the codegen finds loops with a
+//     backward-edge heuristic, and an appended guard block would mark most of
+//     the function as a loop body and cost hot loops their registers.
+//   * Every offset is affine in `iv` with a non-negative constant coefficient,
+//     traced through single-def instructions inside L that dominate the access
+//     and loop-invariant leaves (no definition inside L, one definition
+//     dominating h — the guard block then reads exactly the value the body
+//     reads, because nothing inside L redefines it).
+//   * Length arithmetic never wraps. Constant spans fold through
+//     `@addWithOverflow`/`@subWithOverflow`/`@mulWithOverflow` and the loop is
+//     left fully checked on overflow; runtime spans are built from
+//     `@checked_sub`/`@checked_mul`/`@checked_add`, which trap rather than wrap
+//     (fail closed — never a silently shortened span).
+//   * A provable trip count must reach HOIST_MIN_TRIPS: one verifier call only
+//     pays for itself after enough per-access probes disappear.
 // ════════════════════════════════════════════════════════════════════════════
 
 /// Reported by analyze: 0 = ok, otherwise a reason code (for the explain mode).
@@ -4489,9 +4539,1008 @@ pub const BoundsHoistStats = struct {
     accesses_rewritten: u32 = 0,
 };
 
-pub fn hoistBoundsChecks(module: *IRModule, stats: ?*BoundsHoistStats) bool {
-    // Deliberate no-op; see the section header above (Issue #2 soundness).
-    _ = module;
-    if (stats) |s| s.* = .{};
+/// One verifier call replaces `trips` inline chunk-cache probes, so hoisting
+/// only pays for itself from this many provable iterations on. Loops whose
+/// bounds are runtime values are not measurable here and are allowed through:
+/// their guard still runs once per loop entry.
+const HOIST_MIN_TRIPS: i64 = 12;
+
+/// Distinct (base, offset) families one loop may get a guard for.
+const HOIST_MAX_GROUPS: usize = 4;
+
+/// Access sites remembered for one loop.
+const HOIST_MAX_SITES: usize = 128;
+
+/// Guard-block budget: 4 groups x (offset + length + guard) + terminator.
+const HOIST_MAX_NB_INSTS: usize = 48;
+
+/// Definition census of the function: how often each vreg is written, plus the
+/// (block, index) of its last definition — only meaningful when `cnt == 1`.
+const bhDefs = struct {
+    cnt: [MAX_TRACKED_VREGS]u32 = .{0} ** MAX_TRACKED_VREGS,
+    blk: [MAX_TRACKED_VREGS]u16 = .{0} ** MAX_TRACKED_VREGS,
+    idx: [MAX_TRACKED_VREGS]u16 = .{0} ** MAX_TRACKED_VREGS,
+};
+
+/// Constant values of single-definition vregs, folded along the reverse
+/// postorder so operands are resolved before their users.
+const bhConsts = struct {
+    known: [MAX_TRACKED_VREGS]bool = .{false} ** MAX_TRACKED_VREGS,
+    val: [MAX_TRACKED_VREGS]i64 = .{0} ** MAX_TRACKED_VREGS,
+};
+
+/// A bound, an offset part or a length: `v == 0` means the constant `val`,
+/// otherwise the runtime value of one loop-invariant vreg.
+const bhSpanValue = struct {
+    v: u16 = 0,
+    val: i64 = 0,
+};
+
+/// An access offset proven to be `c*iv + k + ds*d`.
+const bhSpanOffset = struct {
+    c: i64 = 0,
+    k: i64 = 0,
+    d: u16 = 0,
+    ds: i64 = 0,
+};
+
+const bhCtx = struct {
+    f: *const IRFn,
+    cfg: *const CFGInfo,
+    defs: *const bhDefs,
+    consts: *const bhConsts,
+    in_loop: []const bool,
+    h: u16,
+    /// Block the offset currently being traced has to dominate.
+    site: u16 = 0,
+    iv: u16 = 0,
+};
+
+fn bhAccessWidth(op: IROp) i64 {
+    return switch (op) {
+        .call_read_byte, .call_write_byte => 1,
+        .call_read_u32, .call_write_u32 => 4,
+        .call_read_u64, .call_write_u64 => 8,
+        else => 0,
+    };
+}
+
+/// Ops a loop body may contain while its accesses are being proven. Everything
+/// else — calls, allocation, free, bulk memory ops, map/channel/IO, unchecked
+/// stores through `deref_store`/`field_store`, phis, returns — disqualifies the
+/// loop, because it could invalidate the chunk, alias the buffer, or emit output
+/// before a trap that the hoisted guard would raise first.
+fn bhLoopOpAllowed(op: IROp) bool {
+    return switch (op) {
+        .const_int,
+        .const_str,
+        .copy,
+        .load_local,
+        .store_local,
+        .jump,
+        .cond_jump,
+        .call_ptr_add,
+        .add,
+        .sub,
+        .mul,
+        .div,
+        .udiv,
+        .@"mod",
+        .umod,
+        .shl,
+        .shr,
+        .ushr,
+        .bit_and,
+        .bit_or,
+        .bit_xor,
+        .bit_not,
+        .logic_not,
+        .neg,
+        .fadd,
+        .fsub,
+        .fmul,
+        .fdiv,
+        .fneg,
+        .itof,
+        .uitof,
+        .ftoi,
+        .ftou,
+        .f32_to_f64,
+        .f64_to_f32,
+        .sext8,
+        .sext16,
+        .sext32,
+        .zext8,
+        .zext16,
+        .zext32,
+        .select,
+        .cmp_eq,
+        .cmp_ne,
+        .cmp_lt,
+        .cmp_le,
+        .cmp_gt,
+        .cmp_ge,
+        .ucmp_lt,
+        .ucmp_le,
+        .ucmp_gt,
+        .ucmp_ge,
+        .fcmp_eq,
+        .fcmp_ne,
+        .fcmp_lt,
+        .fcmp_le,
+        .fcmp_gt,
+        .fcmp_ge,
+        => true,
+        else => false,
+    };
+}
+
+fn bhBuildDefs(f: *const IRFn, t: *bhDefs) void {
+    @memset(&t.cnt, 0);
+    for (0..f.block_count) |bi| {
+        const b = &f.blocks[bi];
+        for (0..b.inst_count) |ii| {
+            const d = b.insts[ii].dest;
+            if (d == 0 or d >= MAX_TRACKED_VREGS) continue;
+            t.cnt[d] += 1;
+            t.blk[d] = @intCast(bi);
+            t.idx[d] = @intCast(ii);
+        }
+    }
+}
+
+fn bhBuildConsts(f: *const IRFn, cfg: *const CFGInfo, t: *const bhDefs, c: *bhConsts) void {
+    @memset(&c.known, false);
+    for (cfg.rpo[0..cfg.rpo_len]) |bi| {
+        const b = &f.blocks[bi];
+        for (0..b.inst_count) |ii| {
+            const inst = b.insts[ii];
+            const d = inst.dest;
+            if (d == 0 or d >= MAX_TRACKED_VREGS) continue;
+            // A vreg written more than once does not have one value, so it can
+            // never stand for a constant here.
+            if (t.cnt[d] != 1) continue;
+            switch (inst.op) {
+                .const_int => {
+                    c.known[d] = true;
+                    c.val[d] = inst.imm;
+                },
+                .copy => {
+                    const s = inst.src1;
+                    if (s > 0 and s < MAX_TRACKED_VREGS and c.known[s]) {
+                        c.known[d] = true;
+                        c.val[d] = c.val[s];
+                    }
+                },
+                .add, .sub, .mul => {
+                    const a = inst.src1;
+                    const b2 = inst.src2;
+                    if (a == 0 or a >= MAX_TRACKED_VREGS or !c.known[a]) continue;
+                    if (b2 == 0 or b2 >= MAX_TRACKED_VREGS or !c.known[b2]) continue;
+                    const x = c.val[a];
+                    const y = c.val[b2];
+                    const r = switch (inst.op) {
+                        .add => @addWithOverflow(x, y),
+                        .sub => @subWithOverflow(x, y),
+                        else => @mulWithOverflow(x, y),
+                    };
+                    if (r[1] != 0) continue; // leave it symbolic, never wrap
+                    c.known[d] = true;
+                    c.val[d] = r[0];
+                },
+                else => {},
+            }
+        }
+    }
+}
+
+/// One value for the whole loop: every definition lives outside L and at least
+/// one of them dominates the header, so the guard block — whose only predecessor
+/// is the preheader — reads exactly what the body will read.
+fn bhInvariant(ctx: *const bhCtx, v: u16) bool {
+    if (v == 0 or v >= MAX_TRACKED_VREGS) return false;
+    if (ctx.defs.cnt[v] == 0) return false;
+    var saw_dom = false;
+    for (0..ctx.f.block_count) |bi| {
+        const b = &ctx.f.blocks[bi];
+        for (0..b.inst_count) |ii| {
+            if (b.insts[ii].dest != v) continue;
+            if (ctx.in_loop[@intCast(bi)]) return false;
+            if (dominates(ctx.cfg, @intCast(bi), ctx.h)) saw_dom = true;
+        }
+    }
+    return saw_dom;
+}
+
+/// Exactly one definition in the function, outside L, dominating the header.
+/// Used for values the *entry test* relied on, where a second definition could
+/// change the bound between the test and the guard.
+fn bhStable(ctx: *const bhCtx, v: u16) bool {
+    if (v == 0 or v >= MAX_TRACKED_VREGS) return false;
+    if (ctx.consts.known[v]) return true;
+    if (ctx.defs.cnt[v] != 1) return false;
+    const db = ctx.defs.blk[v];
+    if (db >= ctx.f.block_count or ctx.in_loop[db]) return false;
+    return dominates(ctx.cfg, db, ctx.h);
+}
+
+fn bhMergeOffset(a: bhSpanOffset, b: bhSpanOffset, neg_b: bool, out: *bhSpanOffset) bool {
+    const sgn: i64 = if (neg_b) -1 else 1;
+    const bc = @mulWithOverflow(b.c, sgn);
+    if (bc[1] != 0) return false;
+    const bk = @mulWithOverflow(b.k, sgn);
+    if (bk[1] != 0) return false;
+    const bds = @mulWithOverflow(b.ds, sgn);
+    if (bds[1] != 0) return false;
+    const c = @addWithOverflow(a.c, bc[0]);
+    if (c[1] != 0) return false;
+    const k = @addWithOverflow(a.k, bk[0]);
+    if (k[1] != 0) return false;
+    var d = a.d;
+    var ds = a.ds;
+    if (b.d != 0) {
+        if (d == 0) {
+            d = b.d;
+            ds = bds[0];
+        } else if (d == b.d) {
+            const sum = @addWithOverflow(ds, bds[0]);
+            if (sum[1] != 0) return false;
+            ds = sum[0];
+            if (ds == 0) d = 0;
+        } else {
+            return false; // two distinct runtime values in one offset
+        }
+    }
+    if (c[0] < 0) return false; // a shrinking offset has no [lo,hi] start
+    out.* = .{ .c = c[0], .k = k[0], .d = d, .ds = ds };
+    return true;
+}
+
+/// Prove `v` to be `c*iv + k + ds*d` at the current access site.
+fn bhAnalyzeOffset(ctx: *const bhCtx, v: u16, depth: u32, out: *bhSpanOffset) bool {
+    if (depth > 12) return false;
+    if (v == 0 or v >= MAX_TRACKED_VREGS) return false;
+    if (v == ctx.iv) {
+        out.* = .{ .c = 1 };
+        return true;
+    }
+    if (ctx.consts.known[v]) {
+        out.* = .{ .k = ctx.consts.val[v] };
+        return true;
+    }
+    if (ctx.defs.cnt[v] != 1) {
+        if (!bhInvariant(ctx, v)) return false;
+        out.* = .{ .d = v, .ds = 1 };
+        return true;
+    }
+    const db = ctx.defs.blk[v];
+    if (db >= ctx.f.block_count) return false;
+    if (!ctx.in_loop[db]) {
+        if (!bhInvariant(ctx, v)) return false;
+        out.* = .{ .d = v, .ds = 1 };
+        return true;
+    }
+    // A definition inside the loop must dominate the access: that rules out
+    // reading the expression before it was ever computed. (A value carried over
+    // from an earlier iteration is still fine — `iv` is monotone, so every
+    // value it ever held lies in [lo, hi].)
+    if (!dominates(ctx.cfg, db, ctx.site)) return false;
+    const di = ctx.f.blocks[db].insts[ctx.defs.idx[v]];
+    var a: bhSpanOffset = .{};
+    var b: bhSpanOffset = .{};
+    switch (di.op) {
+        .copy => return bhAnalyzeOffset(ctx, di.src1, depth + 1, out),
+        .add => {
+            if (!bhAnalyzeOffset(ctx, di.src1, depth + 1, &a)) return false;
+            if (!bhAnalyzeOffset(ctx, di.src2, depth + 1, &b)) return false;
+            return bhMergeOffset(a, b, false, out);
+        },
+        .sub => {
+            if (!bhAnalyzeOffset(ctx, di.src1, depth + 1, &a)) return false;
+            if (!bhAnalyzeOffset(ctx, di.src2, depth + 1, &b)) return false;
+            return bhMergeOffset(a, b, true, out);
+        },
+        .mul => {
+            if (!bhAnalyzeOffset(ctx, di.src1, depth + 1, &a)) return false;
+            if (!bhAnalyzeOffset(ctx, di.src2, depth + 1, &b)) return false;
+            const a_const = a.c == 0 and a.d == 0;
+            const b_const = b.c == 0 and b.d == 0;
+            if (a_const == b_const) return false; // both or neither: not affine
+            const scale: i64 = if (a_const) a.k else b.k;
+            const other: bhSpanOffset = if (a_const) b else a;
+            const rc = @mulWithOverflow(other.c, scale);
+            if (rc[1] != 0) return false;
+            const rk = @mulWithOverflow(other.k, scale);
+            if (rk[1] != 0) return false;
+            const rds = @mulWithOverflow(other.ds, scale);
+            if (rds[1] != 0) return false;
+            if (rc[0] < 0) return false;
+            out.* = .{ .c = rc[0], .k = rk[0], .d = other.d, .ds = rds[0] };
+            return true;
+        },
+        .shl => {
+            // Strength reduction turns `iv * 8` into `iv << 3`, so a shift by a
+            // constant is the same affine scaling. The amount must be the
+            // constant side: `k << iv` grows exponentially, not affinely.
+            if (!bhAnalyzeOffset(ctx, di.src2, depth + 1, &b)) return false;
+            if (b.c != 0 or b.d != 0 or b.k < 0 or b.k > 62) return false;
+            if (!bhAnalyzeOffset(ctx, di.src1, depth + 1, &a)) return false;
+            const scale: i64 = @as(i64, 1) << @intCast(b.k);
+            const rc = @mulWithOverflow(a.c, scale);
+            if (rc[1] != 0) return false;
+            const rk = @mulWithOverflow(a.k, scale);
+            if (rk[1] != 0) return false;
+            const rds = @mulWithOverflow(a.ds, scale);
+            if (rds[1] != 0) return false;
+            if (rc[0] < 0) return false;
+            out.* = .{ .c = rc[0], .k = rk[0], .d = a.d, .ds = rds[0] };
+            return true;
+        },
+        else => return false,
+    }
+}
+
+// ── guard-block emission helpers ────────────────────────────────────────────
+
+fn bhNbPush(nb: *[HOIST_MAX_NB_INSTS]IRInst, n: *usize, inst: IRInst) bool {
+    if (n.* >= nb.len) return false;
+    nb[n.*] = inst;
+    n.* += 1;
+    return true;
+}
+
+/// A fresh vreg, or 0 once the tracked range is exhausted (Issue #5: vreg
+/// overflow must never wrap silently).
+fn bhNbFresh(next_v: *u32) u16 {
+    if (next_v.* + 1 >= MAX_TRACKED_VREGS) return 0;
+    const v: u16 = @intCast(next_v.*);
+    next_v.* += 1;
+    return v;
+}
+
+fn bhNbValue(
+    nb: *[HOIST_MAX_NB_INSTS]IRInst,
+    n: *usize,
+    next_v: *u32,
+    sv: bhSpanValue,
+) ?u16 {
+    if (sv.v != 0) return sv.v;
+    const d = bhNbFresh(next_v);
+    if (d == 0) return null;
+    if (!bhNbPush(nb, n, .{ .op = .const_int, .dest = d, .imm = sv.val })) return null;
+    return d;
+}
+
+/// `a op b` with both operands materialised, folding to a constant when it can.
+/// Returns null on overflow or a full guard block — the caller then leaves the
+/// loop fully checked instead of emitting a shortened span.
+fn bhNbChecked(
+    nb: *[HOIST_MAX_NB_INSTS]IRInst,
+    n: *usize,
+    next_v: *u32,
+    op: IROp,
+    a: bhSpanValue,
+    b: bhSpanValue,
+) ?bhSpanValue {
+    if (a.v == 0 and b.v == 0) {
+        const r = switch (op) {
+            .call_checked_add => @addWithOverflow(a.val, b.val),
+            .call_checked_sub => @subWithOverflow(a.val, b.val),
+            .call_checked_mul => @mulWithOverflow(a.val, b.val),
+            else => return null,
+        };
+        if (r[1] != 0) return null;
+        return bhSpanValue{ .val = r[0] };
+    }
+    const av = bhNbValue(nb, n, next_v, a) orelse return null;
+    const bv = bhNbValue(nb, n, next_v, b) orelse return null;
+    const d = bhNbFresh(next_v);
+    if (d == 0) return null;
+    if (!bhNbPush(nb, n, .{
+        .op = op,
+        .dest = d,
+        .args = .{ av, bv, 0, 0, 0, 0, 0, 0 },
+        .arg_count = 2,
+    })) return null;
+    return bhSpanValue{ .v = d };
+}
+
+/// Prove one loop's accesses and, on success, splice a guard block onto the
+/// preheader edge and mark them `unchecked_access`.
+fn bhTryLoop(
+    f: *IRFn,
+    cfg: *const CFGInfo,
+    defs: *const bhDefs,
+    consts: *const bhConsts,
+    st: *BoundsHoistStats,
+    h: u16,
+    back_src: u16,
+) bool {
+    if (h >= f.block_count or back_src >= f.block_count) return false;
+
+    // ── 1. the natural loop ───────────────────────────────────────────────
+    var in_loop: [MAX_BLOCKS_PER_FN]bool = .{false} ** MAX_BLOCKS_PER_FN;
+    var loop_blocks: [MAX_BLOCKS_PER_FN]u16 = undefined;
+    var loop_n: usize = 0;
+    in_loop[h] = true;
+    loop_blocks[loop_n] = h;
+    loop_n += 1;
+    if (back_src != h) {
+        var stack: [MAX_BLOCKS_PER_FN]u16 = undefined;
+        var sp: usize = 0;
+        in_loop[back_src] = true;
+        loop_blocks[loop_n] = back_src;
+        loop_n += 1;
+        stack[sp] = back_src;
+        sp += 1;
+        while (sp > 0) {
+            sp -= 1;
+            const cur = stack[sp];
+            for (0..cfg.pred_cnt[cur]) |pi| {
+                const p = cfg.preds[cur][pi];
+                if (p >= f.block_count or in_loop[p]) continue;
+                if (loop_n >= loop_blocks.len or sp >= stack.len) return false;
+                in_loop[p] = true;
+                loop_blocks[loop_n] = p;
+                loop_n += 1;
+                stack[sp] = p;
+                sp += 1;
+            }
+        }
+    }
+
+    var ctx = bhCtx{
+        .f = f,
+        .cfg = cfg,
+        .defs = defs,
+        .consts = consts,
+        .in_loop = &in_loop,
+        .h = h,
+    };
+
+    // ── 2. body op allowlist, access sites ────────────────────────────────
+    const Site = struct { b: u16, i: u16 };
+    var sites: [HOIST_MAX_SITES]Site = undefined;
+    var site_n: usize = 0;
+    for (loop_blocks[0..loop_n]) |bi| {
+        const b = &f.blocks[bi];
+        for (0..b.inst_count) |ii| {
+            const op = b.insts[ii].op;
+            if (bhAccessWidth(op) != 0) {
+                // Already proven by an earlier round: not a site any more. This
+                // is also what makes the pass terminate — a loop whose accesses
+                // are all guarded has nothing left to hoist, so it is not
+                // given a second (redundant) guard block on its entry edge.
+                if (b.insts[ii].unchecked_access) continue;
+                if (site_n >= sites.len) return false;
+                sites[site_n] = .{ .b = bi, .i = @intCast(ii) };
+                site_n += 1;
+            } else if (!bhLoopOpAllowed(op)) {
+                return false;
+            }
+        }
+    }
+    if (site_n == 0) return false;
+
+    // ── 2b. exactly one way out, and it is the backedge test ──────────────
+    // With a single exit the induction variable really does run up to `hi`, so
+    // the widest offset of a proven group is genuinely touched on the last
+    // iteration. That is what makes a trapping guard equivalent to the checked
+    // program trapping: without it a loop could stop short of the range its
+    // bound describes, and the guard would fault a run that never accessed out
+    // of bounds. The body's op allowlist (no IO, no free, no return) means
+    // nothing observable happens before that trap either.
+    {
+        var exits: usize = 0;
+        for (loop_blocks[0..loop_n]) |bi| {
+            var succs: [2]u16 = .{ 0, 0 };
+            const ns = getSuccs(&f.blocks[bi], &succs);
+            for (succs[0..ns]) |s| {
+                if (s >= f.block_count or in_loop[s]) continue;
+                exits += 1;
+                if (bi != back_src) return false;
+            }
+        }
+        if (exits != 1) return false;
+    }
+
+    // ── 3. the only way in is one preheader that dominates the header ─────
+    var pre: i32 = -1;
+    for (loop_blocks[0..loop_n]) |bi| {
+        for (0..cfg.pred_cnt[bi]) |pi| {
+            const p = cfg.preds[bi][pi];
+            if (p >= f.block_count or in_loop[p]) continue;
+            if (bi != h) return false; // an entry that is not the header
+            if (pre == -1) {
+                pre = @intCast(p);
+            } else if (pre != @as(i32, @intCast(p))) {
+                return false; // two distinct preheaders: no single guard site
+            }
+        }
+    }
+    if (pre < 0) return false;
+    const pre_b: u16 = @intCast(pre);
+    if (!dominates(cfg, pre_b, h)) return false;
+    const pblk = &f.blocks[pre_b];
+    if (pblk.inst_count == 0) return false;
+
+    // ── 4. canonical induction variable, from the backedge test ───────────
+    const bb = &f.blocks[back_src];
+    if (bb.inst_count == 0) return false;
+    const bterm = bb.insts[bb.inst_count - 1];
+    if (bterm.op != .cond_jump) return false;
+    if (bterm.target_block != h) return false; // the backedge is the "continue" edge
+    var iv: u16 = 0;
+    var hi_val: bhSpanValue = .{};
+    var hi_adj: i64 = 0; // -1 when the bound is exclusive (`<`)
+    {
+        const cv = bterm.src1;
+        if (cv == 0 or cv >= MAX_TRACKED_VREGS or defs.cnt[cv] != 1) return false;
+        if (defs.blk[cv] >= f.block_count) return false;
+        const ci = f.blocks[defs.blk[cv]].insts[defs.idx[cv]];
+        var left: u16 = 0;
+        var right: u16 = 0;
+        var incl = false;
+        switch (ci.op) {
+            .cmp_le => {
+                left = ci.src1;
+                right = ci.src2;
+                incl = true;
+            },
+            .cmp_lt => {
+                left = ci.src1;
+                right = ci.src2;
+            },
+            .cmp_ge => {
+                left = ci.src2;
+                right = ci.src1;
+                incl = true;
+            },
+            .cmp_gt => {
+                left = ci.src2;
+                right = ci.src1;
+            },
+            else => return false,
+        }
+        if (!incl) hi_adj = -1;
+        iv = left;
+        if (iv == 0 or iv >= MAX_TRACKED_VREGS) return false;
+        // The bound: a constant, or one vreg with a single definition. A bound
+        // that is redefined anywhere could differ between the entry test and
+        // the guard, which would invalidate `lo <= hi`.
+        if (right > 0 and right < MAX_TRACKED_VREGS and consts.known[right]) {
+            hi_val = .{ .val = consts.val[right] };
+        } else {
+            if (!bhStable(&ctx, right)) return false;
+            hi_val = .{ .v = right };
+        }
+        if (right == iv) return false;
+    }
+    ctx.iv = iv;
+
+    // ── 5. exactly two definitions of `iv`: init outside, increment at the
+    //       bottom of the backedge block ──────────────────────────────────
+    var init_at: i32 = -1; // index in the defining block, -1 = none
+    var init_blk: u16 = 0;
+    var inc_at: i32 = -1;
+    var inc_blk: u16 = 0;
+    for (0..f.block_count) |bi| {
+        const b = &f.blocks[bi];
+        for (0..b.inst_count) |ii| {
+            if (b.insts[ii].dest != iv) continue;
+            if (in_loop[@intCast(bi)]) {
+                if (inc_at >= 0) return false;
+                inc_at = @intCast(ii);
+                inc_blk = @intCast(bi);
+            } else {
+                if (init_at >= 0) return false;
+                init_at = @intCast(ii);
+                init_blk = @intCast(bi);
+            }
+        }
+    }
+    if (init_at < 0 or inc_at < 0) return false;
+    if (inc_blk != back_src) return false; // the increment must close the iteration
+    if (!dominates(cfg, init_blk, h)) return false;
+    const inc_idx: u16 = @intCast(inc_at);
+    const init_idx: u16 = @intCast(init_at);
+
+    // The step must be a positive constant, and nothing in the backedge block
+    // may touch memory after it: an access there would see an `iv` that has
+    // already left the proven range.
+    var step: i64 = 0;
+    {
+        const inc = f.blocks[inc_blk].insts[inc_idx];
+        if (inc.op == .add) {
+            if (inc.src1 == iv) {
+                if (!constOfOperand(consts, inc.src2, &step)) return false;
+            } else if (inc.src2 == iv) {
+                if (!constOfOperand(consts, inc.src1, &step)) return false;
+            } else return false;
+        } else if (inc.op == .copy) {
+            // rotated form: `t = iv + step; iv = copy t`
+            const t = inc.src1;
+            if (t == 0 or t >= MAX_TRACKED_VREGS or defs.cnt[t] != 1) return false;
+            if (defs.blk[t] != inc_blk or defs.idx[t] >= inc_idx) return false;
+            const ti = f.blocks[defs.blk[t]].insts[defs.idx[t]];
+            if (ti.op != .add) return false;
+            if (ti.src1 == iv) {
+                if (!constOfOperand(consts, ti.src2, &step)) return false;
+            } else if (ti.src2 == iv) {
+                if (!constOfOperand(consts, ti.src1, &step)) return false;
+            } else return false;
+        } else return false;
+        if (step <= 0) return false; // only a growing `iv` has lo as its minimum
+        for (sites[0..site_n]) |s| {
+            if (s.b != inc_blk) continue;
+            if (s.i > inc_idx) return false;
+        }
+    }
+
+    // `lo` as a constant, when the init proves one (used for the trip-count
+    // test and to fold the span). At runtime the guard block reads `iv` itself,
+    // which still holds `lo` on the edge into the loop.
+    var lo_const: ?i64 = null;
+    {
+        const init = f.blocks[init_blk].insts[init_idx];
+        switch (init.op) {
+            .const_int => lo_const = init.imm,
+            .copy => {
+                const s = init.src1;
+                if (s > 0 and s < MAX_TRACKED_VREGS and consts.known[s]) lo_const = consts.val[s];
+            },
+            else => {},
+        }
+    }
+    // On the edge into the loop `iv` still holds its initial value, so the
+    // guard block can read it directly. When the init proves a constant,
+    // folding it in keeps the whole span arithmetic constant, which shrinks
+    // the guard block to a couple of instructions and lets the backends emit
+    // the length as an immediate.
+    const lo_val = if (lo_const) |lc| bhSpanValue{ .val = lc } else bhSpanValue{ .v = iv };
+
+    // ── 6. the entry edge must guarantee lo <= hi ─────────────────────────
+    {
+        const pterm = pblk.insts[pblk.inst_count - 1];
+        var unconditional = false;
+        switch (pterm.op) {
+            .jump => {
+                if (pterm.target_block != h) return false;
+                unconditional = true;
+            },
+            .cond_jump => {
+                if (pterm.target_block != h) return false;
+                if (pterm.alt_block == h) {
+                    unconditional = true; // both edges enter: the test proves nothing
+                } else {
+                    const pcv = pterm.src1;
+                    if (pcv == 0 or pcv >= MAX_TRACKED_VREGS or defs.cnt[pcv] != 1) return false;
+                    if (defs.blk[pcv] != pre_b) return false;
+                    const pi = f.blocks[defs.blk[pcv]].insts[defs.idx[pcv]];
+                    var left: u16 = 0;
+                    var right: u16 = 0;
+                    switch (pi.op) {
+                        .cmp_le => {
+                            left = pi.src1;
+                            right = pi.src2;
+                            if (hi_adj != 0) return false;
+                        },
+                        .cmp_lt => {
+                            left = pi.src1;
+                            right = pi.src2;
+                            if (hi_adj == 0) return false;
+                        },
+                        .cmp_ge => {
+                            left = pi.src2;
+                            right = pi.src1;
+                            if (hi_adj != 0) return false;
+                        },
+                        .cmp_gt => {
+                            left = pi.src2;
+                            right = pi.src1;
+                            if (hi_adj == 0) return false;
+                        },
+                        else => return false,
+                    }
+                    if (left != iv) return false;
+                    // same bound value as the backedge test
+                    if (hi_val.v == 0) {
+                        if (!(right > 0 and right < MAX_TRACKED_VREGS and consts.known[right] and
+                            consts.val[right] == hi_val.val)) return false;
+                    } else if (right != hi_val.v) return false;
+                }
+            },
+            else => return false,
+        }
+        if (unconditional) {
+            // Nothing tests the range, so it has to be a constant fact.
+            if (lo_const == null or hi_val.v != 0) return false;
+            const hi_eff = @addWithOverflow(hi_val.val, hi_adj);
+            if (hi_eff[1] != 0) return false;
+            if (lo_const.? > hi_eff[0]) return false;
+        }
+    }
+
+    // ── 7. offsets: group the accesses by (base, offset expression) ───────
+    // An access whose address cannot be bounded is simply left out of every
+    // group and keeps its own per-access check; only what is proven gets
+    // hoisted. A group is usable only if one of its accesses sits in the
+    // header, which — with the single exit above — is the access that touches
+    // the group's widest offset on the loop's last iteration.
+    const Group = struct { base: u16, off: bhSpanOffset, width: i64, header: bool };
+    var groups: [HOIST_MAX_GROUPS]Group = undefined;
+    var group_n: usize = 0;
+    var site_group: [HOIST_MAX_SITES]i32 = .{-1} ** HOIST_MAX_SITES;
+    for (sites[0..site_n], 0..) |s, si| {
+        ctx.site = s.b;
+        const inst = f.blocks[s.b].insts[s.i];
+        const width = bhAccessWidth(inst.op);
+        const addr = inst.args[0];
+        if (addr == 0 or addr >= MAX_TRACKED_VREGS) continue;
+        var base: u16 = 0;
+        var off: bhSpanOffset = .{};
+        if (defs.cnt[addr] == 1 and defs.blk[addr] == s.b and in_loop[s.b] and
+            defs.idx[addr] < s.i)
+        {
+            const pa = f.blocks[defs.blk[addr]].insts[defs.idx[addr]];
+            if (pa.op != .call_ptr_add or pa.arg_count < 2) continue;
+            base = pa.args[0];
+            if (!bhAnalyzeOffset(&ctx, pa.args[1], 0, &off)) continue;
+        } else {
+            base = addr; // the access address is the invariant pointer itself
+        }
+        if (base == iv or !bhInvariant(&ctx, base)) continue;
+        if (off.d != 0 and (off.d == iv or !bhInvariant(&ctx, off.d))) continue;
+        if (off.c < 0) continue;
+
+        var gi: usize = group_n;
+        var found = false;
+        for (0..group_n) |g| {
+            if (groups[g].base == base and groups[g].off.c == off.c and
+                groups[g].off.k == off.k and groups[g].off.d == off.d and
+                groups[g].off.ds == off.ds)
+            {
+                gi = g;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            if (group_n >= groups.len) continue; // too many families: leave it checked
+            groups[group_n] = .{ .base = base, .off = off, .width = width, .header = s.b == h };
+            gi = group_n;
+            group_n += 1;
+        } else {
+            if (width > groups[gi].width) groups[gi].width = width;
+            if (s.b == h) groups[gi].header = true;
+        }
+        site_group[si] = @intCast(gi);
+    }
+    // Drop the groups that never reach the header, and unmark their sites.
+    {
+        var w: usize = 0;
+        var remap: [HOIST_MAX_GROUPS]i32 = .{-1} ** HOIST_MAX_GROUPS;
+        for (0..group_n) |g| {
+            if (!groups[g].header) continue;
+            remap[g] = @intCast(w);
+            groups[w] = groups[g];
+            w += 1;
+        }
+        group_n = w;
+        for (site_group[0..site_n], 0..) |sg, si| {
+            if (sg < 0) continue;
+            site_group[si] = remap[@intCast(sg)];
+        }
+    }
+    if (group_n == 0) return false;
+
+    // ── 8. one provable trip count is enough to pay for the guard ─────────
+    var hi_eff_const: ?i64 = null;
+    if (hi_val.v == 0) {
+        const r = @addWithOverflow(hi_val.val, hi_adj);
+        if (r[1] != 0) return false;
+        hi_eff_const = r[0];
+    }
+    if (lo_const != null and hi_eff_const != null) {
+        if (lo_const.? > hi_eff_const.?) return false; // the loop never runs
+        const span_iv = @subWithOverflow(hi_eff_const.?, lo_const.?);
+        if (span_iv[1] != 0) return false;
+        // Both operands are non-negative here (lo <= hi, step > 0).
+        const trips = @divTrunc(span_iv[0], step) + 1;
+        if (trips < HOIST_MIN_TRIPS) return false;
+    }
+
+    // ── 9. build the guard block ──────────────────────────────────────────
+    var nb: [HOIST_MAX_NB_INSTS]IRInst = undefined;
+    var nb_n: usize = 0;
+    var next_v: u32 = f.vreg_count;
+
+    for (groups[0..group_n]) |g| {
+        // start = base + c*lo + k + ds*d
+        var t: ?bhSpanValue = bhSpanValue{ .val = 0 };
+        if (g.off.c != 0) {
+            t = bhNbChecked(&nb, &nb_n, &next_v, .call_checked_mul, .{ .val = g.off.c }, lo_val) orelse return false;
+        }
+        if (g.off.k != 0) {
+            t = bhNbChecked(&nb, &nb_n, &next_v, .call_checked_add, t.?, .{ .val = g.off.k }) orelse return false;
+        }
+        if (g.off.d != 0) {
+            const dv = bhSpanValue{ .v = g.off.d };
+            if (g.off.ds == 1) {
+                t = bhNbChecked(&nb, &nb_n, &next_v, .call_checked_add, t.?, dv) orelse return false;
+            } else {
+                const scaled = bhNbChecked(&nb, &nb_n, &next_v, .call_checked_mul, .{ .val = g.off.ds }, dv) orelse return false;
+                t = bhNbChecked(&nb, &nb_n, &next_v, .call_checked_add, t.?, scaled) orelse return false;
+            }
+        }
+        var addr_v: u16 = g.base;
+        if (!(t.?.v == 0 and t.?.val == 0)) {
+            const off_v = bhNbValue(&nb, &nb_n, &next_v, t.?) orelse return false;
+            const av = bhNbFresh(&next_v);
+            if (av == 0) return false;
+            if (!bhNbPush(&nb, &nb_n, .{
+                .op = .call_ptr_add,
+                .dest = av,
+                .args = .{ g.base, off_v, 0, 0, 0, 0, 0, 0 },
+                .arg_count = 2,
+            })) return false;
+            addr_v = av;
+        }
+
+        // len = c*(hi - lo) + width   (k and ds*d cancel out)
+        var len: bhSpanValue = .{ .val = g.width };
+        if (g.off.c != 0) {
+            var diff = bhNbChecked(&nb, &nb_n, &next_v, .call_checked_sub, hi_val, lo_val) orelse return false;
+            if (hi_adj != 0) {
+                diff = bhNbChecked(&nb, &nb_n, &next_v, .call_checked_add, diff, .{ .val = hi_adj }) orelse return false;
+            }
+            const prod = bhNbChecked(&nb, &nb_n, &next_v, .call_checked_mul, .{ .val = g.off.c }, diff) orelse return false;
+            len = bhNbChecked(&nb, &nb_n, &next_v, .call_checked_add, prod, .{ .val = g.width }) orelse return false;
+        }
+        if (len.v == 0 and len.val <= 0) return false; // never a zero-length proof
+
+        if (len.v == 0) {
+            if (!bhNbPush(&nb, &nb_n, .{
+                .op = .bounds_hoist_guard,
+                .args = .{ addr_v, 0, 0, 0, 0, 0, 0, 0 },
+                .arg_count = 1,
+                .imm = len.val,
+            })) return false;
+        } else {
+            if (!bhNbPush(&nb, &nb_n, .{
+                .op = .bounds_hoist_guard,
+                .args = .{ addr_v, len.v, 0, 0, 0, 0, 0, 0 },
+                .arg_count = 2,
+            })) return false;
+        }
+    }
+    // The guard block is spliced in *at* the header's index below, so its jump
+    // to the header (h + 1 after the shift) is a forward edge.
+    if (pre_b >= h) return false;
+    if (next_v + 2 >= MAX_TRACKED_VREGS) return false;
+    if (f.block_count + 1 >= MAX_BLOCKS_PER_FN) return false;
+    if (!bhNbPush(&nb, &nb_n, .{ .op = .jump, .target_block = h + 1 })) return false;
+
+    // ── 10. commit: splice the block in, redirect the edge, uncheck the
+    //        proven accesses ──────────────────────────────────────────────
+    // Placement matters for code quality, not just correctness. Appending the
+    // guard block at the end of the block array made its jump to the header a
+    // long *backward* edge, and the codegen detects loops with a backward-edge
+    // heuristic (analyzeElidedConsts and friends mark every block in
+    // [target..source] as "inside a loop"). One guard block at the end therefore
+    // marked most of the function as a loop body, which pinned far more
+    // constants into the five callee-saved registers and cost hot loops their
+    // registers — measured as n-body running 13% slower with a byte-identical
+    // hot loop. Inserted directly before its header the guard's jump is forward,
+    // the real backedge is untouched, and every heuristic sees exactly the loops
+    // it saw before.
+    var shift: u32 = f.block_count;
+    while (shift > h) : (shift -= 1) f.blocks[shift] = f.blocks[shift - 1];
+    f.block_count += 1;
+    f.vreg_count = @intCast(next_v); // checked against MAX_TRACKED_VREGS above
+
+    // Every reference to a block at or after the header moves up by one. The
+    // guard slot itself is skipped and filled in below.
+    for (0..f.block_count) |bi| {
+        f.blocks[bi].label = @intCast(bi);
+        if (bi == h) continue;
+        for (0..f.blocks[bi].inst_count) |ii| {
+            const inst = &f.blocks[bi].insts[ii];
+            switch (inst.op) {
+                .jump, .cond_jump => {
+                    if (inst.target_block >= h) inst.target_block += 1;
+                    if (inst.op == .cond_jump and inst.alt_block >= h) inst.alt_block += 1;
+                },
+                .phi => {
+                    for (0..@min(inst.arg_count, inst.phi_blocks.len)) |pi| {
+                        if (inst.phi_blocks[pi] >= h) inst.phi_blocks[pi] += 1;
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+
+    f.blocks[h].label = h;
+    f.blocks[h].inst_count = @intCast(nb_n);
+    for (0..nb_n) |i| f.blocks[h].insts[i] = nb[i];
+
+    // The preheader kept its index (pre < h); its edge to the old header now
+    // points at h + 1 and is redirected through the guard block.
+    const pt = &f.blocks[pre_b].insts[f.blocks[pre_b].inst_count - 1];
+    if (pt.target_block == h + 1) pt.target_block = h;
+    if (pt.op == .cond_jump and pt.alt_block == h + 1) pt.alt_block = h;
+
+    for (sites[0..site_n], 0..) |s, si| {
+        // Only the accesses a guard actually covers lose their own check;
+        // everything unproven stays exactly as safe as it was.
+        if (site_group[si] < 0) continue;
+        const sb: u16 = if (s.b >= h) s.b + 1 else s.b;
+        f.blocks[sb].insts[s.i].unchecked_access = true;
+        st.accesses_rewritten += 1;
+    }
+    st.loops_hoisted += 1;
+    return true;
+}
+
+fn constOfOperand(consts: *const bhConsts, v: u16, out: *i64) bool {
+    if (v == 0 or v >= MAX_TRACKED_VREGS) return false;
+    if (!consts.known[v]) return false;
+    out.* = consts.val[v];
+    return true;
+}
+
+fn hoistBoundsChecksFn(f: *IRFn, st: *BoundsHoistStats) bool {
+    if (f.block_count < 2) return false;
+    var defs: bhDefs = .{};
+    var consts: bhConsts = .{};
+    var changed = false;
+    // Each success splices a block in, which invalidates the CFG facts, so the
+    // scan restarts. The cap bounds the work; loops that stay unprovable are
+    // simply left fully checked.
+    var round: u32 = 0;
+    while (round < 8) : (round += 1) {
+        var cfg: CFGInfo = .{};
+        buildCFGInfo(f, &cfg);
+        if (cfg.pred_overflow or cfg.rpo_len == 0) break;
+        bhBuildDefs(f, &defs);
+        bhBuildConsts(f, &cfg, &defs, &consts);
+        if (!bhTryOnce(f, &cfg, &defs, &consts, st)) break;
+        changed = true;
+    }
+    return changed;
+}
+
+fn bhTryOnce(
+    f: *IRFn,
+    cfg: *const CFGInfo,
+    defs: *const bhDefs,
+    consts: *const bhConsts,
+    st: *BoundsHoistStats,
+) bool {
+    for (0..f.block_count) |bi| {
+        var succs: [2]u16 = .{ 0, 0 };
+        const ns = getSuccs(&f.blocks[bi], &succs);
+        for (succs[0..ns]) |hs| {
+            if (hs >= f.block_count) continue;
+            // A backedge: the target dominates the source, so it is a loop
+            // header and `bi` closes one iteration.
+            if (!dominates(cfg, hs, @intCast(bi))) continue;
+            st.loops_considered += 1;
+            if (bhTryLoop(f, cfg, defs, consts, st, hs, @intCast(bi))) return true;
+        }
+    }
     return false;
+}
+
+pub fn hoistBoundsChecks(module: *IRModule, stats: ?*BoundsHoistStats) bool {
+    var local = BoundsHoistStats{};
+    var changed = false;
+    for (0..module.fn_count) |fi| {
+        if (hoistBoundsChecksFn(&module.fns[fi], &local)) changed = true;
+    }
+    if (stats) |s| {
+        s.* = local;
+    }
+    return changed;
 }

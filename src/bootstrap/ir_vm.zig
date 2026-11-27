@@ -880,12 +880,18 @@ pub const VMState = struct {
             .call_write_byte => try self.writeU8(vregs[inst.args[0]], @truncate(vregs[inst.args[1]])),
             .call_read_u32 => vregs[inst.dest] = try self.readU32(vregs[inst.args[0]]),
             .call_write_u32 => try self.writeU32(vregs[inst.args[0]], @truncate(vregs[inst.args[1]])),
-            // bounds_hoist_guard: the native backend emits one range test here
-            // and then runs the loop body unchecked. The VM keeps its normal
-            // per-access checks, so the guard is a no-op — but it must still
-            // validate the base pointer, because a native run would trap here.
+            // bounds_hoist_guard: the native backend proves here that
+            // [start, start+len) lies inside one live chunk, and then runs the
+            // loop's accesses unchecked. The VM keeps its own per-access
+            // checks, so the guard is redundant for it — but it must still
+            // reproduce the trap a native run would raise, so the two backends
+            // stay differentially equivalent. A negative length traps, exactly
+            // as __lir_chk_ptr_n does.
             .bounds_hoist_guard => {
-                _ = try self.resolveSlice(vregs[inst.args[0]], 1, false);
+                const len_i: i64 = if (inst.arg_count >= 2) @bitCast(vregs[inst.args[1]]) else inst.imm;
+                if (len_i < 0) return error.Trap;
+                const len: usize = @intCast(len_i);
+                _ = try self.resolveSlice(vregs[inst.args[0]], len, false);
             },
             .call_read_u64 => vregs[inst.dest] = try self.readU64(vregs[inst.args[0]]),
             .call_write_u64 => try self.writeU64(vregs[inst.args[0]], vregs[inst.args[1]]),

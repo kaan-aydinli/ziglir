@@ -1422,11 +1422,32 @@ pub fn emitC(alloc: std.mem.Allocator, module: *const IRModule, source: []const 
                     .call_malloc => try w.print("    v{d} = lir_malloc((int64_t)v{d});\n", .{ inst.dest, inst.args[0] }),
                     .call_free => try w.print("    lir_free(v{d});\n", .{inst.args[0]}),
                     .call_ptr_add => try w.print("    v{d} = v{d} + v{d};\n", .{ inst.dest, inst.args[0], inst.args[1] }),
-                    .call_read_byte => try w.print("    lir_chk_ptr_n(v{d}, 1u); v{d} = (uint64_t)*(const uint8_t *)(uintptr_t)v{d};\n", .{ inst.args[0], inst.dest, inst.args[0] }),
-                    .call_write_byte => try w.print("    lir_chk_ptr_n(v{d}, 1u); *(uint8_t *)(uintptr_t)v{d} = (uint8_t)v{d};\n", .{ inst.args[0], inst.args[0], inst.args[1] }),
-                    .call_read_u32 => try w.print("    do {{ lir_chk_ptr_n(v{d}, 4u); uint32_t _t; memcpy(&_t, (const void *)(uintptr_t)v{d}, 4); v{d} = _t; }} while (0);\n", .{ inst.args[0], inst.args[0], inst.dest }),
-                    .call_write_u32 => try w.print("    do {{ lir_chk_ptr_n(v{d}, 4u); uint32_t _t = (uint32_t)v{d}; memcpy((void *)(uintptr_t)v{d}, &_t, 4); }} while (0);\n", .{ inst.args[0], inst.args[1], inst.args[0] }),
-                    .bounds_hoist_guard => try w.print("    lir_chk_ptr_n(v{d}, 1u); /* bounds-hoist guard */\n", .{inst.args[0]}),
+                    .call_read_byte => if (inst.unchecked_access)
+                        try w.print("    v{d} = (uint64_t)*(const uint8_t *)(uintptr_t)v{d};\n", .{ inst.dest, inst.args[0] })
+                    else
+                        try w.print("    lir_chk_ptr_n(v{d}, 1u); v{d} = (uint64_t)*(const uint8_t *)(uintptr_t)v{d};\n", .{ inst.args[0], inst.dest, inst.args[0] }),
+                    .call_write_byte => if (inst.unchecked_access)
+                        try w.print("    *(uint8_t *)(uintptr_t)v{d} = (uint8_t)v{d};\n", .{ inst.args[0], inst.args[1] })
+                    else
+                        try w.print("    lir_chk_ptr_n(v{d}, 1u); *(uint8_t *)(uintptr_t)v{d} = (uint8_t)v{d};\n", .{ inst.args[0], inst.args[0], inst.args[1] }),
+                    .call_read_u32 => if (inst.unchecked_access)
+                        try w.print("    do {{ uint32_t _t; memcpy(&_t, (const void *)(uintptr_t)v{d}, 4); v{d} = _t; }} while (0);\n", .{ inst.args[0], inst.dest })
+                    else
+                        try w.print("    do {{ lir_chk_ptr_n(v{d}, 4u); uint32_t _t; memcpy(&_t, (const void *)(uintptr_t)v{d}, 4); v{d} = _t; }} while (0);\n", .{ inst.args[0], inst.args[0], inst.dest }),
+                    .call_write_u32 => if (inst.unchecked_access)
+                        try w.print("    do {{ uint32_t _t = (uint32_t)v{d}; memcpy((void *)(uintptr_t)v{d}, &_t, 4); }} while (0);\n", .{ inst.args[1], inst.args[0] })
+                    else
+                        try w.print("    do {{ lir_chk_ptr_n(v{d}, 4u); uint32_t _t = (uint32_t)v{d}; memcpy((void *)(uintptr_t)v{d}, &_t, 4); }} while (0);\n", .{ inst.args[0], inst.args[1], inst.args[0] }),
+                    // One span guard for a whole loop: the hoisting pass proved
+                    // every access it unchecks lies in [start, start+len), so
+                    // this is the same proof the per-access lir_chk_ptr_n calls
+                    // make, once instead of per access. arg_count == 2 means the
+                    // length is a runtime value (a bound the compiler could not
+                    // fold); otherwise the immediate carries it.
+                    .bounds_hoist_guard => if (inst.arg_count >= 2)
+                        try w.print("    lir_chk_ptr_n(v{d}, (size_t)(uint64_t)v{d}); /* span guard */\n", .{ inst.args[0], inst.args[1] })
+                    else
+                        try w.print("    lir_chk_ptr_n(v{d}, (size_t){d}u); /* span guard */\n", .{ inst.args[0], @as(u64, @bitCast(inst.imm)) }),
                     .call_read_u64 => if (inst.unchecked_access)
                         try w.print("    memcpy(&v{d}, (const void *)(uintptr_t)v{d}, 8);\n", .{ inst.dest, inst.args[0] })
                     else
