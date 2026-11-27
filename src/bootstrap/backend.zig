@@ -45,12 +45,22 @@ pub fn emitCSource(
     return try c_backend_mod.emitC(alloc, module, source, target);
 }
 
+/// Which instruction set the native backend may assume.
+///
+/// `.host` samples CPUID on the machine doing the compile and uses whatever it
+/// reports, pairing every such instruction with a fail-closed startup check so
+/// the artifact can never meet a CPU that lacks it silently. `.baseline` keeps
+/// the portable x86-64 forms (software popcount) for artifacts that will be
+/// copied to machines the compiler never saw.
+pub const CpuMode = enum { host, baseline };
+
 pub fn emitBinary(
     alloc: std.mem.Allocator,
     module: *const ir.IRModule,
     source: []const u8,
     target: Target,
     requested_backend: BackendKind,
+    cpu_mode: CpuMode,
 ) ![]u8 {
     if (!target.isSupported()) return error.UnsupportedTarget;
     const kind = target.resolveBackend(requested_backend);
@@ -62,6 +72,7 @@ pub fn emitBinary(
             const ir_cg = alloc.create(ir_codegen_mod.IRCodegen) catch return error.OutOfMemory;
             defer alloc.destroy(ir_cg);
             ir_cg.init(source, module);
+            if (cpu_mode == .baseline) ir_cg.cpu_popcnt = false;
             ir_cg.compile();
             if (ir_cg.invalid_reference) return error.UndefinedFunctionCall;
             if (ir_cg.overflowed) return error.CodeTooLarge;

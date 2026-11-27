@@ -71,6 +71,9 @@ pub const Compiler = struct {
     emit_c: bool = false,
     quiet: bool = false,
     diag_format: diag_mod.Format = .human,
+    /// `--cpu=baseline` asks for a portable artifact; the default samples the
+    /// host CPUID and emits a fail-closed startup check for anything it uses.
+    cpu_mode: backend_mod.CpuMode = .host,
     test_mode: bool = false,
     /// VM-only budgets (`lir run --backend=vm --max-steps=N --timeout-ms=M`).
     /// Non-zero defaults; the VM normalizes 0 back to the default at run time.
@@ -473,6 +476,6 @@ pub const Compiler = struct {
             return try backend_mod.emitCSource(alloc, ir_module, self.source, self.target);
         }
 
-        return try backend_mod.emitBinary(alloc, ir_module, self.source, self.target, self.backend_kind);
+        return try backend_mod.emitBinary(alloc, ir_module, self.source, self.target, self.backend_kind, self.cpu_mode);
     }
 };

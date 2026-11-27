@@ -232,6 +232,9 @@ fn printUsage() void {
         \\    -O0 | -O1 | -O2     Optimization level (default: -O2)
         \\    --target <triple>   Target platform (run 'lir targets' for list)
         \\    --backend <kind>    Backend: auto | native | wasm | c | vm
+        \\    --cpu <mode>        host (default): use instructions this CPU reports via
+        \\                        CPUID, each guarded by a fail-closed startup check;
+        \\                        baseline: portable x86-64 only (software popcount)
         \\    --emit-ir           Print lowered & optimized IR to stdout
         \\    --emit-c            Emit standalone portable C11 source instead of linking
         \\  run [file|dir]      Compile and execute (supports --backend=vm/wasm/c/native)
@@ -373,6 +376,15 @@ fn parseBackendOrDie(spec: []const u8) BackendKind {
     };
 }
 
+fn parseCpuModeOrDie(spec: []const u8) Backend.CpuMode {
+    if (eql(spec, "baseline") or eql(spec, "portable") or eql(spec, "generic")) return .baseline;
+    if (eql(spec, "host") or eql(spec, "native")) return .host;
+    printErr("Error: unknown cpu mode '");
+    printErr(spec);
+    printErr("' (expected host or baseline)\n");
+    sysExit(1);
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // CLI Commands
 // ════════════════════════════════════════════════════════════════════════════
@@ -394,6 +406,7 @@ fn cmdBuild(args: []const []const u8) void {
     var backend_kind: BackendKind = .auto;
     var emit_ir = false;
     var emit_c = false;
+    var cpu_mode: Backend.CpuMode = .host;
 
     var idx: usize = 0;
     while (idx < args.len) : (idx += 1) {
@@ -413,6 +426,8 @@ fn cmdBuild(args: []const []const u8) void {
             opt_level = ol;
         } else if (eql(arg, "--emit-ir")) {
             emit_ir = true;
+        } else if (parseFlagValue(args, &idx, "--cpu=", "--cpu")) |spec| {
+            cpu_mode = parseCpuModeOrDie(spec);
         } else if (eql(arg, "--emit-c")) {
             emit_c = true;
         } else if (parseDiagFormatFlag(args, &idx)) {
@@ -448,6 +463,7 @@ fn cmdBuild(args: []const []const u8) void {
     var compiler = Compiler.initForTarget(source_buf, in_path, opt_level, target, backend_kind);
     compiler.emit_ir = emit_ir;
     compiler.emit_c = emit_c;
+    compiler.cpu_mode = cpu_mode;
     compiler.diag_format = diag_mod.default_format;
     const result = compiler.compile() catch |err| {
         if (cli_json) {
@@ -938,6 +954,7 @@ fn cmdRun(args: []const []const u8) void {
     var opt_level: OptLevel = .O2;
     var target = Target.host();
     var backend_kind: BackendKind = .auto;
+    var cpu_mode: Backend.CpuMode = .host;
     var prog_args_start: usize = args.len;
     // VM resource budgets (--backend=vm). Must be > 0: the limits exist so a
     // runaway guest program cannot pin the host, and a flag that disables
@@ -955,6 +972,8 @@ fn cmdRun(args: []const []const u8) void {
             target = parseTargetOrDie(spec);
         } else if (parseFlagValue(args, &idx, "--backend=", "--backend")) |spec| {
             backend_kind = parseBackendOrDie(spec);
+        } else if (parseFlagValue(args, &idx, "--cpu=", "--cpu")) |spec| {
+            cpu_mode = parseCpuModeOrDie(spec);
         } else if (parseFlagValue(args, &idx, "--max-steps=", "--max-steps")) |spec| {
             vm_max_steps = parseBudgetOrDie(spec, "--max-steps");
         } else if (parseFlagValue(args, &idx, "--timeout-ms=", "--timeout-ms")) |spec| {
@@ -988,6 +1007,7 @@ fn cmdRun(args: []const []const u8) void {
     var compiler = Compiler.initForTarget(source_buf, in_path, opt_level, target, backend_kind);
     compiler.vm_max_steps = vm_max_steps;
     compiler.vm_max_wall_ms = vm_max_wall_ms;
+    compiler.cpu_mode = cpu_mode;
     const prog_args = if (prog_args_start < args.len) args[prog_args_start..] else &[_][]const u8{};
     executeCompiledArtifact(alloc, &compiler, prog_args);
 }

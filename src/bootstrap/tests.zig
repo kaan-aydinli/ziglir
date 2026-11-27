@@ -31,6 +31,18 @@ fn compileSourceWithOpt(source: []const u8, opt_level: main.OptLevel) ![]u8 {
     return try std.testing.allocator.dupe(u8, output);
 }
 
+/// Compile with an explicit CPU mode so a test can compare the host-specific
+/// instruction selection against the portable baseline byte for byte in output.
+fn compileSourceCpuMode(source: []const u8, opt_level: main.OptLevel, cpu_mode: main.Backend.CpuMode) ![]u8 {
+    var compiler = main.Compiler.initWithOpts(source, "<test>", opt_level);
+    compiler.quiet = true;
+    compiler.cpu_mode = cpu_mode;
+    const output = try compiler.compile();
+    defer std.heap.page_allocator.free(output);
+
+    return try std.testing.allocator.dupe(u8, output);
+}
+
 fn runElfCapture(allocator: std.mem.Allocator, elf: []const u8, name_suffix: []const u8) !struct { exit_code: u8, stdout: []u8 } {
     var path_buf: [128]u8 = undefined;
     const tmp_path = try std.fmt.bufPrint(&path_buf, "/tmp/lir_test_{d}_{s}", .{ std.os.linux.getpid(), name_suffix });
@@ -3117,7 +3129,7 @@ test "backend entry points independently reject unsupported target pairs" {
     const invalid = main.Target{ .arch = .wasm32, .os = .linux };
     try std.testing.expectError(
         error.UnsupportedTarget,
-        main.Backend.emitBinary(std.heap.page_allocator, module, "", invalid, .auto),
+        main.Backend.emitBinary(std.heap.page_allocator, module, "", invalid, .auto, .host),
     );
     try std.testing.expectError(
         error.UnsupportedTarget,
@@ -4046,6 +4058,46 @@ test "codegen: frame-shrink state must not leak from one function into the next"
         "-3750763034362895579\n\n4c4952\n6\n\n",
         res.stdout,
     );
+}
+
+test "codegen: @popcount agrees between host POPCNT and the portable SWAR path" {
+    // The native backend emits the hardware POPCNT instruction when the host
+    // CPUID reports it, and the 21-instruction SWAR sequence otherwise. Both
+    // must compute the identical function for every input, including 0, a
+    // single bit, a full word, and values produced at run time -- a wrong
+    // ModRM byte or a swapped operand would show up here rather than as a
+    // mysterious benchmark difference.
+    //
+    // The expected values are not taken from either implementation: they are
+    // the mathematical bit counts (0 -> 0, 0xFF -> 8, all-ones -> 64, 1 -> 1)
+    // plus sum(popcount(i * 2654435761) for i in 0..99) == 1880, computed
+    // independently.
+    const src =
+        \\fn main() -> i64 {
+        \\    printInt(@popcount(0 as u64))
+        \\    printInt(@popcount(255 as u64))
+        \\    printInt(@popcount(-1 as u64))
+        \\    printInt(@popcount(1 as u64))
+        \\    var i: i64 = 0
+        \\    var acc: i64 = 0
+        \\    while i < 100 {
+        \\        acc = acc + @popcount((i * 2654435761) as u64)
+        \\        i = i + 1
+        \\    }
+        \\    printInt(acc)
+        \\    return 0
+        \\}
+    ;
+    const expected = "0\n8\n64\n1\n1880\n";
+
+    inline for (.{ .host, .baseline }) |mode| {
+        const elf = try compileSourceCpuMode(src, .O2, mode);
+        defer std.testing.allocator.free(elf);
+        const res = try runElfCapture(std.testing.allocator, elf, @tagName(mode));
+        defer std.testing.allocator.free(res.stdout);
+        try std.testing.expectEqual(@as(u8, 0), res.exit_code);
+        try std.testing.expectEqualStrings(expected, res.stdout);
+    }
 }
 
 test "distinct syntax: guard, unless, until, proc compile and execute" {
