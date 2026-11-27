@@ -1809,6 +1809,19 @@ fn diamondCopiesToSelect(f: *IRFn) bool {
         }
     }
 
+    var use_cnt: [MAX_TRACKED_VREGS]u16 = .{0} ** MAX_TRACKED_VREGS;
+    for (0..f.block_count) |bi| {
+        const b = &f.blocks[bi];
+        for (0..b.inst_count) |ii| {
+            const it = b.insts[ii];
+            if (it.src1 > 0 and it.src1 < MAX_TRACKED_VREGS) use_cnt[it.src1] +|= 1;
+            if (it.src2 > 0 and it.src2 < MAX_TRACKED_VREGS) use_cnt[it.src2] +|= 1;
+            for (0..@min(it.arg_count, it.args.len)) |ai| {
+                if (it.args[ai] > 0 and it.args[ai] < MAX_TRACKED_VREGS) use_cnt[it.args[ai]] +|= 1;
+            }
+        }
+    }
+
     var changed = false;
     for (0..f.block_count) |bi| {
         const c = &f.blocks[bi];
@@ -1860,20 +1873,94 @@ fn diamondCopiesToSelect(f: *IRFn) bool {
         // the selects would assign on a path where the copies never ran.
         if (in_deg[m] != 2) continue;
 
-        // No arm may read what the diamond writes, nor the condition itself:
-        // the selects all read pre-diamond values, so such a source would see
-        // an update the copied form had not made yet at that point.
-        for (0..n - 1) |k| {
-            const d = bt.insts[k].dest;
-            if (d == cv) {
-                ok = false;
-                break;
+        // Where each select should write. The arms assign temporaries that the
+        // merge block immediately copies into the real variables:
+        //
+        //     T: v245 = copy v241        C: v239 = select cv ? v241 : v239
+        //        jump M            ->       v240 = select cv ? v244 : v240
+        //     M: v239 = copy v245         jump M
+        //        v240 = copy v246
+        //
+        // Writing the selects straight into v239/v240 removes both copies, and
+        // that matters for more than the two instructions: the temporaries are
+        // short-lived, so the allocator gives them whatever is free - often a
+        // scratch register, with a spill for the variable behind it - while the
+        // variables themselves hold the register they have had all loop. A cmov
+        // that writes the variable's own register is one instruction; one that
+        // writes a scratch is a move, a cmov, a store and a reload.
+        var dests: [DIAMOND_MAX_COPIES]u16 = undefined;
+        var copy_at: [DIAMOND_MAX_COPIES]u16 = undefined;
+        var merge_copies = m < f.block_count;
+        if (merge_copies) {
+            const mb0 = &f.blocks[m];
+            for (0..n - 1) |k| {
+                const arm_d = bt.insts[k].dest;
+                // The temporary may only feed that one copy, or dropping the
+                // copy would leave another reader without a definition.
+                if (arm_d >= MAX_TRACKED_VREGS or use_cnt[arm_d] != 1) {
+                    merge_copies = false;
+                    break;
+                }
+                var found: u32 = 0xFFFF;
+                for (0..mb0.inst_count) |q| {
+                    const mq = mb0.insts[q];
+                    if (mq.op == .copy and mq.src1 == arm_d and mq.dest != 0) {
+                        found = @intCast(q);
+                        break;
+                    }
+                }
+                if (found == 0xFFFF) {
+                    merge_copies = false;
+                    break;
+                }
+                copy_at[k] = @intCast(found);
+                dests[k] = mb0.insts[found].dest;
+                for (0..k) |j| {
+                    if (dests[j] == dests[k] or bt.insts[j].dest == arm_d) {
+                        merge_copies = false;
+                        break;
+                    }
+                }
+                if (!merge_copies) break;
             }
-            for (0..n - 1) |j| {
-                if (bt.insts[j].src1 == d or be.insts[j].src1 == d) {
+        }
+        if (merge_copies) {
+            // Nothing in the merge may read a variable before the copy that
+            // assigns it: hoisting that assignment into C would show it a value
+            // the copied form had not produced yet.
+            const mb1 = &f.blocks[m];
+            for (0..n - 1) |k| {
+                for (0..copy_at[k]) |q| {
+                    if (instReadsVreg(mb1.insts[q], dests[k])) {
+                        merge_copies = false;
+                        break;
+                    }
+                }
+                if (!merge_copies) break;
+            }
+        }
+        if (!merge_copies) {
+            for (0..n - 1) |k| dests[k] = bt.insts[k].dest;
+        }
+
+        // A select reads pre-diamond values, so it may read its own destination
+        // (`best = select c ? i : best`) but never one an earlier select has
+        // already rewritten - the copied form would still have been reading the
+        // old one at that point. Reading the condition is likewise out.
+        for (0..n - 1) |k| {
+            const srcs = [2]u16{ bt.insts[k].src1, be.insts[k].src1 };
+            for (srcs) |sv| {
+                if (sv == cv) {
                     ok = false;
                     break;
                 }
+                for (dests[0..k]) |earlier| {
+                    if (sv == earlier) {
+                        ok = false;
+                        break;
+                    }
+                }
+                if (!ok) break;
             }
             if (!ok) break;
         }
@@ -1884,7 +1971,7 @@ fn diamondCopiesToSelect(f: *IRFn) bool {
         for (0..n - 1) |k| {
             var sel = IRInst{
                 .op = .select,
-                .dest = bt.insts[k].dest,
+                .dest = dests[k],
                 .src1 = cv,
                 .src2 = bt.insts[k].src1, // the true arm
             };
@@ -1897,6 +1984,23 @@ fn diamondCopiesToSelect(f: *IRFn) bool {
         c.inst_count += 1;
         bt.inst_count = 0;
         be.inst_count = 0;
+        if (merge_copies) {
+            const mb = &f.blocks[m];
+            var w: u16 = 0;
+            for (0..mb.inst_count) |q| {
+                var dropped = false;
+                for (0..n - 1) |k| {
+                    if (copy_at[k] == q) {
+                        dropped = true;
+                        break;
+                    }
+                }
+                if (dropped) continue;
+                mb.insts[w] = mb.insts[q];
+                w += 1;
+            }
+            mb.inst_count = w;
+        }
         changed = true;
     }
     return changed;
