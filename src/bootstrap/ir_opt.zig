@@ -164,6 +164,10 @@ fn optimizeFn(module: *IRModule, fi: u32, level: OptLevel) void {
     var post_iter: u32 = 0;
     while (post_iter < 4) : (post_iter += 1) {
         var changed = false;
+        // Before the copy passes get another look: they happily propagate
+        // through one arm of a diamond and leave the other, which breaks the
+        // both-arms-are-copies shape this needs.
+        if (diamondCopiesToSelect(f)) changed = true;
         if (globalCopyPropagate(f)) changed = true;
         if (coalesceCopiesPostSSA(f)) changed = true;
         if (localConstantFoldAndLVN(f)) changed = true;
@@ -1761,6 +1765,138 @@ fn threadCondBoolDiamondFixpoint(f: *IRFn) bool {
     var guard: u32 = 0;
     while (guard < 64) : (guard += 1) {
         if (!threadCondBoolDiamond(f)) break;
+        changed = true;
+    }
+    return changed;
+}
+
+/// How many variables one converted diamond may assign. Beyond that the cmov
+/// chain costs more code than the branch it replaces saves.
+const DIAMOND_MAX_COPIES: usize = 4;
+
+/// Post-SSA diamond of copies -> a chain of selects.
+///
+/// destructSSA lowers a phi whose incoming edges are a conditional's two arms
+/// into exactly this shape, and it is the shape an `if` that assigns more than
+/// one variable ends up with:
+///
+///     C: cv = cmp_lt a, b            C: cv = cmp_lt a, b
+///        cond_jump cv ? T : E           v245 = select cv ? v241 : v239
+///     T: v245 = copy v241      ->       v246 = select cv ? v244 : v240
+///        v246 = copy v244               jump M
+///        jump M
+///     E: v245 = copy v239
+///        v246 = copy v240
+///        jump M
+///
+/// The copies are cheap; the branch is not. A condition that depends on the
+/// data - `if ad < best_d`, the inner test of k-means, `if x < min` in any
+/// reduction - is true about as often as it is false and has no pattern the
+/// predictor can learn, so it costs a flushed pipeline every few iterations.
+/// Selects let codegen fuse the compare into a cmov chain, which never
+/// mispredicts, and both arms were already side-effect free (they are copies).
+///
+/// This runs after destructSSA because that is where the shape appears; the
+/// SSA-level ifConversion above cannot see it, and by the time the loop has
+/// been rotated into its final form the phi it would have matched is gone.
+fn diamondCopiesToSelect(f: *IRFn) bool {
+    var in_deg: [MAX_BLOCKS_PER_FN]u16 = .{0} ** MAX_BLOCKS_PER_FN;
+    for (0..f.block_count) |bi| {
+        var succs: [2]u16 = .{ 0, 0 };
+        const ns = getSuccs(&f.blocks[bi], &succs);
+        for (succs[0..ns]) |sc| {
+            if (sc < f.block_count) in_deg[sc] += 1;
+        }
+    }
+
+    var changed = false;
+    for (0..f.block_count) |bi| {
+        const c = &f.blocks[bi];
+        if (c.inst_count == 0) continue;
+        const term = c.insts[c.inst_count - 1];
+        if (term.op != .cond_jump) continue;
+        const cv = term.src1;
+        if (cv == 0) continue;
+        const t = term.target_block;
+        const e = term.alt_block;
+        if (t == e or t == bi or e == bi) continue;
+        if (t >= f.block_count or e >= f.block_count) continue;
+        // Only C reaches an arm, so an arm's copies run exactly when C branches
+        // that way - the same condition the selects will read.
+        if (in_deg[t] != 1 or in_deg[e] != 1) continue;
+
+        const bt = &f.blocks[t];
+        const be = &f.blocks[e];
+        const n = bt.inst_count;
+        if (n < 2 or n != be.inst_count or n - 1 > DIAMOND_MAX_COPIES) continue;
+
+        // Both arms: the same destinations, in the same order, assigned by
+        // copies, then one jump to one merge block.
+        var ok = true;
+        for (0..n - 1) |k| {
+            const it = bt.insts[k];
+            const ie = be.insts[k];
+            if (it.op != .copy or ie.op != .copy) {
+                ok = false;
+                break;
+            }
+            if (it.dest == 0 or it.dest != ie.dest) {
+                ok = false;
+                break;
+            }
+            if (it.src1 == 0 or ie.src1 == 0) {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok) continue;
+        const jt = bt.insts[n - 1];
+        const je = be.insts[n - 1];
+        if (jt.op != .jump or je.op != .jump) continue;
+        if (jt.target_block != je.target_block) continue;
+        const m = jt.target_block;
+        if (m >= f.block_count or m == bi or m == t or m == e) continue;
+        // The merge is reached only through the arms. With a third predecessor
+        // the selects would assign on a path where the copies never ran.
+        if (in_deg[m] != 2) continue;
+
+        // No arm may read what the diamond writes, nor the condition itself:
+        // the selects all read pre-diamond values, so such a source would see
+        // an update the copied form had not made yet at that point.
+        for (0..n - 1) |k| {
+            const d = bt.insts[k].dest;
+            if (d == cv) {
+                ok = false;
+                break;
+            }
+            for (0..n - 1) |j| {
+                if (bt.insts[j].src1 == d or be.insts[j].src1 == d) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok) break;
+        }
+        if (!ok) continue;
+        if (c.inst_count - 1 + n >= MAX_INSTS_PER_BLOCK) continue;
+
+        c.inst_count -= 1; // drop the cond_jump
+        for (0..n - 1) |k| {
+            var sel = IRInst{
+                .op = .select,
+                .dest = bt.insts[k].dest,
+                .src1 = cv,
+                .src2 = bt.insts[k].src1, // the true arm
+            };
+            sel.arg_count = 1;
+            sel.args[0] = be.insts[k].src1; // the false arm
+            c.insts[c.inst_count] = sel;
+            c.inst_count += 1;
+        }
+        c.insts[c.inst_count] = .{ .op = .jump, .target_block = m };
+        c.inst_count += 1;
+        bt.inst_count = 0;
+        be.inst_count = 0;
         changed = true;
     }
     return changed;

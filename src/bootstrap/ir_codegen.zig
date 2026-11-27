@@ -272,6 +272,19 @@ pub const IRCodegen = struct {
     // Per-vreg allocation state (for current function)
     vreg_reg: [MAX_VREGS]u8 = undefined,
     vreg_spill_slot: [MAX_VREGS]u32 = undefined,
+    // ── addressing-mode fold state (see planAddrFolds) ──────────────────
+    // Keyed by the `call_ptr_add` result vreg. `vreg_fold_base[v] == 0`
+    // means v is not folded and the ordinary paths run.
+    vreg_fold_base: [MAX_VREGS]u16 = .{0} ** MAX_VREGS,
+    vreg_fold_idx: [MAX_VREGS]u16 = .{0} ** MAX_VREGS,
+    vreg_fold_scale: [MAX_VREGS]u8 = .{0} ** MAX_VREGS,
+    vreg_fold_disp: [MAX_VREGS]i32 = .{0} ** MAX_VREGS,
+    /// A vreg whose defining instruction is folded into a memory operand and
+    /// therefore must not be emitted at all.
+    vreg_fold_away: [MAX_VREGS]bool = .{false} ** MAX_VREGS,
+    /// Registers this function's allocator handed to a vreg. Scratch picks
+    /// stay away from them, which the unfolded paths cannot promise.
+    reg_is_allocated: [16]bool = .{false} ** 16,
     vreg_def_cnt: [MAX_VREGS]u16 = undefined,
     vreg_last_use: [MAX_VREGS]u32 = undefined,
     vreg_start: [MAX_VREGS]u32 = undefined,
@@ -939,6 +952,31 @@ pub const IRCodegen = struct {
         }
     }
 
+
+    /// `mov [base + idx*scale + disp], src` - the store twin of
+    /// emitMemLoadIdxScaleDisp. Same SIB rules: rsp can never be the index, and
+    /// rbp/r13 as the base forces the mod=01 form with a zero disp8.
+    fn emitMemStoreIdxScaleDisp(self: *IRCodegen, base: u8, idx: u8, scale_log2: u2, disp: i32, src: u8) void {
+        std.debug.assert(idx != 4);
+        var rex: u8 = 0x48;
+        if (src >= 8) rex |= 0x04;
+        if (idx >= 8) rex |= 0x02;
+        if (base >= 8) rex |= 0x01;
+        self.emit8(rex);
+        self.emit8(0x89);
+        if (disp == 0 and (base & 7) != 5) {
+            self.emit8(0x04 | ((src & 7) << 3));
+            self.emit8((@as(u8, scale_log2) << 6) | ((idx & 7) << 3) | (base & 7));
+        } else if (disp >= -128 and disp <= 127) {
+            self.emit8(0x44 | ((src & 7) << 3));
+            self.emit8((@as(u8, scale_log2) << 6) | ((idx & 7) << 3) | (base & 7));
+            self.emit8(@bitCast(@as(i8, @intCast(disp))));
+        } else {
+            self.emit8(0x84 | ((src & 7) << 3));
+            self.emit8((@as(u8, scale_log2) << 6) | ((idx & 7) << 3) | (base & 7));
+            self.emit32(@bitCast(disp));
+        }
+    }
     fn emitNopPadding(self: *IRCodegen, pad: usize) void {
         var p = pad;
         while (p > 0) {
@@ -1532,6 +1570,274 @@ pub const IRCodegen = struct {
         };
     }
 
+
+    // ═══════════════════════════════════════════════════════════
+    // Addressing-mode fold
+    // ═══════════════════════════════════════════════════════════
+    //
+    // `@read_u64(@ptr_add(base, i * 8))` asks for three machine values: the
+    // scaled offset, the pointer, and the loaded word. x86 computes
+    // `[base + index*scale + disp]` inside the memory operand itself, so with
+    // the fold the pointer and the scaled offset never exist: two vregs leave
+    // the allocator's problem, and the load is one instruction instead of a
+    // shift, an add and - whenever those two vregs lost the fight for one of
+    // the ten allocatable registers - a store/reload pair around them.
+    //
+    // The decision is taken once, in planAddrFolds, before live ranges are
+    // measured. The emitter reads the same table, so planning and emission can
+    // never disagree about whether an instruction exists; a disagreement would
+    // read a vreg the allocator was told to skip.
+
+    /// How often each vreg is read anywhere in the function.
+    fn countVregUses(ir_fn: *const IRFn, out: *[MAX_VREGS]u16) void {
+        const n: usize = @min(@as(usize, ir_fn.vreg_count) + 2, MAX_VREGS);
+        @memset(out[0..n], 0);
+        for (0..ir_fn.block_count) |bi| {
+            const blk = &ir_fn.blocks[bi];
+            for (0..blk.inst_count) |ii| {
+                const inst = blk.insts[ii];
+                if (inst.src1 > 0 and inst.src1 < MAX_VREGS) out[inst.src1] +|= 1;
+                if (inst.src2 > 0 and inst.src2 < MAX_VREGS) out[inst.src2] +|= 1;
+                for (0..@min(inst.arg_count, inst.args.len)) |ai| {
+                    if (inst.args[ai] > 0 and inst.args[ai] < MAX_VREGS) out[inst.args[ai]] +|= 1;
+                }
+            }
+        }
+    }
+
+    /// The one definition of `v`, when it sits in block `bi` strictly before
+    /// instruction `before`. Same-block-only keeps the folded access reading
+    /// exactly the value the unfolded one would have read.
+    fn singleDefBefore(self: *const IRCodegen, ir_fn: *const IRFn, v: u16, bi: usize, before: usize) ?IRInst {
+        if (v == 0 or v >= MAX_VREGS) return null;
+        if (self.vreg_def_cnt[v] != 1) return null;
+        for (0..ir_fn.block_count) |ob| {
+            const blk = &ir_fn.blocks[ob];
+            for (0..blk.inst_count) |oi| {
+                if (blk.insts[oi].dest != v) continue;
+                if (ob != bi or oi >= before) return null;
+                return blk.insts[oi];
+            }
+        }
+        return null;
+    }
+
+    /// Decide every addressing-mode fold in this function.
+    fn planAddrFolds(self: *IRCodegen, ir_fn: *const IRFn, fused: *[MAX_VREGS]bool) void {
+        const n: usize = @min(@as(usize, ir_fn.vreg_count) + 2, MAX_VREGS);
+        @memset(self.vreg_fold_base[0..n], 0);
+        @memset(self.vreg_fold_idx[0..n], 0);
+        @memset(self.vreg_fold_scale[0..n], 0);
+        @memset(self.vreg_fold_disp[0..n], 0);
+        @memset(self.vreg_fold_away[0..n], false);
+
+        var use_cnt: [MAX_VREGS]u16 = .{0} ** MAX_VREGS;
+        countVregUses(ir_fn, &use_cnt);
+        // Uses of an offset expression that a fold consumed. When that reaches the
+        // total, the shift or multiply itself is dead and goes too.
+        var folded_off_uses: [MAX_VREGS]u16 = .{0} ** MAX_VREGS;
+        @memset(folded_off_uses[0..n], 0);
+
+        for (0..ir_fn.block_count) |bi| {
+            const blk = &ir_fn.blocks[bi];
+            for (0..blk.inst_count) |ii| {
+                const acc = blk.insts[ii];
+                // Only the 64-bit forms: every buffer benchmark uses them, and
+                // one width keeps the encoding table small enough to audit.
+                if (acc.op != .call_read_u64 and acc.op != .call_write_u64) continue;
+                if (acc.arg_count < 1) continue;
+                if (acc.op == .call_write_u64 and acc.arg_count < 2) continue;
+                const addr = acc.args[0];
+                if (addr == 0 or addr >= MAX_VREGS) continue;
+                // One reader only. Anything else still needs the pointer as a
+                // value, so it has to be materialised regardless.
+                if (use_cnt[addr] != 1) continue;
+                const pa = self.singleDefBefore(ir_fn, addr, bi, ii) orelse continue;
+                if (pa.op != .call_ptr_add or pa.arg_count < 2) continue;
+                const base = pa.args[0];
+                const off = pa.args[1];
+                if (base == 0 or base >= MAX_VREGS) continue;
+                if (off == 0 or off >= MAX_VREGS) continue;
+                if (base == off) continue; // SIB wants two distinct registers
+
+                var idx: u16 = off;
+                var scale: u8 = 0;
+                var disp: i32 = 0;
+                if (off < MAX_VREGS and self.vreg_const_known[off]) {
+                    // A constant offset is a displacement, not an index.
+                    const cv = self.vreg_const_imm[off];
+                    if (!fitsI32NonMin(cv)) continue;
+                    idx = 0;
+                    disp = @intCast(cv);
+                } else if (self.singleDefBefore(ir_fn, off, bi, ii)) |sd| {
+                    // `i << s` and `i * 2^s` are the scale field of the addressing
+                    // mode; x86 multiplies for free, so the shift stops existing.
+                    var sh: u8 = 0;
+                    var src: u16 = 0;
+                    if (sd.op == .shl and sd.src2 > 0 and sd.src2 < MAX_VREGS and
+                        self.vreg_const_known[sd.src2] and self.vreg_const_imm[sd.src2] >= 1 and
+                        self.vreg_const_imm[sd.src2] <= 3)
+                    {
+                        sh = @intCast(self.vreg_const_imm[sd.src2]);
+                        src = sd.src1;
+                    } else if (sd.op == .mul) {
+                        const s1c = sd.src1 > 0 and sd.src1 < MAX_VREGS and self.vreg_const_known[sd.src1];
+                        const s2c = sd.src2 > 0 and sd.src2 < MAX_VREGS and self.vreg_const_known[sd.src2];
+                        if (s1c != s2c) {
+                            const cv = if (s1c) self.vreg_const_imm[sd.src1] else self.vreg_const_imm[sd.src2];
+                            const lg: ?u8 = switch (cv) {
+                                2 => 1,
+                                4 => 2,
+                                8 => 3,
+                                else => null,
+                            };
+                            if (lg) |l| {
+                                sh = l;
+                                src = if (s1c) sd.src2 else sd.src1;
+                            }
+                        }
+                    }
+                    if (src > 0 and src < MAX_VREGS and src != base) {
+                        idx = src;
+                        scale = sh;
+                        folded_off_uses[off] +|= 1;
+                    }
+                }
+
+                self.vreg_fold_base[addr] = base;
+                self.vreg_fold_idx[addr] = idx;
+                self.vreg_fold_scale[addr] = scale;
+                self.vreg_fold_disp[addr] = disp;
+                self.vreg_fold_away[addr] = true;
+                fused[addr] = true;
+            }
+        }
+
+        // Second sweep: an offset expression every one of whose readers was folded
+        // away is dead. Dropping it returns a register to the values a hot loop
+        // actually needs, which is the point of the fold.
+        for (0..ir_fn.block_count) |bi| {
+            const blk = &ir_fn.blocks[bi];
+            for (0..blk.inst_count) |ii| {
+                const inst = blk.insts[ii];
+                const d = inst.dest;
+                if (d == 0 or d >= MAX_VREGS) continue;
+                if (inst.op != .shl and inst.op != .mul) continue;
+                if (folded_off_uses[d] == 0 or folded_off_uses[d] != use_cnt[d]) continue;
+                fused[d] = true;
+                self.vreg_fold_away[d] = true;
+            }
+        }
+    }
+
+    /// A scratch register for the fold. rax and r11 are never handed to a vreg,
+    /// rcx and rdx only by the div/mod hardware preference, so this always finds
+    /// one; the second pass exists only so a fold can never fail halfway through
+    /// emitting, after planning already removed the instructions it replaces.
+    fn pickScratchReg(self: *const IRCodegen, taken: u16) u8 {
+        for ([_]u8{ 0, 1, 2, 11 }) |r| {
+            if ((taken & (@as(u16, 1) << @intCast(r))) != 0) continue;
+            if (self.reg_is_allocated[r]) continue;
+            if (self.isParkedMagicReg(r)) continue;
+            return r;
+        }
+        for ([_]u8{ 0, 1, 2, 11 }) |r| {
+            if ((taken & (@as(u16, 1) << @intCast(r))) != 0) continue;
+            return r;
+        }
+        return 0;
+    }
+
+    /// The register an address operand reads from: its own when the allocator gave
+    /// it one, otherwise a scratch loaded with it.
+    fn foldOperandReg(self: *IRCodegen, v: u16, taken: *u16) u8 {
+        if (v < MAX_VREGS) {
+            if (self.vregPhys(v)) |r| return r;
+        }
+        const s = self.pickScratchReg(taken.*);
+        self.loadVregToReg(v, s);
+        taken.* |= @as(u16, 1) << @intCast(s);
+        return s;
+    }
+
+    /// Emit a 64-bit access whose address planAddrFolds folded. Returns false when
+    /// this access is not folded, so the caller runs its ordinary path.
+    fn emitFoldedMemAccess(self: *IRCodegen, inst: IRInst, is_write: bool) bool {
+        if (inst.arg_count < 1) return false;
+        const addr = inst.args[0];
+        if (addr == 0 or addr >= MAX_VREGS) return false;
+        const base_v = self.vreg_fold_base[addr];
+        if (base_v == 0) return false;
+        if (is_write and inst.arg_count < 2) return false;
+        const idx_v = self.vreg_fold_idx[addr];
+        const scale: u2 = @intCast(self.vreg_fold_scale[addr]);
+        const disp = self.vreg_fold_disp[addr];
+
+        var taken: u16 = 0;
+        const base_reg = self.foldOperandReg(base_v, &taken);
+        // rsp is not in any allocator pool and not in the scratch list, so it
+        // can never come back as an index; emitMemLoadIdxScaleDisp asserts the
+        // same invariant the unfolded paths already rely on.
+        const idx_reg: u8 = if (idx_v != 0) self.foldOperandReg(idx_v, &taken) else 0;
+
+        var mem_base = base_reg;
+        var mem_idx: u8 = idx_reg;
+        var mem_scale: u2 = scale;
+        var mem_disp = disp;
+        if (!inst.unchecked_access) {
+            // The probe wants the address in a register, so one `lea` stands in
+            // for the shift, the add and any spill traffic around them. base and
+            // idx are dead once it is computed, which frees their scratches for
+            // the value a store still has to load.
+            const probe = self.pickScratchReg(taken);
+            if (idx_v == 0) {
+                self.emitLeaRegDisp(probe, base_reg, disp);
+            } else {
+                self.emitLeaRegIdxScaleDisp(probe, base_reg, idx_reg, scale, disp);
+            }
+            self.emitPtrTrapN(probe, 8);
+            mem_base = probe;
+            mem_idx = 0;
+            mem_scale = 0;
+            mem_disp = 0;
+            taken = @as(u16, 1) << @intCast(probe);
+        }
+
+        if (!is_write) {
+            const dst_reg: u8 = self.vregPhys(inst.dest) orelse self.pickScratchReg(taken);
+            if (mem_idx == 0) {
+                self.emitMemLoadDisp(dst_reg, mem_base, mem_disp);
+            } else {
+                self.emitMemLoadIdxScaleDisp(dst_reg, mem_base, mem_idx, mem_scale, mem_disp);
+            }
+            if (inst.dest != 0 and self.vregPhys(inst.dest) == null) self.storeRegToVreg(dst_reg, inst.dest);
+            return true;
+        }
+
+        const val_v = inst.args[1];
+        var val_reg: u8 = NO_REG;
+        if (val_v > 0 and val_v < MAX_VREGS) val_reg = self.vregPhys(val_v) orelse NO_REG;
+        if (val_reg == NO_REG) {
+            val_reg = self.pickScratchReg(taken);
+            taken |= @as(u16, 1) << @intCast(val_reg);
+            self.loadVregToReg(val_v, val_reg);
+        }
+        if (mem_idx == 0) {
+            self.emitMemStoreDisp(mem_base, val_reg, mem_disp);
+        } else {
+            self.emitMemStoreIdxScaleDisp(mem_base, mem_idx, mem_scale, mem_disp, val_reg);
+        }
+        if (inst.dest != 0) {
+            if (self.vregPhys(inst.dest)) |dr| {
+                self.xorReg(dr, dr);
+            } else {
+                const z = self.pickScratchReg(taken);
+                self.xorReg(z, z);
+                self.storeRegToVreg(z, inst.dest);
+            }
+        }
+        return true;
+    }
     fn allocRegsForFn(self: *IRCodegen, ir_fn: *const IRFn) void {
         // Reset only the live vreg range. Every one of these arrays is indexed by
         // a vreg belonging to the function currently being compiled (<= vreg_count),
@@ -1567,6 +1873,11 @@ pub const IRCodegen = struct {
         var pos: u32 = 0;
         var vreg_weight: [MAX_VREGS]u32 = .{0} ** MAX_VREGS;
         var vreg_fused_skip: [MAX_VREGS]bool = .{false} ** MAX_VREGS;
+
+        // Decided before any live range is measured: a folded pointer and its
+        // scaled offset are not values any more, so they must not compete for
+        // a register or extend one.
+        self.planAddrFolds(ir_fn, &vreg_fused_skip);
 
         for (0..ir_fn.block_count) |bi| {
             block_start_pos[bi] = pos;
@@ -1701,6 +2012,30 @@ pub const IRCodegen = struct {
                         call_pos_count += 1;
                     } else if (pos < overflow_call_min_pos) {
                         overflow_call_min_pos = pos;
+                    }
+                }
+                // A folded access reads its base and its index *here*, not
+                // where the `call_ptr_add` it replaced sat. The two positions
+                // can be separated by real work - `cen[q] = s / m` computes the
+                // quotient between building the pointer and using it - and a
+                // live range that ends at the pointer would let the allocator
+                // hand that register to the instruction in between. Extending
+                // both operands to the access is what keeps the folded form
+                // reading the values it was planned against.
+                if ((inst.op == .call_read_u64 or inst.op == .call_write_u64) and inst.arg_count >= 1) {
+                    const fa = inst.args[0];
+                    if (fa > 0 and fa < MAX_VREGS and self.vreg_fold_base[fa] != 0) {
+                        const fold_ops = [2]u16{ self.vreg_fold_base[fa], self.vreg_fold_idx[fa] };
+                        for (fold_ops) |fv| {
+                            if (fv == 0 or fv >= MAX_VREGS or self.vreg_elided_const[fv]) continue;
+                            max_vreg = @max(max_vreg, @as(u32, fv));
+                            self.vreg_last_use[fv] = pos;
+                            if (!vreg_fused_skip[fv]) {
+                                self.vreg_start[fv] = @min(self.vreg_start[fv], pos);
+                                self.vreg_end[fv] = @max(self.vreg_end[fv], pos);
+                                vreg_weight[fv] +|= 1;
+                            }
+                        }
                     }
                 }
                 pos += 1;
@@ -2054,6 +2389,11 @@ pub const IRCodegen = struct {
         }
 
         self.cur_num_spills = next_spill - 1;
+        @memset(&self.reg_is_allocated, false);
+        for (1..@min(@as(usize, max_vreg) + 1, MAX_VREGS)) |rv| {
+            const ar = self.vreg_reg[rv];
+            if (ar != NO_REG and ar < 16) self.reg_is_allocated[ar] = true;
+        }
         self.cur_callee_count = 0;
         for (CALLEE_SAVED_POOL) |r| {
             if ((used_callee_mask & (@as(u16, 1) << @intCast(r))) != 0) {
@@ -3087,6 +3427,19 @@ pub const IRCodegen = struct {
                 const cur_pos = block_base_pos[bi] + ii;
                 const inst = blk.insts[ii];
 
+                // planAddrFolds folded this value into a later memory operand:
+                // the addressing mode computes it, so there is nothing to emit
+                // and the allocator was told to skip it.
+                if (inst.dest > 0 and inst.dest < MAX_VREGS and self.vreg_fold_away[inst.dest]) {
+                    switch (inst.op) {
+                        .call_ptr_add, .shl, .mul => {
+                            ii += 1;
+                            continue;
+                        },
+                        else => {},
+                    }
+                }
+
                 // Skip entry load_local already materialized directly by emitParallelRegParamMoves
                 if (bi == 0 and inst.op == .load_local) {
                     var skipped = false;
@@ -3254,39 +3607,59 @@ pub const IRCodegen = struct {
                     }
 
                     // Fused compare + select optimization -> cmp / test; cmovcc
+                    //
+                    // One compare can feed a whole *run* of selects: that is
+                    // what a diamond assigning several variables turns into
+                    // (see diamondCopiesToSelect in ir_opt.zig). Every cmov in
+                    // the run reads the same flags, so the compare is emitted
+                    // once and each select costs a cmov plus the moves that put
+                    // its two arms in place - never a second test, and never a
+                    // branch to mispredict.
                     if (isCmpOp(inst.op) and next_inst.op == .select and
                         inst.dest != 0 and next_inst.src1 == inst.dest and
-                        inst.dest < MAX_VREGS and self.vreg_def_cnt[inst.dest] == 1 and
-                        self.vreg_last_use[inst.dest] == cur_pos + 1)
+                        inst.dest < MAX_VREGS and self.vreg_def_cnt[inst.dest] == 1)
                     {
-                        const eff_op = self.emitCmpOperands(inst.op, inst.src1, inst.src2);
-                        const dst = self.vregPhys(next_inst.dest) orelse 0;
-                        const true_v = next_inst.src2;
-                        const false_v = if (next_inst.arg_count > 0) next_inst.args[0] else 0;
-
-                        if (self.vregPhys(false_v) != dst) {
-                            self.loadVregToRegNoFlags(false_v, dst);
+                        var n_sel: u16 = 0;
+                        while (ii + 1 + n_sel < blk.inst_count) : (n_sel += 1) {
+                            const sel = blk.insts[ii + 1 + n_sel];
+                            if (sel.op != .select or sel.src1 != inst.dest or sel.dest == 0) break;
                         }
-                        const true_phys = self.vregPhys(true_v);
-                        const scratch: u8 = if (true_phys != null and true_phys.? != dst)
-                            true_phys.?
-                        else blk_sc: {
-                            const sc: u8 = if (dst != 1) 1 else 2;
-                            self.loadVregToRegNoFlags(true_v, sc);
-                            break :blk_sc sc;
-                        };
+                        // The compare's last reader has to be the run's final
+                        // select, or something else still needs the 0/1 value
+                        // and it would have to be materialised after all.
+                        if (n_sel > 0 and self.vreg_last_use[inst.dest] == cur_pos + n_sel) {
+                            const eff_op = self.emitCmpOperands(inst.op, inst.src1, inst.src2);
+                            const cc = cmpCc(eff_op);
+                            for (0..n_sel) |k| {
+                                const sel = blk.insts[ii + 1 + k];
+                                const dst = self.vregPhys(sel.dest) orelse 0;
+                                const true_v = sel.src2;
+                                const false_v = if (sel.arg_count > 0) sel.args[0] else 0;
 
-                        const cc = cmpCc(eff_op);
-                        self.emitRex(dst, scratch);
-                        self.emit8(0x0F);
-                        self.emit8(0x40 | cc); // cmov<cc> dst, scratch
-                        self.emitModRM(3, dst, scratch);
+                                if (self.vregPhys(false_v) != dst) {
+                                    self.loadVregToRegNoFlags(false_v, dst);
+                                }
+                                const true_phys = self.vregPhys(true_v);
+                                const scratch: u8 = if (true_phys != null and true_phys.? != dst)
+                                    true_phys.?
+                                else blk_sc: {
+                                    const sc: u8 = if (dst != 1) 1 else 2;
+                                    self.loadVregToRegNoFlags(true_v, sc);
+                                    break :blk_sc sc;
+                                };
 
-                        if (self.vregPhys(next_inst.dest) == null) {
-                            self.storeRegToVreg(dst, next_inst.dest);
+                                self.emitRex(dst, scratch);
+                                self.emit8(0x0F);
+                                self.emit8(0x40 | cc); // cmov<cc> dst, scratch
+                                self.emitModRM(3, dst, scratch);
+
+                                if (self.vregPhys(sel.dest) == null) {
+                                    self.storeRegToVreg(dst, sel.dest);
+                                }
+                            }
+                            ii += 1 + n_sel;
+                            continue;
                         }
-                        ii += 2;
-                        continue;
                     }
 
                     // Fused ptr arithmetic (add / call_ptr_add) + inline memory access (read/write byte/u32/u64)
@@ -7043,34 +7416,38 @@ pub const IRCodegen = struct {
                 }
             },
             .call_read_u64 => {
-                const ptr_reg: u8 = self.vregPhys(inst.args[0]) orelse blk: {
-                    self.loadVregToReg(inst.args[0], 0);
-                    break :blk 0;
-                };
-                // hoistBoundsChecks proved this buffer is entirely inside the
-                // heap for the whole loop, so the per-access check is redundant.
-                if (!inst.unchecked_access) self.emitPtrTrapN(ptr_reg, 8);
-                const dst_reg: u8 = self.vregPhys(inst.dest) orelse 0;
-                self.emitMemLoadDisp(dst_reg, ptr_reg, 0);
-                if (inst.dest != 0 and self.vregPhys(inst.dest) == null) self.storeRegToVreg(dst_reg, inst.dest);
+                if (!self.emitFoldedMemAccess(inst, false)) {
+                    const ptr_reg: u8 = self.vregPhys(inst.args[0]) orelse blk: {
+                        self.loadVregToReg(inst.args[0], 0);
+                        break :blk 0;
+                    };
+                    // hoistBoundsChecks proved this buffer is entirely inside the
+                    // heap for the whole loop, so the per-access check is redundant.
+                    if (!inst.unchecked_access) self.emitPtrTrapN(ptr_reg, 8);
+                    const dst_reg: u8 = self.vregPhys(inst.dest) orelse 0;
+                    self.emitMemLoadDisp(dst_reg, ptr_reg, 0);
+                    if (inst.dest != 0 and self.vregPhys(inst.dest) == null) self.storeRegToVreg(dst_reg, inst.dest);
+                }
             },
             .call_write_u64 => {
-                const ptr_reg: u8 = self.vregPhys(inst.args[0]) orelse blk: {
-                    self.loadVregToReg(inst.args[0], 0);
-                    break :blk 0;
-                };
-                if (!inst.unchecked_access) self.emitPtrTrapN(ptr_reg, 8);
-                const val_reg: u8 = self.vregPhys(inst.args[1]) orelse blk_v: {
-                    self.loadVregToReg(inst.args[1], 1);
-                    break :blk_v 1;
-                };
-                self.emitMemStoreDisp(ptr_reg, val_reg, 0);
-                if (inst.dest != 0) {
-                    if (self.vregPhys(inst.dest)) |dr| {
-                        self.xorReg(dr, dr);
-                    } else {
-                        self.xorReg(0, 0);
-                        self.storeRegToVreg(0, inst.dest);
+                if (!self.emitFoldedMemAccess(inst, true)) {
+                    const ptr_reg: u8 = self.vregPhys(inst.args[0]) orelse blk: {
+                        self.loadVregToReg(inst.args[0], 0);
+                        break :blk 0;
+                    };
+                    if (!inst.unchecked_access) self.emitPtrTrapN(ptr_reg, 8);
+                    const val_reg: u8 = self.vregPhys(inst.args[1]) orelse blk_v: {
+                        self.loadVregToReg(inst.args[1], 1);
+                        break :blk_v 1;
+                    };
+                    self.emitMemStoreDisp(ptr_reg, val_reg, 0);
+                    if (inst.dest != 0) {
+                        if (self.vregPhys(inst.dest)) |dr| {
+                            self.xorReg(dr, dr);
+                        } else {
+                            self.xorReg(0, 0);
+                            self.storeRegToVreg(0, inst.dest);
+                        }
                     }
                 }
             },

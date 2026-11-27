@@ -4100,6 +4100,161 @@ test "codegen: @popcount agrees between host POPCNT and the portable SWAR path" 
     }
 }
 
+test "codegen: a folded [base + index*8] access keeps its operands live" {
+    // The native backend folds `@read_u64(@ptr_add(base, i * 8))` into the x86
+    // memory operand `[base + i*8]`, so the pointer and the scaled offset stop
+    // being values the register allocator has to place. That is only sound if
+    // the *base* and the *index* stay live until the access itself - and the
+    // access is not where the `@ptr_add` it replaced sat. `dst[q] = src[q] / m`
+    // is the shape that caught this: IRGen builds the destination pointer
+    // first, then computes the quotient, so a live range that ended at the
+    // pointer let the allocator hand that very register to the division result
+    // and the store indexed off the quotient instead of off q.
+    //
+    // The expected numbers are the integer quotients floor((q+1)*100 / (q%3+2))
+    // for q in 0..7 - 50, 66, 75, 200, 166, 150, 350, 266 - summed: 1323. They
+    // come from the arithmetic, not from any backend.
+    const src =
+        \\fn main() -> i64 {
+        \\    let n: i64 = 8
+        \\    let a = @malloc(n * 8)
+        \\    let b = @malloc(n * 8)
+        \\    if a == 0 as *u8 { return 1 }
+        \\    if b == 0 as *u8 { return 2 }
+        \\    var i: i64 = 0
+        \\    while i < n {
+        \\        @write_u64(@ptr_add(a, i * 8), (i + 1) * 100)
+        \\        i = i + 1
+        \\    }
+        \\    var q: i64 = 0
+        \\    var acc: i64 = 0
+        \\    while q < n {
+        \\        let s = @read_u64(@ptr_add(a, q * 8)) as i64
+        \\        let m = (q % 3) + 2
+        \\        @write_u64(@ptr_add(b, q * 8), s / m)
+        \\        acc = acc + (@read_u64(@ptr_add(b, q * 8)) as i64)
+        \\        q = q + 1
+        \\    }
+        \\    printInt(acc)
+        \\    @free(a)
+        \\    @free(b)
+        \\    return 0
+        \\}
+    ;
+    inline for (.{ .O0, .O1, .O2 }) |lvl| {
+        const elf = try compileSourceWithOpt(src, lvl);
+        defer std.testing.allocator.free(elf);
+        const res = try runElfCapture(std.testing.allocator, elf, "fold_live_" ++ @tagName(lvl));
+        defer std.testing.allocator.free(res.stdout);
+        try std.testing.expectEqual(@as(u8, 0), res.exit_code);
+        try std.testing.expectEqualStrings("1323\n", res.stdout);
+    }
+}
+
+test "codegen: a folded out-of-chunk store still traps at every -O level" {
+    // The fold removes instructions, never checks. Writing one element past a
+    // 64-byte chunk through `@ptr_add(buf, i * 8)` lands inside the heap arena
+    // but outside the chunk, which the deferred probe must still catch - at
+    // -O2, where the fold is active, exactly as at -O0.
+    const src =
+        \\fn main() -> i64 {
+        \\    let buf = @malloc(64)
+        \\    if buf == 0 as *u8 { return 1 }
+        \\    var i: i64 = 0
+        \\    while i < 16 {
+        \\        @write_u64(@ptr_add(buf, i * 8), i * i)
+        \\        i += 1
+        \\    }
+        \\    printInt(@read_u64(@ptr_add(buf, 8)) as i64)
+        \\    @free(buf)
+        \\    return 0
+        \\}
+    ;
+    inline for (.{ .O0, .O1, .O2 }) |lvl| {
+        const elf = try compileSourceWithOpt(src, lvl);
+        defer std.testing.allocator.free(elf);
+        try runElfExpectSigIll(std.testing.allocator, elf, "fold_oob_" ++ @tagName(lvl));
+    }
+}
+
+test "opt: an if that assigns several variables becomes a cmov chain" {
+    // destructSSA turns `if d < best { best = v; best_d = d }` into a diamond
+    // whose two arms are nothing but copies into the same destinations.
+    // diamondCopiesToSelect rewrites that into one select per variable so
+    // codegen can fuse the compare into a cmov chain. The branch it replaces is
+    // decided by the data, so it mispredicts about as often as it is taken and
+    // dominates the runtime of every reduction loop; the cmovs never do.
+    //
+    // Round r scans v = ((i*37) % 23) - 11 + 5r for i in 0..19 and keeps the v
+    // of smallest |v|. Rounds 0-2 reach v = 0, round 3 bottoms out at 4 and
+    // round 4 at 9, so total = sum(best*(r+1) + best_d) = 4*4 + 4 + 9*5 + 9 =
+    // 74 - an arithmetic oracle, not a transcript of any backend.
+    const reduction_src =
+        \\fn main() -> i64 {
+        \\    var total: i64 = 0
+        \\    var r: i64 = 0
+        \\    while r < 5 {
+        \\        var best: i64 = 0
+        \\        var best_d: i64 = 9223372036854775807
+        \\        var i: i64 = 0
+        \\        while i < 20 {
+        \\            let v = ((i * 37) % 23) - 11 + r * 5
+        \\            let d = @max(v, 0 - v)
+        \\            if d < best_d {
+        \\                best_d = d
+        \\                best = v
+        \\            }
+        \\            i = i + 1
+        \\        }
+        \\        total = total + best * (r + 1) + best_d
+        \\        r = r + 1
+        \\    }
+        \\    printInt(total)
+        \\    return 0
+        \\}
+    ;
+
+    // Three variables assigned together: the chain has to keep all three
+    // consistent, which is what a single cmov per variable cannot fake.
+    const triple_src =
+        \\fn main() -> i64 {
+        \\    var s1: i64 = 0
+        \\    var s2: i64 = 0
+        \\    var s3: i64 = 0
+        \\    var acc: i64 = 0
+        \\    var i: i64 = 0
+        \\    while i < 30 {
+        \\        let x = (i * 29) % 17
+        \\        if x < 9 {
+        \\            s1 = x
+        \\            s2 = x * x
+        \\            s3 = x * x * x
+        \\        }
+        \\        acc = acc + s1 + s2 + s3
+        \\        i = i + 1
+        \\    }
+        \\    printInt(acc)
+        \\    return 0
+        \\}
+    ;
+
+    inline for (.{ .O0, .O1, .O2 }) |lvl| {
+        const elf1 = try compileSourceWithOpt(reduction_src, lvl);
+        defer std.testing.allocator.free(elf1);
+        const res1 = try runElfCapture(std.testing.allocator, elf1, "cmov_red_" ++ @tagName(lvl));
+        defer std.testing.allocator.free(res1.stdout);
+        try std.testing.expectEqual(@as(u8, 0), res1.exit_code);
+        try std.testing.expectEqualStrings("74\n", res1.stdout);
+
+        const elf2 = try compileSourceWithOpt(triple_src, lvl);
+        defer std.testing.allocator.free(elf2);
+        const res2 = try runElfCapture(std.testing.allocator, elf2, "cmov_triple_" ++ @tagName(lvl));
+        defer std.testing.allocator.free(res2.stdout);
+        try std.testing.expectEqual(@as(u8, 0), res2.exit_code);
+        try std.testing.expectEqualStrings("3354\n", res2.stdout);
+    }
+}
+
 test "distinct syntax: guard, unless, until, proc compile and execute" {
     const src =
         \\proc check_guard(x: i64) -> i64 {
