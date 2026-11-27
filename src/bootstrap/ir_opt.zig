@@ -68,6 +68,9 @@ fn optimizeFn(module: *IRModule, fi: u32, level: OptLevel) void {
         _ = simplifyCFG(f);
         _ = mem2reg(f);
         _ = simplifyTrivialPhis(f);
+        _ = threadCondBoolDiamondFixpoint(f);
+        _ = foldPow2ModZeroTest(f);
+        _ = correlatedPow2DivToShift(f);
         _ = ifConversion(f);
         _ = localConstantFoldAndLVN(f);
         _ = globalCopyPropagate(f);
@@ -112,6 +115,24 @@ fn optimizeFn(module: *IRModule, fi: u32, level: OptLevel) void {
                 if (localStoreToLoadForward(f)) changed = true;
             }
             if (simplifyTrivialPhis(f)) changed = true;
+            // Read branch conditions as facts before the diamond they guard can
+            // be if-converted away: threading the short-circuit boolean removes
+            // the flag, and the remainder/division correlation needs the
+            // `x % 2^k == 0` test to still be a branch on a single-predecessor
+            // edge.
+            //
+            // NOTE: no simplifyCFG here on purpose. Running simplifyCFG at this
+            // early point in the -O2 loop miscompiles: inserting that one call,
+            // with none of the three passes above enabled, drops
+            // ai/tests/30_noema_training_data from 9/9 to 7/9 and
+            // ai/tests/37_noema_multimodal from 17/17 to 13/17 on all three
+            // backends. The unreachable blocks these passes leave behind are
+            // collected by the simplifyCFG that already runs later in the same
+            // iteration, so nothing is lost by not calling it twice.
+            // Tracked as Issue #7 (early-position simplifyCFG miscompile).
+            if (threadCondBoolDiamondFixpoint(f)) changed = true;
+            if (foldPow2ModZeroTest(f)) changed = true;
+            if (correlatedPow2DivToShift(f)) changed = true;
             if (ifConversion(f)) changed = true;
             if (localConstantFoldAndLVN(f)) changed = true;
         if (globalValueNumbering(f)) changed = true;
@@ -1135,6 +1156,616 @@ fn sinkCompareToConsumer(f: *IRFn) bool {
     return changed;
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// CORRELATED POW-2 ARITHMETIC + SHORT-CIRCUIT BOOL THREADING
+//
+// Three passes that remove work a generic optimizer leaves behind because it
+// is visible only when a *branch condition* is read as a *fact* about a value:
+//
+//   foldPow2ModZeroTest      `x % 2^k` used only as a zero test  -> `x & (2^k-1)`
+//   correlatedPow2DivToShift `div(x, 2^j)` under a proof that 2^j | x -> `shr(x, j)`
+//   threadCondBoolDiamond    short-circuit and/or bool materialisation -> two jumps
+//
+// All three preserve semantics for every i64 input, including the negative and
+// overflow cases where signed division by a power of two differs from a shift.
+// None of them removes a bounds check, a division guard or any other safety
+// check: each either replaces an operation with a cheaper one that provably
+// computes the same value, or deletes a control-flow detour whose two edges
+// keep exactly the destinations they had.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Value of `v` when `v` resolves, through unique definitions and `copy` hops,
+/// to a single `const_int`. Null for anything ambiguous — including the
+/// multiple definitions out-of-SSA destruction produces — so callers never act
+/// on a guess.
+fn optUniqueConst(f: *const IRFn, v: u16) ?i64 {
+    var cur = v;
+    var hops: u16 = 0;
+    while (cur != 0 and hops < 16) : (hops += 1) {
+        var n_def: usize = 0;
+        var def: ?IRInst = null;
+        for (0..f.block_count) |bi| {
+            const b = &f.blocks[bi];
+            for (0..b.inst_count) |ii| {
+                if (b.insts[ii].dest != cur) continue;
+                n_def += 1;
+                def = b.insts[ii];
+                if (n_def > 1) return null;
+            }
+        }
+        const d = def orelse return null;
+        if (d.op == .const_int) return d.imm;
+        // Value numbering and copy propagation regularly re-express a constant
+        // as a copy of the vreg that already holds it, so `copy` is followed
+        // rather than treated as "not a constant". Each hop still demands a
+        // unique definition, which is what keeps this exact.
+        if (d.op == .copy) {
+            cur = d.src1;
+            continue;
+        }
+        return null;
+    }
+    return null;
+}
+
+/// True when `v` has exactly one definition in `f`.
+fn optSingleDef(f: *const IRFn, v: u16) bool {
+    if (v == 0) return false;
+    var n: usize = 0;
+    for (0..f.block_count) |bi| {
+        const b = &f.blocks[bi];
+        for (0..b.inst_count) |ii| {
+            if (b.insts[ii].dest == v) n += 1;
+            if (n > 1) return false;
+        }
+    }
+    return n == 1;
+}
+
+/// True when every read of `v` sits in block `b0` or `b1`. Used to prove a
+/// value dies together with the blocks that are about to become unreachable.
+fn optUsesConfined(f: *const IRFn, v: u16, b0: u16, b1: u16) bool {
+    if (v == 0) return true;
+    for (0..f.block_count) |bi| {
+        if (bi == b0 or bi == b1) continue;
+        const b = &f.blocks[bi];
+        for (0..b.inst_count) |ii| {
+            if (instReadsVreg(b.insts[ii], v)) return false;
+        }
+    }
+    return true;
+}
+
+/// Insert `dest = const val` at `pos` inside `b`, shifting the tail right, and
+/// return its vreg. Reuses an identical constant already materialised earlier
+/// in the same block, whose definition therefore still dominates `pos`.
+fn optInsertConst(f: *IRFn, b: *IRBlock, pos: u16, val: i64) ?u16 {
+    for (0..pos) |ii| {
+        if (b.insts[ii].op == .const_int and b.insts[ii].imm == val and b.insts[ii].dest != 0) {
+            return b.insts[ii].dest;
+        }
+    }
+    if (b.inst_count + 1 > MAX_INSTS_PER_BLOCK) return null;
+    if (f.vreg_count + 1 >= MAX_TRACKED_VREGS) return null;
+    const v = f.vreg_count;
+    f.vreg_count += 1;
+    var k: u16 = b.inst_count;
+    while (k > pos) : (k -= 1) {
+        b.insts[k] = b.insts[k - 1];
+    }
+    b.insts[pos] = .{ .op = .const_int, .dest = v, .imm = val };
+    b.inst_count += 1;
+    return v;
+}
+
+/// Exponent of a positive power-of-two constant, else null. Rejects values
+/// whose negation or shift count would not fit the i64 arithmetic below.
+fn optPow2Exp(cv: i64) ?u8 {
+    if (cv <= 1) return null;
+    if (cv == std.math.minInt(i64)) return null;
+    if ((cv & (cv - 1)) != 0) return null;
+    const k = @ctz(@as(u64, @bitCast(cv)));
+    if (k < 1 or k > 62) return null;
+    return @intCast(k);
+}
+
+/// True when every read of the remainder `v` is a zero test: `v == 0`,
+/// `v != 0`, or a boolean consumer (`cond_jump`, `select` condition,
+/// `logic_not`) whose meaning is "is v zero?". Anything that reads the
+/// remainder's *value* — including a comparison against a non-zero constant —
+/// disqualifies the fold, because a signed truncating remainder carries the
+/// dividend's sign while a bit mask never does.
+fn optOnlyZeroTestUses(f: *const IRFn, v: u16) bool {
+    if (v == 0) return false;
+    var any_use = false;
+    for (0..f.block_count) |bi| {
+        const b = &f.blocks[bi];
+        for (0..b.inst_count) |ii| {
+            const u = b.insts[ii];
+            if (u.dest == v) continue;
+            const as_s1 = u.src1 == v;
+            const as_s2 = u.src2 == v;
+            if (instReadsVreg(u, v) and !as_s1 and !as_s2) return false; // used as an argument
+            if (!as_s1 and !as_s2) continue;
+            any_use = true;
+            switch (u.op) {
+                .cond_jump, .select, .logic_not => {
+                    // These read src1 as a truth value; a value operand is not a test.
+                    if (!as_s1 or as_s2) return false;
+                },
+                .cmp_eq, .cmp_ne => {
+                    if (as_s1 == as_s2) return false; // both sides or neither
+                    const other = if (as_s1) u.src2 else u.src1;
+                    const oc = optUniqueConst(f, other) orelse return false;
+                    if (oc != 0) return false;
+                },
+                else => return false,
+            }
+        }
+    }
+    return any_use;
+}
+
+/// `x % 2^k` whose result is only ever tested against zero becomes
+/// `x & (2^k - 1)`.
+///
+/// Signed truncating remainder takes the sign of the dividend, so `x % 8` and
+/// `x & 7` disagree for negative x (-3 % 8 is -3 while -3 & 7 is 5). The zero
+/// test does not disagree: 2^k divides x exactly when x's low k bits are clear,
+/// for every two's-complement i64, because divisibility by a power of two is a
+/// property of the bit pattern and not of the sign. Restricting the fold to
+/// zero tests is therefore exact for all inputs.
+///
+/// The payoff is large because the backends lower a signed remainder by a
+/// constant into the full sign-correcting sequence (cqto / shr $63 / add / sar
+/// / shl / sub — eight instructions), while `bit_and` against a constant that
+/// feeds a zero comparison is already fused by the native code generator into a
+/// single `test $imm, reg`.
+fn foldPow2ModZeroTest(f: *IRFn) bool {
+    var changed = false;
+    for (0..f.block_count) |bi| {
+        const b = &f.blocks[bi];
+        var ii: u16 = 0;
+        while (ii < b.inst_count) {
+            const dest = b.insts[ii].dest;
+            if (b.insts[ii].op != .@"mod" or dest == 0) {
+                ii += 1;
+                continue;
+            }
+            const cv = optUniqueConst(f, b.insts[ii].src2) orelse {
+                ii += 1;
+                continue;
+            };
+            const k = optPow2Exp(cv) orelse {
+                ii += 1;
+                continue;
+            };
+            if (!optSingleDef(f, dest) or !optOnlyZeroTestUses(f, dest)) {
+                ii += 1;
+                continue;
+            }
+            const mask: i64 = (@as(i64, 1) << @as(u6, @intCast(k))) - 1;
+            const mv = optInsertConst(f, b, ii, mask) orelse {
+                ii += 1;
+                continue;
+            };
+            // optInsertConst either reused an earlier constant (no shift, the
+            // remainder is still at ii) or inserted one at ii (remainder at ii+1).
+            const at: u16 = if (b.insts[ii].op == .@"mod" and b.insts[ii].dest == dest) ii else ii + 1;
+            if (at >= b.inst_count or b.insts[at].op != .@"mod" or b.insts[at].dest != dest) {
+                ii = at + 1;
+                continue;
+            }
+            b.insts[at].op = .bit_and;
+            b.insts[at].src2 = mv;
+            changed = true;
+            ii = at + 1;
+        }
+    }
+    return changed;
+}
+
+const OptDivProof = struct {
+    /// The dividend whose divisibility was established.
+    x: u16,
+    /// `2^k` divides x on the guarded edge.
+    k: u8,
+    /// Block and index of the instruction producing the tested mask.
+    bi: u16,
+    ii: u16,
+};
+
+/// Interpret `m == 0` as "x is divisible by 2^k" when `m` is `x & (2^k-1)` or
+/// `x % 2^k`. Null for any other shape.
+fn optMaskZeroProof(f: *const IRFn, m: u16) ?OptDivProof {
+    if (m == 0) return null;
+    for (0..f.block_count) |bi| {
+        const b = &f.blocks[bi];
+        for (0..b.inst_count) |ii| {
+            const d = b.insts[ii];
+            if (d.dest != m) continue;
+            if (d.src1 == 0) return null;
+            if (d.op == .bit_and) {
+                const mv = optUniqueConst(f, d.src2) orelse return null;
+                if (mv <= 0 or mv == std.math.maxInt(i64)) return null;
+                const p: i64 = mv + 1;
+                // mv must be exactly 2^k - 1: every low bit set, nothing above.
+                if ((p & mv) != 0) return null;
+                const k = optPow2Exp(p) orelse return null;
+                return .{ .x = d.src1, .k = k, .bi = @intCast(bi), .ii = @intCast(ii) };
+            }
+            if (d.op == .@"mod") {
+                const cv = optUniqueConst(f, d.src2) orelse return null;
+                const k = optPow2Exp(cv) orelse return null;
+                return .{ .x = d.src1, .k = k, .bi = @intCast(bi), .ii = @intCast(ii) };
+            }
+            return null;
+        }
+    }
+    return null;
+}
+
+/// Rewrite `div(x, 2^j)` to `shr(x, j)` — and `mod(x, 2^j)` to the constant
+/// zero — inside a block whose only incoming edge already proved `2^k | x`
+/// with `j <= k`.
+///
+/// Truncating division and floor division (what an arithmetic right shift
+/// computes) agree exactly on multiples of the divisor, so under the proof the
+/// sign-correction sequence the backends emit for a signed constant division
+/// (cqto / shr $63 / add / sar) collapses to a single `sar`, and the remainder
+/// is statically zero. This is correlated-value propagation driven by the
+/// branch condition instead of a range analysis, so it needs no lattice: the
+/// guard is that the block has exactly one predecessor, that predecessor's
+/// terminator selects it on the proving comparison, the mask is computed in
+/// that same predecessor, and `x` is not redefined anywhere between the proof
+/// and the use.
+///
+/// No check is lost. A division by a non-zero *constant* has no zero-divisor
+/// trap to skip, the divisor is positive so there is no `minInt / -1` overflow
+/// case, and the value computed is bit-identical to the correcting sequence's.
+fn correlatedPow2DivToShift(f: *IRFn) bool {
+    if (f.block_count == 0 or f.block_count > MAX_BLOCKS_PER_FN) return false;
+    var pcnt: [MAX_BLOCKS_PER_FN]u16 = .{0} ** MAX_BLOCKS_PER_FN;
+    var pred0: [MAX_BLOCKS_PER_FN]u16 = .{0} ** MAX_BLOCKS_PER_FN;
+    for (0..f.block_count) |bi| {
+        var succs: [2]u16 = undefined;
+        const sc = getSuccs(&f.blocks[bi], &succs);
+        for (0..sc) |si| {
+            const s = succs[si];
+            if (s >= f.block_count) continue;
+            if (pcnt[s] == 0) pred0[s] = @intCast(bi);
+            pcnt[s] += 1;
+        }
+    }
+
+    var changed = false;
+    for (0..f.block_count) |pbi| {
+        const pb = &f.blocks[pbi];
+        if (pb.inst_count < 2) continue;
+        const pterm = pb.insts[pb.inst_count - 1];
+        if (pterm.op != .cond_jump) continue;
+        const c = pterm.src1;
+        if (c == 0) continue;
+
+        // Locate the definition of the tested condition inside this block.
+        var cdef_idx: ?u16 = null;
+        var ci: u16 = pb.inst_count;
+        while (ci > 0) {
+            ci -= 1;
+            if (pb.insts[ci].dest == c) {
+                cdef_idx = ci;
+                break;
+            }
+        }
+
+        var proof: ?OptDivProof = null;
+        var proof_edge_true = false;
+        if (cdef_idx) |cdi| {
+            const cdef = pb.insts[cdi];
+            if (cdef.op != .cmp_eq and cdef.op != .cmp_ne) continue;
+            const s1_zero = (optUniqueConst(f, cdef.src1) orelse 1) == 0;
+            const s2_zero = (optUniqueConst(f, cdef.src2) orelse 1) == 0;
+            if (s1_zero == s2_zero) continue; // neither or both sides are zero
+            const m = if (s1_zero) cdef.src2 else cdef.src1;
+            proof = optMaskZeroProof(f, m);
+            // cmp_eq: the mask is zero on the true edge. cmp_ne: on the false edge.
+            proof_edge_true = cdef.op == .cmp_eq;
+        } else {
+            // The terminator tests the mask itself: zero on the false edge.
+            proof = optMaskZeroProof(f, c);
+            proof_edge_true = false;
+        }
+        const pf = proof orelse continue;
+        // The mask must be produced in this block, so the value proven
+        // divisible is the value the branch actually tested.
+        if (pf.bi != pbi) continue;
+
+        // x must survive from the proof to the branch untouched.
+        var live = true;
+        var q: u16 = pf.ii + 1;
+        while (q + 1 < pb.inst_count) : (q += 1) {
+            if (pb.insts[q].dest == pf.x) live = false;
+        }
+        if (!live) continue;
+
+        const tbi: u16 = if (proof_edge_true) pterm.target_block else pterm.alt_block;
+        if (tbi >= f.block_count or tbi == pbi) continue;
+        if (pcnt[tbi] != 1 or pred0[tbi] != pbi) continue;
+
+        const tb = &f.blocks[tbi];
+        if (tb.inst_count == 0) continue;
+
+        var jj: u16 = 0;
+        while (jj + 1 < tb.inst_count) : (jj += 1) {
+            const inst = tb.insts[jj];
+            if (inst.dest == pf.x) break; // x redefined: the proof no longer applies
+            if (inst.op != .div and inst.op != .@"mod") continue;
+            if (inst.src1 != pf.x or inst.dest == 0) continue;
+            const cv = optUniqueConst(f, inst.src2) orelse continue;
+            const j = optPow2Exp(cv) orelse continue;
+            if (j > pf.k) continue;
+            if (inst.op == .@"mod") {
+                tb.insts[jj] = .{ .op = .const_int, .dest = inst.dest, .imm = 0 };
+                changed = true;
+                continue;
+            }
+            const sv = optInsertConst(f, tb, jj, @as(i64, j)) orelse continue;
+            const at: u16 = if (tb.insts[jj].op == .div and tb.insts[jj].src1 == pf.x) jj else jj + 1;
+            if (at >= tb.inst_count or tb.insts[at].op != .div or tb.insts[at].src1 != pf.x) continue;
+            tb.insts[at].op = .shr;
+            tb.insts[at].src2 = sv;
+            changed = true;
+            jj = at;
+        }
+    }
+    return changed;
+}
+
+/// Operand a block's last write to `v` produces, for the out-of-SSA shape
+/// `v = copy u`. Null when the block never writes `v`.
+fn optLastWriteOperand(b: *const IRBlock, v: u16) ?u16 {
+    var k: u16 = b.inst_count;
+    while (k > 0) {
+        k -= 1;
+        const inst = b.insts[k];
+        if (inst.dest != v) continue;
+        return switch (inst.op) {
+            .copy, .const_int => inst.src1,
+            else => v,
+        };
+    }
+    return null;
+}
+
+/// Thread away the boolean a short-circuit `and` / `or` materialises.
+///
+/// Lowering `a and b` produces a diamond that stores the second condition in a
+/// flag and then branches on that flag:
+///
+///     P: cond_jump c ? A : Z          A: v = <cmp>; jump M
+///     Z: <const cv>;      jump M      M: f = phi(v, cv); cond_jump f ? X : Y
+///
+/// Deciding that costs a `setcc` / `movzbq` / `mov` / `jmp` on one arm, a
+/// `xor` / `jmp` on the other, and a fresh `test` in M — around seven
+/// instructions per evaluation, and they land in the loop header when the
+/// condition is a loop test. When the diamond is private to P the flag never
+/// has to exist:
+///
+///     P: cond_jump c ? A : (cv == 0 ? Y : X)
+///     A: v = <cmp>; cond_jump v ? X : Y
+///
+/// Z and M become unreachable and simplifyCFG drops them. Both edges of M's
+/// branch keep the destination they had, so no control flow changes — only the
+/// detour disappears.
+fn threadCondBoolDiamond(f: *IRFn) bool {
+    if (f.block_count == 0 or f.block_count > MAX_BLOCKS_PER_FN) return false;
+
+    var pcnt: [MAX_BLOCKS_PER_FN]u16 = .{0} ** MAX_BLOCKS_PER_FN;
+    var preds: [MAX_BLOCKS_PER_FN][4]u16 = undefined;
+    for (0..f.block_count) |bi| {
+        var succs: [2]u16 = undefined;
+        const sc = getSuccs(&f.blocks[bi], &succs);
+        for (0..sc) |si| {
+            const s = succs[si];
+            if (s >= f.block_count) continue;
+            if (pcnt[s] < 4) {
+                preds[s][pcnt[s]] = @intCast(bi);
+                pcnt[s] += 1;
+            } else {
+                pcnt[s] = 99; // saturated: "many predecessors"
+            }
+        }
+    }
+
+    for (0..f.block_count) |pbi| {
+        const pb = &f.blocks[pbi];
+        if (pb.inst_count == 0) continue;
+        const pterm = pb.insts[pb.inst_count - 1];
+        if (pterm.op != .cond_jump) continue;
+        const abi = pterm.target_block;
+        const zbi = pterm.alt_block;
+        if (abi == zbi or abi >= f.block_count or zbi >= f.block_count) continue;
+        if (pcnt[abi] != 1 or pcnt[zbi] != 1) continue;
+        if (preds[abi][0] != pbi or preds[zbi][0] != pbi) continue;
+
+        const ab = &f.blocks[abi];
+        const zb = &f.blocks[zbi];
+        if (ab.inst_count == 0 or zb.inst_count == 0) continue;
+        const aterm = ab.insts[ab.inst_count - 1];
+        const zterm = zb.insts[zb.inst_count - 1];
+        if (aterm.op != .jump or zterm.op != .jump) continue;
+        if (aterm.target_block != zterm.target_block) continue;
+        const mbi = aterm.target_block;
+        if (mbi >= f.block_count or mbi == pbi or mbi == abi or mbi == zbi) continue;
+        if (pcnt[mbi] != 2) continue;
+
+        const mb = &f.blocks[mbi];
+        if (mb.inst_count == 0) continue;
+        const mterm = mb.insts[mb.inst_count - 1];
+        if (mterm.op != .cond_jump) continue;
+        const xbi = mterm.target_block;
+        const ybi = mterm.alt_block;
+        if (xbi == ybi or xbi >= f.block_count or ybi >= f.block_count) continue;
+        // Keep the rewrite local: neither destination may be a block this
+        // transform makes unreachable.
+        if (xbi == abi or xbi == zbi or xbi == mbi) continue;
+        if (ybi == abi or ybi == zbi or ybi == mbi) continue;
+
+        // Resolve the value M branches on back through any copy chain to the
+        // instruction inside M that actually produces it. Normalisation leaves
+        // `phi` followed by `copy` followed by `cond_jump` here, so matching on
+        // a fixed instruction count would miss the common shape.
+        if (mterm.src1 == 0) continue;
+        var cur: u16 = mterm.src1;
+        var producer: ?IRInst = null;
+        var hops: u16 = 0;
+        while (cur != 0 and hops < 16) : (hops += 1) {
+            var def: ?IRInst = null;
+            for (0..mb.inst_count - 1) |ii| {
+                if (mb.insts[ii].dest == cur) {
+                    def = mb.insts[ii];
+                    break;
+                }
+            }
+            const d = def orelse break; // produced outside M
+            if (d.op == .copy) {
+                cur = d.src1;
+                continue;
+            }
+            producer = d;
+            break;
+        }
+        if (cur == 0) continue;
+
+        var v_a: u16 = 0;
+        var v_z: u16 = 0;
+        if (producer) |pr| {
+            if (pr.op != .phi or pr.arg_count != 2) continue;
+            const ok_order = (pr.phi_blocks[0] == abi and pr.phi_blocks[1] == zbi) or
+                (pr.phi_blocks[0] == zbi and pr.phi_blocks[1] == abi);
+            if (!ok_order) continue;
+            v_a = if (pr.phi_blocks[0] == abi) pr.args[0] else pr.args[1];
+            v_z = if (pr.phi_blocks[0] == abi) pr.args[1] else pr.args[0];
+        } else {
+            // Out of SSA: both arms write the tested vreg directly.
+            v_a = optLastWriteOperand(ab, cur) orelse continue;
+            v_z = optLastWriteOperand(zb, cur) orelse continue;
+        }
+        if (v_a == 0 or v_z == 0) continue;
+
+        const c_a = optUniqueConst(f, v_a);
+        const c_z = optUniqueConst(f, v_z);
+        // Exactly one arm must be a compile-time constant: that is what makes
+        // M's branch decidable on the edge arriving from it.
+        if ((c_a == null) == (c_z == null)) continue;
+        const const_is_a = c_a != null;
+        const cv = (c_a orelse c_z).?;
+        const ev = if (const_is_a) v_z else v_a;
+        const ebi: u16 = if (const_is_a) zbi else abi;
+        const kbi: u16 = if (const_is_a) abi else zbi;
+        if (ev == 0 or !optSingleDef(f, ev)) continue;
+
+        // The expr arm's value must be produced inside it, so the new
+        // terminator still reads a live definition.
+        var defined_here = false;
+        for (0..f.blocks[ebi].inst_count) |ii| {
+            if (f.blocks[ebi].insts[ii].dest == ev) defined_here = true;
+        }
+        if (!defined_here) continue;
+
+        // M disappears entirely, so every value it defines must die with it:
+        // the merge phi, and any copy chain that carried it to the branch.
+        var m_defs_ok = true;
+        for (0..mb.inst_count) |ii| {
+            if (mb.insts[ii].dest == 0) continue;
+            if (!optUsesConfined(f, mb.insts[ii].dest, mbi, mbi)) m_defs_ok = false;
+        }
+        if (!m_defs_ok) continue;
+
+        // The const arm dies: everything it *defines* must die with it, i.e. be
+        // read only by itself or by M, and it must have no side effects. The
+        // terminator is excluded — it is the `jump M` this transform redirects,
+        // and in SSA form the arm often holds nothing else, so requiring it to
+        // be a copy or a constant would reject the very shape the pass exists
+        // for.
+        var k_ok = true;
+        const k_body = if (f.blocks[kbi].inst_count > 0) f.blocks[kbi].inst_count - 1 else 0;
+        for (0..k_body) |ii| {
+            const inst = f.blocks[kbi].insts[ii];
+            // `nop` is the blank DCE leaves behind; it defines and reads
+            // nothing, so it is as harmless here as a copy of a constant.
+            if (inst.op != .const_int and inst.op != .copy and inst.op != .nop) {
+                k_ok = false;
+                break;
+            }
+            if (inst.dest != 0 and !optUsesConfined(f, inst.dest, kbi, mbi)) {
+                k_ok = false;
+                break;
+            }
+        }
+        if (!k_ok) continue;
+
+        // The destination the const arm always took now also receives P as a
+        // predecessor, so it must not merge values with a phi naming M or K.
+        const const_target: u16 = if (cv == 0) ybi else xbi;
+        const remap_target: u16 = if (const_target == xbi) ybi else xbi;
+        var phi_ok = true;
+        for (0..f.blocks[const_target].inst_count) |ii| {
+            const inst = f.blocks[const_target].insts[ii];
+            if (inst.op != .phi) continue;
+            for (0..@min(inst.arg_count, inst.phi_blocks.len)) |pi| {
+                if (inst.phi_blocks[pi] == mbi or inst.phi_blocks[pi] == kbi) phi_ok = false;
+            }
+        }
+        if (!phi_ok) continue;
+
+        // The other destination keeps a single predecessor (the expr arm), so
+        // phi entries naming M are re-attributed to that arm: every path from M
+        // to it came through the expr arm anyway.
+        for (0..f.blocks[remap_target].inst_count) |ii| {
+            if (f.blocks[remap_target].insts[ii].op != .phi) continue;
+            for (0..@min(f.blocks[remap_target].insts[ii].arg_count, f.blocks[remap_target].insts[ii].phi_blocks.len)) |pi| {
+                if (f.blocks[remap_target].insts[ii].phi_blocks[pi] == mbi) {
+                    f.blocks[remap_target].insts[ii].phi_blocks[pi] = ebi;
+                }
+            }
+        }
+
+        // Redirect P's edge to the const arm, and let the expr arm decide M's
+        // branch itself.
+        if (const_is_a) {
+            pb.insts[pb.inst_count - 1].target_block = const_target;
+            pb.insts[pb.inst_count - 1].alt_block = zbi;
+        } else {
+            pb.insts[pb.inst_count - 1].target_block = abi;
+            pb.insts[pb.inst_count - 1].alt_block = const_target;
+        }
+        f.blocks[ebi].insts[f.blocks[ebi].inst_count - 1] = .{
+            .op = .cond_jump,
+            .src1 = ev,
+            .target_block = xbi,
+            .alt_block = ybi,
+        };
+        // Predecessor facts changed; the caller re-runs the pass to a fixpoint.
+        return true;
+    }
+    return false;
+}
+
+/// `threadCondBoolDiamond` rewrites one site per call because each rewrite
+/// invalidates the predecessor counts it reasoned from. Drive it to a fixpoint;
+/// the bound is well above the number of short-circuit operators any real
+/// function carries and keeps a malformed CFG from spinning.
+fn threadCondBoolDiamondFixpoint(f: *IRFn) bool {
+    var changed = false;
+    var guard: u32 = 0;
+    while (guard < 64) : (guard += 1) {
+        if (!threadCondBoolDiamond(f)) break;
+        changed = true;
+    }
+    return changed;
+}
+
 fn ifConversion(f: *IRFn) bool {
     var in_deg: [MAX_BLOCKS_PER_FN]u16 = .{0} ** MAX_BLOCKS_PER_FN;
     for (0..f.block_count) |bi| {
@@ -1164,7 +1795,21 @@ fn ifConversion(f: *IRFn) bool {
         const b_then = &f.blocks[b_then_idx];
         const b_else = &f.blocks[b_else_idx];
         if (b_then.inst_count == 0 or b_else.inst_count == 0) continue;
-        if (b_then.inst_count > 3 or b_else.inst_count > 3) continue;
+        // Budget for turning a branch into a select. If-conversion runs both
+        // arms, so it pays only when the arms are cheap; but a limit of three
+        // instructions rejects precisely the shapes that matter most, because a
+        // two-operation arm plus the copy that feeds the merge phi already
+        // costs four. `if n % 2 == 0 { n / 2 } else { 3 * n + 1 }` — the
+        // collatz step, whose parity branch is close to unpredictable and
+        // therefore expensive to mispredict — is exactly that shape. Raise the
+        // per-arm limit to five and the combined to eight. Speculation stays
+        // side-effect and trap free regardless of the budget: every body
+        // instruction must still pass isSimpleSpeculativeOp, which admits no
+        // call, no load and no division or remainder that could trap.
+        const then_body_n = b_then.inst_count - 1;
+        const else_body_n = b_else.inst_count - 1;
+        if (then_body_n > 5 or else_body_n > 5) continue;
+        if (then_body_n + else_body_n > 8) continue;
 
         const term_then = b_then.insts[b_then.inst_count - 1];
         const term_else = b_else.insts[b_else.inst_count - 1];
