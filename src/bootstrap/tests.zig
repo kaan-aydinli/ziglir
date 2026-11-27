@@ -3987,6 +3987,67 @@ test "comprehensive stdlib modules: collections, hash, fmt, time, http, math, an
     );
 }
 
+test "codegen: frame-shrink state must not leak from one function into the next" {
+    // Regression test for a native-codegen miscompile. The backend can elide a
+    // callee frame when the entry block is a cheap guard that either returns a
+    // constant immediately or continues into the real body: it emits B0 with no
+    // prologue, inlines the early `ret`, and only builds the frame at the
+    // continuation block. That decision is recorded in the cur_shrink_* fields.
+    //
+    // Those fields used to be written ONLY on the path where the elision
+    // applies, but both emitters that consume them (compileFusedCmpBranch and
+    // the plain .cond_jump arm) test just `cur_shrink_shared and cur_bi == 0`
+    // and cannot see whether the current function is eligible at all. So every
+    // ineligible function that happened to be compiled next inherited the
+    // previous function's eligibility, continuation block index, and early-return
+    // constant -- and emitted an early `mov rax, <other function's constant>;
+    // ret` plus a jump to <other function's block index> at the top of its own
+    // entry block. Depending on where that stale index landed, downstream
+    // functions silently returned wrong values or segfaulted.
+    //
+    // `shrinker_shared` below is the trigger: its early-return block has TWO
+    // predecessors (`buf == 0` from B0 and `len <= 0` from B1), which selects
+    // the shared-return form of the elision and leaves cur_shrink_shared set.
+    // `hex_encode` is the victim: it cannot elide (it needs a real frame) yet
+    // its entry block ends in a cond_jump. It is called rather than inlined, so
+    // a leak shows up directly in stdout. Before the fix this binary printed
+    // the first line and then segfaulted (exit 139); the IR VM, which has no
+    // such state, always produced the expected output.
+    const src =
+        \\import std::fmt
+        \\import std::str
+        \\
+        \\fn shrinker_shared(buf: *u8, len: i64) -> i64 {
+        \\    if buf == 0 as *u8 or len <= 0 { return -3750763034362895579 }
+        \\    var h: i64 = -3750763034362895579
+        \\    var i: i64 = 0
+        \\    while i < len {
+        \\        h = (h ^ (@read_u8(@ptr_add(buf, i)) as i64)) * 1099511628211
+        \\        i += 1
+        \\    }
+        \\    return h
+        \\}
+        \\
+        \\fn main() -> i64 {
+        \\    printInt(shrinker_shared(0 as *u8, 4))
+        \\    println("")
+        \\    println(hex_encode("LIR"))
+        \\    printInt(@string_len(hex_encode("LIR")))
+        \\    println("")
+        \\    return 0
+        \\}
+    ;
+    const elf = try compileSourceWithOpt(src, .O2);
+    defer std.testing.allocator.free(elf);
+    const res = try runElfCapture(std.testing.allocator, elf, "shrink_state_leak");
+    defer std.testing.allocator.free(res.stdout);
+    try std.testing.expectEqual(@as(u8, 0), res.exit_code);
+    try std.testing.expectEqualStrings(
+        "-3750763034362895579\n\n4c4952\n6\n\n",
+        res.stdout,
+    );
+}
+
 test "distinct syntax: guard, unless, until, proc compile and execute" {
     const src =
         \\proc check_guard(x: i64) -> i64 {

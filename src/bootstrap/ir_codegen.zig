@@ -2588,6 +2588,36 @@ pub const IRCodegen = struct {
         var shrink_cont_bi: u16 = 0xFFFF;
         var can_shrink = !self.cur_frame_active and self.cur_callee_count > 0 and
             ir_fn.param_count > 0 and ir_fn.param_count <= 6 and ir_fn.block_count >= 3;
+
+        // The shrink state is strictly per function and MUST be cleared here,
+        // unconditionally. The two emitters that act on it (compileFusedCmpBranch
+        // and the .cond_jump arm below) decide purely from
+        // `cur_shrink_shared and cur_bi == 0`; they have no visibility into
+        // `can_shrink`. Until this reset the fields were written only on the
+        // can_shrink path, so every function that could not shrink inherited the
+        // previous function's state. A function whose entry block happens to end
+        // in a cond_jump then emitted the *previous* function's early return:
+        // it jumped to the previous function's continuation block index and
+        // returned the previous function's shrink_ret_imm. Downstream functions
+        // were silently miscompiled or crashed, depending on what that stale
+        // block index happened to land on.
+        //
+        // This is reachable without any optimizer help -- it only needs one
+        // function that shrinks with a *shared* early-return block (so
+        // shrink_ret_shared is true) followed by one that cannot shrink and
+        // whose B0 ends in a cond_jump. threaded-condition folding produces
+        // exactly that pair routinely, because merging the flag diamond adds a
+        // second edge to the constant-return block and flips it from the
+        // exclusive (shared=false) to the shared form.
+        //
+        // Clearing up front is safe for the shrinking case too: the can_shrink
+        // path repopulates every field below once its own checks pass.
+        self.cur_shrink_shared = false;
+        self.cur_shrink_ret_vreg = 0;
+        self.cur_shrink_ret_imm = 0;
+        self.cur_shrink_ret_is_imm = false;
+        self.cur_shrink_cont_bi = 0xFFFF;
+
         if (can_shrink) {
             for (0..ir_fn.param_count) |pi| {
                 const tv = self.param_target_vreg[pi];
