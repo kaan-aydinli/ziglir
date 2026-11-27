@@ -68,28 +68,48 @@ The LIR side needs only `zig build -Doptimize=ReleaseFast` to produce
 
 ## Measured results
 
-Median of 13 interleaved rounds, 2-core Xeon @ 2.60 GHz shared VM, LIR at its
-highest level (`-O2`):
+`run_c.py`, 2-core Xeon @ 2.60 GHz shared VM, LIR at its highest level (`-O2`).
+All eleven outputs are checked against `expected.txt` before anything is timed.
 
 | workload | LIR ms | LLVM C ms | gcc ms | LIR/LLVM | LIR/gcc |
 |---|---:|---:|---:|---:|---:|
-| 01_matrix_mul | 11.37 | 2.12 | 2.13 | 5.36 | 5.34 |
-| 02_nbody | 112.43 | 14.44 | 18.04 | 7.79 | 6.23 |
-| 03_sieve | 71.83 | 30.32 | 28.56 | 2.37 | 2.52 |
-| 04_mandelbrot | 178.28 | 52.24 | 54.38 | 3.41 | 3.28 |
-| 05_collatz | 516.85 | 137.26 | 276.50 | 3.77 | 1.87 |
-| 06_fib_mod | 70.54 | 30.14 | 32.81 | 2.34 | 2.15 |
-| 07_prime_count | 181.77 | 174.16 | 277.59 | 1.04 | 0.65 |
-| 08_bitmix | 100.04 | 42.18 | 82.35 | 2.37 | 1.21 |
-| 09_tak | 5.10 | 5.41 | 5.41 | 0.94 | 0.94 |
-| 10_isqrt | 125.28 | 98.90 | 105.53 | 1.27 | 1.19 |
-| 11_kmeans | 75.88 | 9.70 | 15.27 | 7.82 | 4.97 |
-| **geomean** | | | | **2.75** | **2.16** |
+| 01_matrix_mul | 1.03 | 1.47 | 1.46 | 0.70 | 0.71 |
+| 02_nbody | 15.76 | 13.15 | 14.36 | 1.20 | 1.10 |
+| 03_sieve | 21.71 | 16.49 | 18.64 | 1.32 | 1.17 |
+| 04_mandelbrot | 54.64 | 47.15 | 43.78 | 1.16 | 1.25 |
+| 05_collatz | 124.52 | 131.32 | 195.80 | 0.95 | 0.64 |
+| 06_fib_mod | 23.94 | 24.00 | 24.03 | 1.00 | 1.00 |
+| 07_prime_count | 142.35 | 140.12 | 227.35 | 1.02 | 0.63 |
+| 08_bitmix | 33.75 | 23.90 | 44.75 | 1.41 | 0.75 |
+| 09_tak | 2.56 | 3.26 | 3.17 | 0.78 | 0.81 |
+| 10_isqrt | 84.26 | 65.63 | 82.51 | 1.28 | 1.02 |
+| 11_kmeans | 11.53 | 6.31 | 11.80 | 1.83 | 0.98 |
+| **geomean** | | | | **1.112** | **0.888** |
 
-LIR is at parity where the work is dominated by division or unpredictable
-branches (`07`, `09`, `10`) and loses badly where the backend is weakest:
-inner-loop addressing (`01`, `11`), call-heavy loops (`02`), dependent multiply
-chains (`04`).
+LIR now beats the gcc twins on 7 of 11 and is within a few percent of the
+clang `-O3 -march=native` twins on 6 of 11. The same table measured against an
+earlier state of the native backend read 2.75 / 2.16; the distance was closed by
+folding pointer arithmetic into x86 addressing modes, if-converting the
+copy-only diamonds that `destructSSA` leaves behind into `cmov` chains, letting
+a converted diamond write the variables it assigns instead of temporaries,
+collapsing `t = x + 1; x = copy t` back into an in-place update, and budgeting
+the registers promised to wide literals against the pressure the function
+actually has.
+
+The remaining gap is concentrated where the twins get something the backend
+still does not: `08_bitmix` and `10_isqrt` want a shorter dependent-operation
+chain per iteration, `03_sieve` wants the store inside the counting loop
+addressed without a reload, and `11_kmeans` is the one place clang fully unrolls
+a small constant-trip loop - its centroid loop runs 10.6 instructions per
+iteration against LIR's 14, and none of the difference is a bounds check.
+
+Two caveats worth repeating before anyone reads a single row too closely. The
+workloads are ~1-150 ms and the harness interleaves rounds, so a row whose
+kernel is under a millisecond (`01`, `09`) carries several percent of process
+startup and code-layout noise: `01_matrix_mul` measures up to 6% either way
+between builds whose hot loop is byte-identical. And the C columns are
+hand-written twins of the Rust sources, not Rust; see the top of this file for
+why that substitution was necessary.
 
 `08_bitmix` used to disagree with its twin by 7.4e12. The benchmark was wrong,
 not the compiler: the LIR source shifted a signed value (arithmetic `>>`) while

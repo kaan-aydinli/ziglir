@@ -4177,6 +4177,141 @@ test "codegen: a folded out-of-chunk store still traps at every -O level" {
     }
 }
 
+test "codegen: a reduction that needs more live values than there are registers" {
+    // The inner loop below carries ten live values at once - two loop counters,
+    // three accumulators, the point, the centroid, the distance and its absolute
+    // value, plus i64::MAX reaching the `best_d` seed through a copy - against
+    // the ten registers the native backend allocates from. Something has to go
+    // to the stack, and which one it is decides the loop's instruction count:
+    // a value read every iteration costs a reload every iteration, while one
+    // that is only live *across* the loop costs a single spill outside it.
+    //
+    // Two allocator decisions are on trial here. A wide literal used once is no
+    // longer promised a register when the function already peaks above the
+    // register count, because the promise is what starves the inner loop. And a
+    // binary operation whose left operand came back from a spill slot encodes
+    // its right operand's own register instead of copying it to a scratch first.
+    //
+    // q scans 0..5; for each q the inner loop scans ci 0..7, takes
+    // cv = ((ci*29 + q*7) % 23) - 11 against pv = ((q*41) % 19) - 9, and keeps
+    // the cv of smallest |pv - cv|. total folds each round as
+    // total*31 + best*(q+1) + best_d + pv and spread sums |d|*ci.
+    // Both are computed here from the arithmetic, not read off a backend.
+    const src =
+        \\fn main() -> i64 {
+        \\    var total: i64 = 0
+        \\    var spread: i64 = 0
+        \\    var q: i64 = 0
+        \\    while q < 6 {
+        \\        var best: i64 = 0
+        \\        var best_d: i64 = 9223372036854775807
+        \\        var pv: i64 = (q * 41) % 19 - 9
+        \\        var ci: i64 = 0
+        \\        while ci < 8 {
+        \\            let cv = (ci * 29 + q * 7) % 23 - 11
+        \\            let d = pv - cv
+        \\            let ad = @max(d, 0 - d)
+        \\            spread = spread + ad * ci
+        \\            if ad < best_d {
+        \\                best_d = ad
+        \\                best = cv
+        \\            }
+        \\            ci = ci + 1
+        \\        }
+        \\        total = total * 31 + best * (q + 1) + best_d + pv
+        \\        q = q + 1
+        \\    }
+        \\    printInt(total)
+        \\    printInt(spread)
+        \\    return 0
+        \\}
+    ;
+
+    inline for (.{ .O0, .O1, .O2 }) |lvl| {
+        const elf = try compileSourceWithOpt(src, lvl);
+        defer std.testing.allocator.free(elf);
+        const res = try runElfCapture(std.testing.allocator, elf, "reg_pressure_" ++ @tagName(lvl));
+        defer std.testing.allocator.free(res.stdout);
+        try std.testing.expectEqual(@as(u8, 0), res.exit_code);
+        try std.testing.expectEqualStrings("-526644939\n1238\n", res.stdout);
+    }
+}
+
+test "codegen: an in-place loop counter beside a swap in the same body" {
+    // `i = i + 1` reaches codegen as `t = add i, 1; i = copy t`: SSA gives `i`
+    // one definition per path, so destructSSA has to name the new value. The
+    // allocator now lets `t` share `i`'s register, which turns the pair into a
+    // single `add` and gives the register back. That is only sound while `t`
+    // dies at the copy and nothing reads `i` in between - the same body also
+    // rotates `a` and `b` through a temporary, the shape that an earlier,
+    // IR-level version of this rewrite got wrong by advancing a counter twice.
+    //
+    // a,b start at 3,7 and rotate through t = a; a = b + i; b = t * 2 for
+    // i = 0..11, accumulating s += a - b.
+    const src =
+        \\fn main() -> i64 {
+        \\    var a: i64 = 3
+        \\    var b: i64 = 7
+        \\    var s: i64 = 0
+        \\    var i: i64 = 0
+        \\    while i < 12 {
+        \\        let t = a
+        \\        a = b + i
+        \\        b = t * 2
+        \\        s = s + a - b
+        \\        i = i + 1
+        \\    }
+        \\    printInt(s)
+        \\    printInt(a)
+        \\    printInt(b)
+        \\    return 0
+        \\}
+    ;
+
+    inline for (.{ .O0, .O1, .O2 }) |lvl| {
+        const elf = try compileSourceWithOpt(src, lvl);
+        defer std.testing.allocator.free(elf);
+        const res = try runElfCapture(std.testing.allocator, elf, "in_place_ctr_" ++ @tagName(lvl));
+        defer std.testing.allocator.free(res.stdout);
+        try std.testing.expectEqual(@as(u8, 0), res.exit_code);
+        try std.testing.expectEqualStrings("-603\n369\n676\n", res.stdout);
+    }
+}
+
+test "codegen: two wide literals reused every iteration of a loop" {
+    // The other side of the register budget: a 64-bit literal that does not fit
+    // an imm32 and *is* read as an arithmetic operand still earns a register,
+    // because eliding it would re-issue a ten-byte `movabs` on every iteration
+    // instead of encoding the register it already sits in. This is an LCG whose
+    // multiplier and increment are both such literals, so the loop only stays
+    // correct if each iteration multiplies by 6364136223846793005 and adds
+    // 1442695040888963407 - a stale or half-materialised literal shows up
+    // immediately in the accumulated sum.
+    const src =
+        \\fn main() -> i64 {
+        \\    var h: i64 = 1
+        \\    var acc: i64 = 0
+        \\    var i: i64 = 0
+        \\    while i < 64 {
+        \\        h = h * 6364136223846793005 + 1442695040888963407
+        \\        acc = acc + h * (i + 1)
+        \\        i = i + 1
+        \\    }
+        \\    printInt(acc)
+        \\    return 0
+        \\}
+    ;
+
+    inline for (.{ .O0, .O1, .O2 }) |lvl| {
+        const elf = try compileSourceWithOpt(src, lvl);
+        defer std.testing.allocator.free(elf);
+        const res = try runElfCapture(std.testing.allocator, elf, "wide_lit_loop_" ++ @tagName(lvl));
+        defer std.testing.allocator.free(res.stdout);
+        try std.testing.expectEqual(@as(u8, 0), res.exit_code);
+        try std.testing.expectEqualStrings("-3692200262743037056\n", res.stdout);
+    }
+}
+
 test "opt: an if that assigns several variables becomes a cmov chain" {
     // destructSSA turns `if d < best { best = v; best_d = d }` into a diamond
     // whose two arms are nothing but copies into the same destinations.

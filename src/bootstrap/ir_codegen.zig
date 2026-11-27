@@ -1252,6 +1252,13 @@ pub const IRCodegen = struct {
         }
         var used_in_loop: [MAX_VREGS]bool = .{false} ** MAX_VREGS;
         var used_as_call_arg: [MAX_VREGS]bool = .{false} ** MAX_VREGS;
+        // True while every use seen so far is `d = copy v`. A copy loads its
+        // source straight into the destination's register, so an elided
+        // constant materialises there with one `movabs` - exactly the one
+        // instruction a kept register would have spent on `mov`. Any other use
+        // (an arithmetic operand, a call argument) needs the value in a
+        // register of its own first, and that is the instruction keeping saves.
+        var copy_only_use: [MAX_VREGS]bool = .{true} ** MAX_VREGS;
 
         for (0..ir_fn.block_count) |bi| {
             const blk = &ir_fn.blocks[bi];
@@ -1270,12 +1277,14 @@ pub const IRCodegen = struct {
                 }
                 if (inst.src1 > 0 and inst.src1 < MAX_VREGS) {
                     use_cnt[inst.src1] = use_cnt[inst.src1] +| 1;
+                    if (inst.op != .copy) copy_only_use[inst.src1] = false;
                     if (inst.op != .ret and !(isCommutative(inst.op) and self.vreg_const_known[inst.src1] and fitsI32NonMin(self.vreg_const_imm[inst.src1]))) {
                         non_foldable[inst.src1] = true;
                     }
                 }
                 if (inst.src2 > 0 and inst.src2 < MAX_VREGS) {
                     use_cnt[inst.src2] = use_cnt[inst.src2] +| 1;
+                    copy_only_use[inst.src2] = false;
                     if (self.vreg_const_known[inst.src2]) {
                         const imm = self.vreg_const_imm[inst.src2];
                         const ok = (isFoldableRhsBinOp(inst.op) and fitsI32NonMin(imm)) or
@@ -1287,6 +1296,7 @@ pub const IRCodegen = struct {
                     const a = inst.args[ai];
                     if (a > 0 and a < MAX_VREGS) {
                         use_cnt[a] = use_cnt[a] +| 1;
+                        copy_only_use[a] = false;
                         if (inst.op != .call) non_foldable[a] = true;
                     }
                 }
@@ -1314,8 +1324,19 @@ pub const IRCodegen = struct {
             // one use is not inside a loop. "One static use" inside a loop body
             // means one `movabs` per iteration, which for a wide literal is
             // real per-iteration work and ten bytes of hot code.
+            //
+            // A single use that is only a copy is cheap inside a loop too. The
+            // k-means `best_d` seed is `v240 = copy v90` in the per-point
+            // preheader: keeping i64::MAX in a register emitted `mov %r12,%rdi`
+            // per point, eliding it emits `movabs $0x7fff...,%rdi` per point -
+            // the same one instruction - but keeping also held a callee-saved
+            // register for the whole function. The centroid loop runs inside
+            // that function with four array bases and a loop-carried point value
+            // competing for the same five registers, and it lost: the inner loop
+            // paid a spill, a reload and a store per centroid to park a literal
+            // that was never read there.
             const single_use_is_cheap = use_cnt[v] <= 1 and
-                !(used_in_loop[v] and !used_as_call_arg[v]);
+                (!(used_in_loop[v] and !used_as_call_arg[v]) or copy_only_use[v]);
             if (foldable or !non_foldable[v] or single_use_is_cheap) {
                 self.vreg_elided_const[v] = true;
                 continue;
@@ -1874,6 +1895,20 @@ pub const IRCodegen = struct {
         var vreg_weight: [MAX_VREGS]u32 = .{0} ** MAX_VREGS;
         var vreg_fused_skip: [MAX_VREGS]bool = .{false} ** MAX_VREGS;
 
+        // `t = x OP c` immediately followed by `x = copy t` is what destructSSA
+        // leaves behind for an in-place update: SSA names the new value `t`
+        // because `x` may only be defined once per path, and the copy then puts
+        // it back. On the machine that is `lea 0x1(%r8),%r10; mov %r10,%r8` -
+        // two instructions and a whole register for a value that is dead the
+        // moment it is copied. The live-range model cannot see the sharing on
+        // its own: `x` is read before the update in the same loop body, so the
+        // back-edge pass stretches its range over the whole loop and it
+        // overlaps `t`'s. Recording the alias here and resolving it once every
+        // register is handed out is what lets the copy disappear.
+        var in_place_alias: [MAX_VREGS]u16 = .{0} ** MAX_VREGS;
+        var in_place_use_cnt: [MAX_VREGS]u16 = undefined;
+        countVregUses(ir_fn, &in_place_use_cnt);
+
         // Decided before any live range is measured: a folded pointer and its
         // scaled offset are not values any more, so they must not compete for
         // a register or extend one.
@@ -1898,6 +1933,19 @@ pub const IRCodegen = struct {
                     };
                     if (two_addr_s1 > 0 and two_addr_s1 < MAX_VREGS and !self.vreg_elided_const[two_addr_s1]) {
                         if (self.vreg_copy_hint[inst.dest] == 0) self.vreg_copy_hint[inst.dest] = two_addr_s1;
+                    }
+                    // The temporary may only be read by the copy that writes the
+                    // operand back, or sharing the operand's register would
+                    // overwrite a value some later instruction still needs.
+                    if (two_addr_s1 > 0 and two_addr_s1 < MAX_VREGS and
+                        two_addr_s1 != inst.dest and in_place_use_cnt[inst.dest] == 1 and
+                        !self.vreg_elided_const[inst.dest] and !self.vreg_keep_const_reg[inst.dest] and
+                        ii + 1 < blk.inst_count)
+                    {
+                        const nx = blk.insts[ii + 1];
+                        if (nx.op == .copy and nx.dest == two_addr_s1 and nx.src1 == inst.dest) {
+                            in_place_alias[inst.dest] = two_addr_s1;
+                        }
                     }
                 }
                 if (ii + 1 < blk.inst_count and isCmpOp(inst.op) and (blk.insts[ii + 1].op == .cond_jump or blk.insts[ii + 1].op == .select) and
@@ -2109,6 +2157,11 @@ pub const IRCodegen = struct {
         var v: u32 = 1;
         while (v <= max_vreg) : (v += 1) {
             if (self.vreg_elided_const[v] or vreg_fused_skip[v] or self.vreg_start[v] > self.vreg_end[v]) continue;
+            // An in-place alias takes its operand's register once every register
+            // is decided; asking for one of its own in the meantime only holds a
+            // register it is about to give back, and holding it can be what
+            // pushes a real value out.
+            if (in_place_alias[v] != 0) continue;
             for (call_positions[0..call_pos_count]) |cp| {
                 if (self.vreg_start[v] < cp and cp < self.vreg_end[v]) {
                     self.vreg_crosses_call[v] = true;
@@ -2156,6 +2209,31 @@ pub const IRCodegen = struct {
             }
         }
 
+        // Live ranges are known now, so the peak number of simultaneously live
+        // vregs can be measured. Two budgets below read it: how many registers a
+        // parked magic multiplier may take, and how many wide constants may be
+        // promised one. It has to be measured *before* those constants stretch
+        // their own ranges over the whole function, or the stretch hides the
+        // pressure the program itself already has.
+        var peak_live: u32 = 0;
+        {
+            var live_delta: [MAX_VREGS + 2]i32 = .{0} ** (MAX_VREGS + 2);
+            const span = @min(@as(usize, pos) + 2, MAX_VREGS);
+            for (1..@min(@as(usize, max_vreg) + 1, MAX_VREGS)) |lv| {
+                if (self.vreg_elided_const[lv] or vreg_fused_skip[lv]) continue;
+                if (self.vreg_start[lv] > self.vreg_end[lv]) continue;
+                const ls: usize = @min(self.vreg_start[lv], @as(u32, @intCast(MAX_VREGS - 1)));
+                const le: usize = @min(self.vreg_end[lv] + 1, @as(u32, @intCast(MAX_VREGS - 1)));
+                live_delta[ls] += 1;
+                live_delta[le] -= 1;
+            }
+            var run: i32 = 0;
+            for (0..span) |lp| {
+                run += live_delta[lp];
+                if (run > 0 and @as(u32, @intCast(run)) > peak_live) peak_live = @intCast(run);
+            }
+        }
+
         // Wider-than-imm32 constants that are reused many times keep a register:
         // force their live range over the whole function so the allocator both
         // assigns one and never evicts them (eviction would re-issue the
@@ -2168,19 +2246,35 @@ pub const IRCodegen = struct {
         // constants than that was a correctness bug: the extras received no
         // register, yet both the prologue materialisation and the defining
         // `const_int` instruction skipped them, so every later read saw whatever
-        // happened to be in the register the allocator reused. Function entry
-        // holds no live values, so the count of live values at position zero
-        // plus the kept constants is a safe upper bound on the pressure.
+        // happened to be in the register the allocator reused.
+        //
+        // Function entry holds no live values, so the count of live values at
+        // position zero plus the kept constants is a safe upper bound on the
+        // callee-saved pressure.
         var live_at_entry: u32 = 0;
         for (1..@min(@as(usize, max_vreg) + 1, MAX_VREGS)) |lv| {
             if (self.vreg_elided_const[lv] or vreg_fused_skip[lv]) continue;
             if (self.vreg_start[lv] > self.vreg_end[lv]) continue;
             if (self.vreg_start[lv] == 0) live_at_entry += 1;
         }
-        const kept_room: usize = if (live_at_entry + 1 >= CALLEE_SAVED_POOL.len)
+        const callee_room: usize = if (live_at_entry + 1 >= CALLEE_SAVED_POOL.len)
             0
         else
             @as(usize, CALLEE_SAVED_POOL.len - 1 - live_at_entry);
+        // ... and only while the function has a register to spare. A kept
+        // constant is live from entry to return, so it is live at the peak too:
+        // promising one when the program already needs more registers than exist
+        // does not remove a `movabs`, it decides *who* gets spilled instead -
+        // and the greedy pass spills whatever is cheapest by weight, which in a
+        // nested loop is the value the inner loop reads every iteration.
+        // k-means peaks at 14 live vregs against 10 allocatable registers; the
+        // golden-ratio literal it kept in rbx is read once per point, while the
+        // centroid loop it starved reloaded a spilled value once per centroid.
+        const pressure_room: usize = if (peak_live >= ALL_ALLOC_REGS.len)
+            0
+        else
+            ALL_ALLOC_REGS.len - peak_live;
+        const kept_room: usize = @min(callee_room, pressure_room);
         // The list is ordered most-used first; keep as many as the register
         // budget allows. A constant that is not kept is fully elided-or-plain
         // (see below), so a partial selection stays consistent: only `kept_n`
@@ -2219,29 +2313,6 @@ pub const IRCodegen = struct {
             }
         }
 
-        // Live ranges are known now, so the peak number of simultaneously live
-        // vregs can be measured. That is what decides whether the allocator has
-        // a register to spare for a parked magic multiplier: reserving one in a
-        // loop that already runs at capacity only trades a `movabs` for spill
-        // traffic, which is a net loss.
-        var peak_live: u32 = 0;
-        {
-            var live_delta: [MAX_VREGS + 2]i32 = .{0} ** (MAX_VREGS + 2);
-            const span = @min(@as(usize, pos) + 2, MAX_VREGS);
-            for (1..@min(@as(usize, max_vreg) + 1, MAX_VREGS)) |lv| {
-                if (self.vreg_elided_const[lv] or vreg_fused_skip[lv]) continue;
-                if (self.vreg_start[lv] > self.vreg_end[lv]) continue;
-                const ls: usize = @min(self.vreg_start[lv], @as(u32, @intCast(MAX_VREGS - 1)));
-                const le: usize = @min(self.vreg_end[lv] + 1, @as(u32, @intCast(MAX_VREGS - 1)));
-                live_delta[ls] += 1;
-                live_delta[le] -= 1;
-            }
-            var run: i32 = 0;
-            for (0..span) |lp| {
-                run += live_delta[lp];
-                if (run > 0 and @as(u32, @intCast(run)) > peak_live) peak_live = @intCast(run);
-            }
-        }
         // Kept constants and parked magic multipliers compete for the same five
         // callee-saved registers. Budget them together: whatever the kept
         // constants left over is what parking may use, otherwise the two
@@ -2385,6 +2456,29 @@ pub const IRCodegen = struct {
                     self.vreg_spill_slot[cur_v] = ir_fn.total_locals + next_spill;
                     next_spill += 1;
                 }
+            }
+        }
+
+        // Resolve the in-place aliases now that every register is decided: the
+        // temporary takes the operand's register, so the arithmetic lands
+        // straight in it and the copy emits nothing (`movRegReg` skips a move
+        // onto itself). An alias is dropped when the operand was spilled - there
+        // is no register to share - when the operand's register holds a parked
+        // magic multiplier, which the update would clobber, or when the
+        // temporary itself crosses a call and so needs a callee-saved register
+        // of its own.
+        for (1..@min(@as(usize, max_vreg) + 1, MAX_VREGS)) |av| {
+            const asrc = in_place_alias[av];
+            if (asrc == 0 or asrc >= MAX_VREGS) continue;
+            const sr = self.vreg_reg[asrc];
+            if (!self.vreg_crosses_call[av] and sr != NO_REG and !self.isParkedMagicReg(sr)) {
+                self.vreg_reg[av] = sr;
+            } else {
+                // The alias did not hold. The temporary was left out of the
+                // allocation order above, so it still has neither a register nor
+                // a slot - and a vreg with neither reads back as zero.
+                self.vreg_spill_slot[av] = ir_fn.total_locals + next_spill;
+                next_spill += 1;
             }
         }
 
@@ -7610,8 +7704,18 @@ pub const IRCodegen = struct {
                 return;
             } else {
                 self.loadVregToReg(s1, rd);
-                self.loadVregToReg(s2, scratch);
-                self.emitBinRegReg(op, rd, scratch);
+                // The right operand is the source of the machine instruction, so
+                // a register it already has is the register to encode - copying
+                // it to a scratch first is a `mov` that computes nothing. This
+                // branch is reached when the *left* operand has no register (it
+                // was spilled, or it is a wide literal being materialised), and
+                // the two cases above only fire when both do.
+                if (r2_opt != null and r2_opt.? != rd) {
+                    self.emitBinRegReg(op, rd, r2_opt.?);
+                } else {
+                    self.loadVregToReg(s2, scratch);
+                    self.emitBinRegReg(op, rd, scratch);
+                }
                 return;
             }
         }
