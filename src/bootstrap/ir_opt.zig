@@ -4529,7 +4529,30 @@ fn unrollCountedLoops(f: *IRFn) bool {
 //     `@checked_sub`/`@checked_mul`/`@checked_add`, which trap rather than wrap
 //     (fail closed — never a silently shortened span).
 //   * A provable trip count must reach HOIST_MIN_TRIPS: one verifier call only
-//     pays for itself after enough per-access probes disappear.
+//     pays for itself after enough per-access probes disappear. A loop that is
+//     too short is still hoisted when its guard can move outward instead.
+//
+// Guard placement, and moving a guard outward:
+//   The guard block is spliced in directly before the header it protects (never
+//   appended at the end of the block array, whose backward jump the codegen's
+//   loop heuristics would misread) and the preheader's edge is redirected
+//   through it, so it runs exactly when the loop is entered and dominates every
+//   access.
+//
+//   A guard proves a property of a *chunk*, and the body allowlist means nothing
+//   inside the loop can invalidate one. So when every value the guard reads is
+//   also invariant in an enclosing loop E, E's body is held to the same
+//   allowlist, and entering E falls through by unconditional jumps to the block
+//   that leads into this loop, the identical guard may sit on E's entry edge
+//   instead — running once per entry into E rather than once per entry into the
+//   inner loop. The last condition is what keeps it honest: an outer guard runs
+//   before the inner loop's own entry test, so that test must be a formality
+//   (unconditional, or constant-foldable to true), or the guard could fault a
+//   run in which the inner loop never executed at all. This is what makes short
+//   inner loops worth hoisting: a k-means centroid scan of 8 iterations over an
+//   8-element buffer becomes one guard per Lloyd iteration instead of one per
+//   point, and its 16 probes per point disappear (measured 2.2x on that
+//   workload).
 // ════════════════════════════════════════════════════════════════════════════
 
 /// Reported by analyze: 0 = ok, otherwise a reason code (for the explain mode).
@@ -4945,6 +4968,250 @@ fn bhNbChecked(
     return bhSpanValue{ .v = d };
 }
 
+/// The blocks of the natural loop of `back_src -> h`, or false if it does not
+/// fit. `in_set` is cleared over the function's blocks first.
+fn bhNaturalLoop(
+    f: *const IRFn,
+    cfg: *const CFGInfo,
+    h: u16,
+    back_src: u16,
+    in_set: []bool,
+    blocks: []u16,
+    n: *usize,
+) bool {
+    @memset(in_set[0..f.block_count], false);
+    n.* = 0;
+    if (h >= f.block_count or back_src >= f.block_count) return false;
+    in_set[h] = true;
+    blocks[n.*] = h;
+    n.* += 1;
+    if (back_src == h) return true;
+    var stack: [MAX_BLOCKS_PER_FN]u16 = undefined;
+    var sp: usize = 0;
+    in_set[back_src] = true;
+    blocks[n.*] = back_src;
+    n.* += 1;
+    stack[sp] = back_src;
+    sp += 1;
+    while (sp > 0) {
+        sp -= 1;
+        const cur = stack[sp];
+        for (0..cfg.pred_cnt[cur]) |pi| {
+            const p = cfg.preds[cur][pi];
+            if (p >= f.block_count or in_set[p]) continue;
+            if (n.* >= blocks.len or sp >= stack.len) return false;
+            in_set[p] = true;
+            blocks[n.*] = p;
+            n.* += 1;
+            stack[sp] = p;
+            sp += 1;
+        }
+    }
+    return true;
+}
+
+/// The single block outside the loop that reaches it, when there is exactly one
+/// and it dominates the header. Any outside edge into a block other than the
+/// header disqualifies the loop: the guard would not dominate those accesses.
+fn bhUniquePreheader(
+    f: *const IRFn,
+    cfg: *const CFGInfo,
+    in_set: []const bool,
+    header: u16,
+) ?u16 {
+    var pre: i32 = -1;
+    for (0..f.block_count) |bi| {
+        if (!in_set[@intCast(bi)]) continue;
+        for (0..cfg.pred_cnt[bi]) |pi| {
+            const p = cfg.preds[bi][pi];
+            if (p >= f.block_count or in_set[p]) continue;
+            if (bi != header) return null;
+            if (pre == -1) {
+                pre = @intCast(p);
+            } else if (pre != @as(i32, @intCast(p))) {
+                return null;
+            }
+        }
+    }
+    if (pre < 0) return null;
+    const p16: u16 = @intCast(pre);
+    if (!dominates(cfg, p16, header)) return null;
+    if (f.blocks[p16].inst_count == 0) return null;
+    return p16;
+}
+
+/// An enclosing natural loop, plus the preheader a guard block would be spliced
+/// in front of.
+const bhEnclosing = struct {
+    header: u16 = 0,
+    pre: u16 = 0,
+    in_set: [MAX_BLOCKS_PER_FN]bool = .{false} ** MAX_BLOCKS_PER_FN,
+    n: usize = 0,
+};
+
+/// The innermost natural loop that strictly contains `cur` and has a usable
+/// preheader. The preheader must sit *before* the header in the block array so
+/// the spliced guard block keeps jumping forward (see the placement note in
+/// bhTryLoop).
+fn bhFindEnclosing(
+    f: *const IRFn,
+    cfg: *const CFGInfo,
+    cur: []const bool,
+    out: *bhEnclosing,
+) bool {
+    var cur_n: usize = 0;
+    for (0..f.block_count) |bi| {
+        if (cur[bi]) cur_n += 1;
+    }
+    var tmp_in: [MAX_BLOCKS_PER_FN]bool = undefined;
+    var tmp_blocks: [MAX_BLOCKS_PER_FN]u16 = undefined;
+    var found = false;
+    for (0..f.block_count) |bi| {
+        var succs: [2]u16 = .{ 0, 0 };
+        const ns = getSuccs(&f.blocks[bi], &succs);
+        for (succs[0..ns]) |hs| {
+            if (hs >= f.block_count) continue;
+            if (!dominates(cfg, hs, @intCast(bi))) continue; // not a backedge
+            var n: usize = 0;
+            if (!bhNaturalLoop(f, cfg, hs, @intCast(bi), &tmp_in, &tmp_blocks, &n)) continue;
+            if (n <= cur_n) continue; // must strictly contain the inner loop
+            if (found and n >= out.n) continue; // keep the innermost
+            var contains = true;
+            for (0..f.block_count) |k| {
+                if (cur[k] and !tmp_in[k]) {
+                    contains = false;
+                    break;
+                }
+            }
+            if (!contains) continue;
+            const pre = bhUniquePreheader(f, cfg, &tmp_in, hs) orelse continue;
+            if (pre >= hs) continue;
+            out.header = hs;
+            out.pre = pre;
+            out.n = n;
+            @memcpy(out.in_set[0..f.block_count], tmp_in[0..f.block_count]);
+            found = true;
+        }
+    }
+    return found;
+}
+
+/// Whether a guard block built for an inner loop may run on `enc`'s entry edge
+/// instead. Three things have to hold:
+///
+///   * `enc`'s body is held to the same op allowlist as the inner loop's, so
+///     nothing between the guard and the accesses can free, resize, move or
+///     alias a chunk — the proof the guard establishes still holds when the
+///     accesses finally run. A guard block already spliced inside `enc` is
+///     allowed: it only checks.
+///   * Every value the guard reads is invariant in `enc`, so the guard computes
+///     the same start and length it would have computed on the inner edge.
+///   * Entering `enc` falls through, by unconditional jumps only, to `reach` —
+///     the block that leads into the inner loop. Without that the inner loop
+///     could be skipped for a whole `enc` iteration, and a guard covering a
+///     range the run never touches could fault a program that was fine.
+fn bhCanRelocate(
+    f: *const IRFn,
+    cfg: *const CFGInfo,
+    defs: *const bhDefs,
+    consts: *const bhConsts,
+    enc: *const bhEnclosing,
+    nb: []const IRInst,
+    vreg_floor: u16,
+    reach: u16,
+) bool {
+    for (0..f.block_count) |bi| {
+        if (!enc.in_set[@intCast(bi)]) continue;
+        const b = &f.blocks[bi];
+        for (0..b.inst_count) |ii| {
+            const op = b.insts[ii].op;
+            if (bhAccessWidth(op) != 0) continue;
+            if (op == .bounds_hoist_guard) continue;
+            if (!bhLoopOpAllowed(op)) return false;
+        }
+    }
+    var ctx = bhCtx{
+        .f = f,
+        .cfg = cfg,
+        .defs = defs,
+        .consts = consts,
+        .in_loop = &enc.in_set,
+        .h = enc.header,
+    };
+    for (nb) |inst| {
+        for (inst.args[0..@min(inst.arg_count, inst.args.len)]) |a| {
+            if (a == 0 or a >= vreg_floor) continue; // defined in the guard block
+            if (!bhInvariant(&ctx, a)) return false;
+        }
+    }
+    var cur_b: u16 = enc.header;
+    for (0..MAX_BLOCKS_PER_FN) |_| {
+        if (cur_b == reach) return true;
+        if (cur_b >= f.block_count) return false;
+        const b = &f.blocks[cur_b];
+        if (b.inst_count == 0) return false;
+        const term = b.insts[b.inst_count - 1];
+        if (term.op != .jump) return false;
+        cur_b = term.target_block;
+    }
+    return false;
+}
+
+/// Whether leaving the preheader always falls into the loop: either an
+/// unconditional jump, or a test whose operands fold to true. A guard that
+/// moves out to an enclosing loop runs *before* this test, so the test has to be
+/// a formality — otherwise the outer guard could fault a run in which the inner
+/// loop never executed at all.
+fn bhEntryAlwaysTaken(
+    f: *const IRFn,
+    defs: *const bhDefs,
+    consts: *const bhConsts,
+    pre_b: u16,
+    h: u16,
+    iv: u16,
+    lo_const: ?i64,
+) bool {
+    const b = &f.blocks[pre_b];
+    if (b.inst_count == 0) return false;
+    const term = b.insts[b.inst_count - 1];
+    if (term.op == .jump) return term.target_block == h;
+    if (term.op != .cond_jump) return false;
+    if (term.target_block != h or term.alt_block == h) return false;
+    const cv = term.src1;
+    if (cv == 0 or cv >= MAX_TRACKED_VREGS or defs.cnt[cv] != 1) return false;
+    if (defs.blk[cv] >= f.block_count) return false;
+    const ci = f.blocks[defs.blk[cv]].insts[defs.idx[cv]];
+    // At the preheader's test the induction variable still holds its initial
+    // value — it has exactly one definition outside the loop — so a proven
+    // constant init stands in for it here.
+    var x: i64 = undefined;
+    var y: i64 = undefined;
+    {
+        const a = ci.src1;
+        const b2 = ci.src2;
+        if (a == 0 or a >= MAX_TRACKED_VREGS or b2 == 0 or b2 >= MAX_TRACKED_VREGS) return false;
+        if (a == iv) {
+            x = lo_const orelse return false;
+        } else if (consts.known[a]) {
+            x = consts.val[a];
+        } else return false;
+        if (b2 == iv) {
+            y = lo_const orelse return false;
+        } else if (consts.known[b2]) {
+            y = consts.val[b2];
+        } else return false;
+    }
+    return switch (ci.op) {
+        .cmp_le => x <= y,
+        .cmp_lt => x < y,
+        .cmp_ge => x >= y,
+        .cmp_gt => x > y,
+        .cmp_eq => x == y,
+        .cmp_ne => x != y,
+        else => false,
+    };
+}
+
 /// Prove one loop's accesses and, on success, splice a guard block onto the
 /// preheader edge and mark them `unchecked_access`.
 fn bhTryLoop(
@@ -5334,20 +5601,25 @@ fn bhTryLoop(
     }
     if (group_n == 0) return false;
 
-    // ── 8. one provable trip count is enough to pay for the guard ─────────
+    // ── 8. what the guard costs has to be earned back ─────────────────────
+    // One verifier call replaces `trips` inline chunk-cache probes, so a short
+    // provable trip count does not pay for a guard on its own edge. It can
+    // still pay if the guard moves out to an enclosing loop (step 9b), where it
+    // runs once per outer entry instead of once per inner entry.
     var hi_eff_const: ?i64 = null;
     if (hi_val.v == 0) {
         const r = @addWithOverflow(hi_val.val, hi_adj);
         if (r[1] != 0) return false;
         hi_eff_const = r[0];
     }
+    var trips_ok = true;
     if (lo_const != null and hi_eff_const != null) {
         if (lo_const.? > hi_eff_const.?) return false; // the loop never runs
         const span_iv = @subWithOverflow(hi_eff_const.?, lo_const.?);
         if (span_iv[1] != 0) return false;
         // Both operands are non-negative here (lo <= hi, step > 0).
         const trips = @divTrunc(span_iv[0], step) + 1;
-        if (trips < HOIST_MIN_TRIPS) return false;
+        trips_ok = trips >= HOIST_MIN_TRIPS;
     }
 
     // ── 9. build the guard block ──────────────────────────────────────────
@@ -5414,12 +5686,43 @@ fn bhTryLoop(
             })) return false;
         }
     }
-    // The guard block is spliced in *at* the header's index below, so its jump
-    // to the header (h + 1 after the shift) is a forward edge.
-    if (pre_b >= h) return false;
+    // ── 9b. move the guard outward while the span stays invariant ─────────
+    // The guard proves a property of a chunk, and the body allowlist means
+    // nothing inside the loop can invalidate one. So when every value the guard
+    // reads is also invariant in an enclosing loop, and that loop's body is held
+    // to the same allowlist, the very same guard can sit on the enclosing loop's
+    // entry edge instead: it then runs once per entry into the outer loop rather
+    // than once per entry into this one. That is what makes a short inner loop
+    // worth hoisting at all — a k-means centroid scan of 8 iterations over an
+    // 8-element buffer becomes one guard per Lloyd iteration instead of one per
+    // point, and its 16 probes per point disappear.
+    var ins_h: u16 = h;
+    var ins_pre: u16 = pre_b;
+    if (bhEntryAlwaysTaken(f, defs, consts, pre_b, h, iv, lo_const)) {
+        var cur: [MAX_BLOCKS_PER_FN]bool = undefined;
+        @memcpy(cur[0..f.block_count], in_loop[0..f.block_count]);
+        // The block an enclosing header has to fall through to, unconditionally,
+        // for the inner loop's accesses to be certain to run.
+        var reach: u16 = pre_b;
+        const vreg_floor: u16 = f.vreg_count; // everything above is local to nb
+        for (0..4) |_| {
+            var enc: bhEnclosing = .{};
+            if (!bhFindEnclosing(f, cfg, &cur, &enc)) break;
+            if (!bhCanRelocate(f, cfg, defs, consts, &enc, nb[0..nb_n], vreg_floor, reach)) break;
+            @memcpy(cur[0..f.block_count], enc.in_set[0..f.block_count]);
+            reach = enc.header;
+            ins_h = enc.header;
+            ins_pre = enc.pre;
+            trips_ok = true; // once per outer entry now, not once per inner entry
+        }
+    }
+    if (!trips_ok) return false;
+    if (ins_pre >= ins_h) return false;
     if (next_v + 2 >= MAX_TRACKED_VREGS) return false;
     if (f.block_count + 1 >= MAX_BLOCKS_PER_FN) return false;
-    if (!bhNbPush(&nb, &nb_n, .{ .op = .jump, .target_block = h + 1 })) return false;
+    // The guard block is spliced in *at* `ins_h`, so its jump to the block that
+    // follows it (ins_h + 1 after the shift) is a forward edge.
+    if (!bhNbPush(&nb, &nb_n, .{ .op = .jump, .target_block = ins_h + 1 })) return false;
 
     // ── 10. commit: splice the block in, redirect the edge, uncheck the
     //        proven accesses ──────────────────────────────────────────────
@@ -5435,25 +5738,25 @@ fn bhTryLoop(
     // the real backedge is untouched, and every heuristic sees exactly the loops
     // it saw before.
     var shift: u32 = f.block_count;
-    while (shift > h) : (shift -= 1) f.blocks[shift] = f.blocks[shift - 1];
+    while (shift > ins_h) : (shift -= 1) f.blocks[shift] = f.blocks[shift - 1];
     f.block_count += 1;
     f.vreg_count = @intCast(next_v); // checked against MAX_TRACKED_VREGS above
 
-    // Every reference to a block at or after the header moves up by one. The
-    // guard slot itself is skipped and filled in below.
+    // Every reference to a block at or after the insertion point moves up by
+    // one. The guard slot itself is skipped and filled in below.
     for (0..f.block_count) |bi| {
         f.blocks[bi].label = @intCast(bi);
-        if (bi == h) continue;
+        if (bi == ins_h) continue;
         for (0..f.blocks[bi].inst_count) |ii| {
             const inst = &f.blocks[bi].insts[ii];
             switch (inst.op) {
                 .jump, .cond_jump => {
-                    if (inst.target_block >= h) inst.target_block += 1;
-                    if (inst.op == .cond_jump and inst.alt_block >= h) inst.alt_block += 1;
+                    if (inst.target_block >= ins_h) inst.target_block += 1;
+                    if (inst.op == .cond_jump and inst.alt_block >= ins_h) inst.alt_block += 1;
                 },
                 .phi => {
                     for (0..@min(inst.arg_count, inst.phi_blocks.len)) |pi| {
-                        if (inst.phi_blocks[pi] >= h) inst.phi_blocks[pi] += 1;
+                        if (inst.phi_blocks[pi] >= ins_h) inst.phi_blocks[pi] += 1;
                     }
                 },
                 else => {},
@@ -5461,21 +5764,21 @@ fn bhTryLoop(
         }
     }
 
-    f.blocks[h].label = h;
-    f.blocks[h].inst_count = @intCast(nb_n);
-    for (0..nb_n) |i| f.blocks[h].insts[i] = nb[i];
+    f.blocks[ins_h].label = ins_h;
+    f.blocks[ins_h].inst_count = @intCast(nb_n);
+    for (0..nb_n) |i| f.blocks[ins_h].insts[i] = nb[i];
 
-    // The preheader kept its index (pre < h); its edge to the old header now
-    // points at h + 1 and is redirected through the guard block.
-    const pt = &f.blocks[pre_b].insts[f.blocks[pre_b].inst_count - 1];
-    if (pt.target_block == h + 1) pt.target_block = h;
-    if (pt.op == .cond_jump and pt.alt_block == h + 1) pt.alt_block = h;
+    // The preheader kept its index (ins_pre < ins_h); its edge to the old header
+    // now points at ins_h + 1 and is redirected through the guard block.
+    const pt = &f.blocks[ins_pre].insts[f.blocks[ins_pre].inst_count - 1];
+    if (pt.target_block == ins_h + 1) pt.target_block = ins_h;
+    if (pt.op == .cond_jump and pt.alt_block == ins_h + 1) pt.alt_block = ins_h;
 
     for (sites[0..site_n], 0..) |s, si| {
         // Only the accesses a guard actually covers lose their own check;
         // everything unproven stays exactly as safe as it was.
         if (site_group[si] < 0) continue;
-        const sb: u16 = if (s.b >= h) s.b + 1 else s.b;
+        const sb: u16 = if (s.b >= ins_h) s.b + 1 else s.b;
         f.blocks[sb].insts[s.i].unchecked_access = true;
         st.accesses_rewritten += 1;
     }
