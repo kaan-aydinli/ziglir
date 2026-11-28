@@ -5192,6 +5192,232 @@ test "heap-internal out-of-chunk loop traps identically at -O0, -O1 and -O2" {
     try std.testing.expectEqualStrings("136\n", ok_res.stdout); // sum(1..16)
 }
 
+// ── REDUNDANT ACCESS CHECKS: one check per address, not one per access ──────
+fn dedupPtrAdd(dest: u16, base: u16, off: u16) ir_mod.IRInst {
+    return .{ .op = .call_ptr_add, .dest = dest, .args = .{ base, off, 0, 0, 0, 0, 0, 0 }, .arg_count = 2 };
+}
+fn dedupRead64(dest: u16, addr: u16) ir_mod.IRInst {
+    return .{ .op = .call_read_u64, .dest = dest, .args = .{ addr, 0, 0, 0, 0, 0, 0, 0 }, .arg_count = 1 };
+}
+fn dedupWrite64(addr: u16, val: u16) ir_mod.IRInst {
+    return .{ .op = .call_write_u64, .dest = 0, .args = .{ addr, val, 0, 0, 0, 0, 0, 0 }, .arg_count = 2 };
+}
+fn dedupRead8(dest: u16, addr: u16) ir_mod.IRInst {
+    return .{ .op = .call_read_byte, .dest = dest, .args = .{ addr, 0, 0, 0, 0, 0, 0, 0 }, .arg_count = 1 };
+}
+fn dedupWrite8(addr: u16, val: u16) ir_mod.IRInst {
+    return .{ .op = .call_write_byte, .dest = 0, .args = .{ addr, val, 0, 0, 0, 0, 0, 0 }, .arg_count = 2 };
+}
+
+/// Single-block module holding exactly `insts`, so a case can be read as the
+/// instruction sequence the pass actually walks.
+fn buildDedupModule(module: *ir_mod.IRModule, insts: []const ir_mod.IRInst) void {
+    module.init();
+    var f = &module.fns[0];
+    ir_mod.IRModule.initFnSlot(f, 0, 1, 0, 0, 0);
+    f.block_count = 1;
+    f.vreg_count = 64;
+    f.blocks[0].label = 0;
+    f.blocks[0].inst_count = @intCast(insts.len);
+    for (insts, 0..) |ins, i| f.blocks[0].insts[i] = ins;
+    module.fn_count = 1;
+}
+
+/// Runs the pass over `insts` and returns which of them it unchecked.
+fn runDedup(allocator: std.mem.Allocator, insts: []const ir_mod.IRInst, out: []bool) !void {
+    const module = try allocator.create(ir_mod.IRModule);
+    defer allocator.destroy(module);
+    buildDedupModule(module, insts);
+    _ = ir_opt.dedupAccessChecks(module);
+    for (module.fns[0].blocks[0].insts[0..insts.len], 0..) |ins, i| out[i] = ins.unchecked_access;
+}
+
+test "dedupAccessChecks unchecks a second access to an already-checked address" {
+    var got: [8]bool = undefined;
+
+    // The shape `sum[best] += v` lowers to: two `@ptr_add` over the same
+    // (base, offset), a read through the first and a write through the second.
+    // Both addresses are the same value, the block verified it for the read, so
+    // the write's own check can only repeat that verdict.
+    try runDedup(std.testing.allocator, &.{
+        dedupPtrAdd(7, 1, 3),
+        dedupPtrAdd(8, 1, 3),
+        dedupRead64(9, 7),
+        .{ .op = .add, .dest = 10, .src1 = 9, .src2 = 4 },
+        dedupWrite64(8, 10),
+        .{ .op = .ret },
+    }, got[0..6]);
+    try std.testing.expectEqualSlices(bool, &.{ false, false, false, false, true, false }, got[0..6]);
+
+    // Same thing when both accesses share one address vreg instead of two
+    // structurally equal `@ptr_add`s.
+    try runDedup(std.testing.allocator, &.{
+        dedupPtrAdd(7, 1, 3),
+        dedupRead64(9, 7),
+        dedupWrite64(7, 9),
+        .{ .op = .ret },
+    }, got[0..4]);
+    try std.testing.expectEqualSlices(bool, &.{ false, false, true, false }, got[0..4]);
+
+    // Two reads of one address: the second is redundant too.
+    try runDedup(std.testing.allocator, &.{
+        dedupPtrAdd(7, 1, 3),
+        dedupRead64(9, 7),
+        dedupRead64(10, 7),
+        .{ .op = .ret },
+    }, got[0..4]);
+    try std.testing.expectEqualSlices(bool, &.{ false, false, true, false }, got[0..4]);
+}
+
+test "dedupAccessChecks keeps every check it cannot prove redundant" {
+    var got: [8]bool = undefined;
+
+    // A call between the two accesses can allocate, free or rotate the inline
+    // chunk cache, so the first verdict says nothing about the second.
+    try runDedup(std.testing.allocator, &.{
+        dedupPtrAdd(7, 1, 3),
+        dedupPtrAdd(8, 1, 3),
+        dedupRead64(9, 7),
+        .{ .op = .call, .dest = 0, .callee_fn_idx = 1, .arg_count = 0 },
+        dedupWrite64(8, 9),
+        .{ .op = .ret },
+    }, got[0..6]);
+    try std.testing.expectEqualSlices(bool, &.{ false, false, false, false, false, false }, got[0..6]);
+
+    // Redefining the base between the accesses retires the anchor: the second
+    // `@ptr_add` names the same vreg but a different pointer.
+    try runDedup(std.testing.allocator, &.{
+        dedupPtrAdd(7, 1, 3),
+        dedupRead64(9, 7),
+        .{ .op = .add, .dest = 1, .src1 = 1, .src2 = 5 },
+        dedupPtrAdd(8, 1, 3),
+        dedupWrite64(8, 9),
+        .{ .op = .ret },
+    }, got[0..6]);
+    try std.testing.expectEqualSlices(bool, &.{ false, false, false, false, false, false }, got[0..6]);
+
+    // A different offset is a different address.
+    try runDedup(std.testing.allocator, &.{
+        dedupPtrAdd(7, 1, 3),
+        dedupRead64(9, 7),
+        dedupPtrAdd(8, 1, 5),
+        dedupWrite64(8, 9),
+        .{ .op = .ret },
+    }, got[0..5]);
+    try std.testing.expectEqualSlices(bool, &.{ false, false, false, false, false }, got[0..5]);
+
+    // A store drops every anchor, so in a swap only the first of the two writes
+    // is covered. Deliberately conservative: a verified store cannot reach the
+    // cache, but this pass does not ask future access ops to keep that true.
+    try runDedup(std.testing.allocator, &.{
+        dedupPtrAdd(7, 1, 3),
+        dedupPtrAdd(8, 1, 5),
+        dedupRead64(9, 7),
+        dedupRead64(10, 8),
+        dedupWrite64(7, 10),
+        dedupWrite64(8, 9),
+        .{ .op = .ret },
+    }, got[0..7]);
+    try std.testing.expectEqualSlices(bool, &.{ false, false, false, false, true, false, false }, got[0..7]);
+
+    // The 1-byte inline check accepts [lo, hi) while the wider ones accept
+    // [lo, hi], so only a narrow check may cover a wider access, never the
+    // reverse.
+    try runDedup(std.testing.allocator, &.{
+        dedupPtrAdd(7, 1, 3),
+        dedupRead64(9, 7),
+        dedupWrite8(7, 9),
+        .{ .op = .ret },
+    }, got[0..4]);
+    try std.testing.expectEqualSlices(bool, &.{ false, false, false, false }, got[0..4]);
+
+    try runDedup(std.testing.allocator, &.{
+        dedupPtrAdd(7, 1, 3),
+        dedupRead8(9, 7),
+        dedupWrite64(7, 9),
+        .{ .op = .ret },
+    }, got[0..4]);
+    try std.testing.expectEqualSlices(bool, &.{ false, false, true, false }, got[0..4]);
+
+    // An access that span hoisting already unchecked emits no check, so it
+    // cannot vouch for a later one.
+    var hoisted = dedupRead64(9, 7);
+    hoisted.unchecked_access = true;
+    try runDedup(std.testing.allocator, &.{
+        dedupPtrAdd(7, 1, 3),
+        hoisted,
+        dedupWrite64(7, 9),
+        .{ .op = .ret },
+    }, got[0..4]);
+    try std.testing.expectEqualSlices(bool, &.{ false, true, false, false }, got[0..4]);
+}
+
+test "read-modify-write over one address is correct at -O0, -O1 and -O2" {
+    // End to end half of the pin above: the second access of an RMW pair runs
+    // unchecked at -O2, so the arithmetic it feeds must still be right.
+    const src =
+        \\fn main() -> i64 {
+        \\    let buf = @malloc(128)
+        \\    if buf == 0 as *u8 { return 1 }
+        \\    var i: i64 = 0
+        \\    while i < 16 {
+        \\        @write_u64(@ptr_add(buf, i * 8), i + 1)
+        \\        i += 1
+        \\    }
+        \\    var k: i64 = 0
+        \\    while k < 16 {
+        \\        @write_u64(@ptr_add(buf, k * 8), @read_u64(@ptr_add(buf, k * 8)) + k)
+        \\        k += 1
+        \\    }
+        \\    var s: i64 = 0
+        \\    var j: i64 = 0
+        \\    while j < 16 {
+        \\        s += @read_u64(@ptr_add(buf, j * 8))
+        \\        j += 1
+        \\    }
+        \\    printInt(s)
+        \\    @free(buf)
+        \\    return 0
+        \\}
+    ;
+    inline for (.{ .O0, .O1, .O2 }) |lvl| {
+        const elf = try compileSourceWithOpt(src, lvl);
+        defer std.testing.allocator.free(elf);
+        const res = try runElfCapture(std.testing.allocator, elf, "rmw_" ++ @tagName(lvl));
+        defer std.testing.allocator.free(res.stdout);
+        try std.testing.expectEqual(@as(u8, 0), res.exit_code);
+        // slot k holds (k + 1) + k, so the sum is 2 * 120 + 16
+        try std.testing.expectEqualStrings("256\n", res.stdout);
+    }
+}
+
+test "an out-of-chunk read-modify-write traps identically at -O0, -O1 and -O2" {
+    // The safety half. dedupAccessChecks only ever removes the *second* check of
+    // a pair, so an RMW that walks past its 64-byte chunk must still trap at
+    // -O2, at the first access, exactly like it does unoptimized. A pass that
+    // unchecked the leading access instead would turn this into a silent
+    // out-of-bounds write — the release-only memory bug class Issue #2 pinned.
+    const src =
+        \\fn main() -> i64 {
+        \\    let buf = @malloc(64)
+        \\    if buf == 0 as *u8 { return 1 }
+        \\    var i: i64 = 0
+        \\    while i < 16 {
+        \\        @write_u64(@ptr_add(buf, i * 8), @read_u64(@ptr_add(buf, i * 8)) + 1)
+        \\        i += 1
+        \\    }
+        \\    printInt(0)
+        \\    @free(buf)
+        \\    return 0
+        \\}
+    ;
+    inline for (.{ .O0, .O1, .O2 }) |lvl| {
+        const elf = try compileSourceWithOpt(src, lvl);
+        defer std.testing.allocator.free(elf);
+        try runElfExpectSigIll(std.testing.allocator, elf, "rmw_oob_" ++ @tagName(lvl));
+    }
+}
+
 // ── @sha256 builtin: native code blob + cross-backend execution ──────────
 // The digest of "abc" is a fixed, independently published constant, so these
 // expected decimal byte values are an oracle that does not share code with the

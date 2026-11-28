@@ -73,18 +73,18 @@ All eleven outputs are checked against `expected.txt` before anything is timed.
 
 | workload | LIR ms | LLVM C ms | gcc ms | LIR/LLVM | LIR/gcc |
 |---|---:|---:|---:|---:|---:|
-| 01_matrix_mul | 1.03 | 1.47 | 1.46 | 0.70 | 0.71 |
-| 02_nbody | 15.76 | 13.15 | 14.36 | 1.20 | 1.10 |
-| 03_sieve | 21.71 | 16.49 | 18.64 | 1.32 | 1.17 |
-| 04_mandelbrot | 54.64 | 47.15 | 43.78 | 1.16 | 1.25 |
-| 05_collatz | 124.52 | 131.32 | 195.80 | 0.95 | 0.64 |
-| 06_fib_mod | 23.94 | 24.00 | 24.03 | 1.00 | 1.00 |
-| 07_prime_count | 142.35 | 140.12 | 227.35 | 1.02 | 0.63 |
-| 08_bitmix | 33.75 | 23.90 | 44.75 | 1.41 | 0.75 |
-| 09_tak | 2.56 | 3.26 | 3.17 | 0.78 | 0.81 |
-| 10_isqrt | 84.26 | 65.63 | 82.51 | 1.28 | 1.02 |
-| 11_kmeans | 11.53 | 6.31 | 11.80 | 1.83 | 0.98 |
-| **geomean** | | | | **1.112** | **0.888** |
+| 01_matrix_mul | 1.05 | 1.38 | 1.49 | 0.76 | 0.71 |
+| 02_nbody | 15.56 | 13.15 | 14.35 | 1.18 | 1.08 |
+| 03_sieve | 20.03 | 15.06 | 17.14 | 1.33 | 1.17 |
+| 04_mandelbrot | 54.37 | 46.93 | 43.71 | 1.16 | 1.24 |
+| 05_collatz | 127.52 | 134.40 | 199.91 | 0.95 | 0.64 |
+| 06_fib_mod | 23.50 | 23.71 | 23.70 | 0.99 | 0.99 |
+| 07_prime_count | 143.63 | 141.62 | 229.65 | 1.01 | 0.63 |
+| 08_bitmix | 33.37 | 24.00 | 45.20 | 1.39 | 0.74 |
+| 09_tak | 2.43 | 3.06 | 2.96 | 0.79 | 0.82 |
+| 10_isqrt | 84.71 | 66.34 | 83.06 | 1.28 | 1.02 |
+| 11_kmeans | 9.41 | 6.25 | 11.87 | 1.50 | 0.79 |
+| **geomean** | | | | **1.099** | **0.870** |
 
 LIR now beats the gcc twins on 7 of 11 and is within a few percent of the
 clang `-O3 -march=native` twins on 6 of 11. The same table measured against an
@@ -99,24 +99,62 @@ actually has.
 The remaining gap is concentrated where the twins get something the backend
 still does not: `08_bitmix` and `10_isqrt` want a shorter dependent-operation
 chain per iteration, and `03_sieve` wants the store inside the counting loop
-addressed without a reload.
+addressed without a reload. `11_kmeans` still pays a bounds check per point
+assignment that the C twins do not pay at all; that one is the price of memory
+safety and is not coming down without a range proof for a data-dependent index.
 
-`11_kmeans` is worth spelling out, because it is no longer an instruction-count
-problem. Its centroid loop is now twelve instructions with no spill traffic at
-all - one SIB load, a subtract, a three-instruction branchless absolute value,
-a compare and two `cmov`s for the running minimum, and a three-instruction
-loop exit - against roughly 10.6 for clang, which fully unrolls the eight
-centroids. Removing instructions from it stopped buying anything measurable:
-the loop carries `best_d` through `cmp` into `cmovl` and back into `best_d`,
-which is a two-cycle recurrence, and twelve million iterations of it run at
-close to exactly that. Clang's unrolled form does not have a serial chain to be
-bound by; it reduces eight distances as a tree, so its critical path per
-centroid is a fraction of a cycle. Closing the rest of this gap means unrolling
-counted loops whose bodies read memory, not emitting fewer instructions inside
-them. Two things currently stop `unrollCountedLoops` there: it only accepts
-bodies made of `isPureHeaderOp` operations, and it only recognises an induction
-variable updated in place, while out-of-SSA code hands it
-`t = add ci, 1; ci = copy t`.
+`11_kmeans` is worth spelling out, because the last two turns guessed wrong
+about it and the measurement that settled it is cheap to repeat.
+
+The guess was that its centroid loop was the problem: twelve instructions per
+centroid against clang's ten, with a `best_d` -> `cmp` -> `cmovl` -> `best_d`
+two-cycle recurrence, so unrolling the eight centroids was the fix to reach
+for. Disassembling the clang twin killed that twice over. It contains five
+vector instructions in total, all of them zeroing the centroid, sum and count
+buffers, so there is no SIMD to imitate; and its centroid reduction is *not* a
+tree - it is the same serial `cmp`/`cmovge` chain LIR emits, one link per
+centroid. Unrolling would not have bought much either: the trip count is eight,
+so an unrolled body needs its `iv <= limit - factor` guard re-evaluated once per
+point, and counting the guard, the per-repetition index `lea`s and the
+write-backs, the unrolled form comes out within a few instructions of the loop.
+
+What the centroid loop was hiding is the block after it. Assigning one point
+runs `sum[best] += v` and `cnt[best] += 1`, and each of those lowered to two
+independent heap accesses with two `@ptr_add`s, two probe `lea`s and two full
+bounds checks - twenty-six instructions where clang emits two, because
+`best` is a runtime index that access-span hoisting cannot prove a range for.
+The second check of each pair tests the same pointer against the same
+single-entry chunk cache a few instructions after the first one did, with
+nothing in between that can move that cache, so it is a tautology at runtime.
+`dedupAccessChecks` now marks it `unchecked_access`, which drops the probe `lea`
+and the four check instructions and lets the access fold back into its SIB
+operand. Ten instructions per point, 21% off the wall clock (11.53 -> 9.41 ms),
+ratio 1.83 -> 1.50 - and the first check still traps, which the out-of-chunk
+regression test pins at all three optimisation levels.
+
+The general lesson is the one worth keeping: the backend is now close enough to
+the twins that per-loop instruction counts no longer point at the gap. Find it
+by disassembling both sides and counting instructions per *iteration of the
+outermost hot loop*, not per inner-loop body.
+
+Separately, `unrollCountedLoops` was instrumented this turn and never fires -
+not on the eleven workloads, not on any of the 226 `.lir` files in the
+repository. The rejection reasons, counted over the eleven
+workloads plus a synthetic counted-loop probe, say what enabling it would
+actually cost. 24 candidate loops fail the purity test because the body
+contains a call - and the same 24 report `iv_defs = 0`, meaning the induction
+variable is not updated inside the header block at all, so those are multi-block
+loops the pass's single-block shape cannot describe even with calls admitted.
+12 fail because the block's exit test is not a plain `cmp_lt`/`cmp_le` feeding
+the back-edge branch. 4 are longer than the pass's 14-instruction limit. And 2
+reach the induction-variable check and fail it because out-of-SSA code hands
+over `t = add iv, 1; iv = copy t` where the pass only recognises an in-place
+`iv = add iv, 1`. Its unroll guard is fine, incidentally: it reuses the loop's
+own comparison op against `limit - (factor - 1)`, which is the correct bound
+for both `cmp_lt` and `cmp_le`. Reviving it would mean handling multi-block
+bodies and the post-SSA induction-variable form, a much larger change than the
+counts suggest - and after the measurement above, no longer the obvious next
+step for kmeans.
 
 Two caveats worth repeating before anyone reads a single row too closely. The
 workloads are ~1-150 ms and the harness interleaves rounds, so a row whose

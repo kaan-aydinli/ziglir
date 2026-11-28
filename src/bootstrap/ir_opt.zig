@@ -51,6 +51,12 @@ pub fn optimize(module: *IRModule, level: OptLevel) void {
     // verifies on the loop's entry edge; everything it cannot prove keeps its
     // per-access check. See the BOUNDS-HOIST section below.
     if (level == .O2) _ = hoistBoundsChecks(module, null);
+
+    // One check per address, not one per access. Runs after span hoisting so it
+    // only ever looks at accesses that kept their per-access check: an access
+    // hoisting already proved is `unchecked_access` and establishes no anchor.
+    // See the REDUNDANT ACCESS CHECKS section below.
+    if (level == .O2) _ = dedupAccessChecks(module);
 }
 
 fn optimizeFn(module: *IRModule, fi: u32, level: OptLevel) void {
@@ -5325,6 +5331,301 @@ fn unrollCountedLoops(f: *IRFn) bool {
         f.blocks[b_tail_hdr].insts[1] = .{ .op = .cond_jump, .src1 = cmpt_v, .target_block = bi, .alt_block = exit_bi };
 
         changed = true;
+    }
+    return changed;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// REDUNDANT ACCESS CHECKS — one check per address, not one per access
+//
+// `sum[best] += v` lowers to two independent heap accesses, a `@read_u64` and a
+// `@write_u64`, each with its own `@ptr_add` and its own chunk-precise bounds
+// check. In the emitted code the pair costs 13 instructions where the
+// arithmetic needs three:
+//
+//     lea  (%r13,%rsi,8),%rax        lea  (%r13,%rsi,8),%rax
+//     cmp  [chunk_lo],%rax           cmp  [chunk_lo],%rax
+//     jb   cold                      jb   cold
+//     cmp  [chunk_hi],%rax           cmp  [chunk_hi],%rax
+//     ja   cold                      ja   cold
+//     mov  (%rax),%r8                mov  %r8,(%rax)
+//     add  %r10,%r8
+//
+// The second check is a tautology. It tests the same pointer against the same
+// single-entry inline chunk cache ([DATA_VADDR+0xC0..0xC8]), and between the
+// two accesses nothing ran that can move that cache: only the allocator, the
+// free ring and the chunk verifier write it, all of them calls, and every
+// pointer a check lets through lies inside a heap chunk while the cache lives
+// in the runtime data page. So on every path that reaches the second access,
+// the second check passes.
+//
+// This pass therefore marks it `unchecked_access` — the same flag span hoisting
+// uses — which drops the probe `lea` and the four check instructions and lets
+// the access fold back into its SIB operand (`mov %r8,(%r13,%rsi,8)`).
+//
+// SAFETY. This removes *redundant* checks, never a needed one. An access is
+// only unchecked when the same basic block already checked the identical
+// address a few instructions earlier and that check still traps: a program that
+// would fault keeps faulting, at the first access instead of the second. The
+// identity is structural, not name-based — two accesses match only when both
+// addresses are `@ptr_add(b, i)` over the same two vregs with neither vreg
+// redefined in between, or when both read the same unredefined vreg directly.
+// Anything that can branch, call, allocate or write memory drops every anchor,
+// so the window this pass looks through is a straight-line run of arithmetic.
+// A store clears the anchors even though a verified store cannot reach the
+// cache: keeping them would need that argument to hold for every future access
+// op, and it buys nothing on the read-modify-write shape this pass exists for.
+const AccessCheckKind = struct { size: u8, is_store: bool };
+
+/// The heap access ops whose native lowering runs `emitPtrTrapN` on `args[0]`
+/// and whose C backend honours `unchecked_access`. `deref_load`/`field_store`
+/// are deliberately absent: the native backend ignores the flag for them, so
+/// marking them would silently diverge from the C backend.
+fn accessCheckKind(op: IROp) ?AccessCheckKind {
+    return switch (op) {
+        .call_read_byte => .{ .size = 1, .is_store = false },
+        .call_write_byte => .{ .size = 1, .is_store = true },
+        .call_read_u32 => .{ .size = 4, .is_store = false },
+        .call_write_u32 => .{ .size = 4, .is_store = true },
+        .call_read_u64 => .{ .size = 8, .is_store = false },
+        .call_write_u64 => .{ .size = 8, .is_store = true },
+        else => null,
+    };
+}
+
+/// Does a passed check of `early_size` imply the same pointer would pass a
+/// check of `late_size`? The deferred form of `emitPtrTrapN` compares
+/// `[lo] <= p <= [hi]` for every size, but its inline fallback accepts
+/// `p == hi` only for multi-byte accesses, so a 1-byte check is the stricter
+/// of the two and cannot be implied by a wider one.
+fn checkSizeImplies(early_size: u8, late_size: u8) bool {
+    if (late_size != 1) return true;
+    return early_size == 1;
+}
+
+/// Ops that cannot branch, call, allocate, free, touch memory or the chunk
+/// cache, so an anchor established before them is still valid after them.
+/// `@ptr_add` is here too (it lowers to a plain `add`, and `bhLoopOpAllowed`
+/// already treats it as memory-pure) but it is handled separately below because
+/// it also defines an address identity.
+fn isCheckTransparentOp(op: IROp) bool {
+    return switch (op) {
+        .const_int,
+        .const_str,
+        .copy,
+        .load_local,
+        .call_ptr_add,
+        .add,
+        .sub,
+        .mul,
+        .div,
+        .udiv,
+        .@"mod",
+        .umod,
+        .shl,
+        .shr,
+        .ushr,
+        .bit_and,
+        .bit_or,
+        .bit_xor,
+        .bit_not,
+        .logic_not,
+        .neg,
+        .select,
+        .cmp_eq,
+        .cmp_ne,
+        .cmp_lt,
+        .cmp_le,
+        .cmp_gt,
+        .cmp_ge,
+        .ucmp_lt,
+        .ucmp_le,
+        .ucmp_gt,
+        .ucmp_ge,
+        .sext8,
+        .sext16,
+        .sext32,
+        .zext8,
+        .zext16,
+        .zext32,
+        => true,
+        // Floating point is transparent for the cache too, but `fdiv` can raise
+        // and the flag state matters to nobody here; kept out only to keep the
+        // list to what the benchmarks actually put between two accesses.
+        else => false,
+    };
+}
+
+fn dedupAccessChecksFn(f: *IRFn) bool {
+    const MAX_IDS: usize = 32;
+    const MAX_ANCHORS: usize = 8;
+
+    // Address identities currently known: `id_addr` holds `@ptr_add(base, idx)`
+    // with neither operand redefined since.
+    var id_addr: [MAX_IDS]u16 = undefined;
+    var id_base: [MAX_IDS]u16 = undefined;
+    var id_idx: [MAX_IDS]u16 = undefined;
+    var id_n: usize = 0;
+
+    // Addresses this block has already paid a check for.
+    var an_base: [MAX_ANCHORS]u16 = undefined;
+    var an_idx: [MAX_ANCHORS]u16 = undefined;
+    var an_plain: [MAX_ANCHORS]u16 = undefined;
+    var an_size: [MAX_ANCHORS]u8 = undefined;
+    var an_n: usize = 0;
+
+    var changed = false;
+
+    var bi: usize = 0;
+    while (bi < f.block_count) : (bi += 1) {
+        const b = &f.blocks[bi];
+        id_n = 0;
+        an_n = 0;
+
+        var ii: usize = 0;
+        while (ii < b.inst_count) : (ii += 1) {
+            const inst = &b.insts[ii];
+
+            if (accessCheckKind(inst.op)) |ak| {
+                if (inst.arg_count < 1 or inst.args[0] == 0) {
+                    an_n = 0;
+                    continue;
+                }
+                const av = inst.args[0];
+                // Resolve before the write below: `dest` may alias `av`.
+                var base: u16 = 0;
+                var idx: u16 = 0;
+                var plain: u16 = av;
+                var k: usize = 0;
+                while (k < id_n) : (k += 1) {
+                    if (id_addr[k] != av) continue;
+                    base = id_base[k];
+                    idx = id_idx[k];
+                    plain = 0;
+                    break;
+                }
+
+                if (!inst.unchecked_access) {
+                    var covered: u8 = 0; // 0 = no, 1 = yes
+                    var m: usize = 0;
+                    while (m < an_n) : (m += 1) {
+                        if (an_plain[m] != plain) continue;
+                        if (plain == 0 and (an_base[m] != base or an_idx[m] != idx)) continue;
+                        if (!checkSizeImplies(an_size[m], ak.size)) continue;
+                        covered = 1;
+                        break;
+                    }
+                    if (covered == 1) {
+                        inst.unchecked_access = true;
+                        changed = true;
+                    } else if (an_n < MAX_ANCHORS) {
+                        an_base[an_n] = base;
+                        an_idx[an_n] = idx;
+                        an_plain[an_n] = plain;
+                        an_size[an_n] = ak.size;
+                        an_n += 1;
+                    }
+                }
+
+                // The access defines `dest` (the loaded value, or the void vreg
+                // for a store), which retires any identity or anchor naming it.
+                const d = inst.dest;
+                if (d != 0) {
+                    var w: usize = 0;
+                    while (w < id_n) {
+                        if (id_addr[w] == d or id_base[w] == d or id_idx[w] == d) {
+                            id_n -= 1;
+                            id_addr[w] = id_addr[id_n];
+                            id_base[w] = id_base[id_n];
+                            id_idx[w] = id_idx[id_n];
+                        } else w += 1;
+                    }
+                    var u: usize = 0;
+                    while (u < an_n) {
+                        if (an_plain[u] == d or an_base[u] == d or an_idx[u] == d) {
+                            an_n -= 1;
+                            an_base[u] = an_base[an_n];
+                            an_idx[u] = an_idx[an_n];
+                            an_plain[u] = an_plain[an_n];
+                            an_size[u] = an_size[an_n];
+                        } else u += 1;
+                    }
+                }
+                if (ak.is_store) an_n = 0;
+                continue;
+            }
+
+            if (inst.op == .call_ptr_add and inst.arg_count >= 2 and inst.dest != 0) {
+                const d = inst.dest;
+                var w: usize = 0;
+                while (w < id_n) {
+                    if (id_addr[w] == d or id_base[w] == d or id_idx[w] == d) {
+                        id_n -= 1;
+                        id_addr[w] = id_addr[id_n];
+                        id_base[w] = id_base[id_n];
+                        id_idx[w] = id_idx[id_n];
+                    } else w += 1;
+                }
+                var u: usize = 0;
+                while (u < an_n) {
+                    if (an_plain[u] == d or an_base[u] == d or an_idx[u] == d) {
+                        an_n -= 1;
+                        an_base[u] = an_base[an_n];
+                        an_idx[u] = an_idx[an_n];
+                        an_plain[u] = an_plain[an_n];
+                        an_size[u] = an_size[an_n];
+                    } else u += 1;
+                }
+                if (inst.args[0] != 0 and id_n < MAX_IDS) {
+                    id_addr[id_n] = d;
+                    id_base[id_n] = inst.args[0];
+                    id_idx[id_n] = inst.args[1];
+                    id_n += 1;
+                }
+                continue;
+            }
+
+            if (!isCheckTransparentOp(inst.op)) {
+                // A call, a store, a guard, a terminator or anything else whose
+                // effects this pass does not model: every anchor dies.
+                an_n = 0;
+                id_n = 0;
+                continue;
+            }
+
+            // Transparent, but it still redefines `dest`.
+            const d = inst.dest;
+            if (d != 0) {
+                var w: usize = 0;
+                while (w < id_n) {
+                    if (id_addr[w] == d or id_base[w] == d or id_idx[w] == d) {
+                        id_n -= 1;
+                        id_addr[w] = id_addr[id_n];
+                        id_base[w] = id_base[id_n];
+                        id_idx[w] = id_idx[id_n];
+                    } else w += 1;
+                }
+                var u: usize = 0;
+                while (u < an_n) {
+                    if (an_plain[u] == d or an_base[u] == d or an_idx[u] == d) {
+                        an_n -= 1;
+                        an_base[u] = an_base[an_n];
+                        an_idx[u] = an_idx[an_n];
+                        an_plain[u] = an_plain[an_n];
+                        an_size[u] = an_size[an_n];
+                    } else u += 1;
+                }
+            }
+        }
+    }
+    return changed;
+}
+
+pub fn dedupAccessChecks(module: *IRModule) bool {
+    var changed = false;
+    var fi: u32 = 0;
+    while (fi < module.fn_count) : (fi += 1) {
+        if (dedupAccessChecksFn(&module.fns[fi])) changed = true;
     }
     return changed;
 }
