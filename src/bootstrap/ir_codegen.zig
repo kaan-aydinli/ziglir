@@ -301,6 +301,12 @@ pub const IRCodegen = struct {
     /// register holds the same bits. 0 means "not a duplicate".
     vreg_keep_const_dup: [MAX_VREGS]u16 = undefined,
     vreg_copy_hint: [MAX_VREGS]u16 = undefined,
+    /// Set when `r = select (x > neg x) ? x : neg x` was recognised as |x| and
+    /// `r` was folded onto `x`'s register. The emitter reads this as the
+    /// authority on whether to fuse: the allocator has already merged the two
+    /// live ranges, so emitting the three instructions one at a time would
+    /// write the result over a value the generic `.select` path still reads.
+    vreg_abs_alias: [MAX_VREGS]u16 = undefined,
     vreg_pref_hw_reg: [MAX_VREGS]u8 = undefined,
     /// Magic multipliers of constant divisors used inside a loop, parked in a
     /// callee-saved register for the whole function (one `movabs` at entry
@@ -475,6 +481,19 @@ pub const IRCodegen = struct {
     fn popReg(self: *IRCodegen, r: u8) void {
         if (r >= 8) self.emit8(0x41);
         self.emit8(0x58 + (r & 7));
+    }
+
+    fn emitNegReg(self: *IRCodegen, reg: u8) void {
+        self.emit8(if (reg >= 8) 0x49 else 0x48);
+        self.emit8(0xF7);
+        self.emit8(0xD8 | (reg & 7)); // NEG r/m64 (F7 /3)
+    }
+
+    fn emitCmovRegReg(self: *IRCodegen, dst: u8, src: u8, cc: u8) void {
+        self.emitRex(dst, src);
+        self.emit8(0x0F);
+        self.emit8(0x40 | cc);
+        self.emitModRM(3, dst, src);
     }
 
     fn movRegReg(self: *IRCodegen, dst: u8, src: u8) void {
@@ -1873,6 +1892,7 @@ pub const IRCodegen = struct {
         @memset(self.vreg_end[0..n_vregs], 0);
         @memset(self.vreg_crosses_call[0..n_vregs], false);
         @memset(self.vreg_copy_hint[0..n_vregs], 0);
+        @memset(self.vreg_abs_alias[0..n_vregs], 0);
         @memset(self.vreg_pref_hw_reg[0..n_vregs], NO_REG);
 
         self.pending_keep_const_count = 0;
@@ -1908,6 +1928,13 @@ pub const IRCodegen = struct {
         var in_place_alias: [MAX_VREGS]u16 = .{0} ** MAX_VREGS;
         var in_place_use_cnt: [MAX_VREGS]u16 = undefined;
         countVregUses(ir_fn, &in_place_use_cnt);
+
+        // Absolute-value candidates, keyed by the select's destination: the
+        // vreg holding `x` and the position of the `neg`. Whether the alias is
+        // taken is decided after every live range is final, because it depends
+        // on `x` dying exactly at the select.
+        var abs_cand_x: [MAX_VREGS]u16 = .{0} ** MAX_VREGS;
+        var abs_cand_pos: [MAX_VREGS]u32 = .{0} ** MAX_VREGS;
 
         // Decided before any live range is measured: a folded pointer and its
         // scaled offset are not values any more, so they must not compete for
@@ -1946,6 +1973,31 @@ pub const IRCodegen = struct {
                         if (nx.op == .copy and nx.dest == two_addr_s1 and nx.src1 == inst.dest) {
                             in_place_alias[inst.dest] = two_addr_s1;
                         }
+                    }
+                }
+                // `t = neg x ; c = cmp_gt x, t ; r = select c ? x : t` is how
+                // `@max(d, 0 - d)` reaches codegen. `neg` already leaves the
+                // sign of -x in the flags, so one `cmovg` replaces the compare
+                // and the two moves that feed the select - but only if the
+                // result lands in the register `x` already occupies, which has
+                // to be arranged here, while the positions are known.
+                if (inst.op == .neg and ii + 2 < blk.inst_count and
+                    inst.src1 > 0 and inst.src1 < MAX_VREGS and
+                    inst.dest > 0 and inst.dest < MAX_VREGS and
+                    self.vreg_def_cnt[inst.dest] == 1 and self.vreg_def_cnt[inst.src1] == 1 and
+                    !self.vreg_elided_const[inst.src1])
+                {
+                    const ac = blk.insts[ii + 1];
+                    const as = blk.insts[ii + 2];
+                    if (ac.op == .cmp_gt and ac.src1 == inst.src1 and ac.src2 == inst.dest and
+                        ac.dest > 0 and ac.dest < MAX_VREGS and self.vreg_def_cnt[ac.dest] == 1 and
+                        as.op == .select and as.src1 == ac.dest and as.src2 == inst.src1 and
+                        as.dest > 0 and as.dest < MAX_VREGS and as.dest != inst.src1 and
+                        as.arg_count > 0 and as.args[0] == inst.dest and
+                        !self.vreg_elided_const[as.dest] and !self.vreg_keep_const_reg[as.dest])
+                    {
+                        abs_cand_x[as.dest] = inst.src1;
+                        abs_cand_pos[as.dest] = pos;
                     }
                 }
                 if (ii + 1 < blk.inst_count and isCmpOp(inst.op) and (blk.insts[ii + 1].op == .cond_jump or blk.insts[ii + 1].op == .select) and
@@ -2152,6 +2204,24 @@ pub const IRCodegen = struct {
             }
         }
 
+        // Apply the absolute-value aliases now that every range is final. `x`
+        // must die at the select - the fused form writes the result over it -
+        // and its range then becomes the pair's range, so one register covers
+        // both and nothing else can be handed it in between.
+        var abs_alias: [MAX_VREGS]u16 = .{0} ** MAX_VREGS;
+        for (1..@min(@as(usize, max_vreg) + 1, MAX_VREGS)) |rv| {
+            const xv = abs_cand_x[rv];
+            if (xv == 0 or xv >= MAX_VREGS) continue;
+            if (self.vreg_last_use[xv] != abs_cand_pos[rv] + 2) continue;
+            if (self.vreg_start[xv] > self.vreg_end[xv]) continue;
+            if (self.vreg_start[rv] > self.vreg_end[rv]) continue;
+            self.vreg_start[xv] = @min(self.vreg_start[xv], self.vreg_start[rv]);
+            self.vreg_end[xv] = @max(self.vreg_end[xv], self.vreg_end[rv]);
+            vreg_weight[xv] +|= vreg_weight[rv];
+            abs_alias[rv] = @intCast(xv);
+            self.vreg_abs_alias[rv] = @intCast(xv);
+        }
+
         var order: [MAX_VREGS]u16 = undefined;
         var order_count: usize = 0;
         var v: u32 = 1;
@@ -2161,7 +2231,7 @@ pub const IRCodegen = struct {
             // is decided; asking for one of its own in the meantime only holds a
             // register it is about to give back, and holding it can be what
             // pushes a real value out.
-            if (in_place_alias[v] != 0) continue;
+            if (in_place_alias[v] != 0 or abs_alias[v] != 0) continue;
             for (call_positions[0..call_pos_count]) |cp| {
                 if (self.vreg_start[v] < cp and cp < self.vreg_end[v]) {
                     self.vreg_crosses_call[v] = true;
@@ -2477,6 +2547,23 @@ pub const IRCodegen = struct {
                 // The alias did not hold. The temporary was left out of the
                 // allocation order above, so it still has neither a register nor
                 // a slot - and a vreg with neither reads back as zero.
+                self.vreg_spill_slot[av] = ir_fn.total_locals + next_spill;
+                next_spill += 1;
+            }
+        }
+
+        // The absolute-value result takes the register its operand already
+        // holds; the merged range above is what makes that safe. If the operand
+        // was spilled there is nothing to share and the pair falls back to a
+        // slot of its own - the emitter's non-aliased path still saves the
+        // compare, it just cannot save the move.
+        for (1..@min(@as(usize, max_vreg) + 1, MAX_VREGS)) |av| {
+            const asrc = abs_alias[av];
+            if (asrc == 0 or asrc >= MAX_VREGS) continue;
+            const sr = self.vreg_reg[asrc];
+            if (sr != NO_REG and !self.isParkedMagicReg(sr)) {
+                self.vreg_reg[av] = sr;
+            } else {
                 self.vreg_spill_slot[av] = ir_fn.total_locals + next_spill;
                 next_spill += 1;
             }
@@ -3644,6 +3731,50 @@ pub const IRCodegen = struct {
                                 continue;
                             }
                         }
+                    }
+                }
+
+                // Fused |x|: t = neg x; c = cmp_gt x, t; r = select c ? x : t
+                // -> mov rt, rx; neg rt; cmovg rt, rx. `neg` leaves the sign of
+                // -x in SF, so `cmovg` fires exactly when -x > 0, that is when
+                // x < 0; for x == 0 the zero flag holds it off and for
+                // x == i64::MIN overflow sets SF == OF, which is what the
+                // compare it replaces also concluded. Same four corners, three
+                // instructions instead of five.
+                if (inst.op == .neg and ii + 2 < blk.inst_count and
+                    inst.src1 > 0 and inst.src1 < MAX_VREGS and inst.dest < MAX_VREGS)
+                {
+                    const ac = blk.insts[ii + 1];
+                    const as = blk.insts[ii + 2];
+                    if (as.dest > 0 and as.dest < MAX_VREGS and
+                        self.vreg_abs_alias[as.dest] == inst.src1 and
+                        ac.op == .cmp_gt and ac.src1 == inst.src1 and ac.src2 == inst.dest and
+                        as.op == .select and as.src1 == ac.dest and as.src2 == inst.src1 and
+                        as.arg_count > 0 and as.args[0] == inst.dest)
+                    {
+                        const xr = self.vregPhys(inst.src1);
+                        const rr = self.vregPhys(as.dest);
+                        var taken: u16 = 0;
+                        if (xr) |r| taken |= @as(u16, 1) << @intCast(r);
+                        if (rr) |r| taken |= @as(u16, 1) << @intCast(r);
+                        if (xr != null and rr != null and xr.? == rr.?) {
+                            const rd = rr.?;
+                            const rt = self.pickScratchReg(taken);
+                            self.movRegReg(rt, rd);
+                            self.emitNegReg(rt);
+                            self.emitCmovRegReg(rd, rt, 0xF); // cmovg
+                        } else {
+                            const rd: u8 = rr orelse 0;
+                            taken |= @as(u16, 1) << @intCast(rd);
+                            self.loadVregToReg(inst.src1, rd);
+                            const rt = self.pickScratchReg(taken);
+                            self.movRegReg(rt, rd);
+                            self.emitNegReg(rt);
+                            self.emitCmovRegReg(rd, rt, 0xF); // cmovg
+                            if (rr == null) self.storeRegToVreg(rd, as.dest);
+                        }
+                        ii += 3;
+                        continue;
                     }
                 }
 

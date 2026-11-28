@@ -98,10 +98,25 @@ actually has.
 
 The remaining gap is concentrated where the twins get something the backend
 still does not: `08_bitmix` and `10_isqrt` want a shorter dependent-operation
-chain per iteration, `03_sieve` wants the store inside the counting loop
-addressed without a reload, and `11_kmeans` is the one place clang fully unrolls
-a small constant-trip loop - its centroid loop runs 10.6 instructions per
-iteration against LIR's 14, and none of the difference is a bounds check.
+chain per iteration, and `03_sieve` wants the store inside the counting loop
+addressed without a reload.
+
+`11_kmeans` is worth spelling out, because it is no longer an instruction-count
+problem. Its centroid loop is now twelve instructions with no spill traffic at
+all - one SIB load, a subtract, a three-instruction branchless absolute value,
+a compare and two `cmov`s for the running minimum, and a three-instruction
+loop exit - against roughly 10.6 for clang, which fully unrolls the eight
+centroids. Removing instructions from it stopped buying anything measurable:
+the loop carries `best_d` through `cmp` into `cmovl` and back into `best_d`,
+which is a two-cycle recurrence, and twelve million iterations of it run at
+close to exactly that. Clang's unrolled form does not have a serial chain to be
+bound by; it reduces eight distances as a tree, so its critical path per
+centroid is a fraction of a cycle. Closing the rest of this gap means unrolling
+counted loops whose bodies read memory, not emitting fewer instructions inside
+them. Two things currently stop `unrollCountedLoops` there: it only accepts
+bodies made of `isPureHeaderOp` operations, and it only recognises an induction
+variable updated in place, while out-of-SSA code hands it
+`t = add ci, 1; ci = copy t`.
 
 Two caveats worth repeating before anyone reads a single row too closely. The
 workloads are ~1-150 ms and the harness interleaves rounds, so a row whose

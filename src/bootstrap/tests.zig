@@ -4237,6 +4237,69 @@ test "codegen: a reduction that needs more live values than there are registers"
     }
 }
 
+test "codegen: an absolute value folds to neg + cmovg, corners included" {
+    // `@max(d, 0 - d)` reaches codegen as `t = neg x; c = cmp_gt x, t;
+    // r = select c ? x : t` - five instructions, three of them moving the same
+    // two numbers between registers. `neg` already leaves the sign of -x in SF,
+    // so a single `cmovg` picks the right one, provided the result can land in
+    // the register `x` occupies; the allocator merges the two live ranges to
+    // make that possible, which is why `x` has to die at the select.
+    //
+    // The condition is `cmovg` firing exactly when -x > 0, so the four corners
+    // are the point of the test: x == 0 is held off by ZF, x == i64::MIN sets
+    // OF so SF == OF and the move fires onto a value that is its own negation,
+    // and x == +-2^62 is where the compare it replaces would have had to
+    // reason about 2x overflowing. Every one of them has to agree with the
+    // signed comparison the IR asks for.
+    //
+    // s adds |0|, |5|, |-5|, |1|, |-1|, |i64::MAX|, |i64::MIN|, |2^62|,
+    // |-2^62| = 0+5+5+1+1+i64::MAX+i64::MIN+2^62+2^62, wrapping, which is
+    // -9223372036854775797. acc sums |((i*37) % 19) - 9| * (i+1) for i < 40,
+    // which is 4059. Both are computed from that arithmetic, not read off a
+    // backend; the calls keep the arguments out of the constant folder, so the
+    // corners really do reach the fused sequence at runtime.
+    const src =
+        \\fn absof(d: i64) -> i64 {
+        \\    return @max(d, 0 - d)
+        \\}
+        \\
+        \\fn main() -> i64 {
+        \\    let mn = 0 - 9223372036854775807 - 1
+        \\    let mx = 9223372036854775807
+        \\    let p62 = 4611686018427387904
+        \\    var s: i64 = 0
+        \\    s = s + absof(0)
+        \\    s = s + absof(5)
+        \\    s = s + absof(0 - 5)
+        \\    s = s + absof(1)
+        \\    s = s + absof(0 - 1)
+        \\    s = s + absof(mx)
+        \\    s = s + absof(mn)
+        \\    s = s + absof(p62)
+        \\    s = s + absof(0 - p62)
+        \\    var acc: i64 = 0
+        \\    var i: i64 = 0
+        \\    while i < 40 {
+        \\        let d = (i * 37) % 19 - 9
+        \\        acc = acc + absof(d) * (i + 1)
+        \\        i = i + 1
+        \\    }
+        \\    printInt(s)
+        \\    printInt(acc)
+        \\    return 0
+        \\}
+    ;
+
+    inline for (.{ .O0, .O1, .O2 }) |lvl| {
+        const elf = try compileSourceWithOpt(src, lvl);
+        defer std.testing.allocator.free(elf);
+        const res = try runElfCapture(std.testing.allocator, elf, "abs_corners_" ++ @tagName(lvl));
+        defer std.testing.allocator.free(res.stdout);
+        try std.testing.expectEqual(@as(u8, 0), res.exit_code);
+        try std.testing.expectEqualStrings("-9223372036854775797\n4059\n", res.stdout);
+    }
+}
+
 test "codegen: an in-place loop counter beside a swap in the same body" {
     // `i = i + 1` reaches codegen as `t = add i, 1; i = copy t`: SSA gives `i`
     // one definition per path, so destructSSA has to name the new value. The
