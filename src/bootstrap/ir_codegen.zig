@@ -1145,6 +1145,25 @@ pub const IRCodegen = struct {
         return false;
     }
 
+    /// `instReadsVreg`, extended with the operands a planned address fold moves
+    /// to the access site. A folded `@read_u64`/`@write_u64` reads its base and
+    /// its index where the *access* sits, not where the `@ptr_add` it replaced
+    /// sat, and neither vreg appears in the access's `args` - so a scan that
+    /// only reads the IR operands concludes an access does not touch a vreg it
+    /// is about to read out of a SIB operand. The live-range builder has the
+    /// same exception for the same reason; this is its read-side twin.
+    fn instReadsVregFolded(self: *const IRCodegen, inst: IRInst, v: u16) bool {
+        if (v == 0) return false;
+        if (instReadsVreg(inst, v)) return true;
+        if ((inst.op == .call_read_u64 or inst.op == .call_write_u64) and inst.arg_count >= 1) {
+            const fa = inst.args[0];
+            if (fa > 0 and fa < MAX_VREGS and self.vreg_fold_base[fa] != 0) {
+                if (self.vreg_fold_base[fa] == v or self.vreg_fold_idx[fa] == v) return true;
+            }
+        }
+        return false;
+    }
+
     fn fitsI32NonMin(imm: i64) bool {
         return imm > std.math.minInt(i32) and imm <= std.math.maxInt(i32);
     }
@@ -1967,11 +1986,46 @@ pub const IRCodegen = struct {
                     if (two_addr_s1 > 0 and two_addr_s1 < MAX_VREGS and
                         two_addr_s1 != inst.dest and in_place_use_cnt[inst.dest] == 1 and
                         !self.vreg_elided_const[inst.dest] and !self.vreg_keep_const_reg[inst.dest] and
+                        !vreg_fused_skip[inst.dest] and !vreg_fused_skip[two_addr_s1] and
                         ii + 1 < blk.inst_count)
                     {
-                        const nx = blk.insts[ii + 1];
-                        if (nx.op == .copy and nx.dest == two_addr_s1 and nx.src1 == inst.dest) {
-                            in_place_alias[inst.dest] = two_addr_s1;
+                        // The write-back copy does not have to be the very next
+                        // instruction. `destructSSA` groups a loop body's updates
+                        // and then their copies, so `acc = acc + x` arrives as
+                        // three defs followed by three copies:
+                        //
+                        //     [9]  v13 = add v51, v12       [13] v51 = copy v13
+                        //     [11] v17 = add v52, v16       [14] v52 = copy v17
+                        //     [12] v20 = add v53, v19       [15] v53 = copy v20
+                        //
+                        // An adjacent-only match left every one of those a
+                        // `lea`/`mov` pair where the source says `add`; in
+                        // 08_bitmix that was five of the hot loop's twenty-seven
+                        // instructions. Sharing the operand's register across the
+                        // gap is still sound. The copy is in the same block, so
+                        // no branch can skip it, and the scan below refuses the
+                        // alias the moment anything reads the operand, writes the
+                        // operand, or redefines the temporary before the copy
+                        // runs - which is also what keeps `t = add a, 1; a =
+                        // copy b; b = copy t` shapes out of it. Those reads go
+                        // through `instReadsVregFolded`, not `instReadsVreg`:
+                        // an access whose address was folded reads its base and
+                        // index at the access site and names neither in its
+                        // args, and 02_nbody's accumulation loop has exactly
+                        // that in the gap. Liveness here is
+                        // interval-based and the operand is used at both ends of
+                        // the gap, so its interval already spans every position
+                        // in between and no other vreg can be handed the
+                        // register mid-gap.
+                        var q: usize = ii + 1;
+                        while (q < blk.inst_count) : (q += 1) {
+                            const nq = blk.insts[q];
+                            if (nq.op == .copy and nq.dest == two_addr_s1 and nq.src1 == inst.dest) {
+                                in_place_alias[inst.dest] = two_addr_s1;
+                                break;
+                            }
+                            if (nq.dest == two_addr_s1 or nq.dest == inst.dest) break;
+                            if (self.instReadsVregFolded(nq, two_addr_s1)) break;
                         }
                     }
                 }

@@ -73,18 +73,18 @@ All eleven outputs are checked against `expected.txt` before anything is timed.
 
 | workload | LIR ms | LLVM C ms | gcc ms | LIR/LLVM | LIR/gcc |
 |---|---:|---:|---:|---:|---:|
-| 01_matrix_mul | 1.05 | 1.38 | 1.49 | 0.76 | 0.71 |
-| 02_nbody | 15.56 | 13.15 | 14.35 | 1.18 | 1.08 |
-| 03_sieve | 20.03 | 15.06 | 17.14 | 1.33 | 1.17 |
-| 04_mandelbrot | 54.37 | 46.93 | 43.71 | 1.16 | 1.24 |
-| 05_collatz | 127.52 | 134.40 | 199.91 | 0.95 | 0.64 |
-| 06_fib_mod | 23.50 | 23.71 | 23.70 | 0.99 | 0.99 |
-| 07_prime_count | 143.63 | 141.62 | 229.65 | 1.01 | 0.63 |
-| 08_bitmix | 33.37 | 24.00 | 45.20 | 1.39 | 0.74 |
-| 09_tak | 2.43 | 3.06 | 2.96 | 0.79 | 0.82 |
-| 10_isqrt | 84.71 | 66.34 | 83.06 | 1.28 | 1.02 |
-| 11_kmeans | 9.41 | 6.25 | 11.87 | 1.50 | 0.79 |
-| **geomean** | | | | **1.099** | **0.870** |
+| 01_matrix_mul | 1.09 | 1.56 | 1.61 | 0.70 | 0.68 |
+| 02_nbody | 16.62 | 13.76 | 14.82 | 1.21 | 1.12 |
+| 03_sieve | 23.45 | 18.39 | 20.05 | 1.28 | 1.17 |
+| 04_mandelbrot | 57.07 | 49.73 | 46.34 | 1.15 | 1.23 |
+| 05_collatz | 125.94 | 136.25 | 203.11 | 0.92 | 0.62 |
+| 06_fib_mod | 24.45 | 25.09 | 25.13 | 0.97 | 0.97 |
+| 07_prime_count | 146.41 | 145.08 | 234.32 | 1.01 | 0.62 |
+| 08_bitmix | 28.91 | 24.44 | 46.62 | 1.18 | 0.62 |
+| 09_tak | 2.60 | 3.28 | 3.16 | 0.79 | 0.82 |
+| 10_isqrt | 85.21 | 66.79 | 84.14 | 1.28 | 1.01 |
+| 11_kmeans | 9.37 | 6.42 | 12.13 | 1.46 | 0.77 |
+| **geomean** | | | | **1.063** | **0.848** |
 
 LIR now beats the gcc twins on 7 of 11 and is within a few percent of the
 clang `-O3 -march=native` twins on 6 of 11. The same table measured against an
@@ -156,11 +156,46 @@ bodies and the post-SSA induction-variable form, a much larger change than the
 counts suggest - and after the measurement above, no longer the obvious next
 step for kmeans.
 
+`08_bitmix` came down from 1.39 to 1.18 without touching its arithmetic. Its
+loop body updates three variables, and `destructSSA` emits out-of-SSA updates as
+three definitions followed by three grouped copies:
+
+    [9]  v13 = add v51, v12       [13] v51 = copy v13
+    [11] v17 = add v52, v16       [14] v52 = copy v17
+    [12] v20 = add v53, v19       [15] v53 = copy v20
+
+`coalesceCopiesPostSSA` will not touch these - `def_cnt[v51] != 1`, and relaxing
+that check once already broke `a = b; b = t` swaps - so the register allocator
+handles them instead, by giving the temporary the operand's register and letting
+the copy emit nothing. That aliasing existed but only matched when the copy was
+the *immediately next* instruction, which grouped copies never are. Widening the
+match to a copy later in the same block turns each pair into one in-place `add`
+and took five instructions out of a twenty-seven-instruction loop; the same
+shape appears in nine of the eleven workloads, worth 2 to 15 instructions each.
+
+The gap is what makes it interesting. Sharing a register across a distance is
+only sound if nothing in between reads the operand, and one thing reads it
+without saying so in the IR: a `@read_u64` whose address `planAddrFolds` folded
+into a SIB operand reads its base and index *at the access*, not at the
+`@ptr_add` that built it. `02_nbody`'s accumulation loop has exactly that in the
+gap, and aliasing through it made the loop counter advance before the load used
+it as an index - reading one element further each iteration, past the end of a
+buffer whose checks span hoisting had already removed, and printing a different
+wrong number on every run. `instReadsVregFolded` is the read-side twin of the
+exception the live-range builder already carries for the same fold, and the
+regression test for it records the three garbage values the unguarded build
+produced.
+
 Two caveats worth repeating before anyone reads a single row too closely. The
 workloads are ~1-150 ms and the harness interleaves rounds, so a row whose
 kernel is under a millisecond (`01`, `09`) carries several percent of process
 startup and code-layout noise: `01_matrix_mul` measures up to 6% either way
-between builds whose hot loop is byte-identical. And the C columns are
+between builds whose hot loop is byte-identical. Absolute milliseconds also
+drift between runs of this whole table - the run above measured `03_sieve` at
+23.45 ms and the run before it at 20.03 ms, with the clang twin moving from
+15.06 to 18.39 ms alongside it, so neither LIR nor the twin got slower. Only
+the ratio column is comparable across runs, because both sides of a ratio are
+timed in the same run on the same loaded 2-core VM. And the C columns are
 hand-written twins of the Rust sources, not Rust; see the top of this file for
 why that substitution was necessary.
 

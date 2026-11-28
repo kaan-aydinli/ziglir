@@ -5418,6 +5418,56 @@ test "an out-of-chunk read-modify-write traps identically at -O0, -O1 and -O2" {
     }
 }
 
+test "an in-place update may not clobber an index a folded access still reads" {
+    // The register allocator shares a temporary's register with the operand it
+    // updates in place when the write-back copy is a few instructions away,
+    // which is how `acc = acc + x` becomes one `add` instead of a `lea`/`mov`
+    // pair. Sharing is only sound if nothing in the gap reads the operand.
+    //
+    // The gap here holds a `@read_u64` whose address was folded into a SIB
+    // operand, and a folded access reads its base and index *at the access*,
+    // not at the `@ptr_add` that built it - so `i` is an operand of the load
+    // even though the load's IR arguments name only the pointer vreg. A scan
+    // that reads just the IR operands aliases `nxt = i + 1` onto `i`'s
+    // register, the `add` lands before the load, and the load then reads
+    // `buf[i + 1]`: at i = 15 that is one element past a 128-byte chunk whose
+    // accesses span hoisting already unchecked, so it is a silent
+    // out-of-bounds read rather than a trap. Measured without the guard, three
+    // runs of this program printed three different values
+    // (1643013743027191816, 1712078963637475112, 773643282426043832) where the
+    // answer is 360. This is the shape 02_nbody hits in its accumulation loop.
+    const src =
+        \\fn main() -> i64 {
+        \\    let buf = @malloc(128)
+        \\    if buf == 0 as *u8 { return 1 }
+        \\    var w: i64 = 0
+        \\    while w < 16 {
+        \\        @write_u64(@ptr_add(buf, w * 8), w * 3)
+        \\        w += 1
+        \\    }
+        \\    var s: i64 = 0
+        \\    var i: i64 = 0
+        \\    while i < 16 {
+        \\        let p = @ptr_add(buf, i * 8)
+        \\        let nxt = i + 1
+        \\        s += @read_u64(p)
+        \\        i = nxt
+        \\    }
+        \\    printInt(s)
+        \\    @free(buf)
+        \\    return 0
+        \\}
+    ;
+    inline for (.{ .O0, .O1, .O2 }) |lvl| {
+        const elf = try compileSourceWithOpt(src, lvl);
+        defer std.testing.allocator.free(elf);
+        const res = try runElfCapture(std.testing.allocator, elf, "foldgap_" ++ @tagName(lvl));
+        defer std.testing.allocator.free(res.stdout);
+        try std.testing.expectEqual(@as(u8, 0), res.exit_code);
+        try std.testing.expectEqualStrings("360\n", res.stdout); // 3 * sum(0..15)
+    }
+}
+
 // ── @sha256 builtin: native code blob + cross-backend execution ──────────
 // The digest of "abc" is a fixed, independently published constant, so these
 // expected decimal byte values are an oracle that does not share code with the
